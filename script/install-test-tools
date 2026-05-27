@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/test-tools.bash"
+
+ensure_rust_toolchain
+script/validate-test-tools
+
+manifest="$DIR/vendor/test-tools/manifest.toml"
+
+IFS='|' read -r tool_os tool_arch platform target < <(test_tools_host_platform)
+
+cargo_llvm_cov_version="$(read_version_file "$CARGO_LLVM_COV_VERSION_FILE")"
+manifest_cargo_llvm_cov_version="$(toml_value "$manifest" "cargo_llvm_cov_version")"
+
+if [[ "$manifest_cargo_llvm_cov_version" != "$cargo_llvm_cov_version" ]]; then
+  die "manifest cargo-llvm-cov version mismatch (expected ${cargo_llvm_cov_version}, found ${manifest_cargo_llvm_cov_version:-missing})"
+fi
+
+artifact_path=""
+artifact_sha256=""
+while IFS='|' read -r entry_platform _entry_arch _entry_os entry_target _entry_version _entry_url entry_path entry_sha256; do
+  if [[ "$entry_platform" == "$platform" && "$entry_target" == "$target" ]]; then
+    artifact_path="$entry_path"
+    artifact_sha256="$entry_sha256"
+    break
+  fi
+done < <(test_tools_cargo_llvm_cov_entries "$manifest")
+
+if [[ -z "$artifact_path" || -z "$artifact_sha256" ]]; then
+  die "test-tool manifest has no cargo-llvm-cov artifact for ${platform}"
+fi
+
+artifact="$DIR/$artifact_path"
+if [[ ! -f "$artifact" ]]; then
+  die "missing vendored cargo-llvm-cov artifact: $artifact_path"
+fi
+
+actual_sha256="$(sha256_file "$artifact")"
+if [[ "$actual_sha256" != "$artifact_sha256" ]]; then
+  die "cargo-llvm-cov artifact checksum mismatch for ${artifact_path}"
+fi
+validate_tar_entries "$artifact" z
+
+tmp_root="$(make_temp_dir fence-cargo-llvm-cov "$RUNNER_TEMP")"
+cleanup() {
+  remove_generated_path "$tmp_root" "temporary cargo-llvm-cov extraction directory"
+}
+trap cleanup EXIT
+
+tar -xzf "$artifact" -C "$tmp_root"
+if [[ ! -x "$tmp_root/cargo-llvm-cov" ]]; then
+  die "vendored cargo-llvm-cov artifact did not contain expected executable"
+fi
+
+cargo_llvm_cov_root="$RUNNER_TEMP/cargo-llvm-cov-${cargo_llvm_cov_version}"
+remove_generated_path "$cargo_llvm_cov_root" "cargo-llvm-cov install root"
+mkdir -p "$cargo_llvm_cov_root/bin"
+cp "$tmp_root/cargo-llvm-cov" "$cargo_llvm_cov_root/bin/cargo-llvm-cov"
+chmod +x "$cargo_llvm_cov_root/bin/cargo-llvm-cov"
+
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+  echo "$cargo_llvm_cov_root/bin" >> "$GITHUB_PATH"
+fi
+export PATH="$cargo_llvm_cov_root/bin:$PATH"
+
+installed_output="$(cargo-llvm-cov llvm-cov --version 2>/dev/null || true)"
+installed_version="${installed_output#cargo-llvm-cov }"
+installed_version="${installed_version%% *}"
+if [[ "$installed_version" != "$cargo_llvm_cov_version" ]]; then
+  die "cargo-llvm-cov version mismatch (expected ${cargo_llvm_cov_version}, found ${installed_version:-unknown})"
+fi
+
+echo -e "${GREEN}cargo-llvm-cov installed:${OFF} $cargo_llvm_cov_root/bin/cargo-llvm-cov"

@@ -1,0 +1,173 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+ci=false
+case "${1:-}" in
+  --ci)
+    ci=true
+    ;;
+  ""|--offline)
+    ;;
+  *)
+    die "usage: script/validate-locks [--ci|--offline]"
+    ;;
+esac
+
+validate_direct_dependencies_exact() {
+  awk '
+    /^\[dependencies\]/ {
+      in_deps = 1
+      next
+    }
+    /^\[/ {
+      if (in_deps) {
+        exit
+      }
+    }
+    in_deps {
+      line = $0
+      sub(/[[:space:]]*#.*/, "", line)
+      if (line ~ /^[[:space:]]*$/) {
+        next
+      }
+      if (line !~ /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/) {
+        next
+      }
+      if (line ~ /=[[:space:]]*"=/ || line ~ /version[[:space:]]*=[[:space:]]*"=/) {
+        next
+      }
+      print line
+      bad = 1
+    }
+    END {
+      exit bad ? 1 : 0
+    }
+  ' "$DIR/Cargo.toml"
+}
+
+validate_workflow_uses_pinned() {
+  local workflow
+  local line
+  local value
+  local ref
+  local failed=false
+
+  for workflow in "$DIR"/.github/workflows/*.yml; do
+    while IFS= read -r line; do
+      value="${line#*uses:}"
+      value="${value%%#*}"
+      value="$(printf '%s' "$value" | sed "s/^[[:space:]]*//; s/[[:space:]]*$//; s/^[\"']//; s/[\"']$//")"
+      [[ -n "$value" ]] || continue
+      case "$value" in
+        ./*) continue ;;
+        *@*)
+          ref="${value##*@}"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "${workflow#$DIR/}: uses ref is not a full commit SHA: $value" >&2
+            failed=true
+          fi
+          ;;
+        *)
+          echo "${workflow#$DIR/}: uses ref is missing @<sha>: $value" >&2
+          failed=true
+          ;;
+      esac
+    done < <(grep -nE '^[[:space:]]*uses:[[:space:]]*' "$workflow" || true)
+
+    if grep -nE '^[[:space:]]*image:[[:space:]]*[^#[:space:]]' "$workflow" | grep -v '@sha256:' >&2; then
+      failed=true
+    fi
+    if grep -nE '^[[:space:]]*container:[[:space:]]*[^#{[:space:]]' "$workflow" | grep -v '@sha256:' >&2; then
+      failed=true
+    fi
+  done
+
+  if [[ "$failed" == "true" ]]; then
+    die "workflow actions and images must be pinned to immutable SHAs or digests"
+  fi
+}
+
+validate_cargo_vendor_surface() {
+  if [[ ! -f "$DIR/Cargo.lock" ]]; then
+    die "missing Cargo.lock"
+  fi
+  if [[ ! -f "$DIR/.cargo/config.toml" ]]; then
+    die "missing .cargo/config.toml"
+  fi
+  if ! grep -q 'replace-with[[:space:]]*=[[:space:]]*"vendored-sources"' "$DIR/.cargo/config.toml"; then
+    die ".cargo/config.toml must replace crates.io with vendored sources"
+  fi
+  if ! grep -q 'offline[[:space:]]*=[[:space:]]*true' "$DIR/.cargo/config.toml"; then
+    die ".cargo/config.toml must keep Cargo offline by default"
+  fi
+  if [[ ! -d "$VENDOR_DIR" || -z "$(ls -A "$VENDOR_DIR" 2>/dev/null)" ]]; then
+    die "vendor cache is empty; run script/update while online"
+  fi
+  if ! find "$VENDOR_DIR" -mindepth 2 -maxdepth 2 -name .cargo-checksum.json -print -quit | grep -q .; then
+    die "vendor cache is missing Cargo checksum metadata"
+  fi
+  if ! validate_direct_dependencies_exact; then
+    die "Cargo.toml direct dependencies must use exact versions"
+  fi
+  if [[ -e "$DIR/vendor/update-tools" ]] && { [[ ! -d "$DIR/vendor/update-tools" ]] || find "$DIR/vendor/update-tools" -mindepth 1 -print -quit | grep -q .; }; then
+    die "update-tool dependency locks belong in ${UPDATE_TOOLS_LOCK#$DIR/}; do not commit vendor/update-tools"
+  fi
+}
+
+validate_tooling_layout() {
+  local required=(
+    "$RUST_TOOLCHAIN_LOCK"
+    "$UPDATE_TOOLS_LOCK"
+    "$RELEASE_TOOLS_LOCK"
+    "$TEST_TOOLS_LOCK"
+    "$ZIG_VERSION_FILE"
+    "$CARGO_ZIGBUILD_VERSION_FILE"
+    "$CARGO_LLVM_COV_VERSION_FILE"
+    "$CARGO_AUDIT_VERSION_FILE"
+    "$CARGO_DENY_VERSION_FILE"
+  )
+  local old=(
+    "$DIR/rust-toolchain.lock.toml"
+    "$DIR/update-tools.lock.toml"
+    "$DIR/release-tools.lock.toml"
+    "$DIR/test-tools.lock.toml"
+    "$DIR/.zig-version"
+    "$DIR/.cargo-zigbuild-version"
+    "$DIR/.cargo-llvm-cov-version"
+    "$DIR/.cargo-audit-version"
+    "$DIR/.cargo-deny-version"
+  )
+  local file
+
+  for file in "${required[@]}"; do
+    if [[ ! -f "$file" ]]; then
+      die "missing tooling metadata: ${file#$DIR/}"
+    fi
+  done
+
+  for file in "${old[@]}"; do
+    if [[ -e "$file" ]]; then
+      die "obsolete root tooling metadata is not allowed: ${file#$DIR/}; use .cargo/tooling/"
+    fi
+  done
+}
+
+validate_tooling_layout
+
+if [[ "$ci" == "true" ]]; then
+  script/validate-rust-toolchain --ci
+  script/validate-update-tools --ci
+else
+  script/validate-rust-toolchain
+  script/validate-update-tools
+fi
+
+script/validate-release-tools
+script/validate-test-tools
+validate_cargo_vendor_surface
+validate_workflow_uses_pinned
+
+echo -e "${GREEN}lock surfaces verified${OFF}"

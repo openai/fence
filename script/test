@@ -1,0 +1,74 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+ensure_rust_toolchain
+
+script/validate-release-tools
+script/validate-test-tools
+
+case "${1:-}" in
+  "" )
+    ;;
+  --coverage|--cov|-c)
+    ;;
+  *)
+    die "usage: script/test [--coverage|--cov|-c]"
+    ;;
+esac
+
+if [[ -z "${1:-}" ]]; then
+  cargo test --frozen
+  exit 0
+fi
+
+if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
+  die "cargo-llvm-cov is required for coverage runs; run script/install-test-tools first"
+fi
+
+if command -v rustup >/dev/null 2>&1; then
+  if ! rustup component list --installed | grep -Eq '^llvm-tools(-preview)?($|-)'; then
+    die "rustup component llvm-tools-preview is required for coverage runs; run script/prepare-rust first"
+  fi
+fi
+
+echo -e "\n${BLUE}Running coverage: $(date "+%H:%M:%S")${OFF}\n"
+
+lcov_path="$DIR/coverage/lcov.info"
+json_path="$DIR/coverage/coverage.json"
+text_path="$DIR/coverage/coverage.txt"
+html_dir="$DIR/coverage/html"
+
+clear_generated_dir "$DIR/coverage" "coverage output directory"
+
+ignore_regex='(^|/)(tests|benches|target|vendor)/|/\.cargo/registry/|/rustc/'
+
+cargo llvm-cov clean --workspace
+cargo llvm-cov --frozen --workspace --all-features --no-report
+
+cargo llvm-cov report \
+  --text --output-path "$text_path" \
+  --ignore-filename-regex "$ignore_regex" \
+  --fail-under-lines 100 \
+  --fail-under-functions 100 \
+  --fail-under-regions 100
+
+cargo llvm-cov report --lcov --output-path "$lcov_path" \
+  --ignore-filename-regex "$ignore_regex"
+cargo llvm-cov report --json --summary-only --output-path "$json_path" \
+  --ignore-filename-regex "$ignore_regex"
+cargo llvm-cov report --html --output-dir "$html_dir" \
+  --ignore-filename-regex "$ignore_regex"
+
+lines_total="$(awk -F: '/^LF:/ {sum += $2} END {print sum+0}' "$lcov_path")"
+lines_hit="$(awk -F: '/^LH:/ {sum += $2} END {print sum+0}' "$lcov_path")"
+if [[ "$lines_total" -le 0 ]]; then
+  die "coverage report missing line counts"
+fi
+
+coverage_value="$(awk -v hit="$lines_hit" -v total="$lines_total" 'BEGIN {printf "%.1f", (hit/total)*100}')"
+echo "${coverage_value}%" > "$DIR/coverage/total-coverage.txt"
+
+echo -e "\n${GREEN}Coverage: ${coverage_value}% lines, functions, and regions met the 100% gate${OFF}"

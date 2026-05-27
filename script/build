@@ -1,0 +1,318 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+ensure_rust_toolchain
+
+usage() {
+  echo -e "${RED}usage:${OFF} script/build [--release] [--target <triple>] [--targets <triple,...>] [--dist-dir <dir>] [--universal-darwin]" >&2
+}
+
+first_match() {
+  local pattern="$1"
+  local file="$2"
+
+  if command -v rg >/dev/null 2>&1; then
+    rg -m1 "$pattern" "$file"
+  else
+    grep -m1 -E "$pattern" "$file"
+  fi
+}
+
+target_exe_suffix() {
+  case "$1" in
+    *windows*) echo ".exe" ;;
+    *) echo "" ;;
+  esac
+}
+
+target_os() {
+  case "$1" in
+    *-unknown-linux-gnu|*-unknown-linux-musl) echo "linux" ;;
+    *-apple-darwin) echo "darwin" ;;
+    *-pc-windows-gnu|*-pc-windows-msvc) echo "windows" ;;
+    *-unknown-freebsd*) echo "freebsd" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+target_arch() {
+  case "$1" in
+    x86_64-*) echo "amd64" ;;
+    aarch64-*) echo "arm64" ;;
+    armv7-*) echo "armv7" ;;
+    *) echo "${1%%-*}" ;;
+  esac
+}
+
+build_date_utc() {
+  if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
+    if date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" >/dev/null 2>&1; then
+      date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ"
+      return
+    fi
+    if date -u -r "$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ" >/dev/null 2>&1; then
+      date -u -r "$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ"
+      return
+    fi
+  fi
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+generate_docs() {
+  local host_bin="$target_dir/$host_target/release/${package_name}"
+  if [[ ! -x "$host_bin" ]]; then
+    warn "host binary not found for docs at ${host_bin}"
+    return
+  fi
+
+  local docs_dir="$dist_dir/docs"
+  mkdir -p "$docs_dir/completions"/{bash,zsh,fish,powershell} "$docs_dir/man"
+
+  "$host_bin" completions bash > "$docs_dir/completions/bash/${package_name}"
+  "$host_bin" completions zsh > "$docs_dir/completions/zsh/_${package_name}"
+  "$host_bin" completions fish > "$docs_dir/completions/fish/${package_name}.fish"
+  "$host_bin" completions powershell > "$docs_dir/completions/powershell/${package_name}.ps1"
+  "$host_bin" man > "$docs_dir/man/${package_name}.1"
+}
+
+release_mode=false
+universal_darwin=false
+dist_dir="$DIR/dist"
+targets=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --release)
+      release_mode=true
+      ;;
+    --target)
+      if [[ -z "${2:-}" ]]; then
+        usage
+        exit 2
+      fi
+      targets+=("$2")
+      shift
+      ;;
+    --targets)
+      if [[ -z "${2:-}" ]]; then
+        usage
+        exit 2
+      fi
+      IFS=',' read -r -a parsed_targets <<< "$2"
+      targets+=("${parsed_targets[@]}")
+      shift
+      ;;
+    --dist-dir)
+      if [[ -z "${2:-}" ]]; then
+        usage
+        exit 2
+      fi
+      dist_dir="$2"
+      shift
+      ;;
+    --universal-darwin)
+      universal_darwin=true
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+package_line="$(first_match '^[[:space:]]*name[[:space:]]*=' "$DIR/Cargo.toml" || true)"
+package_name=""
+if [[ "$package_line" =~ =[[:space:]]*\"([^\"]+)\" ]]; then
+  package_name="${BASH_REMATCH[1]}"
+fi
+
+if [[ -z "$package_name" ]]; then
+  package_name="$REPO_NAME"
+fi
+
+metadata=$(cargo metadata --frozen --no-deps --format-version 1 2>/dev/null || true)
+target_dir=""
+if [[ -n "$metadata" ]]; then
+  target_dir=$(printf '%s' "$metadata" \
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p; q')
+fi
+
+if [[ -z "$target_dir" ]]; then
+  target_dir="$DIR/target"
+fi
+
+if [[ "$release_mode" != "true" ]]; then
+  echo -e "${BLUE}Building profile:${OFF} ${PURPLE}release${OFF}"
+  cargo build --release --frozen
+
+  exe_suffix=""
+  case "$OSTYPE" in
+    msys*|cygwin*|win32*) exe_suffix=".exe" ;;
+  esac
+
+  binary_path=""
+  candidate="$target_dir/release/${package_name}${exe_suffix}"
+  if [[ -f "$candidate" ]]; then
+    binary_path="$candidate"
+  else
+    fallback=$(find "$target_dir/release" -maxdepth 1 -type f -perm -111 -print -quit 2>/dev/null)
+    if [[ -n "$fallback" ]]; then
+      binary_path="$fallback"
+    fi
+  fi
+
+  if [[ -n "$binary_path" ]]; then
+    binary_size=$(ls -lh "$binary_path" | awk '{print $5}')
+    echo -e "${GREEN}Built binary:${OFF} ${binary_path}"
+    echo -e "${GREEN}Binary size:${OFF} ${binary_size}"
+  else
+    warn "could not determine built binary path/size"
+  fi
+  exit 0
+fi
+
+host_target=$(rustc -vV | awk -F': ' '/^host: /{print $2}')
+if [[ -z "$host_target" ]]; then
+  die "could not determine rust host target"
+fi
+
+if [[ ${#targets[@]} -eq 0 && -n "${BUILD_TARGETS:-}" ]]; then
+  IFS=',' read -r -a targets <<< "$BUILD_TARGETS"
+fi
+
+if [[ ${#targets[@]} -eq 0 ]]; then
+  targets=("$host_target")
+fi
+
+build_version="${BUILD_VERSION:-}"
+if [[ -z "$build_version" && -n "${GITHUB_REF_NAME:-}" ]]; then
+  build_version="$GITHUB_REF_NAME"
+fi
+if [[ -z "$build_version" ]]; then
+  build_version=$(git describe --tags --abbrev=0 2>/dev/null || true)
+fi
+if [[ -z "$build_version" ]]; then
+  build_version="dev"
+fi
+build_version="${build_version//\//-}"
+build_version="${build_version// /-}"
+
+if [[ "$build_version" == "ci" && -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+  source_date_epoch="$(git log -1 --format=%ct HEAD 2>/dev/null || true)"
+  if [[ -n "$source_date_epoch" ]]; then
+    export SOURCE_DATE_EPOCH="$source_date_epoch"
+  fi
+fi
+
+build_commit=$(git rev-parse --short HEAD 2>/dev/null || true)
+if [[ -z "$build_commit" ]]; then
+  build_commit="unknown"
+fi
+build_date=$(build_date_utc)
+
+export BUILD_VERSION="$build_version"
+export BUILD_COMMIT="$build_commit"
+export BUILD_DATE="$build_date"
+
+if [[ -z "$dist_dir" || "$dist_dir" == "/" ]]; then
+  die "invalid dist directory: ${dist_dir}"
+fi
+case "$dist_dir" in
+  /*) ;;
+  *)
+    while [[ "$dist_dir" == ./* ]]; do
+      dist_dir="${dist_dir#./}"
+    done
+    dist_dir="$DIR/$dist_dir"
+    ;;
+esac
+
+clear_generated_dir "$dist_dir" "dist directory"
+
+for target in "${targets[@]}"; do
+  if [[ -z "$target" ]]; then
+    continue
+  fi
+
+  if [[ "$target" != "$host_target" ]]; then
+    if ! rust_target_installed "$target"; then
+      echo -e "${RED}error:${OFF} rust target not installed: ${target}" >&2
+      echo -e "${RED}hint:${OFF} run script/prepare-rust with PREPARE_RUST_TARGETS including ${target}, then re-run the build" >&2
+      exit 1
+    fi
+  fi
+
+  build_cmd=(cargo build)
+  if [[ "$target" != "$host_target" ]]; then
+    require_cmd cargo-zigbuild
+    require_cmd zig
+    assert_tool_version "zig" "$ZIG_VERSION_FILE" "$(zig version)"
+    if [[ -f "$CARGO_ZIGBUILD_VERSION_FILE" ]]; then
+      expected=$(head -n1 "$CARGO_ZIGBUILD_VERSION_FILE" | tr -d '[:space:]')
+      installed_output=$(cargo-zigbuild --version 2>/dev/null || true)
+      installed="${installed_output#cargo-zigbuild }"
+      installed="${installed%% *}"
+      if [[ -n "$installed" && "$installed" != "$expected" ]]; then
+        die "cargo-zigbuild version mismatch (expected ${expected}, found ${installed})"
+      fi
+      if [[ -z "$installed" ]]; then
+        die "could not determine cargo-zigbuild version"
+      fi
+    fi
+    build_cmd=(cargo zigbuild)
+  fi
+
+  "${build_cmd[@]}" --release --frozen --target "$target"
+
+  exe_suffix=$(target_exe_suffix "$target")
+  binary_path="$target_dir/$target/release/${package_name}${exe_suffix}"
+  if [[ ! -f "$binary_path" ]]; then
+    die "expected binary not found at ${binary_path}"
+  fi
+
+  os_name=$(target_os "$target")
+  arch_name=$(target_arch "$target")
+  dist_name="${package_name}_${build_version}_${os_name}-${arch_name}${exe_suffix}"
+
+  cp "$binary_path" "$dist_dir/$dist_name"
+
+  binary_size=$(ls -lh "$binary_path" | awk '{print $5}')
+  echo -e "${GREEN}Built:${OFF} ${dist_name} (${binary_size})"
+done
+
+if [[ "$release_mode" == "true" ]]; then
+  generate_docs
+fi
+
+if [[ "$universal_darwin" == "true" ]]; then
+  require_cmd lipo
+
+  darwin_x86="$target_dir/x86_64-apple-darwin/release/${package_name}"
+  darwin_arm="$target_dir/aarch64-apple-darwin/release/${package_name}"
+
+  if [[ ! -f "$darwin_x86" || ! -f "$darwin_arm" ]]; then
+    die "darwin inputs missing; build x86_64-apple-darwin and aarch64-apple-darwin first"
+  fi
+
+  universal_name="${package_name}_${build_version}_darwin-universal"
+  lipo -create -output "$dist_dir/$universal_name" "$darwin_x86" "$darwin_arm"
+  echo -e "${GREEN}Built:${OFF} ${universal_name}"
+fi
+
+if command -v shasum >/dev/null 2>&1; then
+  (cd "$dist_dir" && find . -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | sort -z | xargs -0 shasum -a 256 > checksums.txt)
+elif command -v sha256sum >/dev/null 2>&1; then
+  (cd "$dist_dir" && find . -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | sort -z | xargs -0 sha256sum > checksums.txt)
+else
+  warn "no sha256 tool found; skipping checksums"
+fi
+
+echo -e "${GREEN}Release artifacts:${OFF} ${dist_dir}"

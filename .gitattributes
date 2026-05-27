@@ -1,0 +1,12 @@
+# Vendored third-party source and tool artifacts should not affect GitHub
+# language statistics for this template.
+vendor/** linguist-vendored=true
+
+# Committed release-tool archives are intentionally opaque binary inputs.
+vendor/**/*.crate binary
+vendor/**/*.tar.gz binary
+vendor/**/*.tar.xz binary
+
+# Project scripts are first-party workflow glue, but should not dominate GitHub
+# language statistics for this Rust template.
+script/** -linguist-detectable

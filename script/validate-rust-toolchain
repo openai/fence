@@ -1,0 +1,133 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/rust-dist.bash"
+
+online=false
+case "${1:-}" in
+  --ci|--online)
+    online=true
+    ;;
+  ""|--offline)
+    ;;
+  *)
+    die "usage: script/validate-rust-toolchain [--ci|--online|--offline]"
+    ;;
+esac
+
+rust_lockfile="$RUST_TOOLCHAIN_LOCK"
+
+if [[ ! -f "$rust_lockfile" ]]; then
+  die "missing Rust toolchain lockfile: $rust_lockfile"
+fi
+
+require_cmd_for_online() {
+  require_cmd curl
+  require_cmd python3
+}
+
+expected_version="$(rust_toolchain_version)"
+rust_version_file="$(read_version_file "$DIR/.rust-version")"
+cargo_rust_version="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$DIR/Cargo.toml" | head -n1)"
+lock_version="$(toml_value "$rust_lockfile" "version")"
+lock_manifest_url="$(toml_value "$rust_lockfile" "manifest_url")"
+lock_manifest_sha="$(toml_value "$rust_lockfile" "manifest_sha256")"
+
+if [[ -z "$expected_version" ]]; then
+  die "missing channel in rust-toolchain.toml"
+fi
+
+if [[ "$rust_version_file" != "$expected_version" ]]; then
+  die ".rust-version mismatch (expected ${expected_version}, found ${rust_version_file:-missing})"
+fi
+
+if [[ "$cargo_rust_version" != "$expected_version" ]]; then
+  die "Cargo.toml rust-version mismatch (expected ${expected_version}, found ${cargo_rust_version:-missing})"
+fi
+
+if [[ "$lock_version" != "$expected_version" ]]; then
+  die "${RUST_TOOLCHAIN_LOCK#$DIR/} version mismatch (expected ${expected_version}, found ${lock_version:-missing})"
+fi
+
+expected_manifest_url="$(rust_dist_manifest_url "$expected_version")"
+if [[ "$lock_manifest_url" != "$expected_manifest_url" ]]; then
+  die "Rust manifest URL mismatch (expected ${expected_manifest_url}, found ${lock_manifest_url:-missing})"
+fi
+
+if ! [[ "$lock_manifest_sha" =~ ^[0-9a-f]{64}$ ]]; then
+  die "Rust manifest checksum is missing or invalid"
+fi
+
+if grep -qE '^[[:space:]]*path[[:space:]]*=' "$rust_lockfile"; then
+  die "${RUST_TOOLCHAIN_LOCK#$DIR/} must not reference local Rust artifact paths"
+fi
+
+for host in "${RUST_DIST_HOSTS[@]}"; do
+  for component in "${RUST_DIST_HOST_COMPONENTS[@]}"; do
+    rust_dist_require_artifact "$rust_lockfile" host "$component" "$host"
+  done
+done
+
+for target in "${RUST_DIST_TARGETS[@]}"; do
+  rust_dist_require_artifact "$rust_lockfile" target rust-std "$target"
+done
+
+artifact_count=0
+while IFS='|' read -r kind component target url sha256; do
+  artifact_count=$((artifact_count + 1))
+  if [[ -z "$kind" || -z "$component" || -z "$target" || -z "$url" || -z "$sha256" ]]; then
+    die "invalid Rust artifact lock entry"
+  fi
+
+  case "$kind" in
+    host|target) ;;
+    *) die "invalid Rust artifact kind: $kind" ;;
+  esac
+
+  case "$url" in
+    https://static.rust-lang.org/dist/*.tar.xz) ;;
+    *) die "unexpected Rust artifact URL: $url" ;;
+  esac
+
+  if ! [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    die "invalid Rust artifact checksum for ${component} ${target}"
+  fi
+done < <(rust_dist_artifact_entries "$rust_lockfile")
+
+if [[ "$artifact_count" -ne 24 ]]; then
+  die "expected 24 Rust artifact lock entries, found $artifact_count"
+fi
+
+if [[ "$online" == "true" ]]; then
+  require_cmd_for_online
+  tmpdir="$(make_temp_dir fence-rust-validate)"
+  cleanup() {
+    remove_generated_path "$tmpdir" "temporary Rust validation directory"
+  }
+  trap cleanup EXIT
+
+  manifest_file="$tmpdir/channel-rust-${expected_version}.toml"
+  manifest_sha_file="$tmpdir/channel-rust-${expected_version}.toml.sha256"
+
+  fetch "$lock_manifest_url" "$manifest_file"
+  fetch "${lock_manifest_url}.sha256" "$manifest_sha_file"
+
+  upstream_manifest_sha="$(awk '{print $1}' "$manifest_sha_file")"
+  actual_manifest_sha="$(sha256_file "$manifest_file")"
+  if [[ -z "$upstream_manifest_sha" || "$actual_manifest_sha" != "$upstream_manifest_sha" ]]; then
+    die "Rust channel manifest checksum mismatch against upstream .sha256"
+  fi
+  if [[ "$actual_manifest_sha" != "$lock_manifest_sha" ]]; then
+    die "Rust channel manifest checksum mismatch against ${RUST_TOOLCHAIN_LOCK#$DIR/}"
+  fi
+
+  hosts_csv="$(rust_dist_csv "${RUST_DIST_HOSTS[@]}")"
+  targets_csv="$(rust_dist_csv "${RUST_DIST_TARGETS[@]}")"
+  if ! diff -u <(rust_dist_artifact_entries "$rust_lockfile" | sort) <(rust_dist_generate_artifact_entries_from_manifest "$manifest_file" "$expected_version" "$hosts_csv" "$targets_csv" | sort); then
+    die "Rust artifact locks differ from upstream channel manifest"
+  fi
+fi
+
+echo -e "${GREEN}Rust toolchain lock verified${OFF}"

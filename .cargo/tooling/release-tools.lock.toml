@@ -1,0 +1,52 @@
+# Locked upstream release-tool inputs.
+#
+# This file is the human-reviewed source of truth for release-tool downloads.
+# `script/vendor-release-tools` reads it while online and writes the generated
+# committed-artifact inventory to `vendor/release-tools/manifest.toml`.
+
+[release_tools]
+lock_version = 1
+zig_version = "0.16.0"
+cargo_zigbuild_version = "0.22.3"
+
+[[zig]]
+platform = "macos-x86_64"
+arch = "x86_64"
+os = "macos"
+version = "0.16.0"
+url = "https://ziglang.org/download/0.16.0/zig-x86_64-macos-0.16.0.tar.xz"
+path = "vendor/release-tools/zig/zig-x86_64-macos-0.16.0.tar.xz"
+sha256 = "0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
+
+[[zig]]
+platform = "macos-aarch64"
+arch = "aarch64"
+os = "macos"
+version = "0.16.0"
+url = "https://ziglang.org/download/0.16.0/zig-aarch64-macos-0.16.0.tar.xz"
+path = "vendor/release-tools/zig/zig-aarch64-macos-0.16.0.tar.xz"
+sha256 = "b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+
+[[zig]]
+platform = "linux-x86_64"
+arch = "x86_64"
+os = "linux"
+version = "0.16.0"
+url = "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
+path = "vendor/release-tools/zig/zig-x86_64-linux-0.16.0.tar.xz"
+sha256 = "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+
+[[zig]]
+platform = "linux-aarch64"
+arch = "aarch64"
+os = "linux"
+version = "0.16.0"
+url = "https://ziglang.org/download/0.16.0/zig-aarch64-linux-0.16.0.tar.xz"
+path = "vendor/release-tools/zig/zig-aarch64-linux-0.16.0.tar.xz"
+sha256 = "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17"
+
+[cargo_zigbuild]
+version = "0.22.3"
+url = "https://static.crates.io/crates/cargo-zigbuild/cargo-zigbuild-0.22.3.crate"
+crate_path = "vendor/release-tools/cargo-zigbuild/cargo-zigbuild-0.22.3.crate"
+crate_sha256 = "418b19ee36a550c7c34a0bfd04e0b31d0dfb2c92f54aa36189ea3f2f85764845"

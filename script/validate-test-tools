@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/test-tools.bash"
+
+test_tools_dir="$DIR/vendor/test-tools"
+manifest="$test_tools_dir/manifest.toml"
+lockfile="$TEST_TOOLS_LOCK"
+
+if [[ ! -f "$lockfile" ]]; then
+  die "missing test-tool lockfile: $lockfile"
+fi
+
+if [[ ! -f "$manifest" ]]; then
+  die "missing test-tool manifest: $manifest"
+fi
+
+cargo_llvm_cov_version="$(read_version_file "$CARGO_LLVM_COV_VERSION_FILE")"
+lock_cargo_llvm_cov_version="$(toml_value "$lockfile" "cargo_llvm_cov_version")"
+manifest_cargo_llvm_cov_version="$(toml_value "$manifest" "cargo_llvm_cov_version")"
+
+if [[ "$lock_cargo_llvm_cov_version" != "$cargo_llvm_cov_version" ]]; then
+  die "${TEST_TOOLS_LOCK#$DIR/} cargo-llvm-cov version mismatch (expected ${cargo_llvm_cov_version}, found ${lock_cargo_llvm_cov_version:-missing})"
+fi
+
+if [[ "$manifest_cargo_llvm_cov_version" != "$cargo_llvm_cov_version" ]]; then
+  die "manifest cargo-llvm-cov version mismatch (expected ${cargo_llvm_cov_version}, found ${manifest_cargo_llvm_cov_version:-missing})"
+fi
+
+if ! diff -u <(test_tools_cargo_llvm_cov_entries "$lockfile" | sort) <(test_tools_cargo_llvm_cov_entries "$manifest" | sort); then
+  die "test-tool lockfile and manifest cargo-llvm-cov entries differ"
+fi
+
+artifact_count=0
+while IFS='|' read -r platform arch os target version url path sha256; do
+  artifact_count=$((artifact_count + 1))
+  if [[ -z "$platform" || -z "$arch" || -z "$os" || -z "$target" || -z "$version" || -z "$url" || -z "$path" || -z "$sha256" ]]; then
+    die "invalid cargo-llvm-cov entry in test-tool manifest"
+  fi
+  if [[ "$version" != "$cargo_llvm_cov_version" ]]; then
+    die "cargo-llvm-cov entry version mismatch for ${platform}"
+  fi
+  reject_unsafe_relative_path "$path" "cargo-llvm-cov manifest path for ${platform}"
+  artifact="$DIR/$path"
+  if [[ ! -f "$artifact" ]]; then
+    die "missing cargo-llvm-cov artifact: $path"
+  fi
+  actual="$(sha256_file "$artifact")"
+  if [[ "$actual" != "$sha256" ]]; then
+    die "cargo-llvm-cov checksum mismatch for $path"
+  fi
+  validate_tar_entries "$artifact" z
+  if ! archive_contains "$artifact" z "cargo-llvm-cov"; then
+    die "cargo-llvm-cov artifact missing executable: $path"
+  fi
+done < <(test_tools_cargo_llvm_cov_entries "$manifest")
+
+if [[ "$artifact_count" -ne 4 ]]; then
+  die "expected 4 vendored cargo-llvm-cov artifacts, found $artifact_count"
+fi
+
+require_pattern() {
+  local file="$1"
+  local pattern="$2"
+  local description="$3"
+
+  if ! grep -qE "$pattern" "$file"; then
+    die "$description"
+  fi
+}
+
+require_pattern "$DIR/.github/workflows/test.yml" 'script/install-test-tools' "test workflow must install vendored test tools before coverage validation"
+require_pattern "$DIR/.github/workflows/test.yml" 'script/test --coverage' "test workflow must run coverage through script/test --coverage"
+
+if grep -nE '\bcurl\b|cargo install[[:space:]].*--version|unset CARGO_NET_OFFLINE|unset RUSTUP_AUTO_INSTALL|RUSTUP_AUTO_INSTALL[[:space:]]*=' "$DIR/script/install-test-tools"; then
+  die "script/install-test-tools must remain offline-only"
+fi
+
+if grep -n -- '--branch' "$DIR/script/test"; then
+  die "script/test must not enable unstable branch coverage"
+fi
+
+for script in "$DIR/script/vendor-test-tools" "$DIR/script/install-test-tools" "$DIR/script/validate-test-tools"; do
+  if grep -nE '[[:xdigit:]]{64}' "$script"; then
+    die "${script#$DIR/} must not contain embedded SHA-256 literals; use ${TEST_TOOLS_LOCK#$DIR/} or the generated manifest"
+  fi
+done
+
+echo -e "${GREEN}test-tool lockfile and manifest verified${OFF}"

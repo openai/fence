@@ -1,0 +1,37 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+ensure_rust_toolchain
+
+CHECK_FORMAT=true
+case "${1:-}" in
+  "")
+    ;;
+  --A|-A|-a|--a|--auto-fix)
+    CHECK_FORMAT=false
+    ;;
+  -h|--help)
+    echo -e "${RED}usage:${OFF} script/lint [--auto-fix]" >&2
+    exit 0
+    ;;
+  *)
+    echo -e "${RED}usage:${OFF} script/lint [--auto-fix]" >&2
+    exit 2
+    ;;
+esac
+if [[ $# -gt 1 ]]; then
+  echo -e "${RED}usage:${OFF} script/lint [--auto-fix]" >&2
+  exit 2
+fi
+
+if [[ "$CHECK_FORMAT" == "true" ]]; then
+  cargo fmt --all -- --check
+else
+  cargo fmt --all
+fi
+cargo clippy --frozen --all-targets --all-features -- -D warnings
+cargo verify-project
+cargo doc --frozen --no-deps --document-private-items --all-features --workspace

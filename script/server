@@ -1,0 +1,9 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+ensure_rust_toolchain
+
+cargo run --frozen -- "$@"

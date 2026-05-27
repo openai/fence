@@ -1,0 +1,17 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+ensure_rust_toolchain
+require_cmd cargo
+
+echo -e "Rust version: ${GREEN}${RUST_VERSION}${OFF}"
+
+ensure_vendor_cache
+
+# This validates that the deps are available so the project can be built offline.
+cargo check --frozen
+
+require_clean_git
