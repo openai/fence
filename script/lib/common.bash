@@ -81,7 +81,7 @@ archive_contains() {
 
 make_temp_dir() {
   local prefix="$1"
-  local root="${2:-${TMPDIR:-/tmp}}"
+  local root="${2:-${TMPDIR:-${RUNNER_TEMP:-$DIR/target/tmp}}}"
 
   mkdir -p "$root"
   mktemp -d "${root}/${prefix}.XXXXXX"
