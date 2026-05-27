@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/release-tools.bash"
+
+ensure_rust_toolchain
+
+release_tools_dir="$DIR/vendor/release-tools"
+manifest="$release_tools_dir/manifest.toml"
+
+if [[ ! -f "$manifest" ]]; then
+  die "missing release-tool manifest: $manifest; run script/vendor-release-tools while online"
+fi
+
+require_cmd cargo
+require_cmd tar
+
+IFS='|' read -r zig_os zig_arch platform < <(release_tools_host_platform)
+
+zig_version="$(read_version_file "$ZIG_VERSION_FILE")"
+cargo_zigbuild_version="$(read_version_file "$CARGO_ZIGBUILD_VERSION_FILE")"
+
+manifest_zig_version="$(toml_value "$manifest" "zig_version")"
+manifest_zigbuild_version="$(toml_value "$manifest" "cargo_zigbuild_version")"
+
+if [[ "$manifest_zig_version" != "$zig_version" ]]; then
+  die "manifest Zig version mismatch (expected ${zig_version}, found ${manifest_zig_version:-missing})"
+fi
+
+if [[ "$manifest_zigbuild_version" != "$cargo_zigbuild_version" ]]; then
+  die "manifest cargo-zigbuild version mismatch (expected ${cargo_zigbuild_version}, found ${manifest_zigbuild_version:-missing})"
+fi
+
+platform="${zig_os}-${zig_arch}"
+zig_path=""
+zig_sha256=""
+while IFS='|' read -r entry_platform _entry_arch _entry_os _entry_version _entry_url entry_path entry_sha256; do
+  if [[ "$entry_platform" == "$platform" ]]; then
+    zig_path="$entry_path"
+    zig_sha256="$entry_sha256"
+    break
+  fi
+done < <(release_tools_zig_entries "$manifest")
+
+if [[ -z "$zig_path" || -z "$zig_sha256" ]]; then
+  die "release-tool manifest has no Zig artifact for ${platform}"
+fi
+
+zig_tarball="$DIR/$zig_path"
+if [[ ! -f "$zig_tarball" ]]; then
+  die "missing vendored Zig artifact: $zig_path"
+fi
+
+actual_zig_sha256="$(sha256_file "$zig_tarball")"
+if [[ "$actual_zig_sha256" != "$zig_sha256" ]]; then
+  die "Zig artifact checksum mismatch for ${zig_path}"
+fi
+validate_tar_entries "$zig_tarball" J
+
+tmp_root="$(make_temp_dir fence-zig "$RUNNER_TEMP")"
+cleanup() {
+  remove_generated_path "$tmp_root" "temporary Zig extraction directory"
+}
+trap cleanup EXIT
+
+tar -xJf "$zig_tarball" -C "$tmp_root"
+extracted="$tmp_root/zig-${zig_arch}-${zig_os}-${zig_version}"
+if [[ ! -x "$extracted/zig" ]]; then
+  die "vendored Zig artifact did not contain expected zig binary"
+fi
+
+zig_root="$RUNNER_TEMP/zig-${zig_arch}-${zig_os}-${zig_version}"
+remove_generated_path "$zig_root" "Zig install root"
+mv "$extracted" "$zig_root"
+
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+  echo "$zig_root" >> "$GITHUB_PATH"
+fi
+export PATH="$zig_root:$PATH"
+
+cargo_crate_path="$(toml_value "$manifest" "crate_path")"
+cargo_crate_sha256="$(toml_value "$manifest" "crate_sha256")"
+cargo_source_archive_path="$(toml_value "$manifest" "source_archive_path")"
+cargo_source_archive_sha256="$(toml_value "$manifest" "source_archive_sha256")"
+cargo_source_archive_root="$(toml_value "$manifest" "source_archive_root")"
+cargo_vendor_archive_path="$(toml_value "$manifest" "vendor_archive_path")"
+cargo_vendor_archive_sha256="$(toml_value "$manifest" "vendor_archive_sha256")"
+cargo_vendor_dir="$(toml_value "$manifest" "vendor_dir")"
+
+if [[ -z "$cargo_crate_path" || -z "$cargo_crate_sha256" || -z "$cargo_source_archive_path" || -z "$cargo_source_archive_sha256" || -z "$cargo_source_archive_root" || -z "$cargo_vendor_archive_path" || -z "$cargo_vendor_archive_sha256" || -z "$cargo_vendor_dir" ]]; then
+  die "release-tool manifest is missing cargo-zigbuild fields"
+fi
+
+cargo_crate_path="$DIR/$cargo_crate_path"
+cargo_source_archive="$DIR/$cargo_source_archive_path"
+cargo_vendor_archive="$DIR/$cargo_vendor_archive_path"
+
+if [[ ! -f "$cargo_crate_path" ]]; then
+  die "missing vendored cargo-zigbuild crate: $cargo_crate_path"
+fi
+if [[ ! -f "$cargo_source_archive" ]]; then
+  die "missing vendored cargo-zigbuild source archive: $cargo_source_archive_path"
+fi
+if [[ ! -f "$cargo_vendor_archive" ]]; then
+  die "missing vendored cargo-zigbuild vendor archive: $cargo_vendor_archive_path"
+fi
+
+actual_crate_sha256="$(sha256_file "$cargo_crate_path")"
+if [[ "$actual_crate_sha256" != "$cargo_crate_sha256" ]]; then
+  die "cargo-zigbuild crate checksum mismatch"
+fi
+actual_source_archive_sha256="$(sha256_file "$cargo_source_archive")"
+if [[ "$actual_source_archive_sha256" != "$cargo_source_archive_sha256" ]]; then
+  die "cargo-zigbuild source archive checksum mismatch"
+fi
+actual_vendor_archive_sha256="$(sha256_file "$cargo_vendor_archive")"
+if [[ "$actual_vendor_archive_sha256" != "$cargo_vendor_archive_sha256" ]]; then
+  die "cargo-zigbuild vendor archive checksum mismatch"
+fi
+
+validate_tar_entries "$cargo_source_archive" z
+validate_tar_entries "$cargo_vendor_archive" z
+
+cargo_extract_root="$RUNNER_TEMP/cargo-zigbuild-extract-${cargo_zigbuild_version}"
+remove_generated_path "$cargo_extract_root" "cargo-zigbuild extraction root"
+mkdir -p "$cargo_extract_root"
+
+tar -xzf "$cargo_source_archive" -C "$cargo_extract_root"
+tar -xzf "$cargo_vendor_archive" -C "$cargo_extract_root"
+
+cargo_source_dir="$cargo_extract_root/$cargo_source_archive_root"
+cargo_vendor_dir="$cargo_extract_root/$cargo_vendor_dir"
+
+if [[ ! -f "$cargo_source_dir/Cargo.toml" || ! -f "$cargo_source_dir/Cargo.lock" ]]; then
+  die "missing vendored cargo-zigbuild source or lockfile"
+fi
+
+if [[ ! -d "$cargo_vendor_dir" || -z "$(ls -A "$cargo_vendor_dir" 2>/dev/null)" ]]; then
+  die "missing vendored cargo-zigbuild dependencies"
+fi
+
+cargo_zigbuild_root="$RUNNER_TEMP/cargo-zigbuild-${cargo_zigbuild_version}"
+cargo_zigbuild_target="$RUNNER_TEMP/cargo-zigbuild-target-${cargo_zigbuild_version}"
+cargo_zigbuild_home="$RUNNER_TEMP/cargo-zigbuild-home-${cargo_zigbuild_version}"
+
+remove_generated_path "$cargo_zigbuild_root" "cargo-zigbuild install root"
+remove_generated_path "$cargo_zigbuild_target" "cargo-zigbuild target directory"
+remove_generated_path "$cargo_zigbuild_home" "cargo-zigbuild cargo home"
+mkdir -p "$cargo_zigbuild_root" "$cargo_zigbuild_target" "$cargo_zigbuild_home"
+export PATH="$cargo_zigbuild_root/bin:$PATH"
+
+CARGO_HOME="$cargo_zigbuild_home" \
+CARGO_TARGET_DIR="$cargo_zigbuild_target" \
+CARGO_NET_OFFLINE=true \
+RUSTUP_OFFLINE=1 \
+cargo install \
+  --path "$cargo_source_dir" \
+  --locked \
+  --offline \
+  --force \
+  --root "$cargo_zigbuild_root" \
+  --config "source.crates-io.replace-with=\"release-tools-vendor\"" \
+  --config "source.release-tools-vendor.directory=\"$cargo_vendor_dir\"" \
+  --config "net.offline=true"
+
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+  echo "$cargo_zigbuild_root/bin" >> "$GITHUB_PATH"
+fi
+
+zig version
+
+installed_output="$(cargo-zigbuild --version 2>/dev/null || true)"
+installed_version="${installed_output#cargo-zigbuild }"
+installed_version="${installed_version%% *}"
+if [[ "$installed_version" != "$cargo_zigbuild_version" ]]; then
+  die "cargo-zigbuild version mismatch (expected ${cargo_zigbuild_version}, found ${installed_version:-unknown})"
+fi

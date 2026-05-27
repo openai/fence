@@ -1,0 +1,26 @@
+[package]
+name = "fence"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95.0"
+
+authors = ["Grant Birkinbine"]
+license = "MIT"
+description = "A source-auditable security agent for hardening CI runner egress"
+readme = "README.md"
+repository = "https://github.com/GrantBirki/fence"
+
+keywords = ["security", "ci", "github-actions", "supply-chain"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+clap = { version = "=4.6.1", features = ["derive"] }
+clap_complete = "=4.6.5"
+clap_mangen = "=0.3.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

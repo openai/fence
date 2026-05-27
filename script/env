@@ -1,0 +1,273 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+# COLORS
+export OFF='\033[0m'
+export RED='\033[0;31m'
+export GREEN='\033[0;32m'
+export BLUE='\033[0;34m'
+export PURPLE='\033[0;35m'
+
+# Default to air-gapped Cargo behavior and prevent rustup proxies from
+# hydrating missing toolchains behind an offline script's back.
+export CARGO_NET_OFFLINE=true
+export RUSTUP_OFFLINE=1
+export RUSTUP_AUTO_INSTALL=0
+
+# set the working directory to the root of the project
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"
+export DIR
+
+source "$DIR/script/lib/common.bash"
+
+TOOLING_DIR="$DIR/.cargo/tooling"
+RUST_TOOLCHAIN_LOCK="$TOOLING_DIR/rust-toolchain.lock.toml"
+UPDATE_TOOLS_LOCK="$TOOLING_DIR/update-tools.lock.toml"
+RELEASE_TOOLS_LOCK="$TOOLING_DIR/release-tools.lock.toml"
+TEST_TOOLS_LOCK="$TOOLING_DIR/test-tools.lock.toml"
+ZIG_VERSION_FILE="$TOOLING_DIR/zig-version"
+CARGO_ZIGBUILD_VERSION_FILE="$TOOLING_DIR/cargo-zigbuild-version"
+CARGO_LLVM_COV_VERSION_FILE="$TOOLING_DIR/cargo-llvm-cov-version"
+CARGO_AUDIT_VERSION_FILE="$TOOLING_DIR/cargo-audit-version"
+CARGO_DENY_VERSION_FILE="$TOOLING_DIR/cargo-deny-version"
+
+export TOOLING_DIR
+export RUST_TOOLCHAIN_LOCK
+export UPDATE_TOOLS_LOCK
+export RELEASE_TOOLS_LOCK
+export TEST_TOOLS_LOCK
+export ZIG_VERSION_FILE
+export CARGO_ZIGBUILD_VERSION_FILE
+export CARGO_LLVM_COV_VERSION_FILE
+export CARGO_AUDIT_VERSION_FILE
+export CARGO_DENY_VERSION_FILE
+
+read_version_file() {
+  local file="$1"
+  if [[ -f "$file" ]]; then
+    head -n1 "$file" | tr -d '[:space:]'
+  fi
+}
+
+rust_toolchain_version() {
+  sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$DIR/rust-toolchain.toml" | head -n1
+}
+
+rust_host_triple() {
+  local arch
+  local os
+
+  arch="$(uname -m || echo unknown)"
+  os="$(uname -s || echo unknown)"
+
+  case "${os}:${arch}" in
+    Linux:x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-gnu" ;;
+    Darwin:x86_64) echo "x86_64-apple-darwin" ;;
+    Darwin:arm64|Darwin:aarch64) echo "aarch64-apple-darwin" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
+if [[ "${CI:-}" != "true" ]]; then
+  LOCAL_TMP_DIR="$DIR/target/tmp"
+  mkdir -p "$LOCAL_TMP_DIR"
+  : "${RUNNER_TEMP:=$LOCAL_TMP_DIR}"
+  : "${TMPDIR:=$LOCAL_TMP_DIR}"
+  export RUNNER_TEMP TMPDIR
+fi
+
+: "${RUNNER_TEMP:=${TMPDIR:-$DIR/target/tmp}}"
+mkdir -p "$RUNNER_TEMP"
+export RUNNER_TEMP
+
+# The name of the repository is the project root directory name.
+REPO_NAME=$(basename "$DIR")
+export REPO_NAME
+
+RUST_TOOLCHAIN_VERSION="$(rust_toolchain_version || true)"
+RUST_HOST_TRIPLE="$(rust_host_triple)"
+
+export RUST_TOOLCHAIN_VERSION
+export RUST_HOST_TRIPLE
+
+refresh_rust_version() {
+  local rust_version_out=""
+
+  if command -v rustc >/dev/null 2>&1; then
+    if rust_version_out="$(rustc --version 2>/dev/null)"; then
+      RUST_VERSION="$(awk '{print $2}' <<<"$rust_version_out")"
+    else
+      RUST_VERSION="missing"
+    fi
+  else
+    RUST_VERSION="missing"
+  fi
+
+  export RUST_VERSION
+}
+
+refresh_rust_version
+
+# detect OS version and architecture
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    PLATFORM="linux"
+    VERSION=$(grep '^VERSION_CODENAME=' /etc/os-release | cut -d '=' -f2 || echo "unknown")
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    PLATFORM="macos"
+    VERSION=$(sw_vers -productVersion || echo "unknown")
+else
+    PLATFORM="unknown"
+    VERSION="unknown"
+fi
+
+ARCH=$(uname -m || echo "unknown")
+
+export PLATFORM
+export VERSION
+export ARCH
+
+if [[ -f "$ZIG_VERSION_FILE" ]]; then
+  ZIG_VERSION="$(read_version_file "$ZIG_VERSION_FILE")"
+else
+  ZIG_VERSION=""
+fi
+
+if [[ -f "$CARGO_ZIGBUILD_VERSION_FILE" ]]; then
+  CARGO_ZIGBUILD_VERSION="$(read_version_file "$CARGO_ZIGBUILD_VERSION_FILE")"
+else
+  CARGO_ZIGBUILD_VERSION=""
+fi
+
+zig_arch="$ARCH"
+case "$zig_arch" in
+  arm64) zig_arch="aarch64" ;;
+esac
+
+if [[ -n "$ZIG_VERSION" && "$PLATFORM" != "unknown" ]]; then
+  ZIG_ROOT="$RUNNER_TEMP/zig-${zig_arch}-${PLATFORM}-${ZIG_VERSION}"
+  : "${ZIG_GLOBAL_CACHE_DIR:=$RUNNER_TEMP/zig-cache-${ZIG_VERSION}/global}"
+  : "${ZIG_LOCAL_CACHE_DIR:=$RUNNER_TEMP/zig-cache-${ZIG_VERSION}/local}"
+  mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+  if [[ -d "$ZIG_ROOT" ]]; then
+    case ":$PATH:" in
+      *":$ZIG_ROOT:"*) ;;
+      *) export PATH="$ZIG_ROOT:$PATH" ;;
+    esac
+    : "${CARGO_ZIGBUILD_ZIG_PATH:=$ZIG_ROOT/zig}"
+  fi
+else
+  ZIG_ROOT=""
+  ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-}"
+  ZIG_LOCAL_CACHE_DIR="${ZIG_LOCAL_CACHE_DIR:-}"
+fi
+
+if [[ -n "$CARGO_ZIGBUILD_VERSION" ]]; then
+  CARGO_ZIGBUILD_ROOT="$RUNNER_TEMP/cargo-zigbuild-${CARGO_ZIGBUILD_VERSION}"
+  : "${CARGO_ZIGBUILD_CACHE_DIR:=$RUNNER_TEMP/cargo-zigbuild-cache-${CARGO_ZIGBUILD_VERSION}}"
+  if [[ -d "$CARGO_ZIGBUILD_ROOT/bin" ]]; then
+    case ":$PATH:" in
+      *":$CARGO_ZIGBUILD_ROOT/bin:"*) ;;
+      *) export PATH="$CARGO_ZIGBUILD_ROOT/bin:$PATH" ;;
+    esac
+  fi
+else
+  CARGO_ZIGBUILD_ROOT=""
+  CARGO_ZIGBUILD_CACHE_DIR="${CARGO_ZIGBUILD_CACHE_DIR:-}"
+fi
+
+if [[ -f "$CARGO_LLVM_COV_VERSION_FILE" ]]; then
+  CARGO_LLVM_COV_VERSION="$(read_version_file "$CARGO_LLVM_COV_VERSION_FILE")"
+else
+  CARGO_LLVM_COV_VERSION=""
+fi
+
+if [[ -n "$CARGO_LLVM_COV_VERSION" ]]; then
+  CARGO_LLVM_COV_ROOT="$RUNNER_TEMP/cargo-llvm-cov-${CARGO_LLVM_COV_VERSION}"
+  if [[ -d "$CARGO_LLVM_COV_ROOT/bin" ]]; then
+    case ":$PATH:" in
+      *":$CARGO_LLVM_COV_ROOT/bin:"*) ;;
+      *) export PATH="$CARGO_LLVM_COV_ROOT/bin:$PATH" ;;
+    esac
+  fi
+else
+  CARGO_LLVM_COV_ROOT=""
+fi
+
+export ZIG_VERSION
+export ZIG_ROOT
+export ZIG_GLOBAL_CACHE_DIR
+export ZIG_LOCAL_CACHE_DIR
+export CARGO_ZIGBUILD_ZIG_PATH
+export CARGO_ZIGBUILD_VERSION
+export CARGO_ZIGBUILD_ROOT
+export CARGO_ZIGBUILD_CACHE_DIR
+export CARGO_LLVM_COV_VERSION
+export CARGO_LLVM_COV_ROOT
+
+VENDOR_DIR="$DIR/vendor/cache"
+export VENDOR_DIR
+
+# make the vendor/cache directory if it doesn't exist
+mkdir -p "$VENDOR_DIR"
+
+die() {
+  echo -e "${RED}error:${OFF} $*" >&2
+  exit 1
+}
+
+warn() {
+  echo -e "${RED}warning:${OFF} $*" >&2
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    die "missing required tool: $cmd"
+  fi
+}
+
+ensure_rust_toolchain() {
+  local expected
+  expected="$(rust_toolchain_version)"
+  if [[ -z "$expected" ]]; then
+    die "missing channel in rust-toolchain.toml"
+  fi
+  if [[ "$RUST_VERSION" == "missing" ]]; then
+    die "rust toolchain is missing or unavailable (expected ${expected}). Repo scripts do not hydrate Rust implicitly; run script/prepare-rust while online, then rerun this command."
+  fi
+  if [[ "$RUST_VERSION" != "$expected" ]]; then
+    die "rust toolchain mismatch (expected ${expected}, found ${RUST_VERSION}). Repo scripts do not switch Rust implicitly; run script/prepare-rust while online or provision the pinned toolchain before rerunning."
+  fi
+
+  if [[ -f "$DIR/.rust-version" ]]; then
+    local file_version
+    file_version="$(read_version_file "$DIR/.rust-version")"
+    if [[ -n "$file_version" && "$file_version" != "$expected" ]]; then
+      die ".rust-version mismatch (expected ${expected}, found ${file_version})"
+    fi
+  fi
+  local cargo_rust_version
+  cargo_rust_version="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$DIR/Cargo.toml" | head -n1)"
+  if [[ -n "$cargo_rust_version" && "$cargo_rust_version" != "$expected" ]]; then
+    die "Cargo.toml rust-version mismatch (expected ${expected}, found ${cargo_rust_version})"
+  fi
+}
+
+ensure_vendor_cache() {
+  if [[ ! -f "$DIR/.cargo/config.toml" ]]; then
+    die "missing .cargo/config.toml; vendored sources are required"
+  fi
+
+  if [[ ! -d "$VENDOR_DIR" || -z "$(ls -A "$VENDOR_DIR" 2>/dev/null)" ]]; then
+    die "vendor cache is empty; run script/update while online to vendor dependencies"
+  fi
+}
+
+require_clean_git() {
+  if [[ "${CI:-}" == "true" ]]; then
+    git diff --exit-code
+    git diff --cached --exit-code
+  fi
+}

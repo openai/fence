@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+expected="$(rust_toolchain_version)"
+if [[ -z "$expected" ]]; then
+  die "missing channel in rust-toolchain.toml"
+fi
+
+require_cmd rustup
+
+script/validate-rust-toolchain --ci
+
+# This script is the intentional online Rust preparation path.
+unset CARGO_NET_OFFLINE
+unset RUSTUP_OFFLINE
+
+install_args=(toolchain install "$expected" --profile minimal --component rustfmt --component clippy --component llvm-tools-preview)
+targets_csv="${PREPARE_RUST_TARGETS:-${VERIFY_RUST_TARGETS:-}}"
+if [[ -n "$targets_csv" ]]; then
+  IFS=',' read -r -a targets <<< "$targets_csv"
+  for target in "${targets[@]}"; do
+    [[ -n "$target" ]] || continue
+    install_args+=(--target "$target")
+  done
+fi
+
+echo -e "${BLUE}Preparing Rust toolchain:${OFF} ${PURPLE}${expected}${OFF}"
+rustup "${install_args[@]}"
+
+refresh_rust_version
+ensure_rust_toolchain
+cargo fmt --version >/dev/null
+cargo clippy --version >/dev/null
+if ! rustup component list --installed | grep -Eq '^llvm-tools(-preview)?($|-)'; then
+  die "llvm-tools-preview component was not installed after preparation"
+fi
+
+if [[ -n "$targets_csv" ]]; then
+  sysroot="$(rustc --print sysroot 2>/dev/null || true)"
+  if [[ -z "$sysroot" ]]; then
+    die "could not determine Rust sysroot after preparation"
+  fi
+  for target in "${targets[@]}"; do
+    [[ -n "$target" ]] || continue
+    if [[ ! -d "$sysroot/lib/rustlib/$target/lib" ]]; then
+      die "rust target not installed after preparation: $target"
+    fi
+  done
+fi
+
+echo -e "${GREEN}Rust toolchain ready:${OFF} ${RUST_VERSION}"

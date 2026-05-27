@@ -1,0 +1,78 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/update-tools.bash"
+
+online=false
+case "${1:-}" in
+  --ci|--online)
+    online=true
+    ;;
+  ""|--offline)
+    ;;
+  *)
+    die "usage: script/validate-update-tools [--ci|--online|--offline]"
+    ;;
+esac
+
+lockfile="$UPDATE_TOOLS_LOCK"
+if [[ ! -f "$lockfile" ]]; then
+  die "missing update-tool lockfile: $lockfile"
+fi
+
+tmpdir=""
+if [[ "$online" == "true" ]]; then
+  require_cmd curl
+  require_cmd tar
+  tmpdir="$(make_temp_dir fence-update-tools)"
+  cleanup() {
+    remove_generated_path "$tmpdir" "temporary update-tool validation directory"
+  }
+  trap cleanup EXIT
+fi
+
+update_tool_require_entry cargo-audit
+update_tool_require_entry cargo-deny
+
+tool_count=0
+while IFS='|' read -r name binary version url crate_sha256 crate_lockfile_sha256; do
+  tool_count=$((tool_count + 1))
+  if [[ -z "$name" || -z "$binary" || -z "$version" || -z "$url" || -z "$crate_sha256" || -z "$crate_lockfile_sha256" ]]; then
+    die "invalid update-tool lock entry"
+  fi
+
+  case "$name" in
+    cargo-audit|cargo-deny) ;;
+    *) die "unexpected update-tool lock entry: $name" ;;
+  esac
+
+  version_file="$TOOLING_DIR/${name}-version"
+  expected_version="$(read_version_file "$version_file")"
+  if [[ "$version" != "$expected_version" ]]; then
+    die "${name} version mismatch (expected ${expected_version:-missing}, found ${version})"
+  fi
+
+  expected_url="$(update_tool_expected_url "$name" "$version")"
+  if [[ "$url" != "$expected_url" ]]; then
+    die "${name} crate URL mismatch (expected ${expected_url}, found ${url})"
+  fi
+
+  if ! [[ "$crate_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    die "${name} crate checksum is missing or invalid"
+  fi
+  if ! [[ "$crate_lockfile_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    die "${name} packaged Cargo.lock checksum is missing or invalid"
+  fi
+
+  if [[ "$online" == "true" ]]; then
+    update_tool_fetch_locked_crate "$name" "$version" "$url" "$crate_sha256" "$crate_lockfile_sha256" "$tmpdir" >/dev/null
+  fi
+done < <(update_tool_entries "$lockfile")
+
+if [[ "$tool_count" -ne 2 ]]; then
+  die "expected 2 update-tool lock entries, found $tool_count"
+fi
+
+echo -e "${GREEN}update-tool locks verified${OFF}"

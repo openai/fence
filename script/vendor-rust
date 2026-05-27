@@ -1,0 +1,51 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/rust-dist.bash"
+
+# This is the intentional online Rust lock refresh path.
+unset CARGO_NET_OFFLINE
+
+require_cmd curl
+require_cmd python3
+
+rust_version="$(rust_toolchain_version)"
+if [[ -z "$rust_version" ]]; then
+  die "missing channel in rust-toolchain.toml"
+fi
+
+manifest_url="$(rust_dist_manifest_url "$rust_version")"
+manifest_sha_url="${manifest_url}.sha256"
+tmpdir="$(make_temp_dir fence-rust)"
+
+cleanup() {
+  remove_generated_path "$tmpdir" "temporary Rust distribution vendor directory"
+}
+trap cleanup EXIT
+
+manifest_file="$tmpdir/channel-rust-${rust_version}.toml"
+manifest_sha_file="$tmpdir/channel-rust-${rust_version}.toml.sha256"
+artifacts_file="$tmpdir/artifacts.psv"
+
+fetch "$manifest_url" "$manifest_file"
+fetch "$manifest_sha_url" "$manifest_sha_file"
+
+expected_manifest_sha="$(awk '{print $1}' "$manifest_sha_file")"
+manifest_sha256="$(sha256_file "$manifest_file")"
+if [[ -z "$expected_manifest_sha" || "$manifest_sha256" != "$expected_manifest_sha" ]]; then
+  die "Rust channel manifest checksum mismatch"
+fi
+
+rust_dist_generate_artifact_entries_from_manifest \
+  "$manifest_file" \
+  "$rust_version" \
+  "$(rust_dist_csv "${RUST_DIST_HOSTS[@]}")" \
+  "$(rust_dist_csv "${RUST_DIST_TARGETS[@]}")" > "$artifacts_file"
+
+mkdir -p "$TOOLING_DIR"
+rust_dist_write_lockfile "$RUST_TOOLCHAIN_LOCK" "$rust_version" "$manifest_url" "$manifest_sha256" "$artifacts_file"
+
+script/validate-rust-toolchain --ci
+echo -e "${GREEN}Rust distribution lock refreshed:${OFF} ${RUST_TOOLCHAIN_LOCK#$DIR/}"

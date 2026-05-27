@@ -1,0 +1,22 @@
+* @GrantBirki
+
+/.github/workflows/** @GrantBirki
+/.github/dependabot.yml @GrantBirki
+/.github/CODEOWNERS @GrantBirki
+
+/script/** @GrantBirki
+/.cargo/config.toml @GrantBirki
+/.cargo/tooling/** @GrantBirki
+
+/Cargo.toml @GrantBirki
+/Cargo.lock @GrantBirki
+/deny.toml @GrantBirki
+/vendor/** @GrantBirki
+
+/rust-toolchain.toml @GrantBirki
+/.rust-version @GrantBirki
+
+/AGENTS.md @GrantBirki
+/README.md @GrantBirki
+/SECURITY.md @GrantBirki
+/docs/** @GrantBirki

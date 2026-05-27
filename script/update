@@ -1,0 +1,73 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/update-tools.bash"
+
+ensure_rust_toolchain
+
+unset CARGO_NET_OFFLINE
+
+echo -e "Rust version: ${GREEN}${RUST_VERSION}${OFF}"
+script/validate-update-tools --ci
+require_cmd curl
+require_cmd tar
+
+config="$DIR/.cargo/config.toml"
+backup="$DIR/.cargo/config.toml.bak"
+
+if [[ ! -f "$config" ]]; then
+  die "missing .cargo/config.toml"
+fi
+
+if [[ -f "$backup" ]]; then
+  die "refusing to overwrite existing backup: $backup"
+fi
+
+restore_config() {
+  if [[ -f "$backup" ]]; then
+    mv "$backup" "$config"
+  fi
+}
+
+tmp_vendor=""
+cleanup() {
+  if [[ -n "$tmp_vendor" && -d "$tmp_vendor" ]]; then
+    remove_generated_path "$tmp_vendor" "temporary vendor directory"
+  fi
+  restore_config
+}
+
+# Temporarily move the offline Cargo config aside so the update path can reach
+# crates.io. This is the only script that should do this.
+mv "$config" "$backup"
+trap cleanup EXIT
+
+cargo update
+if [[ -z "$VENDOR_DIR" || "$VENDOR_DIR" == "/" ]]; then
+  die "invalid vendor directory: ${VENDOR_DIR:-unset}"
+fi
+tmp_vendor="$(make_temp_dir fence-vendor)"
+cargo vendor --locked --versioned-dirs "$tmp_vendor"
+remove_generated_path "$VENDOR_DIR" "vendor cache"
+mkdir -p "$VENDOR_DIR"
+mv "$tmp_vendor"/* "$VENDOR_DIR"/
+rmdir "$tmp_vendor"
+tmp_vendor=""
+
+# Run security checks while online. Advisory DB updates require network.
+install_locked_update_tool cargo-audit cargo-audit "$CARGO_AUDIT_VERSION_FILE" "${CARGO_AUDIT_VERSION:-}"
+install_locked_update_tool cargo-deny cargo-deny "$CARGO_DENY_VERSION_FILE" "${CARGO_DENY_VERSION:-}"
+
+cargo audit
+cargo deny check
+
+# Restore config before verifying offline build.
+trap - EXIT
+cleanup
+
+# Verify the updated lockfile + vendor cache work offline.
+cargo check --frozen
+script/test
+script/lint

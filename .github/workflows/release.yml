@@ -1,0 +1,380 @@
+name: release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+
+permissions: {}
+
+jobs:
+  prepare:
+    if: github.repository == 'grantbirki/fence'
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_tag: ${{ steps.version.outputs.version_tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+      source_date_epoch: ${{ steps.version.outputs.source_date_epoch }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: determine version + tag
+        id: version
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+
+          parse_package_version() {
+            awk '
+              function strip_comment(line, out, i, c, in_string, escaped) {
+                out = ""
+                in_string = 0
+                escaped = 0
+                for (i = 1; i <= length(line); i++) {
+                  c = substr(line, i, 1)
+                  if (escaped) {
+                    out = out c
+                    escaped = 0
+                    continue
+                  }
+                  if (c == "\\" && in_string) {
+                    out = out c
+                    escaped = 1
+                    continue
+                  }
+                  if (c == "\"") {
+                    in_string = !in_string
+                  }
+                  if (c == "#" && !in_string) {
+                    break
+                  }
+                  out = out c
+                }
+                return out
+              }
+
+              {
+                line = strip_comment($0)
+                if (line ~ /^[[:space:]]*\[[[:space:]]*package[[:space:]]*\][[:space:]]*$/) {
+                  in_package = 1
+                  next
+                }
+                if (line ~ /^[[:space:]]*\[/) {
+                  if (in_package) {
+                    exit
+                  }
+                  next
+                }
+                if (in_package && line ~ /^[[:space:]]*version[[:space:]]*=/) {
+                  if (match(line, /"[^"]+"/)) {
+                    print substr(line, RSTART + 1, RLENGTH - 2)
+                    exit
+                  }
+                }
+              }
+            ' "$1"
+          }
+
+          version="$(parse_package_version Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "could not parse version from Cargo.toml" >&2
+            exit 1
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "invalid package version in Cargo.toml: $version" >&2
+            exit 1
+          fi
+          version_tag="v${version}"
+          source_date_epoch="$(git log -1 --format=%ct HEAD)"
+
+          should_release="false"
+          if git cat-file -e "${{ github.event.before }}:Cargo.toml" 2>/dev/null; then
+            previous="$(git show "${{ github.event.before }}:Cargo.toml" | parse_package_version -)"
+            if [[ "$previous" != "$version" ]]; then
+              should_release="true"
+            fi
+          else
+            echo "No prior Cargo.toml exists; establishing the initial version baseline without publishing a release."
+          fi
+
+          if ! git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "Cargo.toml"; then
+            should_release="false"
+          fi
+
+          if git rev-parse "$version_tag" >/dev/null 2>&1; then
+            should_release="false"
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${version_tag}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=${source_date_epoch}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$should_release" != "true" ]]; then
+            echo "No version bump detected; skipping release."
+            exit 0
+          fi
+
+  build-linux-x64:
+    if: needs.prepare.outputs.should_release == 'true' && github.repository == 'grantbirki/fence'
+    needs: prepare
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    env:
+      BUILD_VERSION: ${{ needs.prepare.outputs.version_tag }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: build Linux x64 release
+        run: script/build --release --targets "x86_64-unknown-linux-gnu"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # pin@v7.0.0
+        with:
+          name: dist-linux-x64
+          path: dist/
+          retention-days: 5
+          if-no-files-found: error
+
+  release:
+    if: needs.prepare.outputs.should_release == 'true' && github.repository == 'grantbirki/fence'
+    needs: [prepare, build-linux-x64]
+    permissions:
+      contents: write
+    environment: release
+    concurrency:
+      group: release-${{ needs.prepare.outputs.version_tag }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+    outputs:
+      artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
+
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: dist-linux-x64
+          path: dist/agent
+
+      - name: merge release artifacts
+        run: |
+          set -euo pipefail
+          rm -rf dist/merged
+          mkdir -p dist/merged
+          if [[ -d dist/agent/docs ]]; then
+            cp -R dist/agent/docs dist/merged/
+          fi
+
+          find dist/agent -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | while IFS= read -r -d '' file; do
+            cp "$file" dist/merged/
+          done
+
+          docs_dir="dist/merged/docs"
+          staging="dist/merged/staging"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+
+          for file in dist/merged/*; do
+            case "$(basename "$file")" in
+              checksums.txt|*.tar.gz|docs|staging) continue ;;
+            esac
+            if [[ -f "$file" ]]; then
+              base="$(basename "$file")"
+              binary_name="${base%%_v*}"
+              if [[ -z "$binary_name" || "$binary_name" == "$base" ]]; then
+                binary_name="$base"
+              fi
+              stage_dir="$staging/$base"
+              mkdir -p "$stage_dir"
+              cp "$file" "$stage_dir/$binary_name"
+              if [[ -d "$docs_dir" ]]; then
+                cp -R "$docs_dir"/* "$stage_dir/" 2>/dev/null || true
+              fi
+              chmod +x "$stage_dir/$binary_name"
+              (
+                cd "$stage_dir"
+                tar --sort=name \
+                  --mtime="@${SOURCE_DATE_EPOCH}" \
+                  --owner=0 \
+                  --group=0 \
+                  --numeric-owner \
+                  -czf "../../${base}.tar.gz" .
+              )
+            fi
+          done
+          rm -rf "$staging"
+
+          (
+            cd dist/merged
+            if command -v shasum >/dev/null 2>&1; then
+              find . -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | sort -z | xargs -0 shasum -a 256 > checksums.txt
+            else
+              find . -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | sort -z | xargs -0 sha256sum > checksums.txt
+            fi
+          )
+
+      - name: show artifact sizes
+        run: |
+          set -euo pipefail
+          echo "Release artifacts (dist/merged):"
+          ls -lah dist/merged
+
+      - name: ensure release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "Release $tag" --target "${{ github.sha }}"
+          fi
+
+      - name: publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          mapfile -d '' files < <(find dist/merged -maxdepth 1 -type f -print0)
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No release files found in dist/merged"
+            exit 1
+          fi
+          gh release upload "$tag" "${files[@]}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # pin@v7.0.0
+        id: upload-artifact
+        with:
+          name: dist
+          path: dist/merged/
+          retention-days: 5
+          if-no-files-found: error
+
+  sign:
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          artifact-ids: ${{ needs.release.outputs.artifact-id }}
+          path: "dist/"
+
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # pin@v4.1.0
+        with:
+          subject-path: "dist/"
+
+  verify:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    needs: [prepare, release, sign]
+    steps:
+      - name: verify published release assets
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+
+          tag="$RELEASE_TAG"
+          rm -rf release-download
+          mkdir -p release-download
+          gh release download "$tag" --repo "${OWNER}/${REPO}" --dir release-download
+
+          (
+            cd release-download
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 -c checksums.txt
+            else
+              sha256sum -c checksums.txt
+            fi
+          )
+
+          find release-download -type f ! -name checksums.txt -print0 | while IFS= read -r -d '' file; do
+            echo "Verifying file: $file"
+            gh attestation verify "$file" --repo "${OWNER}/${REPO}" --signer-workflow "${OWNER}/${REPO}/.github/workflows/release.yml"
+          done
+
+  release-summary:
+    permissions: {}
+    runs-on: ubuntu-24.04
+    needs: [prepare, release, verify]
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          artifact-ids: ${{ needs.release.outputs.artifact-id }}
+          path: "dist/"
+
+      - name: show homebrew inputs
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_VERSION"
+          tag="$RELEASE_TAG"
+          purple=$'\033[0;35m'
+          off=$'\033[0m'
+          echo "Release version: ${version}"
+          echo "Release tag: ${tag}"
+          echo "Commit: ${{ github.sha }}"
+          echo
+          if [[ ! -f dist/checksums.txt ]]; then
+            echo "checksums.txt not found"
+            exit 1
+          fi
+          echo "Homebrew sha256 (tarballs for this release):"
+          tarball_count=0
+          while read -r sha file; do
+            if [[ "$file" == *.tar.gz ]]; then
+              printf "sha256 %b%s%b  %s\n" "$purple" "$sha" "$off" "$file"
+              tarball_count=$((tarball_count + 1))
+            fi
+          done < dist/checksums.txt
+
+          if [[ "$tarball_count" -eq 0 ]]; then
+            echo "no tarballs found in dist/checksums.txt"
+            exit 1
+          fi

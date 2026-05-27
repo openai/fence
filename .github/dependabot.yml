@@ -1,0 +1,23 @@
+---
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: "/"
+  groups:
+    github-actions:
+      patterns:
+      - "*"
+  schedule:
+    interval: monthly
+    day: tuesday
+    time: '21:00'
+  cooldown:
+    default-days: 45
+- package-ecosystem: rust-toolchain
+  directory: "/"
+  schedule:
+    interval: monthly
+    day: tuesday
+    time: '21:00'
+  cooldown:
+    default-days: 45

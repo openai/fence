@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/release-tools.bash"
+
+ensure_rust_toolchain
+
+# This is the intentional online release-tool refresh path.
+unset CARGO_NET_OFFLINE
+
+require_cmd cargo
+require_cmd curl
+require_cmd python3
+require_cmd tar
+
+release_tools_dir="$DIR/vendor/release-tools"
+zig_dir="$release_tools_dir/zig"
+cargo_dir="$release_tools_dir/cargo-zigbuild"
+manifest="$release_tools_dir/manifest.toml"
+lockfile="$RELEASE_TOOLS_LOCK"
+
+if [[ ! -f "$lockfile" ]]; then
+  die "missing release-tool lockfile: $lockfile"
+fi
+
+zig_version="$(read_version_file "$ZIG_VERSION_FILE")"
+cargo_zigbuild_version="$(read_version_file "$CARGO_ZIGBUILD_VERSION_FILE")"
+
+if [[ -z "$zig_version" ]]; then
+  die "${ZIG_VERSION_FILE#$DIR/} is required"
+fi
+
+if [[ -z "$cargo_zigbuild_version" ]]; then
+  die "${CARGO_ZIGBUILD_VERSION_FILE#$DIR/} is required"
+fi
+
+locked_zig_version="$(toml_value "$lockfile" "zig_version")"
+locked_zigbuild_version="$(toml_value "$lockfile" "cargo_zigbuild_version")"
+
+if [[ "$locked_zig_version" != "$zig_version" ]]; then
+  die "${RELEASE_TOOLS_LOCK#$DIR/} Zig version mismatch (expected ${zig_version}, found ${locked_zig_version:-missing})"
+fi
+
+if [[ "$locked_zigbuild_version" != "$cargo_zigbuild_version" ]]; then
+  die "${RELEASE_TOOLS_LOCK#$DIR/} cargo-zigbuild version mismatch (expected ${cargo_zigbuild_version}, found ${locked_zigbuild_version:-missing})"
+fi
+
+tmpdir="$(make_temp_dir fence-release-tools)"
+cleanup() {
+  remove_generated_path "$tmpdir" "temporary release-tool vendor directory"
+}
+trap cleanup EXIT
+
+remove_generated_path "$release_tools_dir" "release-tool vendor directory"
+mkdir -p "$TOOLING_DIR" "$zig_dir" "$cargo_dir"
+
+zig_manifest_file="$tmpdir/zig-manifest.toml"
+: > "$zig_manifest_file"
+
+add_zig_artifact() {
+  local platform="$1"
+  local arch="$2"
+  local os="$3"
+  local version="$4"
+  local url="$5"
+  local dest="$6"
+  local expected_sha256="$7"
+  local filename="${dest##*/}"
+  local tmp_artifact="$tmpdir/$filename"
+
+  if [[ -z "$platform" || -z "$arch" || -z "$os" || -z "$version" || -z "$url" || -z "$dest" || -z "$expected_sha256" ]]; then
+    die "invalid Zig entry in ${RELEASE_TOOLS_LOCK#$DIR/}"
+  fi
+
+  if [[ "$version" != "$zig_version" ]]; then
+    die "Zig lock entry version mismatch for ${platform}"
+  fi
+
+  if [[ "$dest" != vendor/release-tools/zig/* ]]; then
+    die "Zig lock entry has unexpected path for ${platform}: $dest"
+  fi
+  reject_unsafe_relative_path "$dest" "Zig lock entry path for ${platform}"
+
+  echo "fetching $url"
+  fetch "$url" "$tmp_artifact"
+
+  local actual_sha256
+  actual_sha256="$(sha256_file "$tmp_artifact")"
+  if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+    die "Zig checksum mismatch for $filename (expected $expected_sha256, found $actual_sha256)"
+  fi
+
+  mv "$tmp_artifact" "$DIR/$dest"
+
+  {
+    echo "[[zig]]"
+    echo "platform = \"$platform\""
+    echo "arch = \"$arch\""
+    echo "os = \"$os\""
+    echo "version = \"$version\""
+    echo "url = \"$url\""
+    echo "path = \"$dest\""
+    echo "sha256 = \"$actual_sha256\""
+    echo
+  } >> "$zig_manifest_file"
+}
+
+zig_count=0
+while IFS='|' read -r platform arch os version url dest expected_sha256; do
+  add_zig_artifact "$platform" "$arch" "$os" "$version" "$url" "$dest" "$expected_sha256"
+  zig_count=$((zig_count + 1))
+done < <(release_tools_zig_entries "$lockfile")
+
+if [[ "$zig_count" -ne 4 ]]; then
+  die "expected 4 Zig entries in ${RELEASE_TOOLS_LOCK#$DIR/}, found $zig_count"
+fi
+
+IFS='|' read -r locked_cargo_version cargo_url cargo_dest expected_cargo_crate_sha256 < <(release_tools_cargo_zigbuild_entry "$lockfile")
+
+if [[ -z "$locked_cargo_version" || -z "$cargo_url" || -z "$cargo_dest" || -z "$expected_cargo_crate_sha256" ]]; then
+  die "${RELEASE_TOOLS_LOCK#$DIR/} is missing cargo-zigbuild fields"
+fi
+
+if [[ "$locked_cargo_version" != "$cargo_zigbuild_version" ]]; then
+  die "cargo-zigbuild lock entry version mismatch (expected ${cargo_zigbuild_version}, found ${locked_cargo_version})"
+fi
+
+if [[ "$cargo_dest" != "vendor/release-tools/cargo-zigbuild/cargo-zigbuild-${cargo_zigbuild_version}.crate" ]]; then
+  die "cargo-zigbuild lock entry has unexpected crate path: $cargo_dest"
+fi
+reject_unsafe_relative_path "$cargo_dest" "cargo-zigbuild lock entry crate path"
+
+cargo_crate="${cargo_dest##*/}"
+cargo_tmp="$tmpdir/$cargo_crate"
+
+echo "fetching $cargo_url"
+fetch "$cargo_url" "$cargo_tmp"
+cargo_crate_sha256="$(sha256_file "$cargo_tmp")"
+if [[ "$cargo_crate_sha256" != "$expected_cargo_crate_sha256" ]]; then
+  die "cargo-zigbuild crate checksum mismatch (expected $expected_cargo_crate_sha256, found $cargo_crate_sha256)"
+fi
+mv "$cargo_tmp" "$DIR/$cargo_dest"
+
+extract_dir="$tmpdir/cargo-zigbuild-source"
+mkdir -p "$extract_dir"
+tar -xzf "$DIR/$cargo_dest" -C "$extract_dir"
+tmp_source_dir="$extract_dir/cargo-zigbuild-${cargo_zigbuild_version}"
+
+if [[ ! -f "$tmp_source_dir/Cargo.toml" ]]; then
+  die "cargo-zigbuild crate did not unpack to expected source directory"
+fi
+
+cargo_vendor_parent="$tmpdir/cargo-zigbuild-${cargo_zigbuild_version}-vendor"
+cargo_vendor_cache="$cargo_vendor_parent/cache"
+mkdir -p "$cargo_vendor_cache"
+
+(
+  cd "$tmp_source_dir"
+  cargo generate-lockfile
+  cargo vendor --locked --versioned-dirs "$cargo_vendor_cache"
+)
+
+cargo_source_archive="cargo-zigbuild-${cargo_zigbuild_version}-source.tar.gz"
+cargo_vendor_archive="cargo-zigbuild-${cargo_zigbuild_version}-vendor.tar.gz"
+cargo_source_archive_dest="vendor/release-tools/cargo-zigbuild/$cargo_source_archive"
+cargo_vendor_archive_dest="vendor/release-tools/cargo-zigbuild/$cargo_vendor_archive"
+cargo_source_archive_root="cargo-zigbuild-${cargo_zigbuild_version}"
+cargo_vendor_archive_root="cargo-zigbuild-${cargo_zigbuild_version}-vendor"
+cargo_vendor_dir_in_archive="${cargo_vendor_archive_root}/cache"
+cargo_lockfile_dest="vendor/release-tools/cargo-zigbuild/cargo-zigbuild-${cargo_zigbuild_version}.Cargo.lock"
+
+create_deterministic_targz "$tmp_source_dir" "$DIR/$cargo_source_archive_dest" "$cargo_source_archive_root"
+create_deterministic_targz "$cargo_vendor_parent" "$DIR/$cargo_vendor_archive_dest" "$cargo_vendor_archive_root"
+cp "$tmp_source_dir/Cargo.lock" "$DIR/$cargo_lockfile_dest"
+
+cargo_source_archive_sha256="$(sha256_file "$DIR/$cargo_source_archive_dest")"
+cargo_vendor_archive_sha256="$(sha256_file "$DIR/$cargo_vendor_archive_dest")"
+cargo_lockfile_sha256="$(sha256_file "$DIR/$cargo_lockfile_dest")"
+
+{
+  echo "# Generated by script/vendor-release-tools."
+  echo "# This manifest is validated by script/validate-release-tools."
+  echo
+  echo "[release_tools]"
+  echo "manifest_version = 1"
+  echo "zig_version = \"$zig_version\""
+  echo "cargo_zigbuild_version = \"$cargo_zigbuild_version\""
+  echo
+  cat "$zig_manifest_file"
+  echo "[cargo_zigbuild]"
+  echo "version = \"$cargo_zigbuild_version\""
+  echo "url = \"$cargo_url\""
+  echo "crate_path = \"$cargo_dest\""
+  echo "crate_sha256 = \"$cargo_crate_sha256\""
+  echo "source_archive_path = \"$cargo_source_archive_dest\""
+  echo "source_archive_sha256 = \"$cargo_source_archive_sha256\""
+  echo "source_archive_root = \"$cargo_source_archive_root\""
+  echo "vendor_archive_path = \"$cargo_vendor_archive_dest\""
+  echo "vendor_archive_sha256 = \"$cargo_vendor_archive_sha256\""
+  echo "vendor_archive_root = \"$cargo_vendor_archive_root\""
+  echo "vendor_dir = \"$cargo_vendor_dir_in_archive\""
+  echo "lockfile_path = \"$cargo_lockfile_dest\""
+  echo "lockfile_sha256 = \"$cargo_lockfile_sha256\""
+} > "$manifest"
+
+script/validate-release-tools
+echo -e "${GREEN}release tools vendored:${OFF} $release_tools_dir"
