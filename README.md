@@ -9,10 +9,10 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current executable is an
-implementation scaffold inherited from the repository bootstrap and exists to
-prove the build, test, lint, packaging, coverage, and release-tooling surface
-before privileged security behavior is introduced.
+Fence is not an enforcement agent yet. The current Phase 1 executable strictly
+validates local JSON policy, renders a frozen network-policy plan, and reports
+read-only host support observations. It never applies a network boundary,
+changes privilege state, or reports protection as available.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -116,20 +116,21 @@ CI additionally runs `script/validate-locks --ci` and
 runners are not fully air-gapped: checkout, action loading, Rust preparation,
 artifact operations, and release publication still require network access.
 
-## Current Scaffold CLI
+## Phase 1 CLI
 
-The present binary is deliberately temporary. It demonstrates release artifact
-plumbing, shell completions, man page generation, test discovery, and version
-metadata while the security agent modules are designed.
+The current binary emits versioned JSON only. `render-plan` is non-mutating,
+and `run` fails closed until the privileged enforcement phases are implemented.
 
 ```console
 script/build
-./target/release/fence version
-./target/release/fence completions bash
-./target/release/fence man
+./target/release/fence --version
+./target/release/fence check-support
+./target/release/fence render-plan --config policy.json
+./target/release/fence run --config /run/fence/example/config.json
 ```
 
-Do not use this scaffold as a runner security control.
+The last command intentionally returns an `enforcement_not_implemented` error
+in Phase 1. Do not use this planner as a runner security control.
 
 ## Release Baseline
 
@@ -140,10 +141,12 @@ deliberate version bump merged to `main` is the release trigger.
 
 The first publishable agent artifact is limited to
 `x86_64-unknown-linux-gnu` and must be proved on GitHub-hosted
-`ubuntu-24.04` x64 before release. Portable validation and retained cross-build
-tooling may continue to run on other prepared hosts, but do not establish
-protected platform support. Publication, artifact attestations, and
-verification remain GitHub-networked operations by design.
+`ubuntu-24.04` x64 before release. Its narrow CLI package contains the binary
+and provenance/checksum assets, not generated shell completion or man-page
+artifacts. Portable validation and retained cross-build tooling may continue
+to run on other prepared hosts, but do not establish protected platform
+support. Publication, artifact attestations, and verification remain
+GitHub-networked operations by design.
 
 ## Security
 

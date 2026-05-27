@@ -1,0 +1,514 @@
+use crate::config::{
+    ContainerPolicy, DestinationType, MAX_ALLOWANCES, MAX_EXPANDED_RULES, MAX_FINDINGS,
+    MAX_REPORT_BYTES, MAX_RESOLVED_ADDRESSES, Mode, NormalizedAllowance, NormalizedConfig,
+    Protocol,
+};
+use crate::error::ErrorDetail;
+use crate::resolver::{Resolution, ResolveError, Resolver};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::net::IpAddr;
+use std::time::Duration;
+
+pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssuranceStatus {
+    PlannedBlockContainment,
+    PlannedBlockDegradedContainerAccess,
+    AuditObservationOnly,
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct EffectiveAllowance {
+    pub destination_type: DestinationType,
+    pub destination: String,
+    pub protocol: Protocol,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ResolutionResult {
+    pub hostname: String,
+    pub addresses: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RuntimePaths {
+    pub directory: String,
+    pub config: String,
+    pub ready: String,
+    pub report: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct LimitStatus {
+    pub max_user_allowances: usize,
+    pub declared_user_allowances: usize,
+    pub duplicate_requested_allowances_collapsed: usize,
+    pub max_addresses_per_hostname: usize,
+    pub max_expanded_rules: usize,
+    pub expanded_rules_before_deduplication: usize,
+    pub duplicate_effective_rules_collapsed: usize,
+    pub max_sampled_findings: usize,
+    pub max_report_bytes: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct FindingState {
+    pub retained: Vec<String>,
+    pub total: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct PlanData {
+    pub implementation_phase: &'static str,
+    pub configuration_schema_version: u32,
+    pub selected_mode: Mode,
+    pub assurance_status: AssuranceStatus,
+    pub invocation_id: String,
+    pub platform_profile: String,
+    pub container_policy: Option<ContainerPolicy>,
+    pub requested_policy: Vec<NormalizedAllowance>,
+    pub effective_policy: Vec<EffectiveAllowance>,
+    pub frozen_resolution_results: Vec<ResolutionResult>,
+    pub derived_runtime_paths: RuntimePaths,
+    pub policy_hash: String,
+    pub limits: LimitStatus,
+    pub findings: FindingState,
+    pub application_status: &'static str,
+    pub verification_status: &'static str,
+    pub limitations: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+struct PolicyHashInput<'a> {
+    mode: Mode,
+    container_policy: Option<ContainerPolicy>,
+    platform_profile: &'a str,
+    allowances: &'a [EffectiveAllowance],
+}
+
+pub fn build_plan(
+    config: NormalizedConfig,
+    resolver: &dyn Resolver,
+) -> Result<PlanData, ErrorDetail> {
+    let mut resolved = BTreeMap::new();
+    let hosts = config
+        .requested_allowances
+        .iter()
+        .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
+        .map(|allowance| allowance.destination.clone())
+        .collect::<BTreeSet<_>>();
+    let mut consumed_budget = Duration::ZERO;
+
+    for host in hosts {
+        let remaining = TOTAL_DNS_BUDGET.saturating_sub(consumed_budget);
+        if remaining.is_zero() {
+            return Err(dns_error("dns_budget_exceeded"));
+        }
+        let timeout = remaining.min(PER_HOST_DNS_TIMEOUT);
+        let Resolution {
+            mut addresses,
+            elapsed,
+        } = resolver
+            .resolve(&host, timeout)
+            .map_err(|failure| match failure {
+                ResolveError::Failed => dns_error("dns_resolution_failed"),
+                ResolveError::TimedOut => dns_error("dns_resolution_timeout"),
+            })?;
+        if elapsed > timeout || elapsed > remaining {
+            return Err(dns_error("dns_resolution_timeout"));
+        }
+        consumed_budget += elapsed;
+        addresses.sort();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Err(dns_error("dns_resolution_failed"));
+        }
+        if addresses.len() > MAX_RESOLVED_ADDRESSES {
+            return Err(ErrorDetail::new(
+                "too_many_resolved_addresses",
+                "hostname resolution exceeds the fixed address limit",
+            )
+            .field("allowances.destination"));
+        }
+        resolved.insert(host, addresses);
+    }
+
+    let mut effective_policy = Vec::new();
+    for allowance in &config.requested_allowances {
+        match allowance.destination_type {
+            DestinationType::Hostname => {
+                let addresses = resolved
+                    .get(&allowance.destination)
+                    .expect("each validated hostname is resolved before expansion");
+                for address in addresses {
+                    effective_policy.push(effective_from_ip(*address, allowance));
+                }
+            }
+            DestinationType::Ip | DestinationType::Cidr => {
+                effective_policy.push(EffectiveAllowance {
+                    destination_type: allowance.destination_type,
+                    destination: allowance.destination.clone(),
+                    protocol: allowance.protocol,
+                    port: allowance.port,
+                });
+            }
+        }
+    }
+
+    let expanded_rules_before_deduplication = effective_policy.len();
+    if expanded_rules_before_deduplication > MAX_EXPANDED_RULES {
+        return Err(ErrorDetail::new(
+            "too_many_expanded_rules",
+            "effective policy exceeds the fixed expanded-rule limit",
+        )
+        .field("allowances"));
+    }
+    effective_policy.sort();
+    effective_policy.dedup();
+
+    let frozen_resolution_results = resolved
+        .into_iter()
+        .map(|(hostname, addresses)| ResolutionResult {
+            hostname,
+            addresses: addresses
+                .into_iter()
+                .map(|address| address.to_string())
+                .collect(),
+        })
+        .collect();
+    let policy_hash = policy_hash(&config, &effective_policy);
+    let assurance_status = assurance_status(config.mode, config.container_policy);
+    let limitations = limitations(assurance_status);
+    let invocation_id = config.invocation_id.clone();
+    let duplicate_effective_rules_collapsed =
+        expanded_rules_before_deduplication - effective_policy.len();
+
+    Ok(PlanData {
+        implementation_phase: "phase1",
+        configuration_schema_version: config.schema_version,
+        selected_mode: config.mode,
+        assurance_status,
+        invocation_id: config.invocation_id,
+        platform_profile: config.platform_profile,
+        container_policy: config.container_policy,
+        requested_policy: config.requested_allowances,
+        effective_policy,
+        frozen_resolution_results,
+        derived_runtime_paths: runtime_paths(&invocation_id),
+        policy_hash,
+        limits: LimitStatus {
+            max_user_allowances: MAX_ALLOWANCES,
+            declared_user_allowances: config.declared_allowance_count,
+            duplicate_requested_allowances_collapsed: config
+                .duplicate_requested_allowances_collapsed,
+            max_addresses_per_hostname: MAX_RESOLVED_ADDRESSES,
+            max_expanded_rules: MAX_EXPANDED_RULES,
+            expanded_rules_before_deduplication,
+            duplicate_effective_rules_collapsed,
+            max_sampled_findings: MAX_FINDINGS,
+            max_report_bytes: MAX_REPORT_BYTES,
+        },
+        findings: FindingState {
+            retained: Vec::new(),
+            total: 0,
+            truncated: false,
+        },
+        application_status: "not_applied",
+        verification_status: "not_verified",
+        limitations,
+    })
+}
+
+fn dns_error(code: &'static str) -> ErrorDetail {
+    ErrorDetail::new(
+        code,
+        "hostname resolution did not complete within fixed bounds",
+    )
+    .field("allowances.destination")
+}
+
+fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> EffectiveAllowance {
+    EffectiveAllowance {
+        destination_type: DestinationType::Ip,
+        destination: address.to_string(),
+        protocol: allowance.protocol,
+        port: allowance.port,
+    }
+}
+
+fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> AssuranceStatus {
+    match (mode, container_policy) {
+        (Mode::Block, Some(ContainerPolicy::UnsafePreserve)) => {
+            AssuranceStatus::PlannedBlockDegradedContainerAccess
+        }
+        (Mode::Block, Some(ContainerPolicy::Disable) | None) => {
+            AssuranceStatus::PlannedBlockContainment
+        }
+        (Mode::Audit, _) => AssuranceStatus::AuditObservationOnly,
+    }
+}
+
+fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
+    let mut limitations = vec!["phase1_planning_only_no_enforcement"];
+    match status {
+        AssuranceStatus::PlannedBlockContainment => {}
+        AssuranceStatus::PlannedBlockDegradedContainerAccess => {
+            limitations.push("container_access_would_invalidate_ordinary_containment");
+        }
+        AssuranceStatus::AuditObservationOnly => {
+            limitations.push("audit_observes_only_and_never_contains");
+        }
+    }
+    limitations
+}
+
+fn runtime_paths(invocation_id: &str) -> RuntimePaths {
+    let directory = format!("/run/fence/{invocation_id}");
+    RuntimePaths {
+        config: format!("{directory}/config.json"),
+        ready: format!("{directory}/ready.json"),
+        report: format!("{directory}/report.json"),
+        state: format!("{directory}/state.json"),
+        directory,
+    }
+}
+
+fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance]) -> String {
+    let bytes = serde_json::to_vec(&PolicyHashInput {
+        mode: config.mode,
+        container_policy: config.container_policy,
+        platform_profile: &config.platform_profile,
+        allowances: effective_policy,
+    })
+    .expect("typed policy hashing input must serialize");
+    let digest = Sha256::digest(bytes);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hash, "{byte:02x}").expect("writing hexadecimal bytes to String must succeed");
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::parse_and_normalize;
+    use crate::resolver::Resolution;
+    use std::cell::RefCell;
+
+    struct FakeResolver {
+        responses: RefCell<Vec<Result<Resolution, ResolveError>>>,
+    }
+
+    impl Resolver for FakeResolver {
+        fn resolve(&self, _hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
+            self.responses.borrow_mut().remove(0)
+        }
+    }
+
+    fn parse(json: &str) -> NormalizedConfig {
+        parse_and_normalize(json.as_bytes()).unwrap()
+    }
+
+    fn resolver(responses: Vec<Result<Resolution, ResolveError>>) -> FakeResolver {
+        FakeResolver {
+            responses: RefCell::new(responses),
+        }
+    }
+
+    fn resolved(addresses: &[&str], elapsed: Duration) -> Result<Resolution, ResolveError> {
+        Ok(Resolution {
+            addresses: addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect(),
+            elapsed,
+        })
+    }
+
+    #[test]
+    fn renders_sorted_frozen_policy_and_hash_independent_of_invocation() {
+        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"one","allowances":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":443}]}"#;
+        let plan = build_plan(
+            parse(json),
+            &resolver(vec![resolved(
+                &["192.0.2.2", "2001:db8::1", "192.0.2.2"],
+                Duration::from_secs(1),
+            )]),
+        )
+        .unwrap();
+        let another = build_plan(
+            parse(&json.replace("one", "two")),
+            &resolver(vec![resolved(
+                &["2001:db8::1", "192.0.2.2"],
+                Duration::from_secs(1),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(plan.policy_hash, another.policy_hash);
+        assert_eq!(plan.effective_policy.len(), 2);
+        assert_eq!(plan.limits.duplicate_effective_rules_collapsed, 1);
+        assert_eq!(plan.frozen_resolution_results[0].addresses[0], "192.0.2.2");
+        assert_eq!(plan.derived_runtime_paths.directory, "/run/fence/one");
+    }
+
+    #[test]
+    fn classifies_block_degraded_and_audit_assurance() {
+        let standard = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let degraded = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"x","container_policy":"unsafe_preserve","allowances":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let audit = build_plan(
+            parse(r#"{"schema_version":1,"mode":"audit","invocation_id":"x","allowances":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            standard.assurance_status,
+            AssuranceStatus::PlannedBlockContainment
+        );
+        assert_eq!(
+            degraded.assurance_status,
+            AssuranceStatus::PlannedBlockDegradedContainerAccess
+        );
+        assert_eq!(
+            audit.assurance_status,
+            AssuranceStatus::AuditObservationOnly
+        );
+        assert_eq!(degraded.limitations.len(), 2);
+        assert_eq!(audit.limitations.len(), 2);
+    }
+
+    #[test]
+    fn rejects_resolution_failures_timeouts_empty_and_address_excess() {
+        let config = parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
+        );
+        assert_eq!(
+            build_plan(config.clone(), &resolver(vec![Err(ResolveError::Failed)]))
+                .unwrap_err()
+                .code,
+            "dns_resolution_failed"
+        );
+        assert_eq!(
+            build_plan(config.clone(), &resolver(vec![Err(ResolveError::TimedOut)]))
+                .unwrap_err()
+                .code,
+            "dns_resolution_timeout"
+        );
+        assert_eq!(
+            build_plan(
+                config.clone(),
+                &resolver(vec![resolved(&[], Duration::ZERO)])
+            )
+            .unwrap_err()
+            .code,
+            "dns_resolution_failed"
+        );
+        let too_many = (0..=MAX_RESOLVED_ADDRESSES)
+            .map(|n| format!("192.0.2.{n}"))
+            .collect::<Vec<_>>();
+        let refs = too_many.iter().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            build_plan(
+                config,
+                &resolver(vec![resolved(&refs, Duration::from_secs(1))])
+            )
+            .unwrap_err()
+            .code,
+            "too_many_resolved_addresses"
+        );
+    }
+
+    #[test]
+    fn rejects_consumed_dns_deadlines() {
+        let config = parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"hostname","destination":"a.example","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"b.example","protocol":"tcp","port":443}]}"#,
+        );
+        assert_eq!(
+            build_plan(
+                config.clone(),
+                &resolver(vec![resolved(&["192.0.2.1"], Duration::from_secs(6))])
+            )
+            .unwrap_err()
+            .code,
+            "dns_resolution_timeout"
+        );
+        assert_eq!(
+            build_plan(
+                config,
+                &resolver(vec![
+                    resolved(&["192.0.2.1"], TOTAL_DNS_BUDGET),
+                    resolved(&["192.0.2.2"], Duration::ZERO),
+                ])
+            )
+            .unwrap_err()
+            .code,
+            "dns_resolution_timeout"
+        );
+    }
+
+    #[test]
+    fn rejects_total_dns_budget_and_expanded_policy_amplification() {
+        let allowances = (0..33)
+            .map(|index| {
+                format!(
+                    r#"{{"destination_type":"hostname","destination":"host-{index}.example","protocol":"tcp","port":443}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let config = parse(&format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{allowances}]}}"#
+        ));
+        let addresses = (0..MAX_RESOLVED_ADDRESSES)
+            .map(|index| format!("192.0.2.{index}"))
+            .collect::<Vec<_>>();
+        let address_refs = addresses.iter().map(String::as_str).collect::<Vec<_>>();
+        let amplified = (0..33)
+            .map(|_| resolved(&address_refs, Duration::ZERO))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            build_plan(config, &resolver(amplified)).unwrap_err().code,
+            "too_many_expanded_rules"
+        );
+
+        let budget_allowances = (0..7)
+            .map(|index| {
+                format!(
+                    r#"{{"destination_type":"hostname","destination":"budget-{index}.example","protocol":"tcp","port":443}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let budget_config = parse(&format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{budget_allowances}]}}"#
+        ));
+        let budget_results = (0..6)
+            .map(|_| resolved(&["192.0.2.1"], PER_HOST_DNS_TIMEOUT))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            build_plan(budget_config, &resolver(budget_results))
+                .unwrap_err()
+                .code,
+            "dns_budget_exceeded"
+        );
+    }
+}

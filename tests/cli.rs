@@ -1,3 +1,6 @@
+use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
@@ -7,78 +10,120 @@ fn run(args: &[&str]) -> Output {
         .expect("failed to run fence binary")
 }
 
-fn stdout(output: &Output) -> String {
+fn success_json(args: &[&str]) -> Value {
+    let output = run(args);
     assert!(
         output.status.success(),
         "command failed with status {:?}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(output.stderr.is_empty());
+    serde_json::from_slice(&output.stdout).expect("stdout should contain JSON")
+}
 
-    String::from_utf8(output.stdout.clone()).expect("stdout should be valid UTF-8")
+fn error_json(args: &[&str], exit_code: i32) -> Value {
+    let output = run(args);
+    assert_eq!(output.status.code(), Some(exit_code));
+    assert!(output.stdout.is_empty());
+    serde_json::from_slice(&output.stderr).expect("stderr should contain JSON")
+}
+
+fn config_file(name: &str, content: &[u8]) -> PathBuf {
+    let directory = PathBuf::from("target/tmp/cli-tests");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(name);
+    fs::write(&path, content).unwrap();
+    path
 }
 
 #[test]
-fn greets_default_name() {
-    assert_eq!(stdout(&run(&[])), "Hello, world!\n");
+fn version_is_json_and_does_not_claim_protection() {
+    let response = success_json(&["--version"]);
+
+    assert_eq!(response["command"], "version");
+    assert_eq!(response["status"], "success");
+    assert_eq!(response["data"]["implementation_phase"], "phase1");
+    assert_eq!(response["data"]["protection_available"], false);
 }
 
 #[test]
-fn greets_named_user() {
-    assert_eq!(stdout(&run(&["--name", "Grant"])), "Hello, Grant!\n");
-}
+fn support_is_read_only_and_not_protective() {
+    let response = success_json(&["check-support"]);
 
-#[test]
-fn repeats_and_shouts_greeting() {
+    assert_eq!(response["command"], "check-support");
+    assert_eq!(response["data"]["protection_available"], false);
     assert_eq!(
-        stdout(&run(&["--name", "codex", "--times", "2", "--shout"])),
-        "HELLO, CODEX!\nHELLO, CODEX!\n"
+        response["data"]["reasons"][0],
+        "enforcement_not_implemented"
     );
 }
 
 #[test]
-fn adds_numbers() {
-    assert_eq!(stdout(&run(&["add", "2", "3"])), "5\n");
+fn renders_deterministic_plan_without_creating_runtime_state() {
+    let invocation_id = format!("cli-plan-{}", std::process::id());
+    let runtime_path = PathBuf::from(format!("/run/fence/{invocation_id}"));
+    let existed_before = runtime_path.exists();
+    let path = config_file(
+        "plan.json",
+        format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","platform_profile":"none","allowances":[{{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443}},{{"destination_type":"cidr","destination":"2001:db8::/64","protocol":"udp","port":53}}]}}"#
+        )
+        .as_bytes(),
+    );
+    let path_arg = path.to_str().unwrap();
+    let first = success_json(&["render-plan", "--config", path_arg]);
+    let second = success_json(&["render-plan", "--config", path_arg]);
+
+    assert_eq!(first, second);
+    assert_eq!(first["data"]["application_status"], "not_applied");
+    assert_eq!(first["data"]["verification_status"], "not_verified");
+    assert_eq!(
+        first["data"]["derived_runtime_paths"]["directory"],
+        runtime_path.to_str().unwrap()
+    );
+    assert_eq!(runtime_path.exists(), existed_before);
 }
 
 #[test]
-fn subtracts_numbers() {
-    assert_eq!(stdout(&run(&["sub", "10", "4"])), "6\n");
+fn run_fails_closed_without_reading_config() {
+    let response = error_json(&["run", "--config", "/not/a/real/config.json"], 1);
+
+    assert_eq!(response["command"], "run");
+    assert_eq!(response["error"]["code"], "enforcement_not_implemented");
 }
 
 #[test]
-fn prints_extended_version_metadata() {
-    let output = stdout(&run(&["version"]));
-    let build_version = option_env!("BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
-    let commit = option_env!("BUILD_COMMIT").unwrap_or("unknown");
-    let build_date = option_env!("BUILD_DATE").unwrap_or("unknown");
+fn invalid_and_oversized_configs_are_structured_errors() {
+    let invalid = config_file(
+        "invalid.json",
+        br#"{"schema_version":1,"mode":"block","invocation_id":"bad","allowances":[],"extra":true}"#,
+    );
+    let oversized = config_file(
+        "oversized.json",
+        &vec![b' '; fence::config::MAX_CONFIG_BYTES + 1],
+    );
+    let invalid_response = error_json(&["render-plan", "--config", invalid.to_str().unwrap()], 1);
+    let oversized_response =
+        error_json(&["render-plan", "--config", oversized.to_str().unwrap()], 1);
 
-    assert!(output.contains(&format!("fence {}", env!("CARGO_PKG_VERSION"))));
-    assert!(output.contains(&format!("build: {build_version}")));
-    assert!(output.contains(&format!("commit: {commit}")));
-    assert!(output.contains(&format!("built: {build_date}")));
+    assert_eq!(
+        invalid_response["error"]["code"],
+        "invalid_json_configuration"
+    );
+    assert_eq!(oversized_response["error"]["code"], "config_too_large");
 }
 
 #[test]
-fn emits_shell_completions() {
-    for shell in ["bash", "zsh", "fish", "powershell"] {
-        let output = stdout(&run(&["completions", shell]));
-        assert!(
-            !output.is_empty(),
-            "{shell} completions should not be empty"
-        );
-        assert!(
-            output.contains("fence"),
-            "{shell} completions should reference the binary name"
-        );
+fn scaffold_and_malformed_commands_are_absent() {
+    for arguments in [
+        vec![],
+        vec!["man"],
+        vec!["completions", "bash"],
+        vec!["add", "2", "3"],
+        vec!["--help"],
+    ] {
+        let response = error_json(&arguments, 2);
+        assert_eq!(response["error"]["code"], "invalid_arguments");
     }
-}
-
-#[test]
-fn emits_man_page() {
-    let output = stdout(&run(&["man"]));
-
-    assert!(output.contains(".TH fence"));
-    assert!(output.contains("Fence agent implementation scaffold"));
-    assert!(output.contains("fence\\-add(1)"));
 }

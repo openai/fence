@@ -191,22 +191,18 @@ jobs:
           set -euo pipefail
           rm -rf dist/merged
           mkdir -p dist/merged
-          if [[ -d dist/agent/docs ]]; then
-            cp -R dist/agent/docs dist/merged/
-          fi
 
           find dist/agent -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | while IFS= read -r -d '' file; do
             cp "$file" dist/merged/
           done
 
-          docs_dir="dist/merged/docs"
           staging="dist/merged/staging"
           rm -rf "$staging"
           mkdir -p "$staging"
 
           for file in dist/merged/*; do
             case "$(basename "$file")" in
-              checksums.txt|*.tar.gz|docs|staging) continue ;;
+              checksums.txt|*.tar.gz|staging) continue ;;
             esac
             if [[ -f "$file" ]]; then
               base="$(basename "$file")"
@@ -217,9 +213,6 @@ jobs:
               stage_dir="$staging/$base"
               mkdir -p "$stage_dir"
               cp "$file" "$stage_dir/$binary_name"
-              if [[ -d "$docs_dir" ]]; then
-                cp -R "$docs_dir"/* "$stage_dir/" 2>/dev/null || true
-              fi
               chmod +x "$stage_dir/$binary_name"
               (
                 cd "$stage_dir"
