@@ -1,0 +1,234 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/observe-hosted-runner"
+fi
+
+require_cmd sudo
+require_cmd python3
+
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "hosted-runner observation requires Linux x86_64"
+fi
+
+runner_principal="$(/usr/bin/id -un)"
+if ! [[ "$runner_principal" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+  die "hosted-runner observation encountered an invalid caller principal"
+fi
+
+# Observe only fixed security-relevant surfaces. Do not emit file contents,
+# environment values, process arguments, workload identifiers, or socket data.
+sudo --non-interactive /usr/bin/python3 - "$runner_principal" <<'PY'
+import grp
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import pwd
+import stat
+import subprocess
+import sys
+
+MAX_POLICY_SOURCE_BYTES = 256 * 1024
+FIXED_PATHS = [
+    "/usr/bin/docker",
+    "/usr/bin/systemctl",
+    "/usr/bin/systemd-run",
+    "/usr/sbin/nft",
+]
+FIXED_UNITS = [
+    "docker.service",
+    "docker.socket",
+    "containerd.service",
+    "containerd.socket",
+]
+FIXED_SOCKETS = [
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/run/containerd/containerd.sock",
+]
+
+
+def command_output(args):
+    try:
+        result = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/usr/sbin:/bin:/sbin"},
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode not in (0, 1, 3, 4):
+        return None
+    return result.stdout[:4096]
+
+
+def runner_nopasswd_markers(contents, principal, groups):
+    text = contents.decode("utf-8", errors="ignore").replace("\\\n", " ")
+    accepted_subjects = {principal: "principal"}
+    accepted_subjects.update({f"%{group}": "group" for group in groups})
+    markers = []
+    for original_line in text.splitlines():
+        line = original_line.split("#", 1)[0].strip()
+        if "NOPASSWD:" not in line:
+            continue
+        subject = line.split(None, 1)[0] if line else ""
+        marker = accepted_subjects.get(subject)
+        if marker is not None and marker not in markers:
+            markers.append(marker)
+    return sorted(markers)
+
+
+def regular_file_observation(path, principal, groups):
+    candidate = pathlib.Path(path)
+    if not candidate.is_file() or candidate.is_symlink():
+        return None
+    if candidate.stat().st_size > MAX_POLICY_SOURCE_BYTES:
+        return {"name": candidate.name, "status": "oversized"}
+    contents = candidate.read_bytes()
+    digest = hashlib.sha256(contents).hexdigest()
+    return {
+        "name": candidate.name,
+        "sha256": digest,
+        "contains_nopasswd_directive": b"NOPASSWD:" in contents,
+        "runner_nopasswd_markers": runner_nopasswd_markers(contents, principal, groups),
+    }
+
+
+def unit_state(unit):
+    output = command_output(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=UnitFileState",
+            unit,
+        ]
+    )
+    values = {
+        "name": unit,
+        "load_state": "unobserved",
+        "active_state": "unobserved",
+        "unit_file_state": "unobserved",
+    }
+    if output is not None:
+        for line in output.splitlines():
+            key, _, value = line.partition("=")
+            output_key = {
+                "LoadState": "load_state",
+                "ActiveState": "active_state",
+                "UnitFileState": "unit_file_state",
+            }.get(key)
+            if output_key is not None:
+                values[output_key] = value[:64]
+    return values
+
+
+def socket_state(path):
+    candidate = pathlib.Path(path)
+    try:
+        metadata = candidate.stat()
+    except FileNotFoundError:
+        return {"path": path, "present": False}
+    mode = stat.S_IMODE(metadata.st_mode)
+    kind = "socket" if stat.S_ISSOCK(metadata.st_mode) else "unexpected_type"
+    try:
+        owner = pwd.getpwuid(metadata.st_uid).pw_name
+    except KeyError:
+        owner = str(metadata.st_uid)
+    try:
+        group = grp.getgrgid(metadata.st_gid).gr_name
+    except KeyError:
+        group = str(metadata.st_gid)
+    return {
+        "path": path,
+        "present": True,
+        "type": kind,
+        "mode": format(mode, "04o"),
+        "owner": owner[:64],
+        "group": group[:64],
+    }
+
+
+def principal_groups(principal):
+    try:
+        primary = pwd.getpwnam(principal).pw_gid
+        identifiers = os.getgrouplist(principal, primary)
+    except KeyError:
+        return []
+    values = []
+    for identifier in sorted(set(identifiers)):
+        try:
+            values.append(grp.getgrgid(identifier).gr_name[:64])
+        except KeyError:
+            values.append(str(identifier))
+    return values[:64]
+
+
+runner_groups = principal_groups(sys.argv[1])
+sudo_sources = []
+main_sudoers = regular_file_observation("/etc/sudoers", sys.argv[1], runner_groups)
+if main_sudoers is not None:
+    main_sudoers["path_class"] = "main_policy"
+    sudo_sources.append(main_sudoers)
+drop_in_root = pathlib.Path("/etc/sudoers.d")
+if drop_in_root.is_dir():
+    for candidate in sorted(drop_in_root.iterdir()):
+        hashed = regular_file_observation(candidate, sys.argv[1], runner_groups)
+        if hashed is not None:
+            hashed["path_class"] = "drop_in"
+            sudo_sources.append(hashed)
+
+docker_ps = command_output(["/usr/bin/docker", "ps", "--quiet"])
+docker_workload_count = (
+    None if docker_ps is None else len([line for line in docker_ps.splitlines() if line])
+)
+
+os_identity = {"id": "unknown", "version_id": "unknown"}
+try:
+    for line in pathlib.Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+        key, _, value = line.partition("=")
+        if key in {"ID", "VERSION_ID"}:
+            os_identity[key.lower()] = value.strip().strip('"')[:64]
+except (FileNotFoundError, UnicodeDecodeError):
+    pass
+
+result = {
+    "schema_version": 1,
+    "observation": "hosted_runner_fingerprint_candidate",
+    "status": "observation_only_no_protection",
+    "protected_target": "github_hosted_ubuntu_24_04_x86_64",
+    "host": {
+        "os_id": os_identity["id"],
+        "os_version_id": os_identity["version_id"],
+        "architecture": platform.machine(),
+        "runner_principal": sys.argv[1],
+        "runner_groups": runner_groups,
+    },
+    "required_paths": [
+        {"path": path, "executable": os.access(path, os.X_OK)} for path in FIXED_PATHS
+    ],
+    "systemd": {"units": [unit_state(unit) for unit in FIXED_UNITS]},
+    "sudo": {
+        "noninteractive_root_observation_succeeded": True,
+        "policy_source_hashes": sudo_sources,
+        "grant_source_review_required": True,
+    },
+    "container_runtime": {
+        "sockets": [socket_state(path) for path in FIXED_SOCKETS],
+        "docker_running_workload_count": docker_workload_count,
+    },
+    "next_step": "review_and_pin_supported_fingerprint_before_lifecycle_mutation",
+}
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+PY

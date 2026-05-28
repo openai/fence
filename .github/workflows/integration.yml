@@ -33,6 +33,9 @@ jobs:
       - name: validate locks
         run: script/validate-locks --ci
 
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
       - name: prepare rust
         run: script/prepare-rust
 
