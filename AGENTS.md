@@ -132,7 +132,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/test-lockdown`
   - Linux x64-only, GitHub-Actions-only hosted lockdown evidence entrypoint; do not run it on developer machines or reusable runners.
   - Executes exactly one `audit`, `rollback`, `unsafe-preserve`, or `standard` scenario inside a root transient `systemd` service after comparing the fixed hosted-runner fingerprint.
-  - Relocates only the accepted runner sudo drop-in and runtime-masks only the accepted Docker/containerd units in the mutating scenarios; rollback proves the restored sudo mode, pinned digest, and measured runner capability, while standard and degraded success paths intentionally do not restore before ephemeral VM teardown.
+  - Relocates only the accepted runner sudo drop-in and runtime-masks only the accepted Docker/containerd units in the mutating scenarios; rollback proves the restored sudo mode, pinned digest, and measured runner capability and permits only a bounded 30-second daemon restart deadline, while standard and degraded success paths intentionally do not restore before ephemeral VM teardown.
   - Emits root-owned, runner-readable `lockdown_evidence_test_only` reports below non-production `/run/fence-lockdown-evidence-*`, emits no readiness, does not apply host network policy, and cannot claim protection.
 
 - `script/measure-platform-egress`
