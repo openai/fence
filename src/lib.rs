@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod findings;
+pub mod hosted_runner;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod nflog;
@@ -17,7 +18,7 @@ pub mod support;
 
 use serde::Serialize;
 
-pub const IMPLEMENTATION_PHASE: &str = "phase2";
+pub const IMPLEMENTATION_PHASE: &str = "phase3";
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct VersionInfo {
@@ -52,7 +53,7 @@ mod tests {
 
         assert_eq!(info.name, env!("CARGO_PKG_NAME"));
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.implementation_phase, "phase2");
+        assert_eq!(info.implementation_phase, "phase3");
         assert!(!info.protection_available);
     }
 }

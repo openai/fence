@@ -142,7 +142,7 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
     if input.platform_profile.as_deref().unwrap_or("none") != "none" {
         return Err(ErrorDetail::new(
             "invalid_platform_profile",
-            "only the none platform profile is available in phase2",
+            "only the none platform profile is available before hosted proof",
         )
         .field("platform_profile"));
     }
@@ -150,7 +150,7 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
     if input.allowances.len() > MAX_ALLOWANCES {
         return Err(ErrorDetail::new(
             "too_many_allowances",
-            "allowances exceeds the fixed phase2 limit",
+            "allowances exceeds the fixed v0 limit",
         )
         .field("allowances"));
     }

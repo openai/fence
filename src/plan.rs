@@ -271,7 +271,7 @@ fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> As
 }
 
 fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
-    let mut limitations = vec!["phase2_network_model_only_no_public_enforcement"];
+    let mut limitations = vec!["phase3_lifecycle_not_activated_no_public_enforcement"];
     match status {
         AssuranceStatus::PlannedBlockContainment => {}
         AssuranceStatus::PlannedBlockDegradedContainerAccess => {

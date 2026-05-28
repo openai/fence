@@ -11,11 +11,13 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current Phase 2C executable strictly
-validates local JSON policy, renders a frozen policy and deterministic native
-`nftables` ruleset preview, and reports read-only host support observations. It
-never applies a network boundary, changes privilege state, writes readiness, or
-reports protection as available.
+Fence is not an enforcement agent yet. The current Phase 3A executable builds
+on the Phase 2 network-evidence backend: it strictly validates local JSON
+policy, renders a frozen policy and deterministic native `nftables` ruleset
+preview, and reports the pending hosted-runner fingerprint gate needed before
+the privileged lifecycle can be activated. It never applies a network
+boundary, changes privilege state, writes readiness, or reports protection as
+available.
 
 Phase 2C additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -25,9 +27,10 @@ raw packet bytes to evidence. This is test-only proof, not a usable protection
 mode.
 
 Pull requests also build a Linux x64 package independently and execute that
-artifact through the Phase 2 JSON CLI contract. This proves the distributed
-binary remains non-enforcing and fail-closed; it is not a public GitHub Action
-or a protection claim.
+artifact through the non-enforcing JSON CLI contract. The `integration`
+workflow additionally records a bounded, read-only hosted-runner fingerprint
+candidate before its existing namespace evidence tests. These checks do not
+establish public protection or create a GitHub Action interface.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -133,14 +136,16 @@ CI additionally runs `script/validate-locks --ci` and
 runners are not fully air-gapped: checkout, action loading, Rust preparation,
 artifact operations, and release publication still require network access.
 On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
-artifact's public non-enforcing contract separately from the privileged
-namespace evidence workflow.
+artifact's public non-enforcing contract separately from
+`script/observe-hosted-runner` and the privileged namespace evidence workflow.
 
-## Phase 2 CLI
+## Phase 3A CLI
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
-hash. `run` fails closed until the privileged lifecycle is implemented.
+hash. `check-support` reports a versioned hosted-runner fingerprint gate as
+pending hosted review. `run` fails closed until the privileged lifecycle is
+implemented and proved.
 
 ```console
 script/build
@@ -151,13 +156,14 @@ script/build
 ```
 
 The last command intentionally returns an `enforcement_not_implemented` error
-through Phase 2. Do not use this planner or its ruleset preview as a runner
-security control.
+through the Phase 3 evidence-only slices. Do not use this planner or its
+ruleset preview as a runner security control.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
-can truthfully establish readiness. That future wrapper is intended to live
-in this repository and carry a reviewed Linux binary in an immutable action
-reference; Phase 2 does not publish an `action.yml` interface or download an
+can truthfully establish readiness and an attested alpha agent has been
+published. That future wrapper is intended to live in this repository and
+carry the reviewed Linux release binary in an immutable action reference; the
+current project does not publish an `action.yml` interface or download an
 agent at workflow runtime.
 
 ## Release Baseline

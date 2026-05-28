@@ -1,3 +1,5 @@
+use crate::IMPLEMENTATION_PHASE;
+use crate::hosted_runner::{HostedRunnerFingerprintV1, hosted_runner_fingerprint_requirement};
 use serde::Serialize;
 use std::path::Path;
 
@@ -55,12 +57,13 @@ pub struct SupportData {
     pub reasons: Vec<&'static str>,
     pub deferred_capability_probes: Vec<&'static str>,
     pub network_backend: NetworkBackendObservation,
+    pub hosted_runner_fingerprint: HostedRunnerFingerprintV1,
 }
 
 pub fn inspect_support(provider: &dyn SupportProvider) -> SupportData {
     let identity = provider.host_identity();
     SupportData {
-        implementation_phase: "phase2",
+        implementation_phase: IMPLEMENTATION_PHASE,
         intended_protected_target_match: identity.os == "linux"
             && identity.architecture == "x86_64",
         host_os: identity.os,
@@ -68,6 +71,7 @@ pub fn inspect_support(provider: &dyn SupportProvider) -> SupportData {
         protection_available: false,
         reasons: vec![
             "public_enforcement_not_activated",
+            "hosted_runner_fingerprint_pending",
             "lockdown_not_implemented",
         ],
         deferred_capability_probes: vec![
@@ -76,6 +80,7 @@ pub fn inspect_support(provider: &dyn SupportProvider) -> SupportData {
             "container_lockdown",
         ],
         network_backend: provider.network_backend_observation(),
+        hosted_runner_fingerprint: hosted_runner_fingerprint_requirement(),
     }
 }
 
@@ -108,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn intended_target_still_reports_no_protection_in_phase2() {
+    fn intended_target_still_reports_no_protection_in_phase3a() {
         let data = inspect_support(&FixedProvider {
             os: "linux",
             architecture: "x86_64",
@@ -120,10 +125,12 @@ mod tests {
             data.reasons,
             vec![
                 "public_enforcement_not_activated",
+                "hosted_runner_fingerprint_pending",
                 "lockdown_not_implemented"
             ]
         );
         assert!(data.network_backend.nft_binary_present);
+        assert_eq!(data.hosted_runner_fingerprint.status, "observation_pending");
     }
 
     #[test]

@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current Phase 2C binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. No first-party runtime path reaches native apply/verify/rollback or NFLOG ingestion; the repository exercises those paths only through privileged evidence tests. A separate packaged-artifact acceptance test executes the distributed CLI shape without claiming protection. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
+The current Phase 3A binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes a pending hosted-runner fingerprint gate, and `run` fails closed without writing readiness or claiming protection. No first-party runtime path reaches native apply/verify/rollback or NFLOG ingestion; the repository exercises those paths only through privileged evidence tests. The integration workflow now collects bounded read-only hosted-runner observations so a later reviewed change can pin the single supported runner shape. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
 
 ## North-Star Principles
 
@@ -126,11 +126,17 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - NFLOG handling may inspect at most the configured 64-byte packet prefix transiently in memory and must serialize approved endpoint metadata only.
   - Must not invoke the public `run` command, create a readiness file, mutate host firewall rules, or make a protection claim.
 
+- `script/observe-hosted-runner`
+  - Linux x64-only, read-only hosted-runner fingerprint candidate collector for the `integration` workflow.
+  - Emits bounded JSON describing only the runner principal/group names, fixed security-relevant paths, fixed systemd unit state, fixed runtime socket state, aggregate Docker workload count, and sudo-policy source digests plus `NOPASSWD` marker classification for review.
+  - Must not emit sudo policy contents, environment values, process arguments, workload identifiers, credentials, or arbitrary host files.
+  - Must not establish support, mutate host state, enable public enforcement, or write readiness.
+
 - `script/test-package-smoke`
   - Linux x64-only offline packaged-artifact acceptance entrypoint; it accepts exactly one already-built Fence binary path.
   - Uses only a literal-IP/CIDR policy fixture and Python standard-library JSON parsing; it must not resolve hostnames, install tools, or use network access.
   - Verifies versioned JSON output, deterministic `render-plan`, fail-closed `run`, no `inet fence_v0` table creation, and no `/run/fence/package-acceptance/` state creation.
-  - Proves only the Phase 2 public CLI contract of a packaged binary; it is distinct from privileged network evidence and cannot make a protection claim.
+  - Proves only the current non-enforcing public CLI contract of a packaged binary; it is distinct from hosted-runner observation and privileged network evidence and cannot make a protection claim.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.
@@ -273,8 +279,8 @@ If any version file changes, update docs and verify the corresponding script beh
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
 - Hosted coverage workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/install-test-tools`, then `script/bootstrap`, then `script/test --coverage`.
-- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` evidence.
-- `acceptance` and `integration` must remain separate evidence boundaries: the former exercises the packaged non-enforcing CLI, while the latter proves privileged kernel/network behavior in disposable namespaces.
+- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, invoke `script/observe-hosted-runner` for bounded read-only runner-shape evidence, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` evidence.
+- `acceptance` and `integration` must remain separate evidence boundaries: the former exercises the packaged non-enforcing CLI, while the latter observes the hosted shape and proves privileged kernel/network behavior without activating protection.
 - Hosted validation should rely on offline defaults from `script/env` after explicit preparation completes.
 - Do not add Rust toolchain setup actions to hosted lint/test/build workflows; use `script/prepare-rust` so the preparation path stays explicit, checksum-gated, and repo-owned.
 - The first publishable agent release build job should run on `ubuntu-24.04`, run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then `script/build --release --targets "x86_64-unknown-linux-gnu"`.
