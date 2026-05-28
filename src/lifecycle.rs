@@ -550,11 +550,10 @@ mod tests {
             Ok(()),
             Err(LifecycleError::new("drift", "test injected drift")),
         ]);
-        network.findings.push_back(Ok(Some(finding_from_prefix(
-            Mode::Block,
-            "t".to_owned(),
-            &[0],
-        ))));
+        network.findings = VecDeque::from([
+            Ok(Some(finding_from_prefix(Mode::Block, "t".to_owned(), &[0]))),
+            Ok(None),
+        ]);
         network.total = VecDeque::from([Ok(0), Ok(1), Ok(1)]);
         let mut session = ResidentSession::establish_test_only(runtime, &plan, network).unwrap();
         assert_eq!(
