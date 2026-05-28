@@ -1,9 +1,11 @@
+use crate::IMPLEMENTATION_PHASE;
 use crate::config::{
     ContainerPolicy, DestinationType, MAX_ALLOWANCES, MAX_EXPANDED_RULES, MAX_FINDINGS,
     MAX_REPORT_BYTES, MAX_RESOLVED_ADDRESSES, Mode, NormalizedAllowance, NormalizedConfig,
     Protocol,
 };
 use crate::error::ErrorDetail;
+use crate::nft::{NetworkEnforcementPreview, build_preview, implicit_ipv6_control};
 use crate::resolver::{Resolution, ResolveError, Resolver};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -14,6 +16,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,7 +82,10 @@ pub struct PlanData {
     pub effective_policy: Vec<EffectiveAllowance>,
     pub frozen_resolution_results: Vec<ResolutionResult>,
     pub derived_runtime_paths: RuntimePaths,
+    pub policy_hash_schema_version: u32,
     pub policy_hash: String,
+    pub ruleset_hash: String,
+    pub network_enforcement_preview: NetworkEnforcementPreview,
     pub limits: LimitStatus,
     pub findings: FindingState,
     pub application_status: &'static str,
@@ -89,10 +95,12 @@ pub struct PlanData {
 
 #[derive(Serialize)]
 struct PolicyHashInput<'a> {
+    policy_hash_schema_version: u32,
     mode: Mode,
     container_policy: Option<ContainerPolicy>,
     platform_profile: &'a str,
     allowances: &'a [EffectiveAllowance],
+    implicit_ipv6_control: crate::nft::ImplicitIpv6Control,
 }
 
 pub fn build_plan(
@@ -186,6 +194,8 @@ pub fn build_plan(
         })
         .collect();
     let policy_hash = policy_hash(&config, &effective_policy);
+    let network_enforcement_preview = build_preview(config.mode, &effective_policy);
+    let ruleset_hash = sha256_hex(network_enforcement_preview.ruleset.as_bytes());
     let assurance_status = assurance_status(config.mode, config.container_policy);
     let limitations = limitations(assurance_status);
     let invocation_id = config.invocation_id.clone();
@@ -193,7 +203,7 @@ pub fn build_plan(
         expanded_rules_before_deduplication - effective_policy.len();
 
     Ok(PlanData {
-        implementation_phase: "phase1",
+        implementation_phase: IMPLEMENTATION_PHASE,
         configuration_schema_version: config.schema_version,
         selected_mode: config.mode,
         assurance_status,
@@ -204,7 +214,10 @@ pub fn build_plan(
         effective_policy,
         frozen_resolution_results,
         derived_runtime_paths: runtime_paths(&invocation_id),
+        policy_hash_schema_version: POLICY_HASH_SCHEMA_VERSION,
         policy_hash,
+        ruleset_hash,
+        network_enforcement_preview,
         limits: LimitStatus {
             max_user_allowances: MAX_ALLOWANCES,
             declared_user_allowances: config.declared_allowance_count,
@@ -258,7 +271,7 @@ fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> As
 }
 
 fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
-    let mut limitations = vec!["phase1_planning_only_no_enforcement"];
+    let mut limitations = vec!["phase2_network_model_only_no_public_enforcement"];
     match status {
         AssuranceStatus::PlannedBlockContainment => {}
         AssuranceStatus::PlannedBlockDegradedContainerAccess => {
@@ -284,12 +297,18 @@ fn runtime_paths(invocation_id: &str) -> RuntimePaths {
 
 fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance]) -> String {
     let bytes = serde_json::to_vec(&PolicyHashInput {
+        policy_hash_schema_version: POLICY_HASH_SCHEMA_VERSION,
         mode: config.mode,
         container_policy: config.container_policy,
         platform_profile: &config.platform_profile,
         allowances: effective_policy,
+        implicit_ipv6_control: implicit_ipv6_control(),
     })
     .expect("typed policy hashing input must serialize");
+    sha256_hex(&bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut hash = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -347,7 +366,7 @@ mod tests {
         )
         .unwrap();
         let another = build_plan(
-            parse(&json.replace("one", "two")),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"two","allowances":[{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#),
             &resolver(vec![resolved(
                 &["2001:db8::1", "192.0.2.2"],
                 Duration::from_secs(1),
@@ -356,10 +375,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.policy_hash, another.policy_hash);
+        assert_eq!(plan.ruleset_hash, another.ruleset_hash);
+        assert_eq!(plan.policy_hash_schema_version, POLICY_HASH_SCHEMA_VERSION);
         assert_eq!(plan.effective_policy.len(), 2);
         assert_eq!(plan.limits.duplicate_effective_rules_collapsed, 1);
         assert_eq!(plan.frozen_resolution_results[0].addresses[0], "192.0.2.2");
         assert_eq!(plan.derived_runtime_paths.directory, "/run/fence/one");
+        assert_eq!(
+            plan.network_enforcement_preview.owned_table.name,
+            crate::nft::NFT_TABLE
+        );
+        assert_eq!(
+            plan.network_enforcement_preview.activation_status,
+            "not_applied"
+        );
     }
 
     #[test]
@@ -392,6 +421,8 @@ mod tests {
             audit.assurance_status,
             AssuranceStatus::AuditObservationOnly
         );
+        assert_ne!(standard.policy_hash, audit.policy_hash);
+        assert_ne!(standard.ruleset_hash, audit.ruleset_hash);
         assert_eq!(degraded.limitations.len(), 2);
         assert_eq!(audit.limitations.len(), 2);
     }

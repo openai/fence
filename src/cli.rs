@@ -12,7 +12,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "fence",
-    about = "Fence phase1 policy planning agent",
+    about = "Fence phase2 network-policy modeling agent",
     disable_help_flag = true,
     disable_version_flag = true
 )]
@@ -135,6 +135,16 @@ mod tests {
                 architecture: "x86_64".to_owned(),
             }
         }
+
+        fn network_backend_observation(&self) -> crate::support::NetworkBackendObservation {
+            crate::support::NetworkBackendObservation {
+                required: "native_nftables",
+                nft_binary_expected_path: "/usr/sbin/nft",
+                nft_binary_present: true,
+                nft_version_observed: None,
+                privileged_semantic_proof: "integration_test_required",
+            }
+        }
     }
 
     fn execute_test(args: &[&str]) -> CommandOutput {
@@ -151,7 +161,7 @@ mod tests {
         let support = execute_test(&["fence", "check-support"]);
 
         assert_eq!(version.exit_code, 0);
-        assert!(version.json.contains("\"implementation_phase\":\"phase1\""));
+        assert!(version.json.contains("\"implementation_phase\":\"phase2\""));
         assert_eq!(support.exit_code, 0);
         assert!(support.json.contains("\"protection_available\":false"));
     }
