@@ -902,6 +902,7 @@ fn set_directory_mode(path: &Path, mode: u32) -> Result<(), BackendError> {
 mod tests {
     use super::*;
     use crate::config::{DestinationType, Mode, Protocol};
+    use crate::findings::finding_from_prefix;
     use crate::nft::{
         NETWORK_EVIDENCE_STATUS, expected_owned_state, unapplied_test_evidence_model,
     };
@@ -1334,6 +1335,25 @@ mod tests {
             .unwrap_err()
             .code,
             "invalid_test_identifier"
+        );
+
+        let mut oversized =
+            unapplied_test_evidence_model(Mode::Audit, "policy".to_owned(), "ruleset".to_owned());
+        oversized.findings.push(finding_from_prefix(
+            Mode::Audit,
+            "x".repeat(MAX_REPORT_BYTES),
+            &[0],
+        ));
+        assert_eq!(
+            write_test_evidence(
+                &root,
+                "oversized",
+                &oversized,
+                &expected_owned_state(Mode::Audit, &[])
+            )
+            .unwrap_err()
+            .code,
+            "evidence_report_too_large"
         );
         fs::remove_dir_all(root).unwrap();
     }

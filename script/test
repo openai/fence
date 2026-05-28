@@ -43,7 +43,7 @@ html_dir="$DIR/coverage/html"
 
 clear_generated_dir "$DIR/coverage" "coverage output directory"
 
-ignore_regex='(^|/)(tests|benches|target|vendor)/|/\.cargo/registry/|/rustc/|/src/nft_backend[.]rs$'
+ignore_regex='(^|/)(tests|benches|target|vendor)/|/\.cargo/registry/|/rustc/|/src/(nft_backend|nflog)[.]rs$'
 
 cargo llvm-cov clean --workspace
 cargo llvm-cov --frozen --workspace --all-features --no-report

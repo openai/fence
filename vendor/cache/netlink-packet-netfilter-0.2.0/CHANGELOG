@@ -1,0 +1,11 @@
+# Changelog
+## [0.2.0] - 2023-07-10
+### Breaking changes
+ - Removed reexport on `nl`, please use `netlink_packet_core`. (a7bfcfd)
+ - Removed reexport on `utils`, please use `netlink_packet_utils`. (a7bfcfd)
+
+### New features
+ - N/A
+
+### Bug fixes
+ - N/A

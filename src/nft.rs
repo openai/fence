@@ -1,4 +1,5 @@
 use crate::config::{Mode, Protocol};
+use crate::findings::ConnectionFinding;
 use crate::plan::EffectiveAllowance;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -72,7 +73,8 @@ pub struct NetworkEvidence {
     pub verification_status: &'static str,
     pub readiness_status: &'static str,
     pub counters: NetworkEvidenceCounters,
-    pub findings: Vec<String>,
+    pub findings: Vec<ConnectionFinding>,
+    pub findings_truncated: bool,
     pub limitations: Vec<&'static str>,
 }
 
@@ -205,9 +207,11 @@ pub fn unapplied_test_evidence_model(
             sampled_violations: 0,
         },
         findings: Vec::new(),
+        findings_truncated: false,
         limitations: vec![
             "network_test_evidence_only_no_containment",
             "readiness_not_available",
+            "packet_prefixes_transiently_inspected_in_memory_not_serialized",
         ],
     }
 }

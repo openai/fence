@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
 use fence::config::{DestinationType, Mode, Protocol, parse_and_normalize};
+use fence::findings::FindingCollection;
+use fence::nflog::NflogReader;
 use fence::nft::{
     NetworkEvidenceCounters, expected_owned_state, render_ruleset, unapplied_test_evidence_model,
 };
@@ -189,6 +191,40 @@ impl Drop for ChildGuard {
 }
 
 #[test]
+#[ignore = "executed as a helper inside a disposable network namespace"]
+fn nflog_worker_collects_bounded_findings() {
+    if std::env::var_os("FENCE_NFLOG_WORKER").is_none() {
+        return;
+    }
+    let mode = match std::env::var("FENCE_NFLOG_MODE").unwrap().as_str() {
+        "block" => Mode::Block,
+        "audit" => Mode::Audit,
+        other => panic!("invalid worker mode: {other}"),
+    };
+    let expected = std::env::var("FENCE_NFLOG_EXPECTED")
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let ready = PathBuf::from(std::env::var_os("FENCE_NFLOG_READY").unwrap());
+    let output = PathBuf::from(std::env::var_os("FENCE_NFLOG_OUTPUT").unwrap());
+    let reader = NflogReader::bind(mode).unwrap();
+    fs::write(&ready, b"bound").unwrap();
+    let mut collection = FindingCollection::empty();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while collection.sampled_total < expected && Instant::now() < deadline {
+        if let Some(finding) = reader.next_finding(Duration::from_millis(100)).unwrap() {
+            collection.record_finding(finding);
+        }
+    }
+    assert!(
+        collection.sampled_total >= expected,
+        "expected {expected} NFLOG findings, received {}",
+        collection.sampled_total
+    );
+    fs::write(output, serde_json::to_vec(&collection).unwrap()).unwrap();
+}
+
+#[test]
 #[ignore = "requires Linux root network namespaces and native nftables"]
 fn block_and_audit_output_paths_emit_only_test_evidence() {
     require_root();
@@ -202,6 +238,8 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
         allowance("2001:db8:1::2", Protocol::Tcp, 18443),
         allowance("2001:db8:1::2", Protocol::Udp, 18444),
     ];
+    let (mut block_worker, block_findings_path) =
+        start_nflog_worker(&topology.client, Mode::Block, "block-findings", 5);
     let mut block = backend(&topology.client);
     let block_program = render_ruleset(Mode::Block, &block_allowances);
     block.preflight(&block_program).unwrap();
@@ -223,8 +261,15 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
         "udp",
         18444
     ));
+    let marker = "fence-private-payload-marker";
+    assert!(!traffic_with_listener_payload(
+        &topology,
+        "192.0.2.2",
+        "udp",
+        19444,
+        marker
+    ));
     assert!(!traffic_with_listener(&topology, "192.0.2.2", "tcp", 19443));
-    assert!(!traffic_with_listener(&topology, "192.0.2.2", "udp", 19444));
     assert!(!traffic_with_listener(
         &topology,
         "2001:db8:1::2",
@@ -244,6 +289,18 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
     ));
     let blocked = block.total_violation_packets().unwrap();
     assert!(blocked >= 5);
+    let block_findings = finish_nflog_worker(&mut block_worker, &block_findings_path);
+    assert!(block_findings.retained.iter().any(|finding| {
+        finding.family == "ipv4" && finding.protocol == "udp" && finding.remote_port == Some(19444)
+    }));
+    assert!(block_findings.retained.iter().any(|finding| {
+        finding.family == "ipv6" && finding.protocol == "tcp" && finding.remote_port == Some(19443)
+    }));
+    assert!(
+        !serde_json::to_string(&block_findings)
+            .unwrap()
+            .contains(marker)
+    );
     let planned = build_plan(
         parse_and_normalize(br#"{"schema_version":1,"mode":"block","invocation_id":"block-output","allowances":[{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":18443},{"destination_type":"ip","destination":"192.0.2.2","protocol":"udp","port":18444},{"destination_type":"ip","destination":"2001:db8:1::2","protocol":"tcp","port":18443},{"destination_type":"ip","destination":"2001:db8:1::2","protocol":"udp","port":18444}]}"#).unwrap(),
         &NoResolver,
@@ -256,8 +313,10 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
     evidence.verification_status = "verified";
     evidence.counters = NetworkEvidenceCounters {
         total_violations: blocked,
-        sampled_violations: 0,
+        sampled_violations: block_findings.sampled_total,
     };
+    evidence.findings = block_findings.retained;
+    evidence.findings_truncated = block_findings.truncated;
     let directory = write_test_evidence(
         &root,
         "block-output",
@@ -274,6 +333,8 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
     assert!(block.rollback_pre_activation().unwrap());
 
     let audit_allowances = Vec::new();
+    let (mut audit_worker, audit_findings_path) =
+        start_nflog_worker(&topology.client, Mode::Audit, "audit-findings", 2);
     let mut audit = backend(&topology.client);
     let audit_program = render_ruleset(Mode::Audit, &audit_allowances);
     audit.preflight(&audit_program).unwrap();
@@ -289,6 +350,11 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
         20444
     ));
     assert!(audit.total_violation_packets().unwrap() >= 2);
+    let audit_findings = finish_nflog_worker(&mut audit_worker, &audit_findings_path);
+    assert_eq!(audit_findings.sampled_total, 2);
+    assert!(audit_findings.retained.iter().all(
+        |finding| finding.classification == fence::findings::FindingClassification::WouldBlock
+    ));
     assert!(audit.rollback_pre_activation().unwrap());
 }
 
@@ -421,10 +487,20 @@ fn traffic_with_listener(
     protocol: &str,
     port: u16,
 ) -> bool {
+    traffic_with_listener_payload(topology, address, protocol, port, "x")
+}
+
+fn traffic_with_listener_payload(
+    topology: &PeerTopology,
+    address: &str,
+    protocol: &str,
+    port: u16,
+    payload: &str,
+) -> bool {
     let ready = evidence_root().join(format!("ready-{protocol}-{port}"));
     let mut listener = start_listener(&topology.server, address, protocol, port, &ready);
     wait_for_path(&ready);
-    let success = send_traffic(&topology.client, address, protocol, port);
+    let success = send_traffic(&topology.client, address, protocol, port, payload);
     let _ = listener.0.kill();
     let _ = listener.0.wait();
     let _ = fs::remove_file(ready);
@@ -435,7 +511,7 @@ fn routed_traffic(topology: &RoutedTopology, port: u16) -> bool {
     let ready = evidence_root().join(format!("ready-forward-{port}"));
     let mut listener = start_listener(&topology.sink, "203.0.113.2", "tcp", port, &ready);
     wait_for_path(&ready);
-    let success = send_traffic(&topology.source, "203.0.113.2", "tcp", port);
+    let success = send_traffic(&topology.source, "203.0.113.2", "tcp", port, "x");
     let _ = listener.0.kill();
     let _ = listener.0.wait();
     let _ = fs::remove_file(ready);
@@ -486,23 +562,65 @@ else:
     ChildGuard(child)
 }
 
-fn send_traffic(namespace: &str, address: &str, protocol: &str, port: u16) -> bool {
+fn send_traffic(namespace: &str, address: &str, protocol: &str, port: u16, payload: &str) -> bool {
     let script = r#"
 import socket, sys
-address, protocol, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+address, protocol, port, payload = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 family = socket.AF_INET6 if ":" in address else socket.AF_INET
 kind = socket.SOCK_STREAM if protocol == "tcp" else socket.SOCK_DGRAM
 s = socket.socket(family, kind)
 s.settimeout(2)
 s.connect((address, port))
-s.send(b"x")
+s.send(payload.encode("ascii"))
 assert s.recv(2) == b"ok"
 "#;
     in_namespace_status(
         namespace,
         PYTHON,
-        &["-c", script, address, protocol, &port.to_string()],
+        &["-c", script, address, protocol, &port.to_string(), payload],
     )
+}
+
+fn start_nflog_worker(
+    namespace: &str,
+    mode: Mode,
+    label: &str,
+    expected: u64,
+) -> (ChildGuard, PathBuf) {
+    let root = evidence_root();
+    let ready = root.join(format!("{label}.ready"));
+    let output = root.join(format!("{label}.json"));
+    let mode_string = match mode {
+        Mode::Block => "block",
+        Mode::Audit => "audit",
+    };
+    let child = Command::new(IP_BINARY_PATH)
+        .args(["netns", "exec", namespace])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "nflog_worker_collects_bounded_findings",
+            "--nocapture",
+        ])
+        .env("FENCE_NFLOG_WORKER", "1")
+        .env("FENCE_NFLOG_MODE", mode_string)
+        .env("FENCE_NFLOG_EXPECTED", expected.to_string())
+        .env("FENCE_NFLOG_READY", &ready)
+        .env("FENCE_NFLOG_OUTPUT", &output)
+        .spawn()
+        .unwrap();
+    wait_for_path(&ready);
+    (ChildGuard(child), output)
+}
+
+fn finish_nflog_worker(worker: &mut ChildGuard, output: &Path) -> FindingCollection {
+    let status = worker.0.wait().unwrap();
+    assert!(
+        status.success(),
+        "NFLOG worker did not complete successfully"
+    );
+    serde_json::from_slice(&fs::read(output).unwrap()).unwrap()
 }
 
 fn wait_for_path(path: &Path) {

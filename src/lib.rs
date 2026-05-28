@@ -3,6 +3,10 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod findings;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod nflog;
 pub mod nft;
 #[doc(hidden)]
 pub mod nft_backend;
