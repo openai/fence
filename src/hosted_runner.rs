@@ -65,8 +65,13 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV1 {
             required_runner_groups: vec!["adm", "users", "docker", "systemd-journal", "runner"],
             executable_paths: vec![
                 "/usr/bin/docker",
+                "/usr/bin/id",
+                "/usr/bin/stat",
+                "/usr/bin/sudo",
                 "/usr/bin/systemctl",
                 "/usr/bin/systemd-run",
+                "/usr/bin/true",
+                "/usr/sbin/visudo",
                 "/usr/sbin/nft",
             ],
             sudo_policy_sources: vec![

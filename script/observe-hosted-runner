@@ -37,8 +37,13 @@ import sys
 MAX_POLICY_SOURCE_BYTES = 256 * 1024
 FIXED_PATHS = [
     "/usr/bin/docker",
+    "/usr/bin/id",
+    "/usr/bin/stat",
+    "/usr/bin/sudo",
     "/usr/bin/systemctl",
     "/usr/bin/systemd-run",
+    "/usr/bin/true",
+    "/usr/sbin/visudo",
     "/usr/sbin/nft",
 ]
 FIXED_UNITS = [
@@ -228,7 +233,7 @@ result = {
         "sockets": [socket_state(path) for path in FIXED_SOCKETS],
         "docker_running_workload_count": docker_workload_count,
     },
-    "next_step": "review_and_pin_supported_fingerprint_before_lifecycle_mutation",
+    "next_step": "compare_to_accepted_fingerprint_before_test_only_lockdown_mutation",
 }
 print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 PY

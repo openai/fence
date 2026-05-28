@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current Phase 3B binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes an accepted but not runtime-checked hosted-runner fingerprint reference, and `run` fails closed without writing readiness or claiming protection. Hidden Linux lifecycle code reaches native apply/verify/rollback and NFLOG ingestion only through privileged evidence tests in disposable namespaces. The integration workflow collects bounded read-only hosted-runner observations for the single pinned runner shape and runs transient-service evidence that writes explicitly test-only state below runner scratch storage. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
+The current Phase 3C binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes an accepted but not runtime-checked hosted-runner fingerprint reference, and `run` fails closed without writing readiness or claiming protection. Hidden Linux code reaches native network apply/verify/rollback, NFLOG ingestion, and measured sudo/container lockdown only through privileged hosted evidence. Namespace-local resident network evidence may emit explicitly test-only readiness below a root-created non-production runtime root; separate disposable-host lockdown scenarios emit no readiness and do not compose host network policy with lockdown. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
 
 ## North-Star Principles
 
@@ -28,6 +28,7 @@ The current Phase 3B binary is still non-enforcing: `render-plan` emits a determ
 ## Non-Negotiable Policy
 
 - No network calls during `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/lint`, `script/build`, or `script/server`.
+- `script/test-lockdown` is intentionally restricted to disposable GitHub-hosted Linux evidence jobs because its successful block and degraded scenarios disable host access without restore.
 - `script/update` is the only normal Cargo dependency update path and is intentionally online-only.
 - `script/vendor-rust` is the only normal Rust distribution lock refresh path and is intentionally online-only.
 - `script/prepare-rust` is the only normal Rust installation path. It is intentionally online, checksum-gated, and must validate `.cargo/tooling/rust-toolchain.lock.toml` before invoking `rustup`.
@@ -69,6 +70,7 @@ Keep transient tool outputs close to the repo when reasonable.
 - Do not hard-code absolute machine-specific temp paths in scripts, docs, workflows, or examples.
 - Do not commit generated temp files, extracted tool directories, build-script executables, or local cache contents.
 - Preserve explicit caller or CI temp roots. GitHub Actions jobs should continue using the runner-provided environment where appropriate.
+- Privileged hosted lifecycle evidence that must prove runner-readable root-owned state may create fixed non-production directories under `/run/fence-*-evidence-*`; it must never write production `/run/fence/` readiness.
 - If a future script needs a scratch directory, derive it from `TMPDIR`, `RUNNER_TEMP`, `target/`, or another ignored repo-local path instead of choosing an OS-global location by default.
 
 ## Bash Maintainability
@@ -117,15 +119,21 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Coverage mode enforces 100% line, function, and region coverage for first-party code.
   - Coverage mode must not install tools, use the network, or enable unstable branch coverage.
   - `cargo test` itself does not emit coverage; coverage mode relies on stable Rust source-based coverage instrumentation through `cargo-llvm-cov`.
-  - Rootless coverage intentionally excludes `src/nft_backend.rs`, `src/nflog.rs`, `src/runtime.rs`, and `src/lifecycle.rs`; those Linux privileged kernel/socket, no-follow runtime-file, and transient-service boundaries are proved through deterministic unit tests plus `script/test-privileged` namespace behavior tests on `ubuntu-24.04`.
+  - Rootless coverage intentionally excludes `src/nft_backend.rs`, `src/nflog.rs`, `src/runtime.rs`, `src/lifecycle.rs`, and `src/lockdown.rs`; those Linux privileged kernel/socket, no-follow runtime-file, transient-service, and host-lockdown boundaries are proved through deterministic unit tests plus hosted privileged evidence on `ubuntu-24.04`.
 
 - `script/test-privileged`
   - Linux x64-only privileged evidence entrypoint; it must not run on ordinary local or portable test paths.
   - Verifies `/usr/sbin/nft`, transient `systemd` service, namespace, IPv6, and NFLOG-rule prerequisites before invoking ignored backend tests.
-  - Runs native apply/verify/rollback, bounded NFLOG collection, and resident transient-service evidence only inside disposable network namespaces and writes test-only evidence beneath `RUNNER_TEMP`.
+  - Runs native apply/verify/rollback, bounded NFLOG collection, and resident transient-service evidence only inside disposable network namespaces and writes protected test-only lifecycle evidence below root-created non-production `/run/fence-resident-evidence-*` paths.
   - Proves five-second resident verification emits a bounded critical finding on owned-network drift and that setup failures roll back before any test-only readiness is written.
   - NFLOG handling may inspect at most the configured 64-byte packet prefix transiently in memory and must serialize approved endpoint metadata only.
-  - May write only explicitly labelled `test_only_ready_no_protection` readiness evidence below the injected test root; it must not invoke the public `run` command, write production `/run/fence` readiness, mutate host firewall rules, or make a protection claim.
+  - May write only explicitly labelled `test_only_ready_no_protection` readiness evidence below a root-created non-production runtime root; it must not invoke the public `run` command, write production `/run/fence` readiness, mutate host firewall rules, or make a protection claim.
+
+- `script/test-lockdown`
+  - Linux x64-only, GitHub-Actions-only hosted lockdown evidence entrypoint; do not run it on developer machines or reusable runners.
+  - Executes exactly one `audit`, `rollback`, `unsafe-preserve`, or `standard` scenario inside a root transient `systemd` service after comparing the fixed hosted-runner fingerprint.
+  - Relocates only the accepted runner sudo drop-in and runtime-masks only the accepted Docker/containerd units in the mutating scenarios; standard and degraded success paths intentionally do not restore before ephemeral VM teardown.
+  - Emits root-owned, runner-readable `lockdown_evidence_test_only` reports below non-production `/run/fence-lockdown-evidence-*`, emits no readiness, does not apply host network policy, and cannot claim protection.
 
 - `script/observe-hosted-runner`
   - Linux x64-only, read-only hosted-runner fingerprint candidate collector for the `integration` workflow.
@@ -281,7 +289,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
 - Hosted coverage workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/install-test-tools`, then `script/bootstrap`, then `script/test --coverage`.
-- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, invoke `script/observe-hosted-runner` for bounded read-only runner-shape evidence, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` and `resident_lifecycle_test_only` evidence.
+- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, invoke `script/observe-hosted-runner` for bounded read-only runner-shape evidence, invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` and `resident_lifecycle_test_only` evidence, and isolate `script/test-lockdown` audit, rollback, degraded, and standard host-lockdown scenarios on disposable runners while preserving the stable aggregate `integration` context.
 - `acceptance` and `integration` must remain separate evidence boundaries: the former exercises the packaged non-enforcing CLI, while the latter observes the hosted shape and proves privileged kernel/network and transient-service behavior without activating protection.
 - Hosted validation should rely on offline defaults from `script/env` after explicit preparation completes.
 - Do not add Rust toolchain setup actions to hosted lint/test/build workflows; use `script/prepare-rust` so the preparation path stays explicit, checksum-gated, and repo-owned.

@@ -421,8 +421,7 @@ fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
     require_root();
     let topology = PeerTopology::new();
     let invocation = format!("resident-{}", unique_suffix());
-    let root = evidence_root().join("resident");
-    fs::create_dir_all(&root).unwrap();
+    let root = PathBuf::from(format!("/run/fence-resident-evidence-{invocation}"));
     let _service = start_resident_service(&topology.client, &root, &invocation, false);
     let directory = root.join(&invocation);
     wait_for_path(&directory.join("ready.json"));
@@ -434,6 +433,19 @@ fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
     assert_eq!(
         fs::metadata(directory.join("report.json")).unwrap().uid(),
         0
+    );
+    must_succeed(
+        Command::new("/usr/bin/sudo")
+            .args([
+                "--non-interactive",
+                "--user",
+                "runner",
+                "--",
+                "/usr/bin/cat",
+            ])
+            .arg(directory.join("report.json"))
+            .output()
+            .unwrap(),
     );
     assert!(!Path::new(&format!("/run/fence/{invocation}/ready.json")).exists());
 
@@ -458,6 +470,7 @@ fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
 
     drop(_service);
     nft_in_namespace(&topology.client, &["list", "table", "inet", "fence_v0"]);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -466,8 +479,7 @@ fn resident_pre_ready_verification_failure_rolls_back_owned_state_without_ready(
     require_root();
     let topology = PeerTopology::new();
     let invocation = format!("resident-fail-{}", unique_suffix());
-    let root = evidence_root().join("resident-failure");
-    fs::create_dir_all(&root).unwrap();
+    let root = PathBuf::from(format!("/run/fence-resident-evidence-{invocation}"));
     let _service = start_resident_service(&topology.client, &root, &invocation, true);
     let directory = root.join(&invocation);
     wait_for_report_value(&directory.join("report.json"), "rolled_back_pre_ready");
@@ -478,6 +490,7 @@ fn resident_pre_ready_verification_failure_rolls_back_owned_state_without_ready(
         "/usr/sbin/nft",
         &["list", "table", "inet", "fence_v0"]
     ));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
