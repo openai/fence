@@ -423,17 +423,13 @@ impl LockdownControl for SystemLockdownControl {
                 "sudo_source_write_rollback_failed",
                 "failed to restore bounded provisional sudo policy state",
             )?;
+            verify_restored_runner_sudo_source(self.sudo_mode.unwrap_or(0o440))?;
             fs::remove_file(&self.quarantine_path).map_err(|_| {
                 LockdownError::new(
                     "sudo_quarantine_remove_rollback_failed",
                     "failed to remove sudo quarantine",
                 )
             })?;
-            require_success(
-                fixed_command("/usr/sbin/visudo", &["--check"])?,
-                "sudo_validation_rollback_failed",
-                "restored sudo policy did not validate",
-            )?;
             self.sudo_relocated = false;
             self.sudo_mode = None;
         }
@@ -573,6 +569,58 @@ fn verify_socket_fingerprint() -> Result<(), LockdownError> {
         if !ownership.status.success() || ownership.stdout != expected_ownership.as_bytes() {
             return Err(unsupported_fingerprint());
         }
+    }
+    Ok(())
+}
+
+fn verify_restored_runner_sudo_source(mode: u32) -> Result<(), LockdownError> {
+    let metadata = fs::symlink_metadata(RUNNER_DROP_IN_PATH).map_err(|_| {
+        LockdownError::new(
+            "sudo_restore_verification_rollback_failed",
+            "restored sudo policy source is unavailable",
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o777 != mode
+    {
+        return Err(LockdownError::new(
+            "sudo_restore_verification_rollback_failed",
+            "restored sudo policy ownership or mode does not match provisional state",
+        ));
+    }
+    let accepted = hosted_runner_fingerprint_requirement()
+        .accepted
+        .sudo_policy_sources
+        .into_iter()
+        .find(|source| source.path_class == "drop_in" && source.name == "runner")
+        .ok_or_else(|| {
+            LockdownError::new(
+                "sudo_restore_verification_rollback_failed",
+                "accepted runner sudo source is not represented in the fingerprint",
+            )
+        })?;
+    let policy_hash = sha256_bounded_file(Path::new(RUNNER_DROP_IN_PATH)).map_err(|_| {
+        LockdownError::new(
+            "sudo_restore_verification_rollback_failed",
+            "restored sudo policy source could not be hashed safely",
+        )
+    })?;
+    let sudo_available = runner_sudo_true()
+        .map_err(|_| {
+            LockdownError::new(
+                "sudo_restore_verification_rollback_failed",
+                "restored sudo policy capability could not be verified",
+            )
+        })?
+        .status
+        .success();
+    if policy_hash != accepted.sha256 || !sudo_available {
+        return Err(LockdownError::new(
+            "sudo_restore_verification_rollback_failed",
+            "restored sudo policy does not match the accepted functional source",
+        ));
     }
     Ok(())
 }
