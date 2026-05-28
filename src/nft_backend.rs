@@ -741,9 +741,13 @@ fn has_implicit_ipv6_control(expressions: &[Value]) -> bool {
 }
 
 fn has_jump(expressions: &[Value], target: &str) -> bool {
-    expressions
-        .iter()
-        .any(|expression| expression.get("jump").and_then(Value::as_str) == Some(target))
+    expressions.iter().any(|expression| {
+        expression
+            .get("jump")
+            .and_then(|jump| jump.get("target"))
+            .and_then(Value::as_str)
+            == Some(target)
+    })
 }
 
 fn has_key(expressions: &[Value], key: &str) -> bool {
@@ -1008,7 +1012,7 @@ mod tests {
             rule(
                 NFT_OUTPUT_CHAIN,
                 "fence:classify",
-                json!([{"jump": NFT_CLASSIFY_CHAIN}]),
+                json!([{"jump": {"target": NFT_CLASSIFY_CHAIN}}]),
             ),
             rule(
                 NFT_FORWARD_CHAIN,
@@ -1018,7 +1022,7 @@ mod tests {
             rule(
                 NFT_FORWARD_CHAIN,
                 "fence:classify",
-                json!([{"jump": NFT_CLASSIFY_CHAIN}]),
+                json!([{"jump": {"target": NFT_CLASSIFY_CHAIN}}]),
             ),
             rule(
                 NFT_CLASSIFY_CHAIN,
@@ -1033,7 +1037,7 @@ mod tests {
             rule(
                 NFT_CLASSIFY_CHAIN,
                 "fence:violation",
-                json!([{"jump": NFT_VIOLATION_CHAIN}]),
+                json!([{"jump": {"target": NFT_VIOLATION_CHAIN}}]),
             ),
             rule(
                 NFT_VIOLATION_CHAIN,
