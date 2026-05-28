@@ -308,6 +308,9 @@ fn normalize_hostname(value: &str) -> Option<String> {
         return None;
     }
     let normalized = value.to_ascii_lowercase();
+    if resembles_numeric_ipv4_address(&normalized) {
+        return None;
+    }
     if normalized.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
@@ -320,6 +323,21 @@ fn normalize_hostname(value: &str) -> Option<String> {
         Some(normalized)
     } else {
         None
+    }
+}
+
+// System resolvers accept legacy IPv4 numbers such as 127.1 and 0x7f000001.
+fn resembles_numeric_ipv4_address(value: &str) -> bool {
+    let mut components = value.split('.');
+    let component_count = components.clone().count();
+    (1..=4).contains(&component_count) && components.all(is_numeric_ipv4_component)
+}
+
+fn is_numeric_ipv4_component(component: &str) -> bool {
+    if let Some(hex) = component.strip_prefix("0x") {
+        !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    } else {
+        !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
     }
 }
 
@@ -517,6 +535,10 @@ mod tests {
                 .any(|rule| rule.destination == "2001:db8::1")
         );
         assert_eq!(zero_prefix_networks.requested_allowances.len(), 2);
+        assert_eq!(
+            normalize_hostname("127.1.example.com").as_deref(),
+            Some("127.1.example.com")
+        );
     }
 
     #[test]
@@ -536,6 +558,22 @@ mod tests {
             ),
             (
                 one_allowance("hostname", "192.0.2.1", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "2130706433", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "127.1", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "0X7f000001", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "0177.0.0.1", "tcp", 443),
                 "invalid_destination",
             ),
             (
