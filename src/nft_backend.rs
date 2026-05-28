@@ -460,9 +460,7 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
             Ok(OwnedRule::Loopback { chain })
         }
         "fence:established"
-            if has_accept(expressions)
-                && has_scalar(expressions, "established")
-                && has_scalar(expressions, "related") =>
+            if has_accept(expressions) && has_established_related_state(expressions) =>
         {
             Ok(OwnedRule::EstablishedRelated { chain })
         }
@@ -680,6 +678,25 @@ fn extract_transport(expressions: &[Value]) -> Result<(String, u16), BackendErro
 
 fn has_accept(expressions: &[Value]) -> bool {
     has_key(expressions, "accept")
+}
+
+fn has_established_related_state(expressions: &[Value]) -> bool {
+    expressions.iter().any(|expression| {
+        let Some(matcher) = expression.get("match") else {
+            return false;
+        };
+        let is_ct_state = matcher
+            .get("left")
+            .and_then(|left| left.get("ct"))
+            .and_then(|ct| ct.get("key"))
+            .and_then(Value::as_str)
+            == Some("state");
+        let values = matcher
+            .get("right")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
+        is_ct_state && values.as_deref() == Some(&[2, 4])
+    })
 }
 
 fn has_jump(expressions: &[Value], target: &str) -> bool {
@@ -959,7 +976,7 @@ mod tests {
             rule(
                 NFT_OUTPUT_CHAIN,
                 "fence:established",
-                json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": ["established", "related"]}}, {"accept": null}]),
+                json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": [2, 4]}}, {"accept": null}]),
             ),
             rule(
                 NFT_OUTPUT_CHAIN,
@@ -974,7 +991,7 @@ mod tests {
             rule(
                 NFT_FORWARD_CHAIN,
                 "fence:established",
-                json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": ["established", "related"]}}, {"accept": null}]),
+                json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": [2, 4]}}, {"accept": null}]),
             ),
             rule(
                 NFT_FORWARD_CHAIN,
