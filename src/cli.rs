@@ -126,6 +126,25 @@ mod tests {
         }
     }
 
+    struct BroadControlPlaneResolver;
+
+    impl Resolver for BroadControlPlaneResolver {
+        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
+            let address = match hostname {
+                "actions-results-receiver-production.githubapp.com" => "192.0.2.10",
+                "api.github.com" => "192.0.2.11",
+                "github.com" => "192.0.2.12",
+                "pipelines.actions.githubusercontent.com" => "192.0.2.13",
+                "results-receiver.actions.githubusercontent.com" => "192.0.2.14",
+                _ => "192.0.2.15",
+            };
+            Ok(Resolution {
+                addresses: vec![address.parse().unwrap()],
+                elapsed: Duration::from_millis(1),
+            })
+        }
+    }
+
     struct LinuxProvider;
 
     impl SupportProvider for LinuxProvider {
@@ -195,5 +214,48 @@ mod tests {
 
         assert_eq!(output.exit_code, 1);
         assert!(output.json.contains("dns_resolution_failed"));
+    }
+
+    #[test]
+    fn render_plan_exposes_explicit_broad_control_plane_candidate_without_activation() {
+        let root = std::path::Path::new("target/tmp/cli-unit-tests");
+        std::fs::create_dir_all(root).unwrap();
+        let config = root.join("broad-control-plane-profile.json");
+        std::fs::write(
+            &config,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_control_plane_candidate_v1","allowances":[]}"#,
+        )
+        .unwrap();
+
+        let output = execute(
+            ["fence", "render-plan", "--config", config.to_str().unwrap()]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &BroadControlPlaneResolver,
+            &LinuxProvider,
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output
+                .json
+                .contains("\"id\":\"github_hosted_control_plane_candidate_v1\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"selection_status\":\"explicit_broad_candidate_not_default\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"candidate_permits_github_api_and_web_service_endpoints\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"application_status\":\"not_applied\"")
+        );
     }
 }

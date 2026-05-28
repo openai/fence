@@ -1,0 +1,50 @@
+name: platform profile candidate
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  candidate:
+    name: broad control-plane candidate ${{ matrix.replica }}
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [one, two, three]
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: run broad GitHub control-plane profile candidate
+        env:
+          PROFILE_CANDIDATE_REPLICA: ${{ matrix.replica }}
+        run: script/test-profile-candidate

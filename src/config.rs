@@ -51,6 +51,22 @@ pub enum ContainerPolicy {
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub enum PlatformProfile {
+    None,
+    GithubHostedControlPlaneCandidateV1,
+}
+
+impl PlatformProfile {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::GithubHostedControlPlaneCandidateV1 => "github_hosted_control_plane_candidate_v1",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DestinationType {
     Hostname,
     Ip,
@@ -77,7 +93,7 @@ pub struct NormalizedConfig {
     pub schema_version: u32,
     pub mode: Mode,
     pub invocation_id: String,
-    pub platform_profile: String,
+    pub platform_profile: PlatformProfile,
     pub container_policy: Option<ContainerPolicy>,
     pub requested_allowances: Vec<NormalizedAllowance>,
     pub declared_allowance_count: usize,
@@ -139,13 +155,19 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
         )
         .field("invocation_id"));
     }
-    if input.platform_profile.as_deref().unwrap_or("none") != "none" {
-        return Err(ErrorDetail::new(
-            "invalid_platform_profile",
-            "only the none platform profile is available before hosted proof",
-        )
-        .field("platform_profile"));
-    }
+    let platform_profile = match input.platform_profile.as_deref().unwrap_or("none") {
+        "none" => PlatformProfile::None,
+        "github_hosted_control_plane_candidate_v1" => {
+            PlatformProfile::GithubHostedControlPlaneCandidateV1
+        }
+        _ => {
+            return Err(ErrorDetail::new(
+                "invalid_platform_profile",
+                "platform_profile must be none or github_hosted_control_plane_candidate_v1",
+            )
+            .field("platform_profile"));
+        }
+    };
     let container_policy = normalize_container_policy(mode, input.container_policy.as_deref())?;
     if input.allowances.len() > MAX_ALLOWANCES {
         return Err(ErrorDetail::new(
@@ -169,7 +191,7 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
         schema_version: CONFIG_SCHEMA_VERSION,
         mode,
         invocation_id: input.invocation_id,
-        platform_profile: "none".to_owned(),
+        platform_profile,
         container_policy,
         duplicate_requested_allowances_collapsed: declared_allowance_count
             - requested_allowances.len(),
@@ -406,25 +428,33 @@ mod tests {
 
         assert_eq!(parsed.mode, Mode::Block);
         assert_eq!(parsed.container_policy, Some(ContainerPolicy::Disable));
-        assert_eq!(parsed.platform_profile, "none");
+        assert_eq!(parsed.platform_profile, PlatformProfile::None);
         assert!(parsed.requested_allowances.is_empty());
     }
 
     #[test]
-    fn accepts_audit_without_lockdown_and_degraded_block() {
+    fn accepts_audit_without_lockdown_degraded_block_and_explicit_candidate_profile() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"none","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_control_plane_candidate_v1","allowances":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","container_policy":"unsafe_preserve","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_control_plane_candidate_v1","container_policy":"unsafe_preserve","allowances":[]}"#,
         )
         .unwrap();
 
         assert_eq!(audit.container_policy, None);
         assert_eq!(
+            audit.platform_profile,
+            PlatformProfile::GithubHostedControlPlaneCandidateV1
+        );
+        assert_eq!(
             degraded.container_policy,
             Some(ContainerPolicy::UnsafePreserve)
+        );
+        assert_eq!(
+            degraded.platform_profile,
+            PlatformProfile::GithubHostedControlPlaneCandidateV1
         );
     }
 
