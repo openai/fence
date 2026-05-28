@@ -41,7 +41,8 @@ sudo /usr/sbin/ip -n "$probe_namespace" link set lo up
 sudo /usr/sbin/ip netns exec "$probe_namespace" /usr/sbin/nft list ruleset >/dev/null
 sudo /usr/sbin/ip netns exec "$probe_namespace" /usr/sbin/ip -6 addr show dev lo >/dev/null
 
-# Parse a bounded NFLOG rule in an isolated namespace; userspace event ingestion is Phase 2C.
+# Parse a bounded NFLOG rule before the ignored tests bind the owned group and
+# consume approved metadata inside disposable namespaces.
 printf '%s\n' \
   'create table inet fence_probe' \
   'add chain inet fence_probe output { type filter hook output priority 10; policy accept; }' \

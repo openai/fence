@@ -9,15 +9,18 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current Phase 2B executable strictly
+Fence is not an enforcement agent yet. The current Phase 2C executable strictly
 validates local JSON policy, renders a frozen policy and deterministic native
 `nftables` ruleset preview, and reports read-only host support observations. It
 never applies a network boundary, changes privilege state, writes readiness, or
 reports protection as available.
 
-Phase 2B additionally exercises native apply, verification, rollback, and
-forwarded-path behavior in disposable privileged test namespaces on
-`ubuntu-24.04`. That evidence is test-only and is not a usable protection mode.
+Phase 2C additionally exercises native apply, verification, rollback,
+forwarded-path behavior, and bounded NFLOG connection findings in disposable
+privileged test namespaces on `ubuntu-24.04`. The event path immediately
+reduces a bounded packet prefix to approved endpoint metadata and never writes
+raw packet bytes to evidence. This is test-only proof, not a usable protection
+mode.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -73,6 +76,8 @@ the caller provides `TMPDIR` or `RUNNER_TEMP`.
 The bootstrap imports these explicit supply-chain inputs:
 
 - `Cargo.lock` plus vendored application crates in `vendor/cache`;
+- Linux-only, exact-pinned MIT netlink crates used solely by Phase 2C
+  privileged NFLOG evidence tests;
 - a checksum lock for the Rust distribution in
   `.cargo/tooling/rust-toolchain.lock.toml`;
 - committed Zig and `cargo-zigbuild` artifacts in `vendor/release-tools`,
