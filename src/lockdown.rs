@@ -391,7 +391,7 @@ impl LockdownControl for SystemLockdownControl {
                         CONTAINER_UNITS[2],
                     ],
                 )?,
-                "lockdown_rollback_failed",
+                "container_unmask_rollback_failed",
                 "failed to unmask provisional container state",
             )?;
             require_success(
@@ -404,7 +404,7 @@ impl LockdownControl for SystemLockdownControl {
                         "docker.service",
                     ],
                 )?,
-                "lockdown_rollback_failed",
+                "container_restart_rollback_failed",
                 "failed to restore provisional container state",
             )?;
             self.containers_masked = false;
@@ -412,7 +412,7 @@ impl LockdownControl for SystemLockdownControl {
         if self.sudo_relocated {
             let bytes = read_bounded_policy_file(&self.quarantine_path).map_err(|_| {
                 LockdownError::new(
-                    "lockdown_rollback_failed",
+                    "sudo_quarantine_read_rollback_failed",
                     "failed to read bounded provisional sudo policy state",
                 )
             })?;
@@ -420,18 +420,18 @@ impl LockdownControl for SystemLockdownControl {
                 Path::new(RUNNER_DROP_IN_PATH),
                 &bytes,
                 self.sudo_mode.unwrap_or(0o440),
-                "lockdown_rollback_failed",
+                "sudo_source_write_rollback_failed",
                 "failed to restore bounded provisional sudo policy state",
             )?;
             fs::remove_file(&self.quarantine_path).map_err(|_| {
                 LockdownError::new(
-                    "lockdown_rollback_failed",
+                    "sudo_quarantine_remove_rollback_failed",
                     "failed to remove sudo quarantine",
                 )
             })?;
             require_success(
                 fixed_command("/usr/sbin/visudo", &["--check"])?,
-                "lockdown_rollback_failed",
+                "sudo_validation_rollback_failed",
                 "restored sudo policy did not validate",
             )?;
             self.sudo_relocated = false;
