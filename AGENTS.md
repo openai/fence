@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current Phase 2B binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. Native apply/verify/rollback code is reachable only from privileged evidence tests; the complete protected lifecycle is a later reviewed change.
+The current Phase 2B binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. No first-party runtime path reaches native apply/verify/rollback; the repository exercises it only through privileged evidence tests. The complete protected lifecycle is a later reviewed change.
 
 ## North-Star Principles
 
