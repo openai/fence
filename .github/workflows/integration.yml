@@ -42,5 +42,5 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: test network evidence
+      - name: test resident lifecycle evidence
         run: script/test-privileged

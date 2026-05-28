@@ -11,7 +11,7 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current Phase 3A executable builds
+Fence is not an enforcement agent yet. The current Phase 3B executable builds
 on the Phase 2 network-evidence backend: it strictly validates local JSON
 policy, renders a frozen policy and deterministic native `nftables` ruleset
 preview, and reports an accepted but not runtime-checked hosted-runner
@@ -19,18 +19,20 @@ fingerprint reference needed before the privileged lifecycle can be activated.
 It never applies a network boundary, changes privilege state, writes
 readiness, or reports protection as available.
 
-Phase 2C additionally exercises native apply, verification, rollback,
+The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
 privileged test namespaces on `ubuntu-24.04`. The event path immediately
 reduces a bounded packet prefix to approved endpoint metadata and never writes
 raw packet bytes to evidence. This is test-only proof, not a usable protection
-mode.
+mode. Phase 3B extends that proof with a transient `systemd` service, secure
+test runtime state, test-only readiness, five-second resident verification,
+critical drift reporting, and pre-ready rollback.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
 workflow additionally records a bounded, read-only hosted-runner fingerprint
-candidate before its existing namespace evidence tests. These checks do not
-establish public protection or create a GitHub Action interface.
+observation before its namespace and resident-service evidence tests. These
+checks do not establish public protection or create a GitHub Action interface.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -86,8 +88,9 @@ the caller provides `TMPDIR` or `RUNNER_TEMP`.
 The bootstrap imports these explicit supply-chain inputs:
 
 - `Cargo.lock` plus vendored application crates in `vendor/cache`;
-- Linux-only, exact-pinned MIT netlink crates used solely by Phase 2C
-  privileged NFLOG evidence tests;
+- Linux-only, exact-pinned MIT netlink crates used solely by privileged NFLOG
+  evidence tests, plus exact-pinned `libc` constants used for no-follow
+  lifecycle-evidence file opens without first-party unsafe code;
 - a checksum lock for the Rust distribution in
   `.cargo/tooling/rust-toolchain.lock.toml`;
 - committed Zig and `cargo-zigbuild` artifacts in `vendor/release-tools`,
@@ -139,7 +142,7 @@ On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
 artifact's public non-enforcing contract separately from
 `script/observe-hosted-runner` and the privileged namespace evidence workflow.
 
-## Phase 3A CLI
+## Phase 3B CLI
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
@@ -156,7 +159,8 @@ script/build
 ```
 
 The last command intentionally returns an `enforcement_not_implemented` error
-through the Phase 3 evidence-only slices. Do not use this planner or its
+through the Phase 3 evidence-only slices. Privileged hosted tests may emit
+explicitly test-only resident evidence, but public CLI execution cannot. Do not use this planner or its
 ruleset preview as a runner security control.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle

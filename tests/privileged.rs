@@ -4,6 +4,7 @@ use fence::config::{
     DestinationType, MAX_FINDINGS, MAX_REPORT_BYTES, Mode, Protocol, parse_and_normalize,
 };
 use fence::findings::FindingCollection;
+use fence::lifecycle::run_resident_test_service;
 use fence::nflog::NflogReader;
 use fence::nft::{
     NetworkEvidenceCounters, expected_owned_state, render_ruleset, unapplied_test_evidence_model,
@@ -13,6 +14,7 @@ use fence::nft_backend::{
 };
 use fence::plan::{EffectiveAllowance, build_plan};
 use fence::resolver::{Resolution, ResolveError, Resolver};
+use fence::runtime::{RESIDENT_EVIDENCE_STATUS, TEST_READY_STATUS};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -193,6 +195,21 @@ impl Drop for ChildGuard {
     }
 }
 
+struct ServiceGuard {
+    unit: String,
+}
+
+impl Drop for ServiceGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("/usr/bin/systemctl")
+            .args(["stop", &self.unit])
+            .status();
+        let _ = Command::new("/usr/bin/systemctl")
+            .args(["reset-failed", &self.unit])
+            .status();
+    }
+}
+
 #[test]
 #[ignore = "executed as a helper inside a disposable network namespace"]
 fn nflog_worker_collects_bounded_findings() {
@@ -225,6 +242,33 @@ fn nflog_worker_collects_bounded_findings() {
         collection.sampled_total
     );
     fs::write(output, serde_json::to_vec(&collection).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "executed as a transient systemd service in a disposable network namespace"]
+fn resident_service_worker() {
+    if std::env::var_os("FENCE_RESIDENT_WORKER").is_none() {
+        return;
+    }
+    require_root();
+    let invocation_id = std::env::var("FENCE_RESIDENT_INVOCATION").unwrap();
+    let runtime_root = PathBuf::from(std::env::var_os("FENCE_RESIDENT_ROOT").unwrap());
+    let unit = std::env::var("FENCE_RESIDENT_UNIT").unwrap();
+    let config = format!(
+        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowances":[]}}"#
+    );
+    let plan = build_plan(parse_and_normalize(config.as_bytes()).unwrap(), &NoResolver).unwrap();
+    let expected = if std::env::var_os("FENCE_RESIDENT_INJECT_PRE_READY_FAILURE").is_some() {
+        Some(expected_owned_state(Mode::Audit, &[]))
+    } else {
+        None
+    };
+    let result = run_resident_test_service(&unit, &runtime_root, &plan, expected);
+    if std::env::var_os("FENCE_RESIDENT_INJECT_PRE_READY_FAILURE").is_some() {
+        assert_eq!(result.unwrap_err().code, "owned_nft_state_mismatch");
+    } else {
+        result.unwrap();
+    }
 }
 
 #[test]
@@ -369,6 +413,71 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
         |finding| finding.classification == fence::findings::FindingClassification::WouldBlock
     ));
     assert!(audit.rollback_pre_activation().unwrap());
+}
+
+#[test]
+#[ignore = "requires Linux root, transient systemd services, namespaces, and native nftables"]
+fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
+    require_root();
+    let topology = PeerTopology::new();
+    let invocation = format!("resident-{}", unique_suffix());
+    let root = evidence_root().join("resident");
+    fs::create_dir_all(&root).unwrap();
+    let _service = start_resident_service(&topology.client, &root, &invocation, false);
+    let directory = root.join(&invocation);
+    wait_for_path(&directory.join("ready.json"));
+
+    let ready = fs::read_to_string(directory.join("ready.json")).unwrap();
+    assert!(ready.contains(TEST_READY_STATUS));
+    assert!(ready.contains("\"protection_available\":false"));
+    assert_eq!(fs::metadata(directory.join("ready.json")).unwrap().uid(), 0);
+    assert_eq!(
+        fs::metadata(directory.join("report.json")).unwrap().uid(),
+        0
+    );
+    assert!(!Path::new(&format!("/run/fence/{invocation}/ready.json")).exists());
+
+    nft_in_namespace(
+        &topology.client,
+        &[
+            "add",
+            "rule",
+            "inet",
+            "fence_v0",
+            "fence_output",
+            "counter",
+            "comment",
+            "\"fence:test_drift\"",
+        ],
+    );
+    wait_for_report_value(&directory.join("report.json"), "resident_network_drift");
+    let report = fs::read_to_string(directory.join("report.json")).unwrap();
+    assert!(report.contains(RESIDENT_EVIDENCE_STATUS));
+    assert!(report.contains("\"verification_status\":\"critical_drift\""));
+    assert!(report.contains("\"readiness_status\":\"test_only_ready_no_protection\""));
+
+    drop(_service);
+    nft_in_namespace(&topology.client, &["list", "table", "inet", "fence_v0"]);
+}
+
+#[test]
+#[ignore = "requires Linux root, transient systemd services, namespaces, and native nftables"]
+fn resident_pre_ready_verification_failure_rolls_back_owned_state_without_ready() {
+    require_root();
+    let topology = PeerTopology::new();
+    let invocation = format!("resident-fail-{}", unique_suffix());
+    let root = evidence_root().join("resident-failure");
+    fs::create_dir_all(&root).unwrap();
+    let _service = start_resident_service(&topology.client, &root, &invocation, true);
+    let directory = root.join(&invocation);
+    wait_for_report_value(&directory.join("report.json"), "rolled_back_pre_ready");
+    assert!(!directory.join("ready.json").exists());
+    assert!(!Path::new(&format!("/run/fence/{invocation}/ready.json")).exists());
+    assert!(!in_namespace_status(
+        &topology.client,
+        "/usr/sbin/nft",
+        &["list", "table", "inet", "fence_v0"]
+    ));
 }
 
 #[test]
@@ -717,6 +826,42 @@ fn start_nflog_worker(
     (ChildGuard(child), output)
 }
 
+fn start_resident_service(
+    namespace: &str,
+    root: &Path,
+    invocation: &str,
+    inject_pre_ready_failure: bool,
+) -> ServiceGuard {
+    let unit = format!("fence-evidence-{invocation}.service");
+    let mut command = Command::new("/usr/bin/systemd-run");
+    command.args([
+        "--quiet",
+        "--collect",
+        "--property=Type=exec",
+        "--unit",
+        &unit,
+        "--setenv=FENCE_RESIDENT_WORKER=1",
+        &format!("--setenv=FENCE_RESIDENT_UNIT={unit}"),
+        &format!("--setenv=FENCE_RESIDENT_INVOCATION={invocation}"),
+        &format!("--setenv=FENCE_RESIDENT_ROOT={}", root.display()),
+    ]);
+    if inject_pre_ready_failure {
+        command.arg("--setenv=FENCE_RESIDENT_INJECT_PRE_READY_FAILURE=1");
+    }
+    command
+        .arg(IP_BINARY_PATH)
+        .args(["netns", "exec", namespace])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "resident_service_worker",
+            "--nocapture",
+        ]);
+    must_succeed(command.output().unwrap());
+    ServiceGuard { unit }
+}
+
 fn finish_nflog_worker(
     worker: &mut ChildGuard,
     output: &Path,
@@ -759,6 +904,20 @@ fn wait_for_path(path: &Path) {
     while !path.exists() {
         assert!(Instant::now() < deadline, "listener did not become ready");
         thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_report_value(path: &Path, value: &str) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if fs::read_to_string(path).is_ok_and(|report| report.contains(value)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "resident report did not contain expected value"
+        );
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

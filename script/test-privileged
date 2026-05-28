@@ -21,9 +21,13 @@ fi
 if [[ ! -x /usr/sbin/nft ]]; then
   die "privileged network evidence tests require executable /usr/sbin/nft"
 fi
+if [[ ! -x /usr/bin/systemd-run || ! -x /usr/bin/systemctl ]]; then
+  die "resident lifecycle evidence tests require executable systemd tools"
+fi
 
 evidence_root="$(make_temp_dir fence-privileged-evidence "$RUNNER_TEMP")"
 probe_namespace="fence-probe-$$"
+probe_service="fence-evidence-probe-$$"
 target_root="$RUNNER_TEMP/fence-privileged-target"
 mkdir -p "$target_root"
 
@@ -36,6 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
+sudo /usr/bin/systemd-run --quiet --wait --collect --unit "$probe_service" /usr/bin/true
 sudo /usr/sbin/ip netns add "$probe_namespace"
 sudo /usr/sbin/ip -n "$probe_namespace" link set lo up
 sudo /usr/sbin/ip netns exec "$probe_namespace" /usr/sbin/nft list ruleset >/dev/null
@@ -66,4 +71,4 @@ sudo env \
   "FENCE_PRIVILEGED_TEST_ROOT=$evidence_root" \
   cargo test --frozen --test privileged -- --ignored --test-threads=1
 
-echo -e "${GREEN}privileged network enforcement test evidence verified${OFF}"
+echo -e "${GREEN}privileged network and resident lifecycle test evidence verified${OFF}"
