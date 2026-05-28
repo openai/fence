@@ -535,9 +535,10 @@ mod tests {
         let plan = plan("resident-proof");
         let runtime = TestRuntimeStore::create(&root, "resident-proof").unwrap();
         let mut network = FakeNetwork::healthy();
-        network
-            .verify
-            .push_back(Err(LifecycleError::new("drift", "test injected drift")));
+        network.verify = VecDeque::from([
+            Ok(()),
+            Err(LifecycleError::new("drift", "test injected drift")),
+        ]);
         network.findings.push_back(Ok(Some(finding_from_prefix(
             Mode::Block,
             "t".to_owned(),

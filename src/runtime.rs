@@ -245,7 +245,7 @@ mod tests {
         let _ = fs::remove_file(&symlink_root);
         let _ = fs::remove_dir_all(&target);
         fs::create_dir_all(&target).unwrap();
-        symlink(&target, &symlink_root).unwrap();
+        symlink(fs::canonicalize(&target).unwrap(), &symlink_root).unwrap();
         assert_eq!(
             TestRuntimeStore::create(&symlink_root, "resident-proof")
                 .unwrap_err()

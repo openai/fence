@@ -447,7 +447,7 @@ fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
             "fence_output",
             "counter",
             "comment",
-            "fence:test_drift",
+            "\"fence:test_drift\"",
         ],
     );
     wait_for_report_value(&directory.join("report.json"), "resident_network_drift");
