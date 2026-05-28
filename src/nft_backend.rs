@@ -515,8 +515,14 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
 }
 
 fn parse_allowance_rule(chain: String, expressions: &[Value]) -> Result<OwnedRule, BackendError> {
-    let (address_family, destination) = extract_destination(expressions)?;
-    let (protocol, port) = extract_transport(expressions)?;
+    if expressions.len() != 3 || expressions[2].get("accept").is_none() {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "allowance rule does not have the exact expected expression shape",
+        ));
+    }
+    let (address_family, destination) = extract_destination(&expressions[..1])?;
+    let (protocol, port) = extract_transport(&expressions[1..2])?;
     Ok(OwnedRule::Allowance {
         chain,
         address_family,
@@ -615,6 +621,12 @@ fn extract_destination(expressions: &[Value]) -> Result<(String, String), Backen
         ) {
             continue;
         }
+        if matcher.get("op").and_then(Value::as_str) != Some("==") {
+            return Err(BackendError::new(
+                "unexpected_nft_state",
+                "allowance destination does not use equality matching",
+            ));
+        }
         let family = protocol.unwrap().to_owned();
         let right = matcher.get("right").ok_or_else(|| {
             BackendError::new("unexpected_nft_state", "allowance destination is absent")
@@ -649,6 +661,12 @@ fn extract_transport(expressions: &[Value]) -> Result<(String, u16), BackendErro
             (Some("tcp"), Some("dport")) | (Some("udp"), Some("dport"))
         ) {
             continue;
+        }
+        if matcher.get("op").and_then(Value::as_str) != Some("==") {
+            return Err(BackendError::new(
+                "unexpected_nft_state",
+                "allowance transport does not use equality matching",
+            ));
         }
         let port = matcher
             .get("right")
@@ -1141,6 +1159,52 @@ mod tests {
         assert_eq!(
             parse_owned_state(b"[]").unwrap_err().code,
             "invalid_nft_json"
+        );
+
+        let unequal_destination = json!([
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "!=", "right": "192.0.2.10"}},
+            {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": 443}},
+            {"accept": null}
+        ]);
+        assert_eq!(
+            parse_allowance_rule(
+                NFT_CLASSIFY_CHAIN.to_owned(),
+                unequal_destination.as_array().unwrap()
+            )
+            .unwrap_err()
+            .code,
+            "unexpected_nft_state"
+        );
+
+        let unequal_port = json!([
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "192.0.2.10"}},
+            {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "!=", "right": 443}},
+            {"accept": null}
+        ]);
+        assert_eq!(
+            parse_allowance_rule(
+                NFT_CLASSIFY_CHAIN.to_owned(),
+                unequal_port.as_array().unwrap()
+            )
+            .unwrap_err()
+            .code,
+            "unexpected_nft_state"
+        );
+
+        let unexpected_extra_match = json!([
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "192.0.2.10"}},
+            {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": 443}},
+            {"match": {"left": {"payload": {"protocol": "tcp", "field": "sport"}}, "op": "==", "right": 12345}},
+            {"accept": null}
+        ]);
+        assert_eq!(
+            parse_allowance_rule(
+                NFT_CLASSIFY_CHAIN.to_owned(),
+                unexpected_extra_match.as_array().unwrap()
+            )
+            .unwrap_err()
+            .code,
+            "unexpected_nft_state"
         );
     }
 
