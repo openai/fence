@@ -465,11 +465,7 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
             Ok(OwnedRule::EstablishedRelated { chain })
         }
         "fence:implicit_ipv6_control"
-            if has_accept(expressions)
-                && has_number(expressions, 255)
-                && has_scalar(expressions, "nd-router-solicit")
-                && has_scalar(expressions, "nd-neighbor-solicit")
-                && has_scalar(expressions, "nd-neighbor-advert") =>
+            if has_accept(expressions) && has_implicit_ipv6_control(expressions) =>
         {
             Ok(OwnedRule::ImplicitIpv6Control {
                 chain,
@@ -699,6 +695,51 @@ fn has_established_related_state(expressions: &[Value]) -> bool {
     })
 }
 
+fn has_implicit_ipv6_control(expressions: &[Value]) -> bool {
+    let hop_limit = expressions.iter().any(|expression| {
+        let Some(matcher) = expression.get("match") else {
+            return false;
+        };
+        matcher
+            .get("left")
+            .and_then(|left| left.get("payload"))
+            .and_then(|payload| payload.get("protocol"))
+            .and_then(Value::as_str)
+            == Some("ip6")
+            && matcher
+                .get("left")
+                .and_then(|left| left.get("payload"))
+                .and_then(|payload| payload.get("field"))
+                .and_then(Value::as_str)
+                == Some("hoplimit")
+            && matcher.get("right").and_then(Value::as_u64) == Some(255)
+    });
+    let control_types = expressions.iter().any(|expression| {
+        let Some(matcher) = expression.get("match") else {
+            return false;
+        };
+        let is_icmp_type = matcher
+            .get("left")
+            .and_then(|left| left.get("payload"))
+            .and_then(|payload| payload.get("protocol"))
+            .and_then(Value::as_str)
+            == Some("icmpv6")
+            && matcher
+                .get("left")
+                .and_then(|left| left.get("payload"))
+                .and_then(|payload| payload.get("field"))
+                .and_then(Value::as_str)
+                == Some("type");
+        let types = matcher
+            .get("right")
+            .and_then(|right| right.get("set"))
+            .and_then(Value::as_array)
+            .map(|types| types.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
+        is_icmp_type && types.as_deref() == Some(&[133, 135, 136])
+    });
+    hop_limit && control_types
+}
+
 fn has_jump(expressions: &[Value], target: &str) -> bool {
     expressions
         .iter()
@@ -726,25 +767,6 @@ fn value_contains_scalar(value: &Value, expected: &str) -> bool {
         Value::Object(values) => values
             .values()
             .any(|value| value_contains_scalar(value, expected)),
-        _ => false,
-    }
-}
-
-fn has_number(expressions: &[Value], expected: i64) -> bool {
-    expressions
-        .iter()
-        .any(|expression| value_contains_number(expression, expected))
-}
-
-fn value_contains_number(value: &Value, expected: i64) -> bool {
-    match value {
-        Value::Number(value) => value.as_i64() == Some(expected),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value_contains_number(value, expected)),
-        Value::Object(values) => values
-            .values()
-            .any(|value| value_contains_number(value, expected)),
         _ => false,
     }
 }
@@ -981,7 +1003,7 @@ mod tests {
             rule(
                 NFT_OUTPUT_CHAIN,
                 "fence:implicit_ipv6_control",
-                json!([{"match": {"left": {"payload": {"protocol": "ip6", "field": "hoplimit"}}, "op": "==", "right": 255}}, {"match": {"left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "op": "in", "right": ["nd-router-solicit", "nd-neighbor-solicit", "nd-neighbor-advert"]}}, {"accept": null}]),
+                json!([{"match": {"left": {"payload": {"protocol": "ip6", "field": "hoplimit"}}, "op": "==", "right": 255}}, {"match": {"left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "op": "==", "right": {"set": [133, 135, 136]}}}, {"accept": null}]),
             ),
             rule(
                 NFT_OUTPUT_CHAIN,
