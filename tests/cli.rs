@@ -56,7 +56,11 @@ fn support_is_read_only_and_not_protective() {
     assert_eq!(response["data"]["protection_available"], false);
     assert_eq!(
         response["data"]["hosted_runner_fingerprint"]["status"],
-        "observation_pending"
+        "accepted_reference_not_checked"
+    );
+    assert_eq!(
+        response["data"]["hosted_runner_fingerprint"]["accepted"]["expected_principal"],
+        "runner"
     );
     assert_eq!(
         response["data"]["reasons"][0],

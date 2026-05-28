@@ -71,7 +71,7 @@ pub fn inspect_support(provider: &dyn SupportProvider) -> SupportData {
         protection_available: false,
         reasons: vec![
             "public_enforcement_not_activated",
-            "hosted_runner_fingerprint_pending",
+            "hosted_runner_fingerprint_not_checked",
             "lockdown_not_implemented",
         ],
         deferred_capability_probes: vec![
@@ -125,12 +125,15 @@ mod tests {
             data.reasons,
             vec![
                 "public_enforcement_not_activated",
-                "hosted_runner_fingerprint_pending",
+                "hosted_runner_fingerprint_not_checked",
                 "lockdown_not_implemented"
             ]
         );
         assert!(data.network_backend.nft_binary_present);
-        assert_eq!(data.hosted_runner_fingerprint.status, "observation_pending");
+        assert_eq!(
+            data.hosted_runner_fingerprint.status,
+            "accepted_reference_not_checked"
+        );
     }
 
     #[test]

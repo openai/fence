@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current Phase 3A binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes a pending hosted-runner fingerprint gate, and `run` fails closed without writing readiness or claiming protection. No first-party runtime path reaches native apply/verify/rollback or NFLOG ingestion; the repository exercises those paths only through privileged evidence tests. The integration workflow now collects bounded read-only hosted-runner observations so a later reviewed change can pin the single supported runner shape. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
+The current Phase 3A binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes an accepted but not runtime-checked hosted-runner fingerprint reference, and `run` fails closed without writing readiness or claiming protection. No first-party runtime path reaches native apply/verify/rollback or NFLOG ingestion; the repository exercises those paths only through privileged evidence tests. The integration workflow collects bounded read-only hosted-runner observations for the single pinned runner shape. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
 
 ## North-Star Principles
 

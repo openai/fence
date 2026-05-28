@@ -14,10 +14,10 @@ GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 Fence is not an enforcement agent yet. The current Phase 3A executable builds
 on the Phase 2 network-evidence backend: it strictly validates local JSON
 policy, renders a frozen policy and deterministic native `nftables` ruleset
-preview, and reports the pending hosted-runner fingerprint gate needed before
-the privileged lifecycle can be activated. It never applies a network
-boundary, changes privilege state, writes readiness, or reports protection as
-available.
+preview, and reports an accepted but not runtime-checked hosted-runner
+fingerprint reference needed before the privileged lifecycle can be activated.
+It never applies a network boundary, changes privilege state, writes
+readiness, or reports protection as available.
 
 Phase 2C additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -144,8 +144,8 @@ artifact's public non-enforcing contract separately from
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
 hash. `check-support` reports a versioned hosted-runner fingerprint gate as
-pending hosted review. `run` fails closed until the privileged lifecycle is
-implemented and proved.
+an accepted reference that is not yet checked or enforced by public execution.
+`run` fails closed until the privileged lifecycle is implemented and proved.
 
 ```console
 script/build

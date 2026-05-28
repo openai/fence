@@ -144,7 +144,7 @@ require(
     "support omitted public-enforcement reason",
 )
 require(
-    "hosted_runner_fingerprint_pending" in data["reasons"],
+    "hosted_runner_fingerprint_not_checked" in data["reasons"],
     "support omitted fingerprint reason",
 )
 require("lockdown_not_implemented" in data["reasons"], "support omitted lockdown reason")
@@ -158,7 +158,19 @@ require(
 )
 require(data["network_backend"]["nft_binary_present"] is True, "support omitted nft binary")
 require(data["hosted_runner_fingerprint"]["schema_version"] == 1, "support fingerprint schema mismatch")
-require(data["hosted_runner_fingerprint"]["status"] == "observation_pending", "support fingerprint status mismatch")
+require(data["hosted_runner_fingerprint"]["status"] == "accepted_reference_not_checked", "support fingerprint status mismatch")
+require(
+    data["hosted_runner_fingerprint"]["accepted"]["expected_principal"] == "runner",
+    "support fingerprint principal mismatch",
+)
+require(
+    any(
+        source["name"] == "runner"
+        and source["runner_nopasswd_markers"] == ["principal"]
+        for source in data["hosted_runner_fingerprint"]["accepted"]["sudo_policy_sources"]
+    ),
+    "support fingerprint did not classify the runner sudo source",
+)
 PY
 
 capture_command plan-first render-plan --config "$fixture"
