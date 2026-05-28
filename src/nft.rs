@@ -275,22 +275,22 @@ pub fn render_ruleset(mode: Mode, allowances: &[EffectiveAllowance]) -> String {
     .unwrap();
     writeln!(
         &mut program,
-        "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_CLASSIFY_CHAIN}"
-    )
-    .unwrap();
-    writeln!(
-        &mut program,
-        "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_VIOLATION_CHAIN}"
-    )
-    .unwrap();
-    writeln!(
-        &mut program,
         "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_OUTPUT_CHAIN} {{ type filter hook output priority {NFT_HOOK_PRIORITY}; policy accept; }}"
     )
     .unwrap();
     writeln!(
         &mut program,
         "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_FORWARD_CHAIN} {{ type filter hook forward priority {NFT_HOOK_PRIORITY}; policy accept; }}"
+    )
+    .unwrap();
+    writeln!(
+        &mut program,
+        "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_CLASSIFY_CHAIN}"
+    )
+    .unwrap();
+    writeln!(
+        &mut program,
+        "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_VIOLATION_CHAIN}"
     )
     .unwrap();
     for rule in build_rules(mode, allowances) {

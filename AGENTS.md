@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current Phase 2A binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. Privileged backend evidence and the complete protected lifecycle are later reviewed changes.
+The current Phase 2B binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. No first-party runtime path reaches native apply/verify/rollback; the repository exercises it only through privileged evidence tests. The complete protected lifecycle is a later reviewed change.
 
 ## North-Star Principles
 
@@ -117,6 +117,13 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Coverage mode enforces 100% line, function, and region coverage for first-party code.
   - Coverage mode must not install tools, use the network, or enable unstable branch coverage.
   - `cargo test` itself does not emit coverage; coverage mode relies on stable Rust source-based coverage instrumentation through `cargo-llvm-cov`.
+  - Rootless coverage intentionally excludes `src/nft_backend.rs`; that Linux privileged backend is proved through deterministic unit tests plus `script/test-privileged` namespace behavior tests on `ubuntu-24.04`.
+
+- `script/test-privileged`
+  - Linux x64-only privileged evidence entrypoint; it must not run on ordinary local or portable test paths.
+  - Verifies `/usr/sbin/nft`, namespace, IPv6, and NFLOG-rule prerequisites before invoking ignored backend tests.
+  - Runs native apply/verify/rollback behavior only inside disposable network namespaces and writes test-only evidence beneath `RUNNER_TEMP`.
+  - Must not invoke the public `run` command, create a readiness file, mutate host firewall rules, or make a protection claim.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.
@@ -256,6 +263,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
 - Hosted coverage workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/install-test-tools`, then `script/bootstrap`, then `script/test --coverage`.
+- The `privileged-integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` evidence.
 - Hosted validation should rely on offline defaults from `script/env` after explicit preparation completes.
 - Do not add Rust toolchain setup actions to hosted lint/test/build workflows; use `script/prepare-rust` so the preparation path stays explicit, checksum-gated, and repo-owned.
 - The first publishable agent release build job should run on `ubuntu-24.04`, run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then `script/build --release --targets "x86_64-unknown-linux-gnu"`.
@@ -302,6 +310,7 @@ Tests are a design requirement for Fence.
 - Use integration tests for IO and process behavior, but do not substitute a few broad end-to-end tests for meaningful unit coverage.
 - The default first-party target is 100% line, function, and region coverage through `script/test --coverage`.
 - Document explicit coverage exceptions in the change that introduces them. Acceptable exceptions are narrow: unreachable defensive code, platform-specific code not runnable on the current CI host, generated code, or behavior proven by a separate higher-fidelity test harness.
+- `src/nft_backend.rs` is an explicit Phase 2B exception: its privileged execution and kernel-state failure paths are validated by `privileged-integration`, while its deterministic normalization and boundary helpers retain ordinary unit tests.
 - Do not enable branch coverage with `cargo-llvm-cov` until that support is stable. Region coverage is the stable high-granularity gate for now.
 - Do not add `cargo-tarpaulin` or another coverage tool just because it is locally installed; `cargo-llvm-cov` is the repo-owned coverage path.
 
