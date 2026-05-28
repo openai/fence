@@ -1,4 +1,4 @@
-use crate::config::{ContainerPolicy, Mode};
+use crate::config::{ContainerPolicy, DestinationType, Mode, Protocol};
 use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
 use crate::lifecycle::{
     CriticalFinding, LifecycleError, NativeResidentNetwork, RESIDENT_VERIFICATION_INTERVAL,
@@ -19,6 +19,7 @@ pub const HOST_BLOCK_CANDIDATE_READY_STATUS: &str =
     "host_block_candidate_ready_no_public_activation";
 const FINDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CRITICAL_FINDINGS: usize = 64;
+const DOCUMENTED_RESULTS_RECEIVER: &str = "results-receiver.actions.githubusercontent.com";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum EvidenceScope {
@@ -65,7 +66,9 @@ impl EvidenceScope {
             ],
             Self::HostBlockCandidate => vec![
                 "host_block_candidate_test_only_no_public_activation",
-                "strict_none_minimal_finalization_candidate_not_general_compatibility",
+                "documented_results_receiver_encoded_as_test_allowance_not_selected_profile",
+                "permitted_candidate_destination_is_available_to_later_code",
+                "minimal_finalization_candidate_not_general_compatibility",
                 "no_action_wrapper_or_supported_agent_release",
                 "packet_prefixes_transiently_inspected_in_memory_not_serialized",
             ],
@@ -81,7 +84,9 @@ impl EvidenceScope {
             ],
             Self::HostBlockCandidate => vec![
                 "host_block_candidate_test_only_no_public_activation",
-                "strict_none_minimal_finalization_candidate_not_general_compatibility",
+                "documented_results_receiver_encoded_as_test_allowance_not_selected_profile",
+                "permitted_candidate_destination_is_available_to_later_code",
+                "minimal_finalization_candidate_not_general_compatibility",
                 "test_ready_is_not_a_public_protection_assertion",
             ],
         }
@@ -424,13 +429,18 @@ fn validate_standard_block_plan(plan: &PlanData) -> Result<(), ComposedError> {
 
 fn validate_host_block_candidate_plan(plan: &PlanData) -> Result<(), ComposedError> {
     validate_standard_block_plan(plan)?;
-    if plan.platform_profile != "none"
-        || !plan.requested_policy.is_empty()
-        || !plan.effective_policy.is_empty()
-    {
+    let is_results_receiver_candidate = matches!(
+        plan.requested_policy.as_slice(),
+        [allowance]
+            if allowance.destination_type == DestinationType::Hostname
+                && allowance.destination == DOCUMENTED_RESULTS_RECEIVER
+                && allowance.protocol == Protocol::Tcp
+                && allowance.port == 443
+    );
+    if plan.platform_profile != "none" || !is_results_receiver_candidate {
         return Err(ComposedError::new(
             "invalid_host_block_candidate_policy",
-            "host block candidate accepts only strict no-profile policy with no allowances",
+            "host block candidate accepts only the documented results-receiver test allowance",
         ));
     }
     Ok(())
@@ -494,6 +504,18 @@ mod tests {
     impl Resolver for LiteralResolver {
         fn resolve(&self, _hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
             panic!("composed lifecycle fixtures contain literal destinations only");
+        }
+    }
+
+    struct DocumentedReceiverResolver;
+
+    impl Resolver for DocumentedReceiverResolver {
+        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
+            assert_eq!(hostname, DOCUMENTED_RESULTS_RECEIVER);
+            Ok(Resolution {
+                addresses: vec!["192.0.2.10".parse().unwrap()],
+                elapsed: Duration::from_millis(1),
+            })
         }
     }
 
@@ -695,12 +717,9 @@ mod tests {
             session.evidence.setup_status,
             "resident_host_block_candidate_test_only"
         );
-        assert!(
-            session
-                .evidence
-                .limitations
-                .contains(&"strict_none_minimal_finalization_candidate_not_general_compatibility")
-        );
+        assert!(session.evidence.limitations.contains(
+            &"documented_results_receiver_encoded_as_test_allowance_not_selected_profile"
+        ));
         let serialized = fs::read_to_string(ready).unwrap();
         assert!(serialized.contains(HOST_BLOCK_CANDIDATE_READY_STATUS));
         assert!(serialized.contains("\"protection_available\":false"));
@@ -708,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_allowances_for_host_block_candidate() {
+    fn rejects_unreviewed_allowances_for_host_block_candidate() {
         let json = r#"{"schema_version":1,"mode":"block","invocation_id":"candidate-rule","platform_profile":"none","container_policy":"disable","allowances":[{"destination_type":"ip","destination":"192.0.2.10","protocol":"tcp","port":443}]}"#;
         let plan = build_plan(
             parse_and_normalize(json.as_bytes()).unwrap(),
@@ -717,6 +736,19 @@ mod tests {
         .unwrap();
         let error = validate_host_block_candidate_plan(&plan).unwrap_err();
         assert_eq!(error.code, "invalid_host_block_candidate_policy");
+    }
+
+    #[test]
+    fn accepts_only_the_documented_receiver_candidate() {
+        let json = format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"candidate-receiver","platform_profile":"none","container_policy":"disable","allowances":[{{"destination_type":"hostname","destination":"{DOCUMENTED_RESULTS_RECEIVER}","protocol":"tcp","port":443}}]}}"#
+        );
+        let plan = build_plan(
+            parse_and_normalize(json.as_bytes()).unwrap(),
+            &DocumentedReceiverResolver,
+        )
+        .unwrap();
+        validate_host_block_candidate_plan(&plan).unwrap();
     }
 
     #[test]
