@@ -40,13 +40,12 @@ platform profile from observed addresses. Separate disposable-host
 finalization experiments applied the same controls with zero allowances and
 with only GitHub's documented log/summary receiver permitted; each completed
 local assertions but failed to yield a terminal successful hosted job while
-the controls remained resident. Phase 4B adds an explicit, non-default
-`github_hosted_job_status_v1` candidate containing only
-`pipelines.actions.githubusercontent.com:443` and
-`results-receiver.actions.githubusercontent.com:443`. A separate
-non-required workflow applies that fixed candidate on disposable hosts; six
-terminal successful jobs are required before it may be considered for
-default selection. No built-in default platform profile is selected.
+the controls remained resident. A Phase 4B experiment then permitted exactly
+the GitHub-owned pipelines and results-receiver HTTPS endpoints in three
+independent hosted jobs. All three completed their visible local steps but
+remained non-terminal past the configured five-minute observation limit, so
+that candidate was rejected as insufficient. No built-in platform profile is
+selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -168,13 +167,8 @@ evidence, not part of the offline developer script contract.
 It separately runs `script/test-composed`, whose block-mode network rules are
 confined to a disposable namespace while the associated host lockdown remains
 test-only evidence on an ephemeral runner.
-The separate `platform profile candidate` workflow may run
-`script/test-profile-candidate` on disposable hosts with the explicit
-two-endpoint candidate. It is destructive, test-only compatibility evidence
-and deliberately does not participate in the required `integration` result
-until the candidate proves terminal completion.
 
-## Phase 4B Evidence Boundary
+## Phase 4A Evidence Boundary
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
@@ -191,7 +185,7 @@ script/build
 ```
 
 The last command intentionally returns an `enforcement_not_implemented` error
-through the Phase 4B evidence-only slices. Privileged hosted tests may emit
+through the Phase 4A evidence-only slices. Privileged hosted tests may emit
 explicitly test-only resident, lockdown, or composed evidence. Resident
 network measurement and composed namespace-network evidence may emit
 non-protecting test readiness; public CLI execution cannot. The composed
@@ -199,22 +193,13 @@ evidence does not protect the workflow host network and cannot be used as a
 runner security control. Phase 4A host-block finalization experiments are
 recorded as negative evidence: strict zero-egress and a candidate permitting
 only the documented log/summary receiver both stranded hosted job completion.
-Phase 4B permits an explicitly selected static job-status candidate in
-`render-plan` and test-only host-block evidence:
-
-```json
-{
-  "platform_profile": "github_hosted_job_status_v1"
-}
-```
-
-That candidate permits only the fixed GitHub-owned pipelines and results
-receiver HTTPS hostnames after they are resolved and frozen before mutation.
-It is not the omitted-field default, does not cover cache, artifact,
-repository API, action-download, or storage traffic, and exposes an egress
-channel that later workflow code could use. It does not activate the public
-agent or justify a default profile unless repeated terminal hosted completion
-proof passes.
+Phase 4B also rejected a static candidate permitting only
+`pipelines.actions.githubusercontent.com:443` and
+`results-receiver.actions.githubusercontent.com:443`: three independent jobs
+completed visible local assertions and remained non-terminal past the
+five-minute observation limit while controls were resident. These negative
+results do not activate the public agent or justify a default platform
+profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
