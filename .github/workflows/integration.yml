@@ -23,6 +23,7 @@ jobs:
   lockdown:
     name: lockdown ${{ matrix.scenario }} evidence
     strategy:
+      fail-fast: false
       matrix:
         scenario: [audit, rollback, unsafe-preserve]
     runs-on: ubuntu-24.04

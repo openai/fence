@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -235,6 +235,7 @@ fn initial_evidence(posture: LockdownPosture) -> LockdownEvidence {
 
 pub struct SystemLockdownControl {
     quarantine_path: PathBuf,
+    sudo_mode: Option<u32>,
     sudo_relocated: bool,
     containers_masked: bool,
 }
@@ -243,6 +244,7 @@ impl SystemLockdownControl {
     pub fn new(runtime_directory: &Path) -> Self {
         Self {
             quarantine_path: runtime_directory.join("sudo-runner.provisional"),
+            sudo_mode: None,
             sudo_relocated: false,
             containers_masked: false,
         }
@@ -277,12 +279,27 @@ impl LockdownControl for SystemLockdownControl {
     }
 
     fn disable_sudo(&mut self) -> Result<(), LockdownError> {
-        fs::rename(RUNNER_DROP_IN_PATH, &self.quarantine_path).map_err(|_| {
-            LockdownError::new(
+        let bytes = read_bounded_policy_file(Path::new(RUNNER_DROP_IN_PATH))?;
+        let mode = fs::metadata(RUNNER_DROP_IN_PATH)
+            .map_err(|_| unsupported_fingerprint())?
+            .permissions()
+            .mode()
+            & 0o777;
+        write_policy_exclusive(
+            &self.quarantine_path,
+            &bytes,
+            0o600,
+            "sudo_lockdown_failed",
+            "failed to create bounded provisional sudo policy state",
+        )?;
+        if fs::remove_file(RUNNER_DROP_IN_PATH).is_err() {
+            let _ = fs::remove_file(&self.quarantine_path);
+            return Err(LockdownError::new(
                 "sudo_lockdown_failed",
-                "failed to relocate the accepted runner sudo policy source",
-            )
-        })?;
+                "failed to remove the accepted runner sudo policy source after quarantine",
+            ));
+        }
+        self.sudo_mode = Some(mode);
         self.sudo_relocated = true;
         require_success(
             fixed_command("/usr/sbin/visudo", &["--check"])?,
@@ -387,10 +404,23 @@ impl LockdownControl for SystemLockdownControl {
             self.containers_masked = false;
         }
         if self.sudo_relocated {
-            fs::rename(&self.quarantine_path, RUNNER_DROP_IN_PATH).map_err(|_| {
+            let bytes = read_bounded_policy_file(&self.quarantine_path).map_err(|_| {
                 LockdownError::new(
                     "lockdown_rollback_failed",
-                    "failed to restore provisional sudo state",
+                    "failed to read bounded provisional sudo policy state",
+                )
+            })?;
+            write_policy_exclusive(
+                Path::new(RUNNER_DROP_IN_PATH),
+                &bytes,
+                self.sudo_mode.unwrap_or(0o440),
+                "lockdown_rollback_failed",
+                "failed to restore bounded provisional sudo policy state",
+            )?;
+            fs::remove_file(&self.quarantine_path).map_err(|_| {
+                LockdownError::new(
+                    "lockdown_rollback_failed",
+                    "failed to remove sudo quarantine",
                 )
             })?;
             require_success(
@@ -399,6 +429,7 @@ impl LockdownControl for SystemLockdownControl {
                 "restored sudo policy did not validate",
             )?;
             self.sudo_relocated = false;
+            self.sudo_mode = None;
         }
         Ok(changed)
     }
@@ -541,6 +572,15 @@ fn verify_socket_fingerprint() -> Result<(), LockdownError> {
 }
 
 fn sha256_bounded_file(path: &Path) -> Result<String, LockdownError> {
+    let bytes = read_bounded_policy_file(path)?;
+    let mut hexadecimal = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut hexadecimal, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Ok(hexadecimal)
+}
+
+fn read_bounded_policy_file(path: &Path) -> Result<Vec<u8>, LockdownError> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -553,11 +593,27 @@ fn sha256_bounded_file(path: &Path) -> Result<String, LockdownError> {
     if bytes.len() as u64 > MAX_POLICY_SOURCE_BYTES {
         return Err(unsupported_fingerprint());
     }
-    let mut hexadecimal = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        write!(&mut hexadecimal, "{byte:02x}").expect("writing to a string cannot fail");
-    }
-    Ok(hexadecimal)
+    Ok(bytes)
+}
+
+fn write_policy_exclusive(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), LockdownError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(path)
+        .map_err(|_| LockdownError::new(code, message))?;
+    file.write_all(bytes)
+        .map_err(|_| LockdownError::new(code, message))?;
+    file.sync_all()
+        .map_err(|_| LockdownError::new(code, message))
 }
 
 fn runner_sudo_true() -> Result<Output, LockdownError> {
