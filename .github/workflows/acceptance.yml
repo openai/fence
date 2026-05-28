@@ -23,8 +23,6 @@ jobs:
   packaged-public-contract:
     name: packaged public contract
     runs-on: ubuntu-24.04
-    env:
-      ACCEPTANCE_DIST: ${{ runner.temp }}/fence-acceptance-dist
 
     steps:
       - name: checkout
@@ -44,13 +42,13 @@ jobs:
       - name: build packaged Linux x64 artifact
         env:
           BUILD_VERSION: acceptance
-        run: script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$ACCEPTANCE_DIST"
+        run: script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$RUNNER_TEMP/fence-acceptance-dist"
 
       - name: verify packaged artifact checksum
-        working-directory: ${{ runner.temp }}/fence-acceptance-dist
         run: |
+          cd "$RUNNER_TEMP/fence-acceptance-dist"
           grep -Eq 'fence_acceptance_linux-amd64$' checksums.txt
           sha256sum -c checksums.txt
 
       - name: exercise packaged public contract
-        run: script/test-package-smoke "$ACCEPTANCE_DIST/fence_acceptance_linux-amd64"
+        run: script/test-package-smoke "$RUNNER_TEMP/fence-acceptance-dist/fence_acceptance_linux-amd64"
