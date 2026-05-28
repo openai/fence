@@ -1,0 +1,141 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 1 ]]; then
+  die "usage: script/measure-platform-egress <start|report>"
+fi
+
+action="$1"
+case "$action" in
+  start|report) ;;
+  *) die "unknown platform-profile measurement action: $action" ;;
+esac
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "platform-profile measurement runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "platform-profile measurement requires Linux x86_64"
+fi
+
+require_cmd python3
+require_cmd sudo
+
+for required in /usr/bin/systemd-run /usr/bin/systemctl /usr/sbin/nft; do
+  if [[ ! -x "$required" ]]; then
+    die "platform-profile measurement requires executable $required"
+  fi
+done
+
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
+invocation="profile-audit-${suffix}"
+unit="fence-evidence-profile-${suffix}.service"
+runtime_root="/run/fence-profile-measurement-${suffix}"
+directory="$runtime_root/$invocation"
+report="$directory/report.json"
+ready="$directory/ready.json"
+production_ready="/run/fence/$invocation/ready.json"
+
+if [[ "$action" == "start" ]]; then
+  ensure_rust_toolchain
+  require_cmd cargo
+
+  if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+    die "platform-profile measurement requires absent preexisting inet fence_v0 table"
+  fi
+  if [[ -e "$production_ready" ]]; then
+    die "platform-profile measurement refuses preexisting production readiness state"
+  fi
+
+  target_root="$RUNNER_TEMP/fence-profile-measurement-target"
+  mkdir -p "$target_root"
+  export CARGO_TARGET_DIR="$target_root"
+  cargo test --frozen --test measurement --no-run
+
+  shopt -s nullglob
+  test_binaries=()
+  for candidate in "$target_root"/debug/deps/measurement-*; do
+    if [[ -f "$candidate" && -x "$candidate" ]]; then
+      test_binaries+=("$candidate")
+    fi
+  done
+  if [[ "${#test_binaries[@]}" -ne 1 ]]; then
+    die "expected exactly one compiled platform-profile measurement test binary"
+  fi
+
+  sudo /usr/bin/systemd-run \
+    --quiet \
+    --collect \
+    --property=Type=exec \
+    --unit "$unit" \
+    --setenv=FENCE_PROFILE_MEASUREMENT_WORKER=1 \
+    "--setenv=FENCE_PROFILE_MEASUREMENT_UNIT=$unit" \
+    "--setenv=FENCE_PROFILE_MEASUREMENT_INVOCATION=$invocation" \
+    "--setenv=FENCE_PROFILE_MEASUREMENT_ROOT=$runtime_root" \
+    "${test_binaries[0]}" --ignored --exact host_audit_measurement_worker --nocapture
+
+  python3 - "$ready" "$report" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+ready_path, report_path, production_ready_path = map(pathlib.Path, sys.argv[1:])
+deadline = time.monotonic() + 10
+while not ready_path.exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+assert ready_path.exists(), "test-only audit measurement readiness was not emitted"
+ready = json.loads(ready_path.read_text(encoding="utf-8"))
+report = json.loads(report_path.read_text(encoding="utf-8"))
+assert ready["status"] == "test_only_ready_no_protection"
+assert ready["mode"] == "audit"
+assert ready["protection_available"] is False
+assert report["status"] == "resident_lifecycle_test_only"
+assert report["mode"] == "audit"
+assert not production_ready_path.exists()
+PY
+
+  sudo /usr/sbin/nft list table inet fence_v0 >/dev/null
+  echo -e "${GREEN}host audit platform-profile measurement activated without protection${OFF}"
+  exit 0
+fi
+
+# The report is collected before hosted-job teardown. The audit service
+# intentionally remains resident so later runner finalization cannot be
+# described as a proved no-restore protected lifecycle in this phase.
+sleep 6
+python3 - "$report" "$ready" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+
+report_path, ready_path, production_ready_path = map(pathlib.Path, sys.argv[1:])
+report = json.loads(report_path.read_text(encoding="utf-8"))
+ready = json.loads(ready_path.read_text(encoding="utf-8"))
+assert report["status"] == "resident_lifecycle_test_only"
+assert report["mode"] == "audit"
+assert report["readiness_status"] == "test_only_ready_no_protection"
+assert report["critical_findings"] == []
+assert ready["protection_available"] is False
+assert not production_ready_path.exists()
+evidence = {
+    "schema_version": 1,
+    "status": "platform_profile_measurement_test_only",
+    "measurement_mode": "audit",
+    "protection_available": False,
+    "profile_decision_status": "not_selected_from_measurement_alone",
+    "resident_evidence": report,
+    "limitations": [
+        "non_blocking_audit_measurement_only",
+        "bounded_metadata_findings_only",
+        "evidence_collected_before_hosted_job_teardown",
+        "no_public_activation_or_protection_claim",
+    ],
+}
+print(json.dumps(evidence, sort_keys=True, separators=(",", ":")))
+PY
+
+echo -e "${GREEN}bounded host audit platform-profile measurement emitted${OFF}"

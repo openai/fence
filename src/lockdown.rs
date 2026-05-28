@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 pub const LOCKDOWN_EVIDENCE_STATUS: &str = "lockdown_evidence_test_only";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTAINER_RESTART_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_POLICY_SOURCE_BYTES: u64 = 256 * 1024;
 const SUDOERS_PATH: &str = "/etc/sudoers";
@@ -395,7 +396,7 @@ impl LockdownControl for SystemLockdownControl {
                 "failed to unmask provisional container state",
             )?;
             require_success(
-                fixed_command(
+                fixed_command_with_timeout(
                     "/usr/bin/systemctl",
                     &[
                         "start",
@@ -403,7 +404,14 @@ impl LockdownControl for SystemLockdownControl {
                         "docker.socket",
                         "docker.service",
                     ],
-                )?,
+                    CONTAINER_RESTART_TIMEOUT,
+                )
+                .map_err(|_| {
+                    LockdownError::new(
+                        "container_restart_rollback_failed",
+                        "bounded container restoration command could not complete",
+                    )
+                })?,
                 "container_restart_rollback_failed",
                 "failed to restore provisional container state",
             )?;
@@ -733,6 +741,14 @@ fn observe_unit(name: &str) -> Result<UnitObservation, LockdownError> {
 }
 
 fn fixed_command(program: &str, arguments: &[&str]) -> Result<Output, LockdownError> {
+    fixed_command_with_timeout(program, arguments, COMMAND_TIMEOUT)
+}
+
+fn fixed_command_with_timeout(
+    program: &str,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<Output, LockdownError> {
     let mut child = Command::new(program)
         .args(arguments)
         .env_clear()
@@ -742,7 +758,7 @@ fn fixed_command(program: &str, arguments: &[&str]) -> Result<Output, LockdownEr
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| unsupported_fingerprint())?;
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
