@@ -97,8 +97,9 @@ elif scenario == "standard":
     assert report["sudo_status"] == "disabled_verified"
     assert report["container_status"] == "disabled_verified"
 elif scenario == "rollback":
-    assert report["setup_status"] == "failed_pre_ready"
-    assert report["rollback_status"] == "rolled_back_pre_ready"
+    assert report["setup_status"] == "failed_pre_ready", report
+    assert report["rollback_status"] == "rolled_back_pre_ready", report
+    assert "rollback_error_code" not in report, report
 PY
 
 case "$scenario" in

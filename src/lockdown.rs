@@ -60,6 +60,8 @@ pub struct LockdownEvidence {
     pub sudo_status: &'static str,
     pub container_status: &'static str,
     pub rollback_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_error_code: Option<&'static str>,
     pub readiness_status: &'static str,
     pub protection_available: bool,
     pub limitations: Vec<&'static str>,
@@ -155,7 +157,10 @@ fn record_pre_ready_rollback(
     evidence.rollback_status = match control.rollback_pre_ready() {
         Ok(true) => "rolled_back_pre_ready",
         Ok(false) => "nothing_to_rollback",
-        Err(_) => "rollback_failed",
+        Err(error) => {
+            evidence.rollback_error_code = Some(error.code);
+            "rollback_failed"
+        }
     };
     let _ = runtime.replace_report(evidence);
 }
@@ -227,6 +232,7 @@ fn initial_evidence(posture: LockdownPosture) -> LockdownEvidence {
         sudo_status: "not_checked",
         container_status: "not_checked",
         rollback_status: "not_required",
+        rollback_error_code: None,
         readiness_status: "not_emitted",
         protection_available: false,
         limitations,
