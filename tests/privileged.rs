@@ -14,9 +14,10 @@ use fence::nft_backend::{
 use fence::plan::{EffectiveAllowance, build_plan};
 use fence::resolver::{Resolution, ResolveError, Resolver};
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -291,7 +292,7 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
     ));
     let blocked = block.total_violation_packets().unwrap();
     assert!(blocked >= 5);
-    let block_findings = finish_nflog_worker(&mut block_worker, &block_findings_path);
+    let block_findings = finish_nflog_worker(&mut block_worker, &block_findings_path, Some(marker));
     assert!(block_findings.retained.iter().any(|finding| {
         finding.family == "ipv4" && finding.protocol == "udp" && finding.remote_port == Some(19444)
     }));
@@ -331,6 +332,16 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
         fs::metadata(directory.join("report.json")).unwrap().uid(),
         0
     );
+    assert!(
+        !String::from_utf8(fs::read(directory.join("state.json")).unwrap())
+            .unwrap()
+            .contains(marker)
+    );
+    assert!(
+        !String::from_utf8(fs::read(directory.join("report.json")).unwrap())
+            .unwrap()
+            .contains(marker)
+    );
     assert!(!directory.join("ready.json").exists());
     assert!(block.rollback_pre_activation().unwrap());
 
@@ -352,7 +363,7 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
         20444
     ));
     assert!(audit.total_violation_packets().unwrap() >= 2);
-    let audit_findings = finish_nflog_worker(&mut audit_worker, &audit_findings_path);
+    let audit_findings = finish_nflog_worker(&mut audit_worker, &audit_findings_path, None);
     assert_eq!(audit_findings.sampled_total, 2);
     assert!(audit_findings.retained.iter().all(
         |finding| finding.classification == fence::findings::FindingClassification::WouldBlock
@@ -415,7 +426,7 @@ fn nflog_retention_and_report_bounds_hold_for_privileged_evidence() {
         .unwrap();
 
     emit_sampled_udp_traffic(&topology.client, "192.0.2.2", 30444, event_count);
-    let findings = finish_nflog_worker(&mut worker, &findings_path);
+    let findings = finish_nflog_worker(&mut worker, &findings_path, None);
     let total_violations = audit.total_violation_packets().unwrap();
     assert_eq!(findings.retained.len(), MAX_FINDINGS);
     assert!(findings.truncated);
@@ -698,19 +709,49 @@ fn start_nflog_worker(
         .env("FENCE_NFLOG_EXPECTED", expected.to_string())
         .env("FENCE_NFLOG_READY", &ready)
         .env("FENCE_NFLOG_OUTPUT", &output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     wait_for_path(&ready);
     (ChildGuard(child), output)
 }
 
-fn finish_nflog_worker(worker: &mut ChildGuard, output: &Path) -> FindingCollection {
+fn finish_nflog_worker(
+    worker: &mut ChildGuard,
+    output: &Path,
+    forbidden_marker: Option<&str>,
+) -> FindingCollection {
     let status = worker.0.wait().unwrap();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    worker
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    worker
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
     assert!(
         status.success(),
         "NFLOG worker did not complete successfully"
     );
-    serde_json::from_slice(&fs::read(output).unwrap()).unwrap()
+    if let Some(marker) = forbidden_marker {
+        assert!(!stdout.contains(marker));
+        assert!(!stderr.contains(marker));
+    }
+    let serialized_findings = fs::read(output).unwrap();
+    if let Some(marker) = forbidden_marker {
+        assert!(!String::from_utf8_lossy(&serialized_findings).contains(marker));
+    }
+    serde_json::from_slice(&serialized_findings).unwrap()
 }
 
 fn wait_for_path(path: &Path) {
