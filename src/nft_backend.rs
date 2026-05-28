@@ -515,7 +515,7 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
         }
         _ => Err(BackendError::new(
             "unexpected_nft_state",
-            "owned nftables table contains an unrecognized or malformed rule",
+            format!("owned nftables table contains malformed rule class {comment}"),
         )),
     }
 }
