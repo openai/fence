@@ -128,7 +128,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/observe-hosted-runner`
   - Linux x64-only, read-only hosted-runner fingerprint candidate collector for the `integration` workflow.
-  - Emits bounded JSON describing only the runner principal/group names, fixed security-relevant paths, fixed systemd unit state, fixed runtime socket state, aggregate Docker workload count, and sudo-policy source digests plus `NOPASSWD` marker classification for review.
+  - Emits bounded JSON describing only the runner principal/group names, fixed security-relevant paths, fixed systemd unit state, fixed runtime socket state, aggregate Docker workload count, and sudo-policy source digests plus reduced principal/group `NOPASSWD` marker classification for review.
   - Must not emit sudo policy contents, environment values, process arguments, workload identifiers, credentials, or arbitrary host files.
   - Must not establish support, mutate host state, enable public enforcement, or write readiness.
 
