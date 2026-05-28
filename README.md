@@ -46,11 +46,12 @@ independent hosted jobs. All three completed their visible local steps but
 remained non-terminal past the configured five-minute observation limit, so
 that candidate was rejected as insufficient. A subsequent non-required
 compatibility experiment accepts only an explicit
-`github_hosted_control_plane_candidate_v1` plan: six fixed GitHub service
-hostnames for web/API, Actions token, pipeline, and results-receiver traffic
-on TCP `443`. It is intentionally broader than a final status-only allowlist,
-is usable by later workflow code as an egress channel, and does not permit
-blob storage, caches, artifact uploads, or action downloads after activation.
+`github_hosted_compatibility_candidate_v1` plan: eight fixed GitHub service
+and results-storage hostnames for web/API, Actions token, pipeline,
+results-receiver, and results-storage traffic on TCP `443`. It is
+intentionally broader than a final status-only allowlist and is usable by
+later workflow code as an egress channel; minimizing the storage contribution
+is follow-up work after compatibility proof.
 It remains test-only and non-default until terminal hosted-runner evidence is
 reviewed; no built-in platform profile is selected.
 
@@ -207,12 +208,12 @@ completed visible local assertions and remained non-terminal past the
 five-minute observation limit while controls were resident. These negative
 results do not activate the public agent or justify a default platform
 profile. A follow-up, non-required candidate may be selected explicitly as
-`github_hosted_control_plane_candidate_v1`; it permits fixed GitHub web/API
-and Actions control-service hosts only for disposable-host compatibility
-evidence. This candidate deliberately trades a larger disclosed egress channel
-for a chance to establish terminal hosted-job behavior before a later
-minimization pass. It is neither a public enforcement interface nor a default
-profile.
+`github_hosted_compatibility_candidate_v1`; it permits fixed GitHub web/API,
+Actions control-service, and results-storage hosts for disposable-host
+compatibility evidence. This candidate deliberately trades a larger disclosed
+egress channel for a chance to establish terminal hosted-job behavior before a
+later minimization pass. It is neither a public enforcement interface nor a
+default profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

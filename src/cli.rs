@@ -126,17 +126,19 @@ mod tests {
         }
     }
 
-    struct BroadControlPlaneResolver;
+    struct BroadCompatibilityResolver;
 
-    impl Resolver for BroadControlPlaneResolver {
+    impl Resolver for BroadCompatibilityResolver {
         fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
             let address = match hostname {
                 "actions-results-receiver-production.githubapp.com" => "192.0.2.10",
                 "api.github.com" => "192.0.2.11",
                 "github.com" => "192.0.2.12",
                 "pipelines.actions.githubusercontent.com" => "192.0.2.13",
-                "results-receiver.actions.githubusercontent.com" => "192.0.2.14",
-                _ => "192.0.2.15",
+                "productionresultssa13.blob.core.windows.net" => "192.0.2.14",
+                "productionresultssa17.blob.core.windows.net" => "192.0.2.15",
+                "results-receiver.actions.githubusercontent.com" => "192.0.2.16",
+                _ => "192.0.2.17",
             };
             Ok(Resolution {
                 addresses: vec![address.parse().unwrap()],
@@ -217,13 +219,13 @@ mod tests {
     }
 
     #[test]
-    fn render_plan_exposes_explicit_broad_control_plane_candidate_without_activation() {
+    fn render_plan_exposes_explicit_broad_compatibility_candidate_without_activation() {
         let root = std::path::Path::new("target/tmp/cli-unit-tests");
         std::fs::create_dir_all(root).unwrap();
-        let config = root.join("broad-control-plane-profile.json");
+        let config = root.join("broad-compatibility-profile.json");
         std::fs::write(
             &config,
-            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_control_plane_candidate_v1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
         )
         .unwrap();
 
@@ -232,7 +234,7 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
-            &BroadControlPlaneResolver,
+            &BroadCompatibilityResolver,
             &LinuxProvider,
         );
 
@@ -240,7 +242,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_control_plane_candidate_v1\"")
+                .contains("\"id\":\"github_hosted_compatibility_candidate_v1\"")
         );
         assert!(
             output
@@ -250,7 +252,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"candidate_permits_github_api_and_web_service_endpoints\"")
+                .contains("\"candidate_permits_github_api_web_and_results_storage_endpoints\"")
         );
         assert!(
             output

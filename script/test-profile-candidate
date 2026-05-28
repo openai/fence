@@ -9,10 +9,10 @@ if [[ $# -ne 0 ]]; then
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
-  die "broad GitHub control-plane profile evidence runs only on disposable GitHub Actions runners"
+  die "broad GitHub compatibility profile evidence runs only on disposable GitHub Actions runners"
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
-  die "broad GitHub control-plane profile evidence requires Linux x86_64"
+  die "broad GitHub compatibility profile evidence requires Linux x86_64"
 fi
 
 ensure_rust_toolchain
@@ -23,7 +23,7 @@ require_cmd sudo
 
 for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
-    die "broad GitHub control-plane profile evidence requires executable $required"
+    die "broad GitHub compatibility profile evidence requires executable $required"
   fi
 done
 
@@ -48,14 +48,14 @@ for candidate in "$target_root"/debug/deps/profile_candidate-*; do
   fi
 done
 if [[ "${#test_binaries[@]}" -ne 1 ]]; then
-  die "expected exactly one compiled broad GitHub control-plane profile test binary"
+  die "expected exactly one compiled broad GitHub compatibility profile test binary"
 fi
 
 if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
-  die "broad GitHub control-plane profile evidence requires absent host inet fence_v0 table"
+  die "broad GitHub compatibility profile evidence requires absent host inet fence_v0 table"
 fi
 if [[ -e "$production_ready" ]]; then
-  die "broad GitHub control-plane profile evidence requires absent production readiness path"
+  die "broad GitHub compatibility profile evidence requires absent production readiness path"
 fi
 
 # This applies block policy on a disposable hosted runner using only the
@@ -70,7 +70,7 @@ sudo /usr/bin/systemd-run \
   "--setenv=FENCE_PROFILE_CANDIDATE_UNIT=$unit" \
   "--setenv=FENCE_PROFILE_CANDIDATE_ROOT=$runtime_root" \
   "--setenv=FENCE_PROFILE_CANDIDATE_INVOCATION=$invocation" \
-  "${test_binaries[0]}" --ignored --exact broad_control_plane_profile_host_block_candidate_worker --nocapture
+  "${test_binaries[0]}" --ignored --exact broad_compatibility_profile_host_block_candidate_worker --nocapture
 
 python3 - "$report" "$ready" "$production_ready" <<'PY'
 import json
@@ -92,8 +92,8 @@ while time.monotonic() < deadline:
         ):
             break
     time.sleep(0.1)
-assert ready is not None, "broad GitHub control-plane profile candidate readiness was not emitted"
-assert report is not None, "broad GitHub control-plane profile candidate report was not emitted"
+assert ready is not None, "broad GitHub compatibility profile candidate readiness was not emitted"
+assert report is not None, "broad GitHub compatibility profile candidate report was not emitted"
 assert ready["status"] == "host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert report["status"] == "host_block_candidate_test_only"
@@ -105,24 +105,24 @@ assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["readiness_status"] == "host_block_candidate_ready_no_public_activation"
 assert report["protection_available"] is False
-assert report["platform_profile"]["id"] == "github_hosted_control_plane_candidate_v1"
+assert report["platform_profile"]["id"] == "github_hosted_compatibility_candidate_v1"
 assert report["platform_profile"]["selection_status"] == "explicit_broad_candidate_not_default"
-assert len(report["platform_profile"]["requested_allowances"]) == 6
+assert len(report["platform_profile"]["requested_allowances"]) == 8
 assert len(report["platform_profile"]["effective_allowances"]) >= 1
-assert len(report["platform_profile"]["frozen_resolution_results"]) == 6
+assert len(report["platform_profile"]["frozen_resolution_results"]) == 8
 assert "candidate_profile_explicit_not_default" in report["limitations"]
 assert "candidate_is_intentionally_broader_than_job_status_only" in report["limitations"]
 assert "no_public_activation" in report["limitations"]
-assert "no_post_ready_blob_storage_cache_or_artifact_support" in report["limitations"]
-assert "permitted_control_channels_are_an_exfiltration_limitation" in report["limitations"]
+assert "candidate_permits_results_storage_compatibility_scope" in report["limitations"]
+assert "permitted_compatibility_channels_are_an_exfiltration_limitation" in report["limitations"]
 assert not production_ready_path.exists()
 PY
 
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
-  die "broad GitHub control-plane profile candidate did not disable runner passwordless sudo"
+  die "broad GitHub compatibility profile candidate did not disable runner passwordless sudo"
 fi
 if docker ps --quiet >/dev/null 2>&1; then
-  die "broad GitHub control-plane profile candidate did not disable runner Docker access"
+  die "broad GitHub compatibility profile candidate did not disable runner Docker access"
 fi
 
 sleep 6
@@ -138,4 +138,4 @@ assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 PY
 
-echo -e "${GREEN}broad GitHub control-plane profile candidate evidence verified${OFF}"
+echo -e "${GREEN}broad GitHub compatibility profile candidate evidence verified${OFF}"

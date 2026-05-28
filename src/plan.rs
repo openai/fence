@@ -17,13 +17,15 @@ use std::time::Duration;
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
 pub const POLICY_HASH_SCHEMA_VERSION: u32 = 2;
-pub const GITHUB_HOSTED_CONTROL_PLANE_CANDIDATE_PROFILE_ID: &str =
-    "github_hosted_control_plane_candidate_v1";
-const GITHUB_CONTROL_PLANE_HOSTS: [&str; 6] = [
+pub const GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID: &str =
+    "github_hosted_compatibility_candidate_v1";
+const GITHUB_COMPATIBILITY_HOSTS: [&str; 8] = [
     "actions-results-receiver-production.githubapp.com",
     "api.github.com",
     "github.com",
     "pipelines.actions.githubusercontent.com",
+    "productionresultssa13.blob.core.windows.net",
+    "productionresultssa17.blob.core.windows.net",
     "results-receiver.actions.githubusercontent.com",
     "vstoken.actions.githubusercontent.com",
 ];
@@ -283,7 +285,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
         PlatformProfile::None => Vec::new(),
-        PlatformProfile::GithubHostedControlPlaneCandidateV1 => GITHUB_CONTROL_PLANE_HOSTS
+        PlatformProfile::GithubHostedCompatibilityCandidateV1 => GITHUB_COMPATIBILITY_HOSTS
             .iter()
             .map(|hostname| NormalizedAllowance {
                 destination_type: DestinationType::Hostname,
@@ -339,18 +341,18 @@ fn platform_plan(
             frozen_resolution_results,
             limitations: Vec::new(),
         },
-        PlatformProfile::GithubHostedControlPlaneCandidateV1 => PlatformProfilePlan {
-            id: GITHUB_HOSTED_CONTROL_PLANE_CANDIDATE_PROFILE_ID,
+        PlatformProfile::GithubHostedCompatibilityCandidateV1 => PlatformProfilePlan {
+            id: GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID,
             selection_status: "explicit_broad_candidate_not_default",
-            purpose: "github_hosted_runner_control_plane_compatibility",
+            purpose: "github_hosted_runner_finalization_compatibility",
             requested_allowances,
             effective_allowances,
             frozen_resolution_results,
             limitations: vec![
                 "candidate_is_intentionally_broader_than_job_status_only",
                 "permitted_platform_destinations_are_available_to_later_workflow_code",
-                "candidate_permits_github_api_and_web_service_endpoints",
-                "profile_does_not_permit_blob_storage_cache_or_artifact_operations",
+                "candidate_permits_github_api_web_and_results_storage_endpoints",
+                "candidate_results_storage_scope_must_be_reduced_after_compatibility_proof",
             ],
         },
     }
@@ -526,8 +528,8 @@ mod tests {
     }
 
     #[test]
-    fn models_explicit_broad_control_plane_candidate_separately_from_user_policy() {
-        let responses = (10..16)
+    fn models_explicit_broad_compatibility_candidate_separately_from_user_policy() {
+        let responses = (10..18)
             .map(|suffix| {
                 let address = format!("192.0.2.{suffix}");
                 resolved(&[address.as_str()], Duration::from_millis(1))
@@ -535,7 +537,7 @@ mod tests {
             .collect();
         let candidate = build_plan(
             parse(
-                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_control_plane_candidate_v1","allowances":[]}"#,
+                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
             ),
             &resolver(responses),
         )
@@ -550,7 +552,7 @@ mod tests {
         assert_eq!(candidate.limits.declared_user_allowances, 0);
         assert_eq!(
             candidate.platform_profile.id,
-            GITHUB_HOSTED_CONTROL_PLANE_CANDIDATE_PROFILE_ID
+            GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID
         );
         assert_eq!(
             candidate.platform_profile.selection_status,
@@ -563,9 +565,9 @@ mod tests {
                 .iter()
                 .map(|allowance| allowance.destination.as_str())
                 .collect::<Vec<_>>(),
-            GITHUB_CONTROL_PLANE_HOSTS.to_vec()
+            GITHUB_COMPATIBILITY_HOSTS.to_vec()
         );
-        assert_eq!(candidate.platform_profile.effective_allowances.len(), 6);
+        assert_eq!(candidate.platform_profile.effective_allowances.len(), 8);
         assert_eq!(
             candidate
                 .platform_profile
@@ -573,9 +575,9 @@ mod tests {
                 .iter()
                 .map(|result| result.hostname.as_str())
                 .collect::<Vec<_>>(),
-            GITHUB_CONTROL_PLANE_HOSTS.to_vec()
+            GITHUB_COMPATIBILITY_HOSTS.to_vec()
         );
-        assert_eq!(candidate.effective_policy.len(), 6);
+        assert_eq!(candidate.effective_policy.len(), 8);
         assert_eq!(none.platform_profile.id, "none");
         assert!(none.platform_profile.requested_allowances.is_empty());
         assert_ne!(candidate.policy_hash, none.policy_hash);
@@ -584,14 +586,14 @@ mod tests {
             candidate
                 .platform_profile
                 .limitations
-                .contains(&"candidate_permits_github_api_and_web_service_endpoints")
+                .contains(&"candidate_permits_github_api_web_and_results_storage_endpoints")
         );
     }
 
     #[test]
-    fn applies_existing_resolution_failures_to_broad_control_plane_candidate() {
+    fn applies_existing_resolution_failures_to_broad_compatibility_candidate() {
         let candidate = parse(
-            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_control_plane_candidate_v1","allowances":[]}"#,
+            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
         );
         assert_eq!(
             build_plan(candidate, &resolver(vec![Err(ResolveError::TimedOut)]))
