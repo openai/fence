@@ -32,9 +32,11 @@ lockdown, rollback, degraded container preservation, and audit preservation.
 Phase 4A begins controlled compatibility measurement by applying only
 non-blocking host audit rules on an ephemeral runner, exercising GitHub
 metadata and artifact paths, and emitting bounded endpoint evidence before
-runner teardown. It emits no protection readiness, does not yet compose
-blocking host network policy with host lockdown, and does not select an
-implicit platform profile from one measurement.
+runner teardown. A follow-up composed evidence service applies block rules
+only inside a disposable network namespace while disabling the measured host
+sudo/container paths in one transient service. Neither path emits protection
+readiness, applies blocking policy to the host network, or selects an implicit
+platform profile from observed addresses.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -153,6 +155,9 @@ The `integration` workflow may intentionally exercise GitHub-hosted metadata
 and artifact services while `script/measure-platform-egress` keeps a
 non-blocking test-only audit service resident; that measurement is online
 evidence, not part of the offline developer script contract.
+It separately runs `script/test-composed`, whose block-mode network rules are
+confined to a disposable namespace while the associated host lockdown remains
+test-only evidence on an ephemeral runner.
 
 ## Phase 4A Evidence Boundary
 
@@ -171,11 +176,12 @@ script/build
 ```
 
 The last command intentionally returns an `enforcement_not_implemented` error
-through the Phase 4A evidence-only slice. Privileged hosted tests may emit
-explicitly test-only resident or lockdown evidence; only resident
-network evidence, including the non-blocking host audit measurement, may emit
-test-only readiness; public CLI execution cannot. Do not use this planner or
-its ruleset preview as a runner security control.
+through the Phase 4A evidence-only slices. Privileged hosted tests may emit
+explicitly test-only resident, lockdown, or composed evidence. Resident
+network measurement and composed namespace-network evidence may emit
+non-protecting test readiness; public CLI execution cannot. The composed
+evidence does not protect the workflow host network and cannot be used as a
+runner security control.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
