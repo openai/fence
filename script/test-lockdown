@@ -61,6 +61,7 @@ report="$runtime_root/$invocation/report.json"
 sudo /usr/bin/systemd-run \
   --quiet \
   --wait \
+  --pipe \
   --collect \
   --property=Type=exec \
   --unit "$unit" \
