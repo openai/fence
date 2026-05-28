@@ -43,7 +43,7 @@ fn version_is_json_and_does_not_claim_protection() {
 
     assert_eq!(response["command"], "version");
     assert_eq!(response["status"], "success");
-    assert_eq!(response["data"]["implementation_phase"], "phase1");
+    assert_eq!(response["data"]["implementation_phase"], "phase2");
     assert_eq!(response["data"]["protection_available"], false);
 }
 
@@ -55,7 +55,11 @@ fn support_is_read_only_and_not_protective() {
     assert_eq!(response["data"]["protection_available"], false);
     assert_eq!(
         response["data"]["reasons"][0],
-        "enforcement_not_implemented"
+        "public_enforcement_not_activated"
+    );
+    assert_eq!(
+        response["data"]["network_backend"]["nft_binary_expected_path"],
+        "/usr/sbin/nft"
     );
 }
 
@@ -78,6 +82,16 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     assert_eq!(first, second);
     assert_eq!(first["data"]["application_status"], "not_applied");
     assert_eq!(first["data"]["verification_status"], "not_verified");
+    assert_eq!(first["data"]["policy_hash_schema_version"], 2);
+    assert_eq!(
+        first["data"]["network_enforcement_preview"]["owned_table"]["name"],
+        "fence_v0"
+    );
+    assert_eq!(
+        first["data"]["network_enforcement_preview"]["nflog"]["group"],
+        4242
+    );
+    assert!(first["data"]["ruleset_hash"].as_str().unwrap().len() == 64);
     assert_eq!(
         first["data"]["derived_runtime_paths"]["directory"],
         runtime_path.to_str().unwrap()
