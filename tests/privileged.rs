@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
 
-use fence::config::{DestinationType, Mode, Protocol, parse_and_normalize};
+use fence::config::{
+    DestinationType, MAX_FINDINGS, MAX_REPORT_BYTES, Mode, Protocol, parse_and_normalize,
+};
 use fence::findings::FindingCollection;
 use fence::nflog::NflogReader;
 use fence::nft::{
@@ -210,7 +212,7 @@ fn nflog_worker_collects_bounded_findings() {
     let reader = NflogReader::bind(mode).unwrap();
     fs::write(&ready, b"bound").unwrap();
     let mut collection = FindingCollection::empty();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while collection.sampled_total < expected && Instant::now() < deadline {
         if let Some(finding) = reader.next_finding(Duration::from_millis(100)).unwrap() {
             collection.record_finding(finding);
@@ -387,6 +389,78 @@ fn conflict_preflight_and_rollback_are_confined_to_owned_namespace_state() {
     );
     assert!(applied.rollback_pre_activation().unwrap());
     nft_in_namespace(&topology.client, &["list", "table", "inet", "foreign_test"]);
+}
+
+#[test]
+#[ignore = "requires Linux root network namespaces and native nftables"]
+fn nflog_retention_and_report_bounds_hold_for_privileged_evidence() {
+    require_root();
+    let topology = PeerTopology::new();
+    let root = evidence_root();
+    fs::create_dir_all(&root).unwrap();
+    let event_count = MAX_FINDINGS as u64 + 1;
+    let (mut worker, findings_path) = start_nflog_worker(
+        &topology.client,
+        Mode::Audit,
+        "bounded-findings",
+        event_count,
+    );
+    let allowances = Vec::new();
+    let mut audit = backend(&topology.client);
+    let program = render_ruleset(Mode::Audit, &allowances);
+    audit.preflight(&program).unwrap();
+    audit.apply_provisional(&program).unwrap();
+    audit
+        .verify_owned_state(&expected_owned_state(Mode::Audit, &allowances))
+        .unwrap();
+
+    emit_sampled_udp_traffic(&topology.client, "192.0.2.2", 30444, event_count);
+    let findings = finish_nflog_worker(&mut worker, &findings_path);
+    let total_violations = audit.total_violation_packets().unwrap();
+    assert_eq!(findings.retained.len(), MAX_FINDINGS);
+    assert!(findings.truncated);
+    assert!(findings.sampled_total > MAX_FINDINGS as u64);
+    assert!(total_violations >= findings.sampled_total);
+
+    let mut evidence =
+        unapplied_test_evidence_model(Mode::Audit, "policy".to_owned(), "ruleset".to_owned());
+    evidence.apply_status = "applied";
+    evidence.verification_status = "verified";
+    evidence.counters = NetworkEvidenceCounters {
+        total_violations,
+        sampled_violations: findings.sampled_total,
+    };
+    evidence.findings = findings.retained;
+    evidence.findings_truncated = findings.truncated;
+    let directory = write_test_evidence(
+        &root,
+        "bounded-output",
+        &evidence,
+        &expected_owned_state(Mode::Audit, &allowances),
+    )
+    .unwrap();
+    let report = fs::read(directory.join("report.json")).unwrap();
+    assert!(report.len() <= MAX_REPORT_BYTES);
+    assert!(
+        String::from_utf8(report)
+            .unwrap()
+            .contains("\"findings_truncated\":true")
+    );
+
+    let mut oversized = evidence;
+    oversized.findings[0].timestamp = "x".repeat(MAX_REPORT_BYTES);
+    assert_eq!(
+        write_test_evidence(
+            &root,
+            "oversized-output",
+            &oversized,
+            &expected_owned_state(Mode::Audit, &allowances)
+        )
+        .unwrap_err()
+        .code,
+        "evidence_report_too_large"
+    );
+    assert!(audit.rollback_pre_activation().unwrap());
 }
 
 #[test]
@@ -579,6 +653,23 @@ assert s.recv(2) == b"ok"
         PYTHON,
         &["-c", script, address, protocol, &port.to_string(), payload],
     )
+}
+
+fn emit_sampled_udp_traffic(namespace: &str, address: &str, port: u16, count: u64) {
+    let script = r#"
+import socket, sys, time
+address, port, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect((address, port))
+for _ in range(count):
+    s.send(b"x")
+    time.sleep(0.0125)
+"#;
+    assert!(in_namespace_status(
+        namespace,
+        PYTHON,
+        &["-c", script, address, &port.to_string(), &count.to_string()],
+    ));
 }
 
 fn start_nflog_worker(
