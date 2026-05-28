@@ -7,6 +7,9 @@ pub mod findings;
 pub mod hosted_runner;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
+pub mod lifecycle;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub mod nflog;
 pub mod nft;
 #[doc(hidden)]
@@ -14,6 +17,9 @@ pub mod nft_backend;
 pub mod output;
 pub mod plan;
 pub mod resolver;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod runtime;
 pub mod support;
 
 use serde::Serialize;
