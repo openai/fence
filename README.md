@@ -3,6 +3,8 @@
 [![lint](https://github.com/GrantBirki/fence/actions/workflows/lint.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/lint.yml)
 [![test](https://github.com/GrantBirki/fence/actions/workflows/test.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/test.yml)
 [![build](https://github.com/GrantBirki/fence/actions/workflows/build.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/build.yml)
+[![acceptance](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)
+[![privileged-integration](https://github.com/GrantBirki/fence/actions/workflows/privileged-integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/privileged-integration.yml)
 
 Fence is an early-stage, source-auditable Rust project for hardening supported
 CI runners against undeclared outbound network access and ordinary
@@ -21,6 +23,11 @@ privileged test namespaces on `ubuntu-24.04`. The event path immediately
 reduces a bounded packet prefix to approved endpoint metadata and never writes
 raw packet bytes to evidence. This is test-only proof, not a usable protection
 mode.
+
+Pull requests also build a Linux x64 package independently and execute that
+artifact through the Phase 2 JSON CLI contract. This proves the distributed
+binary remains non-enforcing and fail-closed; it is not a public GitHub Action
+or a protection claim.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -125,6 +132,9 @@ CI additionally runs `script/validate-locks --ci` and
 `script/prepare-rust` before entering the offline script surface. Hosted
 runners are not fully air-gapped: checkout, action loading, Rust preparation,
 artifact operations, and release publication still require network access.
+On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
+artifact's public non-enforcing contract separately from the privileged
+namespace evidence workflow.
 
 ## Phase 2 CLI
 
@@ -143,6 +153,12 @@ script/build
 The last command intentionally returns an `enforcement_not_implemented` error
 through Phase 2. Do not use this planner or its ruleset preview as a runner
 security control.
+
+A public GitHub Action wrapper is deferred until a later protected lifecycle
+can truthfully establish readiness. That future wrapper is intended to live
+in this repository and carry a reviewed Linux binary in an immutable action
+reference; Phase 2 does not publish an `action.yml` interface or download an
+agent at workflow runtime.
 
 ## Release Baseline
 

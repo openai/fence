@@ -1,0 +1,236 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 1 ]]; then
+  die "usage: script/test-package-smoke <path-to-fence-binary>"
+fi
+
+binary="$1"
+fixture="$DIR/tests/fixtures/acceptance/block-literal-policy.json"
+runtime_directory="/run/fence/package-acceptance"
+
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "packaged public-contract smoke tests require Linux x86_64"
+fi
+
+require_cmd python3
+require_cmd sudo
+
+if [[ ! -x /usr/sbin/nft ]]; then
+  die "packaged public-contract smoke tests require executable /usr/sbin/nft"
+fi
+if [[ ! -f "$binary" || ! -x "$binary" ]]; then
+  die "packaged public-contract smoke tests require an executable Fence binary: $binary"
+fi
+if [[ ! -f "$fixture" ]]; then
+  die "missing packaged public-contract fixture: ${fixture#$DIR/}"
+fi
+
+temporary_directory="$(make_temp_dir fence-package-smoke)"
+cleanup() {
+  remove_generated_path "$temporary_directory" "packaged public-contract smoke directory"
+}
+trap cleanup EXIT
+
+assert_no_owned_table() {
+  local phase="$1"
+  local snapshot="$temporary_directory/nft-${phase}.json"
+
+  sudo /usr/sbin/nft -j list tables > "$snapshot"
+  python3 - "$snapshot" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    document = json.load(source)
+
+for item in document.get("nftables", []):
+    table = item.get("table")
+    if table and table.get("family") == "inet" and table.get("name") == "fence_v0":
+        raise SystemExit("owned table inet fence_v0 unexpectedly exists")
+PY
+}
+
+assert_no_runtime_state() {
+  if [[ -e "$runtime_directory" ]]; then
+    die "public Phase 2 command unexpectedly created runtime state: $runtime_directory"
+  fi
+}
+
+capture_command() {
+  local label="$1"
+  shift
+  local status
+
+  set +e
+  "$binary" "$@" > "$temporary_directory/${label}.stdout" 2> "$temporary_directory/${label}.stderr"
+  status="$?"
+  set -e
+  printf '%s\n' "$status" > "$temporary_directory/${label}.status"
+}
+
+assert_status() {
+  local label="$1"
+  local expected="$2"
+  local actual
+
+  actual="$(tr -d '[:space:]' < "$temporary_directory/${label}.status")"
+  if [[ "$actual" != "$expected" ]]; then
+    die "unexpected exit status for $label (expected ${expected}, found ${actual})"
+  fi
+}
+
+assert_empty_file() {
+  local path="$1"
+  local description="$2"
+
+  if [[ -s "$path" ]]; then
+    die "$description must be empty"
+  fi
+}
+
+assert_no_owned_table before
+assert_no_runtime_state
+
+capture_command version --version
+assert_status version 0
+assert_empty_file "$temporary_directory/version.stderr" "version stderr"
+python3 - "$temporary_directory/version.stdout" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    result = json.load(source)
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(result["schema_version"] == 1, "version response schema mismatch")
+require(result["command"] == "version", "version command field mismatch")
+require(result["status"] == "success", "version response status mismatch")
+require(result["fence_version"] == "0.0.0", "version envelope version mismatch")
+require(result["data"]["implementation_phase"] == "phase2", "version phase mismatch")
+require(result["data"]["protection_available"] is False, "version reported protection")
+PY
+
+capture_command support check-support
+assert_status support 0
+assert_empty_file "$temporary_directory/support.stderr" "check-support stderr"
+python3 - "$temporary_directory/support.stdout" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    result = json.load(source)
+
+data = result["data"]
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(result["schema_version"] == 1, "support response schema mismatch")
+require(result["command"] == "check-support", "support command field mismatch")
+require(result["status"] == "success", "support response status mismatch")
+require(result["fence_version"] == "0.0.0", "support envelope version mismatch")
+require(data["implementation_phase"] == "phase2", "support phase mismatch")
+require(data["intended_protected_target_match"] is True, "support target mismatch")
+require(data["protection_available"] is False, "support reported protection")
+require(
+    "public_enforcement_not_activated" in data["reasons"],
+    "support omitted public-enforcement reason",
+)
+require("lockdown_not_implemented" in data["reasons"], "support omitted lockdown reason")
+require(
+    data["network_backend"]["required"] == "native_nftables",
+    "support backend requirement mismatch",
+)
+require(
+    data["network_backend"]["nft_binary_expected_path"] == "/usr/sbin/nft",
+    "support nft path mismatch",
+)
+require(data["network_backend"]["nft_binary_present"] is True, "support omitted nft binary")
+PY
+
+capture_command plan-first render-plan --config "$fixture"
+capture_command plan-second render-plan --config "$fixture"
+assert_status plan-first 0
+assert_status plan-second 0
+assert_empty_file "$temporary_directory/plan-first.stderr" "first render-plan stderr"
+assert_empty_file "$temporary_directory/plan-second.stderr" "second render-plan stderr"
+cmp -s "$temporary_directory/plan-first.stdout" "$temporary_directory/plan-second.stdout" ||
+  die "render-plan output must be deterministic for the literal-address fixture"
+python3 - "$temporary_directory/plan-first.stdout" <<'PY'
+import json
+import re
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    result = json.load(source)
+
+data = result["data"]
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(result["schema_version"] == 1, "plan response schema mismatch")
+require(result["command"] == "render-plan", "plan command field mismatch")
+require(result["status"] == "success", "plan response status mismatch")
+require(result["fence_version"] == "0.0.0", "plan envelope version mismatch")
+require(data["implementation_phase"] == "phase2", "plan phase mismatch")
+require(data["policy_hash_schema_version"] == 2, "plan policy hash schema mismatch")
+require(re.fullmatch(r"[0-9a-f]{64}", data["policy_hash"]), "invalid policy hash")
+require(re.fullmatch(r"[0-9a-f]{64}", data["ruleset_hash"]), "invalid ruleset hash")
+require(data["application_status"] == "not_applied", "plan reported application")
+require(data["verification_status"] == "not_verified", "plan reported verification")
+require(
+    data["derived_runtime_paths"]["directory"] == "/run/fence/package-acceptance",
+    "plan runtime directory mismatch",
+)
+require(
+    data["network_enforcement_preview"]["activation_status"] == "not_applied",
+    "network preview reported activation",
+)
+require(
+    data["network_enforcement_preview"]["owned_table"]
+    == {"family": "inet", "name": "fence_v0", "single_active_invocation": True},
+    "owned table preview mismatch",
+)
+require(data["network_enforcement_preview"]["nflog"]["group"] == 4242, "nflog group mismatch")
+PY
+
+sentinel="$temporary_directory/nonexistent-run-config.json"
+capture_command run run --config "$sentinel"
+assert_status run 1
+assert_empty_file "$temporary_directory/run.stdout" "run stdout"
+python3 - "$temporary_directory/run.stderr" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as source:
+    result = json.load(source)
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(result["schema_version"] == 1, "run response schema mismatch")
+require(result["command"] == "run", "run command field mismatch")
+require(result["status"] == "error", "run response status mismatch")
+require(result["fence_version"] == "0.0.0", "run envelope version mismatch")
+require(
+    result["error"]["code"] == "enforcement_not_implemented",
+    "run did not fail closed",
+)
+PY
+if [[ -e "$sentinel" ]]; then
+  die "run unexpectedly materialized its nonexistent configuration path"
+fi
+
+assert_no_owned_table after
+assert_no_runtime_state
+
+echo -e "${GREEN}packaged public Phase 2 CLI contract verified${OFF}"

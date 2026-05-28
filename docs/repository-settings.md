@@ -7,10 +7,14 @@ Some security controls cannot be fully represented in tracked files. Configure t
 - Require a pull request before merging.
 - Require CODEOWNER review.
 - Require status checks before merge:
-  - `lint`
-  - `test`
-  - `coverage`
   - `build`
+  - `coverage`
+  - `lint (macos-14)`
+  - `lint (ubuntu-24.04)`
+  - `packaged public contract`
+  - `privileged network evidence`
+  - `test (macos-14)`
+  - `test (ubuntu-24.04)`
 - Require branches to be up to date before merging if that matches the repository's merge policy.
 - Block force-pushes.
 - Block branch deletion.
@@ -27,7 +31,10 @@ Some security controls cannot be fully represented in tracked files. Configure t
 - Keep portable lint/test validation separate from protected-platform claims; fixed macOS validation does not constitute macOS enforcement support.
 - Protected package and release jobs should run only on GitHub-hosted `ubuntu-24.04` x64 and publish only the `x86_64-unknown-linux-gnu` agent artifact until an additional protected target is implemented and tested.
 - Keep the `build` workflow as the PR-based Linux x64 package smoke test: validate locks, prepare Rust, bootstrap, then run native release-mode packaging.
+- Keep the `acceptance` workflow as the distinct Linux x64 packaged public-contract gate: independently package the current commit, verify its checksum, then execute `script/test-package-smoke`.
+- Keep the `privileged-integration` workflow required as the distinct namespace-isolated native network-evidence gate; it does not assert public protection.
 - Exercise retained Zig/`cargo-zigbuild` inputs through a separate offline installation/verification smoke job; those inputs are reserved for future cross-platform investigation and are not current release artifacts.
+- Do not add a public root `action.yml` before the protected lifecycle exists. A later wrapper should remain in this repository and be consumed externally only through an immutable reference.
 - If an egress-blocking action is added, apply it to build/test/package jobs after checkout and before scripts run. Do not apply it to release publishing, signing, or verification jobs unless those jobs are split into an explicitly GitHub-network-allowed phase.
 
 ## CODEOWNERS
