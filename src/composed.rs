@@ -6,7 +6,9 @@ use crate::lifecycle::{
 };
 use crate::lockdown::{LockdownControl, LockdownError, SystemLockdownControl};
 use crate::nft::{NetworkEvidenceCounters, OwnedNftState, expected_owned_state};
-use crate::plan::{AssuranceStatus, PlanData};
+use crate::plan::{
+    AssuranceStatus, GITHUB_HOSTED_JOB_STATUS_PROFILE_ID, PlanData, PlatformProfilePlan,
+};
 use crate::runtime::{RuntimeError, TestRuntimeStore};
 use serde::Serialize;
 use std::path::Path;
@@ -14,8 +16,84 @@ use std::time::{Duration, Instant};
 
 pub const COMPOSED_EVIDENCE_STATUS: &str = "composed_lifecycle_test_only";
 pub const COMPOSED_READY_STATUS: &str = "composed_test_only_ready_no_protection";
+pub const HOST_BLOCK_CANDIDATE_EVIDENCE_STATUS: &str = "host_block_candidate_test_only";
+pub const HOST_BLOCK_CANDIDATE_READY_STATUS: &str =
+    "host_block_candidate_ready_no_public_activation";
 const FINDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CRITICAL_FINDINGS: usize = 64;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum EvidenceScope {
+    NamespaceComposition,
+    HostBlockCandidate,
+}
+
+impl EvidenceScope {
+    fn status(self) -> &'static str {
+        match self {
+            Self::NamespaceComposition => COMPOSED_EVIDENCE_STATUS,
+            Self::HostBlockCandidate => HOST_BLOCK_CANDIDATE_EVIDENCE_STATUS,
+        }
+    }
+
+    fn ready_status(self) -> &'static str {
+        match self {
+            Self::NamespaceComposition => COMPOSED_READY_STATUS,
+            Self::HostBlockCandidate => HOST_BLOCK_CANDIDATE_READY_STATUS,
+        }
+    }
+
+    fn assurance_status(self) -> &'static str {
+        match self {
+            Self::NamespaceComposition => "composed_controls_verified_test_only",
+            Self::HostBlockCandidate => "host_block_candidate_verified_test_only",
+        }
+    }
+
+    fn resident_setup_status(self) -> &'static str {
+        match self {
+            Self::NamespaceComposition => "resident_composed_test_only",
+            Self::HostBlockCandidate => "resident_host_block_candidate_test_only",
+        }
+    }
+
+    fn limitations(self) -> Vec<&'static str> {
+        match self {
+            Self::NamespaceComposition => vec![
+                "composed_lifecycle_test_only_no_public_activation",
+                "network_policy_is_namespace_isolated_not_host_protection",
+                "no_platform_profile_or_host_finalization_proof",
+                "packet_prefixes_transiently_inspected_in_memory_not_serialized",
+            ],
+            Self::HostBlockCandidate => vec![
+                "candidate_profile_explicit_not_default",
+                "github_hosted_job_status_v1",
+                "no_public_activation",
+                "no_post_ready_artifact_or_cache_support",
+                "permitted_status_channel_is_an_exfiltration_limitation",
+                "packet_prefixes_transiently_inspected_in_memory_not_serialized",
+            ],
+        }
+    }
+
+    fn ready_limitations(self) -> Vec<&'static str> {
+        match self {
+            Self::NamespaceComposition => vec![
+                "composed_lifecycle_test_only_no_public_activation",
+                "network_policy_is_namespace_isolated_not_host_protection",
+                "test_ready_is_not_a_protection_assertion",
+            ],
+            Self::HostBlockCandidate => vec![
+                "candidate_profile_explicit_not_default",
+                "github_hosted_job_status_v1",
+                "no_public_activation",
+                "no_post_ready_artifact_or_cache_support",
+                "permitted_status_channel_is_an_exfiltration_limitation",
+                "test_ready_is_not_a_public_protection_assertion",
+            ],
+        }
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ComposedError {
@@ -57,6 +135,7 @@ pub struct ComposedEvidence {
     pub assurance_status: &'static str,
     pub policy_hash: String,
     pub ruleset_hash: String,
+    pub platform_profile: PlatformProfilePlan,
     pub setup_status: &'static str,
     pub network_application_status: &'static str,
     pub network_verification_status: &'static str,
@@ -102,6 +181,7 @@ pub struct ComposedSession<N: ResidentNetwork, C: LockdownControl> {
     evidence: ComposedEvidence,
     findings: FindingCollection,
     next_verification: Duration,
+    scope: EvidenceScope,
 }
 
 impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
@@ -111,11 +191,27 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
         network: N,
         lockdown: C,
     ) -> Result<Self, ComposedError> {
+        Self::establish_with_scope(
+            runtime,
+            plan,
+            network,
+            lockdown,
+            EvidenceScope::NamespaceComposition,
+        )
+    }
+
+    fn establish_with_scope(
+        runtime: TestRuntimeStore,
+        plan: &PlanData,
+        network: N,
+        lockdown: C,
+        scope: EvidenceScope,
+    ) -> Result<Self, ComposedError> {
         validate_standard_block_plan(plan)?;
         let expected_state = expected_owned_state(plan.selected_mode, &plan.effective_policy);
-        let evidence = initial_evidence(plan);
+        let evidence = initial_evidence(plan, scope);
         runtime.write_state_exclusive(&ComposedState {
-            status: COMPOSED_EVIDENCE_STATUS,
+            status: scope.status(),
             mode: plan.selected_mode,
             policy_hash: &plan.policy_hash,
             ruleset_hash: &plan.ruleset_hash,
@@ -132,6 +228,7 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
             evidence,
             findings: FindingCollection::empty(),
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
+            scope,
         };
         if let Err(error) = session.establish_controls(plan) {
             session.rollback_failed_setup();
@@ -144,22 +241,18 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
             return Err(error.into());
         }
         if let Err(error) = session.runtime.write_ready_exclusive(&ComposedReady {
-            status: COMPOSED_READY_STATUS,
+            status: scope.ready_status(),
             mode: plan.selected_mode,
             policy_hash: &plan.policy_hash,
             ruleset_hash: &plan.ruleset_hash,
             protection_available: false,
-            limitations: vec![
-                "composed_lifecycle_test_only_no_public_activation",
-                "network_policy_is_namespace_isolated_not_host_protection",
-                "test_ready_is_not_a_protection_assertion",
-            ],
+            limitations: scope.ready_limitations(),
         }) {
             session.rollback_failed_setup();
             return Err(error.into());
         }
-        session.evidence.setup_status = "resident_composed_test_only";
-        session.evidence.readiness_status = COMPOSED_READY_STATUS;
+        session.evidence.setup_status = scope.resident_setup_status();
+        session.evidence.readiness_status = scope.ready_status();
         session.runtime.replace_report(&session.evidence)?;
         Ok(session)
     }
@@ -232,7 +325,14 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
                 self.evidence.network_verification_status = "critical_drift";
                 self.record_critical(
                     "composed_network_drift",
-                    "namespace-isolated owned nftables state drifted after test readiness",
+                    match self.scope {
+                        EvidenceScope::NamespaceComposition => {
+                            "namespace-isolated owned nftables state drifted after test readiness"
+                        }
+                        EvidenceScope::HostBlockCandidate => {
+                            "host owned nftables state drifted after candidate test readiness"
+                        }
+                    },
                 );
             }
             if self.lockdown.verify_sudo_disabled().is_err() {
@@ -289,13 +389,14 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
     }
 }
 
-fn initial_evidence(plan: &PlanData) -> ComposedEvidence {
+fn initial_evidence(plan: &PlanData, scope: EvidenceScope) -> ComposedEvidence {
     ComposedEvidence {
-        status: COMPOSED_EVIDENCE_STATUS,
+        status: scope.status(),
         mode: plan.selected_mode,
-        assurance_status: "composed_controls_verified_test_only",
+        assurance_status: scope.assurance_status(),
         policy_hash: plan.policy_hash.clone(),
         ruleset_hash: plan.ruleset_hash.clone(),
+        platform_profile: plan.platform_profile.clone(),
         setup_status: "setting_up",
         network_application_status: "not_applied",
         network_verification_status: "not_verified",
@@ -313,12 +414,7 @@ fn initial_evidence(plan: &PlanData) -> ComposedEvidence {
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
         protection_available: false,
-        limitations: vec![
-            "composed_lifecycle_test_only_no_public_activation",
-            "network_policy_is_namespace_isolated_not_host_protection",
-            "no_platform_profile_or_host_finalization_proof",
-            "packet_prefixes_transiently_inspected_in_memory_not_serialized",
-        ],
+        limitations: scope.limitations(),
     }
 }
 
@@ -335,6 +431,20 @@ fn validate_standard_block_plan(plan: &PlanData) -> Result<(), ComposedError> {
     Ok(())
 }
 
+fn validate_host_block_candidate_plan(plan: &PlanData) -> Result<(), ComposedError> {
+    validate_standard_block_plan(plan)?;
+    if plan.platform_profile.id != GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+        || plan.platform_profile.selection_status != "explicit_candidate_not_default"
+        || !plan.requested_policy.is_empty()
+    {
+        return Err(ComposedError::new(
+            "invalid_host_block_candidate_policy",
+            "host block candidate accepts only the explicit static job-status profile with no user allowances",
+        ));
+    }
+    Ok(())
+}
+
 pub fn run_composed_standard_test_service(
     unit_name: &str,
     runtime_root: &Path,
@@ -345,6 +455,29 @@ pub fn run_composed_standard_test_service(
     let network = NativeResidentNetwork::in_current_namespace();
     let lockdown = SystemLockdownControl::new(&runtime.directory);
     let mut session = ComposedSession::establish_test_only(runtime, plan, network, lockdown)?;
+    let start = Instant::now();
+    loop {
+        session.poll_once(start.elapsed(), FINDING_POLL_INTERVAL)?;
+    }
+}
+
+pub fn run_host_block_candidate_test_service(
+    unit_name: &str,
+    runtime_root: &Path,
+    plan: &PlanData,
+) -> Result<(), ComposedError> {
+    validate_test_service_context(unit_name)?;
+    validate_host_block_candidate_plan(plan)?;
+    let runtime = TestRuntimeStore::create(runtime_root, &plan.invocation_id)?;
+    let network = NativeResidentNetwork::in_current_namespace();
+    let lockdown = SystemLockdownControl::new(&runtime.directory);
+    let mut session = ComposedSession::establish_with_scope(
+        runtime,
+        plan,
+        network,
+        lockdown,
+        EvidenceScope::HostBlockCandidate,
+    )?;
     let start = Instant::now();
     loop {
         session.poll_once(start.elapsed(), FINDING_POLL_INTERVAL)?;
@@ -370,6 +503,22 @@ mod tests {
     impl Resolver for LiteralResolver {
         fn resolve(&self, _hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
             panic!("composed lifecycle fixtures contain literal destinations only");
+        }
+    }
+
+    struct JobStatusResolver;
+
+    impl Resolver for JobStatusResolver {
+        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
+            let address = match hostname {
+                "pipelines.actions.githubusercontent.com" => "192.0.2.10",
+                "results-receiver.actions.githubusercontent.com" => "192.0.2.11",
+                _ => panic!("unexpected static status profile hostname"),
+            };
+            Ok(Resolution {
+                addresses: vec![address.parse().unwrap()],
+                elapsed: Duration::from_millis(1),
+            })
         }
     }
 
@@ -480,6 +629,17 @@ mod tests {
         .unwrap()
     }
 
+    fn candidate_plan(invocation: &str) -> PlanData {
+        let json = format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation}","platform_profile":"github_hosted_job_status_v1","container_policy":"disable","allowances":[]}}"#
+        );
+        build_plan(
+            parse_and_normalize(json.as_bytes()).unwrap(),
+            &JobStatusResolver,
+        )
+        .unwrap()
+    }
+
     fn runtime(invocation: &str) -> TestRuntimeStore {
         let root = std::path::PathBuf::from(format!(
             "target/tmp/composed-unit-{}",
@@ -542,6 +702,65 @@ mod tests {
                 .contains("\"protection_available\":false")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn labels_static_profile_candidate_without_a_public_protection_assertion() {
+        let operations = Rc::new(RefCell::new(Vec::new()));
+        let (network, lockdown) = fakes(&operations);
+        let runtime = runtime("host-candidate");
+        let ready = runtime.ready.clone();
+        let root = runtime.directory.parent().unwrap().to_path_buf();
+        let session = ComposedSession::establish_with_scope(
+            runtime,
+            &candidate_plan("host-candidate"),
+            network,
+            lockdown,
+            EvidenceScope::HostBlockCandidate,
+        )
+        .unwrap();
+        assert_eq!(
+            session.evidence.status,
+            HOST_BLOCK_CANDIDATE_EVIDENCE_STATUS
+        );
+        assert_eq!(
+            session.evidence.readiness_status,
+            HOST_BLOCK_CANDIDATE_READY_STATUS
+        );
+        assert_eq!(
+            session.evidence.platform_profile.id,
+            GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+        );
+        assert!(
+            session
+                .evidence
+                .limitations
+                .contains(&"candidate_profile_explicit_not_default")
+        );
+        let serialized = fs::read_to_string(ready).unwrap();
+        assert!(serialized.contains(HOST_BLOCK_CANDIDATE_READY_STATUS));
+        assert!(serialized.contains("\"protection_available\":false"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn accepts_only_explicit_static_profile_for_host_block_candidate() {
+        validate_host_block_candidate_plan(&candidate_plan("candidate-profile")).unwrap();
+        let no_profile = validate_host_block_candidate_plan(&plan("candidate-none")).unwrap_err();
+        assert_eq!(no_profile.code, "invalid_host_block_candidate_policy");
+
+        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"candidate-user","platform_profile":"github_hosted_job_status_v1","container_policy":"disable","allowances":[{"destination_type":"ip","destination":"192.0.2.12","protocol":"tcp","port":443}]}"#;
+        let with_user_rule = build_plan(
+            parse_and_normalize(json.as_bytes()).unwrap(),
+            &JobStatusResolver,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_host_block_candidate_plan(&with_user_rule)
+                .unwrap_err()
+                .code,
+            "invalid_host_block_candidate_policy"
+        );
     }
 
     #[test]

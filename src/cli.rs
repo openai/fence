@@ -126,6 +126,23 @@ mod tests {
         }
     }
 
+    struct StaticStatusResolver;
+
+    impl Resolver for StaticStatusResolver {
+        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
+            let address = if hostname == "pipelines.actions.githubusercontent.com" {
+                "192.0.2.10"
+            } else {
+                assert_eq!(hostname, "results-receiver.actions.githubusercontent.com");
+                "192.0.2.11"
+            };
+            Ok(Resolution {
+                addresses: vec![address.parse().unwrap()],
+                elapsed: Duration::from_millis(1),
+            })
+        }
+    }
+
     struct LinuxProvider;
 
     impl SupportProvider for LinuxProvider {
@@ -195,5 +212,43 @@ mod tests {
 
         assert_eq!(output.exit_code, 1);
         assert!(output.json.contains("dns_resolution_failed"));
+    }
+
+    #[test]
+    fn render_plan_exposes_explicit_static_status_profile_without_activation() {
+        let root = std::path::Path::new("target/tmp/cli-unit-tests");
+        std::fs::create_dir_all(root).unwrap();
+        let config = root.join("static-status-profile.json");
+        std::fs::write(
+            &config,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_job_status_v1","allowances":[]}"#,
+        )
+        .unwrap();
+
+        let output = execute(
+            ["fence", "render-plan", "--config", config.to_str().unwrap()]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &StaticStatusResolver,
+            &LinuxProvider,
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output
+                .json
+                .contains("\"id\":\"github_hosted_job_status_v1\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"selection_status\":\"explicit_candidate_not_default\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"application_status\":\"not_applied\"")
+        );
     }
 }
