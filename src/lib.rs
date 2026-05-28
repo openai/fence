@@ -4,6 +4,8 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod nft;
+#[doc(hidden)]
+pub mod nft_backend;
 pub mod output;
 pub mod plan;
 pub mod resolver;

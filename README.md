@@ -9,11 +9,15 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current Phase 2A executable strictly
+Fence is not an enforcement agent yet. The current Phase 2B executable strictly
 validates local JSON policy, renders a frozen policy and deterministic native
 `nftables` ruleset preview, and reports read-only host support observations. It
 never applies a network boundary, changes privilege state, writes readiness, or
 reports protection as available.
+
+Phase 2B additionally exercises native apply, verification, rollback, and
+forwarded-path behavior in disposable privileged test namespaces on
+`ubuntu-24.04`. That evidence is test-only and is not a usable protection mode.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -117,7 +121,7 @@ CI additionally runs `script/validate-locks --ci` and
 runners are not fully air-gapped: checkout, action loading, Rust preparation,
 artifact operations, and release publication still require network access.
 
-## Phase 2A CLI
+## Phase 2 CLI
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
@@ -132,7 +136,7 @@ script/build
 ```
 
 The last command intentionally returns an `enforcement_not_implemented` error
-in Phase 2A. Do not use this planner or its ruleset preview as a runner
+through Phase 2. Do not use this planner or its ruleset preview as a runner
 security control.
 
 ## Release Baseline

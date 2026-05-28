@@ -1,0 +1,68 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-privileged"
+fi
+
+ensure_rust_toolchain
+require_cmd cargo
+require_cmd sudo
+require_cmd ip
+require_cmd python3
+require_cmd ping
+
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "privileged network evidence tests require Linux x86_64"
+fi
+if [[ ! -x /usr/sbin/nft ]]; then
+  die "privileged network evidence tests require executable /usr/sbin/nft"
+fi
+
+evidence_root="$(make_temp_dir fence-privileged-evidence "$RUNNER_TEMP")"
+probe_namespace="fence-probe-$$"
+target_root="$RUNNER_TEMP/fence-privileged-target"
+mkdir -p "$target_root"
+
+cleanup() {
+  sudo /usr/sbin/ip netns del "$probe_namespace" >/dev/null 2>&1 || true
+  if [[ -d "$evidence_root" ]]; then
+    sudo chown -R "$(id -u):$(id -g)" "$evidence_root" >/dev/null 2>&1 || true
+    remove_generated_path "$evidence_root" "privileged evidence directory" || true
+  fi
+}
+trap cleanup EXIT
+
+sudo /usr/sbin/ip netns add "$probe_namespace"
+sudo /usr/sbin/ip -n "$probe_namespace" link set lo up
+sudo /usr/sbin/ip netns exec "$probe_namespace" /usr/sbin/nft list ruleset >/dev/null
+sudo /usr/sbin/ip netns exec "$probe_namespace" /usr/sbin/ip -6 addr show dev lo >/dev/null
+
+# Parse a bounded NFLOG rule in an isolated namespace; userspace event ingestion is Phase 2C.
+printf '%s\n' \
+  'create table inet fence_probe' \
+  'add chain inet fence_probe output { type filter hook output priority 10; policy accept; }' \
+  'add rule inet fence_probe output limit rate 100/second burst 100 packets log group 4242 prefix "fence-probe" queue-threshold 1 snaplen 64 accept' |
+  sudo /usr/sbin/ip netns exec "$probe_namespace" /usr/sbin/nft -f -
+
+export CARGO_TARGET_DIR="$target_root"
+cargo test --frozen --test privileged --no-run
+
+sudo env \
+  "PATH=$PATH" \
+  "HOME=$HOME" \
+  "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+  "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
+  "CARGO_NET_OFFLINE=$CARGO_NET_OFFLINE" \
+  "RUSTUP_OFFLINE=$RUSTUP_OFFLINE" \
+  "RUSTUP_AUTO_INSTALL=$RUSTUP_AUTO_INSTALL" \
+  "RUNNER_TEMP=$RUNNER_TEMP" \
+  "TMPDIR=${TMPDIR:-$RUNNER_TEMP}" \
+  "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" \
+  "FENCE_PRIVILEGED_TEST_ROOT=$evidence_root" \
+  cargo test --frozen --test privileged -- --ignored --test-threads=1
+
+echo -e "${GREEN}privileged network enforcement test evidence verified${OFF}"
