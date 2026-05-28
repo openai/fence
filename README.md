@@ -40,7 +40,12 @@ platform profile from observed addresses. Separate disposable-host
 finalization experiments applied the same controls with zero allowances and
 with only GitHub's documented log/summary receiver permitted; each completed
 local assertions but failed to yield a terminal successful hosted job while
-the controls remained resident. No built-in platform profile is selected.
+the controls remained resident. A Phase 4B experiment then permitted exactly
+the GitHub-owned pipelines and results-receiver HTTPS endpoints in three
+independent hosted jobs. All three completed their visible local steps but
+remained non-terminal past the configured five-minute observation limit, so
+that candidate was rejected as insufficient. No built-in platform profile is
+selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -188,7 +193,13 @@ evidence does not protect the workflow host network and cannot be used as a
 runner security control. Phase 4A host-block finalization experiments are
 recorded as negative evidence: strict zero-egress and a candidate permitting
 only the documented log/summary receiver both stranded hosted job completion.
-They do not activate the public agent or justify a default platform profile.
+Phase 4B also rejected a static candidate permitting only
+`pipelines.actions.githubusercontent.com:443` and
+`results-receiver.actions.githubusercontent.com:443`: three independent jobs
+completed visible local assertions and remained non-terminal past the
+five-minute observation limit while controls were resident. These negative
+results do not activate the public agent or justify a default platform
+profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
