@@ -268,13 +268,13 @@ If any version file changes, update docs and verify the corresponding script beh
 ## CI Expectations
 
 - The `build` workflow is the PR-based native Linux x64 package smoke test. It should validate locks, prepare Rust, run `script/bootstrap`, and run `script/build --release --targets "x86_64-unknown-linux-gnu"` on `ubuntu-24.04`.
-- The `acceptance` workflow should run only on `ubuntu-24.04`, build its own Linux x64 package from the current commit, verify its checksum, and invoke `script/test-package-smoke` as the `packaged public contract` check.
+- The `acceptance` workflow should run only on `ubuntu-24.04`, build its own Linux x64 package from the current commit, verify its checksum, and invoke `script/test-package-smoke` as the `acceptance` check.
 - The `build` workflow should exercise retained Zig/`cargo-zigbuild` artifacts in a distinct offline install/verify smoke job. That job is not a protected release artifact claim.
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
 - Hosted coverage workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/install-test-tools`, then `script/bootstrap`, then `script/test --coverage`.
-- The `privileged-integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` evidence.
-- `acceptance` and `privileged-integration` must remain separate evidence boundaries: the former exercises the packaged non-enforcing CLI, while the latter proves privileged kernel/network behavior in disposable namespaces.
+- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` evidence.
+- `acceptance` and `integration` must remain separate evidence boundaries: the former exercises the packaged non-enforcing CLI, while the latter proves privileged kernel/network behavior in disposable namespaces.
 - Hosted validation should rely on offline defaults from `script/env` after explicit preparation completes.
 - Do not add Rust toolchain setup actions to hosted lint/test/build workflows; use `script/prepare-rust` so the preparation path stays explicit, checksum-gated, and repo-owned.
 - The first publishable agent release build job should run on `ubuntu-24.04`, run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then `script/build --release --targets "x86_64-unknown-linux-gnu"`.
@@ -322,7 +322,7 @@ Tests are a design requirement for Fence.
 - Use integration tests for IO and process behavior, but do not substitute a few broad end-to-end tests for meaningful unit coverage.
 - The default first-party target is 100% line, function, and region coverage through `script/test --coverage`.
 - Document explicit coverage exceptions in the change that introduces them. Acceptable exceptions are narrow: unreachable defensive code, platform-specific code not runnable on the current CI host, generated code, or behavior proven by a separate higher-fidelity test harness.
-- `src/nft_backend.rs` and `src/nflog.rs` are explicit Phase 2 exceptions: their privileged execution, kernel-state, and netlink-socket failure paths are validated by `privileged-integration`, while deterministic normalization and prefix-to-metadata logic retain ordinary unit tests.
+- `src/nft_backend.rs` and `src/nflog.rs` are explicit Phase 2 exceptions: their privileged execution, kernel-state, and netlink-socket failure paths are validated by `integration`, while deterministic normalization and prefix-to-metadata logic retain ordinary unit tests.
 - Do not enable branch coverage with `cargo-llvm-cov` until that support is stable. Region coverage is the stable high-granularity gate for now.
 - Do not add `cargo-tarpaulin` or another coverage tool just because it is locally installed; `cargo-llvm-cov` is the repo-owned coverage path.
 

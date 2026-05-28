@@ -1,4 +1,4 @@
-name: privileged-integration
+name: integration
 
 on:
   push:
@@ -20,8 +20,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  network-evidence:
-    name: privileged network evidence
+  integration:
+    name: integration
     runs-on: ubuntu-24.04
 
     steps:
@@ -39,5 +39,5 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: prove native network behavior in isolated namespaces
+      - name: test network evidence
         run: script/test-privileged

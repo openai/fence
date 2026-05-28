@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  package-linux-x64:
+  build:
     name: build
     runs-on: ubuntu-24.04
     env:
