@@ -297,9 +297,11 @@ impl<N: ResidentNetwork> ResidentSession<N> {
         finding_timeout: Duration,
     ) -> Result<(), LifecycleError> {
         let mut changed = false;
+        let mut finding_received = false;
         match self.network.next_finding(finding_timeout) {
             Ok(Some(finding)) => {
                 self.findings.record_finding(finding);
+                finding_received = true;
                 changed = true;
             }
             Ok(None) => {}
@@ -311,7 +313,8 @@ impl<N: ResidentNetwork> ResidentSession<N> {
                 changed = true;
             }
         }
-        if elapsed >= self.next_verification {
+        let verification_due = elapsed >= self.next_verification;
+        if verification_due {
             match self.network.verify_owned_state(&self.expected_state) {
                 Ok(()) => {
                     self.evidence.verification_status = "verified";
@@ -333,6 +336,14 @@ impl<N: ResidentNetwork> ResidentSession<N> {
             }
             self.next_verification = elapsed + RESIDENT_VERIFICATION_INTERVAL;
             changed = true;
+        } else if finding_received {
+            match self.network.total_violation_packets() {
+                Ok(total) => self.evidence.counters.total_violations = total,
+                Err(_) => self.record_critical(
+                    "resident_counter_read_failed",
+                    "owned violation counter could not be read after a sampled finding",
+                ),
+            }
         }
         if changed {
             self.evidence.findings = self.findings.retained.clone();
@@ -544,6 +555,7 @@ mod tests {
             "t".to_owned(),
             &[0],
         ))));
+        network.total = VecDeque::from([Ok(0), Ok(1), Ok(1)]);
         let mut session = ResidentSession::establish_test_only(runtime, &plan, network).unwrap();
         assert_eq!(
             *session.network.operations.borrow(),
@@ -553,6 +565,8 @@ mod tests {
             .poll_once(Duration::from_secs(4), Duration::ZERO)
             .unwrap();
         assert_eq!(session.evidence.verification_status, "verified");
+        assert_eq!(session.evidence.counters.sampled_violations, 1);
+        assert_eq!(session.evidence.counters.total_violations, 1);
         session
             .poll_once(Duration::from_secs(5), Duration::ZERO)
             .unwrap();
