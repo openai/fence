@@ -20,8 +20,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lockdown:
+    name: lockdown ${{ matrix.scenario }} evidence
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [audit, rollback, unsafe-preserve]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: test lockdown evidence
+        run: script/test-lockdown "${{ matrix.scenario }}"
+
   integration:
     name: integration
+    needs: lockdown
     runs-on: ubuntu-24.04
 
     steps:
@@ -44,3 +74,6 @@ jobs:
 
       - name: test resident lifecycle evidence
         run: script/test-privileged
+
+      - name: test standard lockdown evidence
+        run: script/test-lockdown standard

@@ -10,6 +10,9 @@ pub mod hosted_runner;
 pub mod lifecycle;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
+pub mod lockdown;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
 pub mod nflog;
 pub mod nft;
 #[doc(hidden)]

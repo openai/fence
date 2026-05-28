@@ -34,16 +34,16 @@ pub struct TestRuntimeStore {
 impl TestRuntimeStore {
     pub fn create(root: &Path, invocation_id: &str) -> Result<Self, RuntimeError> {
         validate_slug(invocation_id)?;
-        if root.starts_with("/run/fence") {
+        if root == Path::new("/run/fence") || root.starts_with("/run/fence/") {
             return Err(RuntimeError::new(
                 "production_runtime_not_activated",
                 "test-only lifecycle evidence cannot write the production runtime root",
             ));
         }
-        create_private_directory_root(root)?;
+        create_owned_reportable_directory_root(root)?;
         let directory = root.join(invocation_id);
         fs::create_dir(&directory).map_err(|error| io_error("runtime_create_failed", error))?;
-        set_directory_mode(&directory, 0o700)?;
+        set_directory_mode(&directory, 0o755)?;
         require_real_directory(&directory)?;
         Ok(Self {
             state: directory.join("state.json"),
@@ -70,13 +70,13 @@ impl TestRuntimeStore {
     }
 }
 
-fn create_private_directory_root(root: &Path) -> Result<(), RuntimeError> {
+fn create_owned_reportable_directory_root(root: &Path) -> Result<(), RuntimeError> {
     if root.exists() {
         require_real_directory(root)?;
     } else {
         fs::create_dir_all(root).map_err(|error| io_error("runtime_create_failed", error))?;
     }
-    set_directory_mode(root, 0o700)?;
+    set_directory_mode(root, 0o755)?;
     require_real_directory(root)
 }
 
@@ -86,7 +86,7 @@ fn require_real_directory(path: &Path) -> Result<(), RuntimeError> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(RuntimeError::new(
             "unsafe_runtime_directory",
-            "runtime storage must be a real private directory",
+            "runtime storage must be a real root-owned directory",
         ));
     }
     Ok(())
@@ -180,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn creates_private_test_storage_and_atomically_replaces_reports() {
+    fn creates_root_owned_readable_evidence_storage_and_atomically_replaces_reports() {
         let root = root();
         let _ = fs::remove_dir_all(&root);
         let store = TestRuntimeStore::create(&root, "resident-proof").unwrap();
@@ -212,7 +212,7 @@ mod tests {
         assert!(!store.directory.join("report.json.next").exists());
         assert_eq!(
             fs::metadata(&store.directory).unwrap().permissions().mode() & 0o777,
-            0o700
+            0o755
         );
         assert_eq!(
             fs::metadata(&store.state).unwrap().permissions().mode() & 0o777,

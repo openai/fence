@@ -11,7 +11,7 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current Phase 3B executable builds
+Fence is not an enforcement agent yet. The current Phase 3C executable builds
 on the Phase 2 network-evidence backend: it strictly validates local JSON
 policy, renders a frozen policy and deterministic native `nftables` ruleset
 preview, and reports an accepted but not runtime-checked hosted-runner
@@ -24,9 +24,13 @@ forwarded-path behavior, and bounded NFLOG connection findings in disposable
 privileged test namespaces on `ubuntu-24.04`. The event path immediately
 reduces a bounded packet prefix to approved endpoint metadata and never writes
 raw packet bytes to evidence. This is test-only proof, not a usable protection
-mode. Phase 3B extends that proof with a transient `systemd` service, secure
-test runtime state, test-only readiness, five-second resident verification,
-critical drift reporting, and pre-ready rollback.
+mode. Phase 3B extends that proof with a transient `systemd` service,
+root-owned test runtime state, test-only readiness, five-second resident
+verification, critical drift reporting, and pre-ready rollback. Phase 3C adds
+separate disposable-runner evidence for measured sudo and Docker/containerd
+lockdown, rollback, degraded container preservation, and audit preservation.
+It emits no lockdown readiness and does not yet compose host network policy
+with host lockdown.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -142,7 +146,7 @@ On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
 artifact's public non-enforcing contract separately from
 `script/observe-hosted-runner` and the privileged namespace evidence workflow.
 
-## Phase 3B CLI
+## Phase 3C CLI
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
@@ -160,8 +164,10 @@ script/build
 
 The last command intentionally returns an `enforcement_not_implemented` error
 through the Phase 3 evidence-only slices. Privileged hosted tests may emit
-explicitly test-only resident evidence, but public CLI execution cannot. Do not use this planner or its
-ruleset preview as a runner security control.
+explicitly test-only resident or lockdown evidence; only resident
+namespace-local network evidence emits test-only readiness, and public CLI
+execution cannot. Do not use this planner or its ruleset preview as a runner
+security control.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

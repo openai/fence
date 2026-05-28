@@ -1,0 +1,126 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 1 ]]; then
+  die "usage: script/test-lockdown <audit|rollback|unsafe-preserve|standard>"
+fi
+
+scenario="$1"
+case "$scenario" in
+  audit|rollback|unsafe-preserve|standard) ;;
+  *) die "unknown lockdown evidence scenario: $scenario" ;;
+esac
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "lockdown evidence scenarios run only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "lockdown evidence scenarios require Linux x86_64"
+fi
+
+ensure_rust_toolchain
+require_cmd cargo
+require_cmd docker
+require_cmd python3
+require_cmd sudo
+
+for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/sbin/visudo; do
+  if [[ ! -x "$required" ]]; then
+    die "lockdown evidence requires executable $required"
+  fi
+done
+
+target_root="$RUNNER_TEMP/fence-lockdown-target-$scenario"
+mkdir -p "$target_root"
+export CARGO_TARGET_DIR="$target_root"
+cargo test --frozen --test lockdown --no-run
+
+shopt -s nullglob
+test_binaries=()
+for candidate in "$target_root"/debug/deps/lockdown-*; do
+  if [[ -f "$candidate" && -x "$candidate" ]]; then
+    test_binaries+=("$candidate")
+  fi
+done
+if [[ "${#test_binaries[@]}" -ne 1 ]]; then
+  die "expected exactly one compiled lockdown evidence test binary"
+fi
+
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
+invocation="lockdown-${scenario}-${suffix}"
+unit="fence-evidence-${invocation}.service"
+runtime_root="/run/fence-lockdown-evidence-${scenario}-${suffix}"
+report="$runtime_root/$invocation/report.json"
+
+# This service mutates only a disposable hosted runner. Standard and degraded
+# evidence deliberately leave successful lockdown state in place until VM
+# teardown; no restore command is issued after verified evidence.
+sudo /usr/bin/systemd-run \
+  --quiet \
+  --wait \
+  --pipe \
+  --collect \
+  --property=Type=exec \
+  --unit "$unit" \
+  --setenv=FENCE_LOCKDOWN_WORKER=1 \
+  "--setenv=FENCE_LOCKDOWN_UNIT=$unit" \
+  "--setenv=FENCE_LOCKDOWN_ROOT=$runtime_root" \
+  "--setenv=FENCE_LOCKDOWN_INVOCATION=$invocation" \
+  "--setenv=FENCE_LOCKDOWN_SCENARIO=$scenario" \
+  "${test_binaries[0]}" --ignored --exact lockdown_service_worker --nocapture
+
+python3 - "$scenario" "$report" "$runtime_root/$invocation/ready.json" "/run/fence/$invocation/ready.json" <<'PY'
+import json
+import pathlib
+import sys
+
+scenario, report_path, test_ready_path, production_ready_path = sys.argv[1:]
+report = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
+assert report["status"] == "lockdown_evidence_test_only"
+assert report["protection_available"] is False
+assert report["readiness_status"] == "not_emitted"
+assert not pathlib.Path(test_ready_path).exists()
+assert not pathlib.Path(production_ready_path).exists()
+if scenario == "audit":
+    assert report["assurance_status"] == "audit_observation_only"
+    assert report["sudo_status"] == "preserved"
+    assert report["container_status"] == "preserved"
+elif scenario == "unsafe-preserve":
+    assert report["assurance_status"] == "degraded_container_control_preserved"
+    assert report["sudo_status"] == "disabled_verified"
+    assert report["container_status"] == "preserved_unsafe"
+elif scenario == "standard":
+    assert report["assurance_status"] == "lockdown_controls_verified_test_only"
+    assert report["sudo_status"] == "disabled_verified"
+    assert report["container_status"] == "disabled_verified"
+elif scenario == "rollback":
+    assert report["setup_status"] == "failed_pre_ready", report
+    assert report["rollback_status"] == "rolled_back_pre_ready", report
+    assert "rollback_error_code" not in report, report
+PY
+
+case "$scenario" in
+  audit|rollback)
+    sudo --non-interactive /usr/bin/true
+    docker ps --quiet >/dev/null
+    ;;
+  unsafe-preserve)
+    if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
+      die "unsafe-preserve evidence did not disable runner passwordless sudo"
+    fi
+    docker ps --quiet >/dev/null
+    ;;
+  standard)
+    if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
+      die "standard lockdown evidence did not disable runner passwordless sudo"
+    fi
+    if docker ps --quiet >/dev/null 2>&1; then
+      die "standard lockdown evidence did not disable runner Docker access"
+    fi
+    ;;
+esac
+
+echo -e "${GREEN}hosted lockdown test evidence verified: $scenario${OFF}"
