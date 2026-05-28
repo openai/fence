@@ -660,9 +660,8 @@ fn emit_sampled_udp_traffic(namespace: &str, address: &str, port: u16, count: u6
 import socket, sys, time
 address, port, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.connect((address, port))
 for _ in range(count):
-    s.send(b"x")
+    s.sendto(b"x", (address, port))
     time.sleep(0.0125)
 "#;
     assert!(in_namespace_status(
