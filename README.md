@@ -36,11 +36,11 @@ runner teardown. A follow-up composed evidence service applies block rules
 only inside a disposable network namespace while disabling the measured host
 sudo/container paths in one transient service. Neither path emits protection
 readiness, applies blocking policy to the host network, or selects an implicit
-platform profile from observed addresses. A strict-none host attempt completed
-its local checks but did not produce a completed workflow result before
-cancellation. A follow-up candidate therefore allows only GitHub's documented
-log/summary receiver as an explicit test allowance while keeping public
-profile selection deferred.
+platform profile from observed addresses. Separate disposable-host
+finalization experiments applied the same controls with zero allowances and
+with only GitHub's documented log/summary receiver permitted; each completed
+local assertions but failed to yield a terminal successful hosted job while
+the controls remained resident. No built-in platform profile is selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -162,10 +162,6 @@ evidence, not part of the offline developer script contract.
 It separately runs `script/test-composed`, whose block-mode network rules are
 confined to a disposable namespace while the associated host lockdown remains
 test-only evidence on an ephemeral runner.
-It also runs `script/test-host-block-candidate` on a separate disposable runner
-to determine whether a minimal job can finish while host block mode, sudo
-lockdown, and container lockdown remain installed with only an explicit test
-allowance for GitHub's documented log/summary receiver.
 
 ## Phase 4A Evidence Boundary
 
@@ -189,11 +185,10 @@ explicitly test-only resident, lockdown, or composed evidence. Resident
 network measurement and composed namespace-network evidence may emit
 non-protecting test readiness; public CLI execution cannot. The composed
 evidence does not protect the workflow host network and cannot be used as a
-runner security control. The host candidate may block its disposable host
-network only under CI evidence labels and encodes its one documented
-log-receiver allowance as test policy, not a selected built-in profile;
-success proves only that minimal test path and does not activate the public
-agent.
+runner security control. Phase 4A host-block finalization experiments are
+recorded as negative evidence: strict zero-egress and a candidate permitting
+only the documented log/summary receiver both stranded hosted job completion.
+They do not activate the public agent or justify a default platform profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

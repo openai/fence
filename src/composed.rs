@@ -1,4 +1,4 @@
-use crate::config::{ContainerPolicy, DestinationType, Mode, Protocol};
+use crate::config::{ContainerPolicy, Mode};
 use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
 use crate::lifecycle::{
     CriticalFinding, LifecycleError, NativeResidentNetwork, RESIDENT_VERIFICATION_INTERVAL,
@@ -14,84 +14,8 @@ use std::time::{Duration, Instant};
 
 pub const COMPOSED_EVIDENCE_STATUS: &str = "composed_lifecycle_test_only";
 pub const COMPOSED_READY_STATUS: &str = "composed_test_only_ready_no_protection";
-pub const HOST_BLOCK_CANDIDATE_EVIDENCE_STATUS: &str = "host_block_candidate_test_only";
-pub const HOST_BLOCK_CANDIDATE_READY_STATUS: &str =
-    "host_block_candidate_ready_no_public_activation";
 const FINDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CRITICAL_FINDINGS: usize = 64;
-const DOCUMENTED_RESULTS_RECEIVER: &str = "results-receiver.actions.githubusercontent.com";
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum EvidenceScope {
-    NamespaceComposition,
-    HostBlockCandidate,
-}
-
-impl EvidenceScope {
-    fn status(self) -> &'static str {
-        match self {
-            Self::NamespaceComposition => COMPOSED_EVIDENCE_STATUS,
-            Self::HostBlockCandidate => HOST_BLOCK_CANDIDATE_EVIDENCE_STATUS,
-        }
-    }
-
-    fn ready_status(self) -> &'static str {
-        match self {
-            Self::NamespaceComposition => COMPOSED_READY_STATUS,
-            Self::HostBlockCandidate => HOST_BLOCK_CANDIDATE_READY_STATUS,
-        }
-    }
-
-    fn assurance_status(self) -> &'static str {
-        match self {
-            Self::NamespaceComposition => "composed_controls_verified_test_only",
-            Self::HostBlockCandidate => "host_block_candidate_verified_test_only",
-        }
-    }
-
-    fn resident_setup_status(self) -> &'static str {
-        match self {
-            Self::NamespaceComposition => "resident_composed_test_only",
-            Self::HostBlockCandidate => "resident_host_block_candidate_test_only",
-        }
-    }
-
-    fn limitations(self) -> Vec<&'static str> {
-        match self {
-            Self::NamespaceComposition => vec![
-                "composed_lifecycle_test_only_no_public_activation",
-                "network_policy_is_namespace_isolated_not_host_protection",
-                "no_platform_profile_or_host_finalization_proof",
-                "packet_prefixes_transiently_inspected_in_memory_not_serialized",
-            ],
-            Self::HostBlockCandidate => vec![
-                "host_block_candidate_test_only_no_public_activation",
-                "documented_results_receiver_encoded_as_test_allowance_not_selected_profile",
-                "permitted_candidate_destination_is_available_to_later_code",
-                "minimal_finalization_candidate_not_general_compatibility",
-                "no_action_wrapper_or_supported_agent_release",
-                "packet_prefixes_transiently_inspected_in_memory_not_serialized",
-            ],
-        }
-    }
-
-    fn ready_limitations(self) -> Vec<&'static str> {
-        match self {
-            Self::NamespaceComposition => vec![
-                "composed_lifecycle_test_only_no_public_activation",
-                "network_policy_is_namespace_isolated_not_host_protection",
-                "test_ready_is_not_a_protection_assertion",
-            ],
-            Self::HostBlockCandidate => vec![
-                "host_block_candidate_test_only_no_public_activation",
-                "documented_results_receiver_encoded_as_test_allowance_not_selected_profile",
-                "permitted_candidate_destination_is_available_to_later_code",
-                "minimal_finalization_candidate_not_general_compatibility",
-                "test_ready_is_not_a_public_protection_assertion",
-            ],
-        }
-    }
-}
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ComposedError {
@@ -178,7 +102,6 @@ pub struct ComposedSession<N: ResidentNetwork, C: LockdownControl> {
     evidence: ComposedEvidence,
     findings: FindingCollection,
     next_verification: Duration,
-    scope: EvidenceScope,
 }
 
 impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
@@ -188,27 +111,11 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
         network: N,
         lockdown: C,
     ) -> Result<Self, ComposedError> {
-        Self::establish_with_scope(
-            runtime,
-            plan,
-            network,
-            lockdown,
-            EvidenceScope::NamespaceComposition,
-        )
-    }
-
-    fn establish_with_scope(
-        runtime: TestRuntimeStore,
-        plan: &PlanData,
-        network: N,
-        lockdown: C,
-        scope: EvidenceScope,
-    ) -> Result<Self, ComposedError> {
         validate_standard_block_plan(plan)?;
         let expected_state = expected_owned_state(plan.selected_mode, &plan.effective_policy);
-        let evidence = initial_evidence(plan, scope);
+        let evidence = initial_evidence(plan);
         runtime.write_state_exclusive(&ComposedState {
-            status: scope.status(),
+            status: COMPOSED_EVIDENCE_STATUS,
             mode: plan.selected_mode,
             policy_hash: &plan.policy_hash,
             ruleset_hash: &plan.ruleset_hash,
@@ -225,7 +132,6 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
             evidence,
             findings: FindingCollection::empty(),
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
-            scope,
         };
         if let Err(error) = session.establish_controls(plan) {
             session.rollback_failed_setup();
@@ -238,18 +144,22 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
             return Err(error.into());
         }
         if let Err(error) = session.runtime.write_ready_exclusive(&ComposedReady {
-            status: scope.ready_status(),
+            status: COMPOSED_READY_STATUS,
             mode: plan.selected_mode,
             policy_hash: &plan.policy_hash,
             ruleset_hash: &plan.ruleset_hash,
             protection_available: false,
-            limitations: scope.ready_limitations(),
+            limitations: vec![
+                "composed_lifecycle_test_only_no_public_activation",
+                "network_policy_is_namespace_isolated_not_host_protection",
+                "test_ready_is_not_a_protection_assertion",
+            ],
         }) {
             session.rollback_failed_setup();
             return Err(error.into());
         }
-        session.evidence.setup_status = scope.resident_setup_status();
-        session.evidence.readiness_status = scope.ready_status();
+        session.evidence.setup_status = "resident_composed_test_only";
+        session.evidence.readiness_status = COMPOSED_READY_STATUS;
         session.runtime.replace_report(&session.evidence)?;
         Ok(session)
     }
@@ -322,14 +232,7 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
                 self.evidence.network_verification_status = "critical_drift";
                 self.record_critical(
                     "composed_network_drift",
-                    match self.scope {
-                        EvidenceScope::NamespaceComposition => {
-                            "namespace-isolated owned nftables state drifted after test readiness"
-                        }
-                        EvidenceScope::HostBlockCandidate => {
-                            "host owned nftables state drifted after candidate test readiness"
-                        }
-                    },
+                    "namespace-isolated owned nftables state drifted after test readiness",
                 );
             }
             if self.lockdown.verify_sudo_disabled().is_err() {
@@ -386,11 +289,11 @@ impl<N: ResidentNetwork, C: LockdownControl> ComposedSession<N, C> {
     }
 }
 
-fn initial_evidence(plan: &PlanData, scope: EvidenceScope) -> ComposedEvidence {
+fn initial_evidence(plan: &PlanData) -> ComposedEvidence {
     ComposedEvidence {
-        status: scope.status(),
+        status: COMPOSED_EVIDENCE_STATUS,
         mode: plan.selected_mode,
-        assurance_status: scope.assurance_status(),
+        assurance_status: "composed_controls_verified_test_only",
         policy_hash: plan.policy_hash.clone(),
         ruleset_hash: plan.ruleset_hash.clone(),
         setup_status: "setting_up",
@@ -410,7 +313,12 @@ fn initial_evidence(plan: &PlanData, scope: EvidenceScope) -> ComposedEvidence {
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
         protection_available: false,
-        limitations: scope.limitations(),
+        limitations: vec![
+            "composed_lifecycle_test_only_no_public_activation",
+            "network_policy_is_namespace_isolated_not_host_protection",
+            "no_platform_profile_or_host_finalization_proof",
+            "packet_prefixes_transiently_inspected_in_memory_not_serialized",
+        ],
     }
 }
 
@@ -427,25 +335,6 @@ fn validate_standard_block_plan(plan: &PlanData) -> Result<(), ComposedError> {
     Ok(())
 }
 
-fn validate_host_block_candidate_plan(plan: &PlanData) -> Result<(), ComposedError> {
-    validate_standard_block_plan(plan)?;
-    let is_results_receiver_candidate = matches!(
-        plan.requested_policy.as_slice(),
-        [allowance]
-            if allowance.destination_type == DestinationType::Hostname
-                && allowance.destination == DOCUMENTED_RESULTS_RECEIVER
-                && allowance.protocol == Protocol::Tcp
-                && allowance.port == 443
-    );
-    if plan.platform_profile != "none" || !is_results_receiver_candidate {
-        return Err(ComposedError::new(
-            "invalid_host_block_candidate_policy",
-            "host block candidate accepts only the documented results-receiver test allowance",
-        ));
-    }
-    Ok(())
-}
-
 pub fn run_composed_standard_test_service(
     unit_name: &str,
     runtime_root: &Path,
@@ -456,29 +345,6 @@ pub fn run_composed_standard_test_service(
     let network = NativeResidentNetwork::in_current_namespace();
     let lockdown = SystemLockdownControl::new(&runtime.directory);
     let mut session = ComposedSession::establish_test_only(runtime, plan, network, lockdown)?;
-    let start = Instant::now();
-    loop {
-        session.poll_once(start.elapsed(), FINDING_POLL_INTERVAL)?;
-    }
-}
-
-pub fn run_host_block_candidate_test_service(
-    unit_name: &str,
-    runtime_root: &Path,
-    plan: &PlanData,
-) -> Result<(), ComposedError> {
-    validate_test_service_context(unit_name)?;
-    validate_host_block_candidate_plan(plan)?;
-    let runtime = TestRuntimeStore::create(runtime_root, &plan.invocation_id)?;
-    let network = NativeResidentNetwork::in_current_namespace();
-    let lockdown = SystemLockdownControl::new(&runtime.directory);
-    let mut session = ComposedSession::establish_with_scope(
-        runtime,
-        plan,
-        network,
-        lockdown,
-        EvidenceScope::HostBlockCandidate,
-    )?;
     let start = Instant::now();
     loop {
         session.poll_once(start.elapsed(), FINDING_POLL_INTERVAL)?;
@@ -504,18 +370,6 @@ mod tests {
     impl Resolver for LiteralResolver {
         fn resolve(&self, _hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
             panic!("composed lifecycle fixtures contain literal destinations only");
-        }
-    }
-
-    struct DocumentedReceiverResolver;
-
-    impl Resolver for DocumentedReceiverResolver {
-        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
-            assert_eq!(hostname, DOCUMENTED_RESULTS_RECEIVER);
-            Ok(Resolution {
-                addresses: vec!["192.0.2.10".parse().unwrap()],
-                elapsed: Duration::from_millis(1),
-            })
         }
     }
 
@@ -688,67 +542,6 @@ mod tests {
                 .contains("\"protection_available\":false")
         );
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn labels_host_block_candidate_without_a_public_protection_assertion() {
-        let operations = Rc::new(RefCell::new(Vec::new()));
-        let (network, lockdown) = fakes(&operations);
-        let runtime = runtime("host-candidate");
-        let ready = runtime.ready.clone();
-        let root = runtime.directory.parent().unwrap().to_path_buf();
-        let session = ComposedSession::establish_with_scope(
-            runtime,
-            &plan("host-candidate"),
-            network,
-            lockdown,
-            EvidenceScope::HostBlockCandidate,
-        )
-        .unwrap();
-        assert_eq!(
-            session.evidence.status,
-            HOST_BLOCK_CANDIDATE_EVIDENCE_STATUS
-        );
-        assert_eq!(
-            session.evidence.readiness_status,
-            HOST_BLOCK_CANDIDATE_READY_STATUS
-        );
-        assert_eq!(
-            session.evidence.setup_status,
-            "resident_host_block_candidate_test_only"
-        );
-        assert!(session.evidence.limitations.contains(
-            &"documented_results_receiver_encoded_as_test_allowance_not_selected_profile"
-        ));
-        let serialized = fs::read_to_string(ready).unwrap();
-        assert!(serialized.contains(HOST_BLOCK_CANDIDATE_READY_STATUS));
-        assert!(serialized.contains("\"protection_available\":false"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rejects_unreviewed_allowances_for_host_block_candidate() {
-        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"candidate-rule","platform_profile":"none","container_policy":"disable","allowances":[{"destination_type":"ip","destination":"192.0.2.10","protocol":"tcp","port":443}]}"#;
-        let plan = build_plan(
-            parse_and_normalize(json.as_bytes()).unwrap(),
-            &LiteralResolver,
-        )
-        .unwrap();
-        let error = validate_host_block_candidate_plan(&plan).unwrap_err();
-        assert_eq!(error.code, "invalid_host_block_candidate_policy");
-    }
-
-    #[test]
-    fn accepts_only_the_documented_receiver_candidate() {
-        let json = format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"candidate-receiver","platform_profile":"none","container_policy":"disable","allowances":[{{"destination_type":"hostname","destination":"{DOCUMENTED_RESULTS_RECEIVER}","protocol":"tcp","port":443}}]}}"#
-        );
-        let plan = build_plan(
-            parse_and_normalize(json.as_bytes()).unwrap(),
-            &DocumentedReceiverResolver,
-        )
-        .unwrap();
-        validate_host_block_candidate_plan(&plan).unwrap();
     }
 
     #[test]
