@@ -61,23 +61,6 @@ build_date_utc() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
-generate_docs() {
-  local host_bin="$target_dir/$host_target/release/${package_name}"
-  if [[ ! -x "$host_bin" ]]; then
-    warn "host binary not found for docs at ${host_bin}"
-    return
-  fi
-
-  local docs_dir="$dist_dir/docs"
-  mkdir -p "$docs_dir/completions"/{bash,zsh,fish,powershell} "$docs_dir/man"
-
-  "$host_bin" completions bash > "$docs_dir/completions/bash/${package_name}"
-  "$host_bin" completions zsh > "$docs_dir/completions/zsh/_${package_name}"
-  "$host_bin" completions fish > "$docs_dir/completions/fish/${package_name}.fish"
-  "$host_bin" completions powershell > "$docs_dir/completions/powershell/${package_name}.ps1"
-  "$host_bin" man > "$docs_dir/man/${package_name}.1"
-}
-
 release_mode=false
 universal_darwin=false
 dist_dir="$DIR/dist"
@@ -287,10 +270,6 @@ for target in "${targets[@]}"; do
   binary_size=$(ls -lh "$binary_path" | awk '{print $5}')
   echo -e "${GREEN}Built:${OFF} ${dist_name} (${binary_size})"
 done
-
-if [[ "$release_mode" == "true" ]]; then
-  generate_docs
-fi
 
 if [[ "$universal_darwin" == "true" ]]; then
   require_cmd lipo

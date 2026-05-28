@@ -270,7 +270,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Merging a version bump to `main` creates the `vX.Y.Z` release through CI.
 - The release workflow is intentionally not manually dispatchable.
 - Do not create or push release tags manually unless the workflow is intentionally being recovered.
-- Release artifacts should include binaries, completions, man pages, checksums, and attestations.
+- Phase 1 and the first protected release package should include the Linux x64 binary, checksums, and attestations; the narrow four-command agent CLI does not publish generated completion or man-page artifacts.
 - Release timestamps should come from `SOURCE_DATE_EPOCH`, normally the commit timestamp.
 - The first protected agent release artifact is `x86_64-unknown-linux-gnu` only and is supported only on the tested GitHub-hosted `ubuntu-24.04` x64 target.
 
@@ -282,7 +282,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Treat clippy warnings as errors.
 - Keep example code simple, but avoid teaching unsafe or surprising production patterns.
 - Preserve public API stability unless the task explicitly calls for a breaking Fence change.
-- If changing CLI output, completions, man-page behavior, or release archive layout, update README examples.
+- If changing CLI output or release archive layout, update README examples.
 
 ## Testing Standards
 
