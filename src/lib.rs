@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod composed;
 pub mod config;
 pub mod error;
 pub mod findings;
