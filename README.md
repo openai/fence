@@ -36,7 +36,10 @@ runner teardown. A follow-up composed evidence service applies block rules
 only inside a disposable network namespace while disabling the measured host
 sudo/container paths in one transient service. Neither path emits protection
 readiness, applies blocking policy to the host network, or selects an implicit
-platform profile from observed addresses.
+platform profile from observed addresses. A separate strict-none candidate
+job applies the same composed controls to an ephemeral host with no allowances
+to test one minimal finalization path; that evidence is not public activation
+or proof of general workflow compatibility.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -158,6 +161,10 @@ evidence, not part of the offline developer script contract.
 It separately runs `script/test-composed`, whose block-mode network rules are
 confined to a disposable namespace while the associated host lockdown remains
 test-only evidence on an ephemeral runner.
+It also runs `script/test-host-block-candidate` on a separate disposable runner
+to determine whether a minimal job can finish while strict host block mode,
+sudo lockdown, and container lockdown remain installed with
+`platform_profile: "none"`.
 
 ## Phase 4A Evidence Boundary
 
@@ -181,7 +188,9 @@ explicitly test-only resident, lockdown, or composed evidence. Resident
 network measurement and composed namespace-network evidence may emit
 non-protecting test readiness; public CLI execution cannot. The composed
 evidence does not protect the workflow host network and cannot be used as a
-runner security control.
+runner security control. The strict-none host candidate may block its
+disposable host network only under CI evidence labels; success proves only
+that minimal test path and does not activate the public agent.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
