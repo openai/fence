@@ -515,7 +515,11 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
         }
         _ => Err(BackendError::new(
             "unexpected_nft_state",
-            format!("owned nftables table contains malformed rule class {comment}"),
+            bounded_message(&format!(
+                "owned nftables table contains malformed rule class {comment}: {}",
+                serde_json::to_string(expressions)
+                    .unwrap_or_else(|_| "structured-expression-unavailable".to_owned())
+            )),
         )),
     }
 }
