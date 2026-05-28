@@ -67,5 +67,5 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: coverage
+      - name: test with coverage
         run: script/test --coverage

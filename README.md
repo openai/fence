@@ -4,7 +4,7 @@
 [![test](https://github.com/GrantBirki/fence/actions/workflows/test.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/test.yml)
 [![build](https://github.com/GrantBirki/fence/actions/workflows/build.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/build.yml)
 [![acceptance](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)
-[![privileged-integration](https://github.com/GrantBirki/fence/actions/workflows/privileged-integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/privileged-integration.yml)
+[![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
 Fence is an early-stage, source-auditable Rust project for hardening supported
 CI runners against undeclared outbound network access and ordinary

@@ -20,8 +20,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  packaged-public-contract:
-    name: packaged public contract
+  acceptance:
+    name: acceptance
     runs-on: ubuntu-24.04
 
     steps:
