@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current Phase 2C binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. No first-party runtime path reaches native apply/verify/rollback or NFLOG ingestion; the repository exercises those paths only through privileged evidence tests. The complete protected lifecycle is a later reviewed change.
+The current Phase 2C binary is still non-enforcing: `render-plan` emits a deterministic native `nftables` preview, while `run` fails closed and no code writes readiness or claims protection. No first-party runtime path reaches native apply/verify/rollback or NFLOG ingestion; the repository exercises those paths only through privileged evidence tests. A separate packaged-artifact acceptance test executes the distributed CLI shape without claiming protection. The complete protected lifecycle and any public GitHub Action wrapper are later reviewed changes.
 
 ## North-Star Principles
 
@@ -27,7 +27,7 @@ The current Phase 2C binary is still non-enforcing: `render-plan` emits a determ
 
 ## Non-Negotiable Policy
 
-- No network calls during `script/bootstrap`, `script/test`, `script/lint`, `script/build`, or `script/server`.
+- No network calls during `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/lint`, `script/build`, or `script/server`.
 - `script/update` is the only normal Cargo dependency update path and is intentionally online-only.
 - `script/vendor-rust` is the only normal Rust distribution lock refresh path and is intentionally online-only.
 - `script/prepare-rust` is the only normal Rust installation path. It is intentionally online, checksum-gated, and must validate `.cargo/tooling/rust-toolchain.lock.toml` before invoking `rustup`.
@@ -54,8 +54,8 @@ The current Phase 2C binary is still non-enforcing: `render-plan` emits a determ
 
 There are three different levels in this repository. Keep them distinct when editing docs or workflows.
 
-1. Local project workflow: checksum-gated online Rust preparation with `script/prepare-rust` when needed, then offline Cargo validation through vendored sources. `script/bootstrap`, `script/test`, `script/lint`, `script/build`, and `script/server` enforce the offline phase.
-2. GitHub-hosted validation: `lint`, `test`, `coverage`, PR `build`, and release build jobs run `script/validate-locks --ci`, then `script/prepare-rust`, then the normal offline scripts. Hosted runners are not air-gapped infrastructure because checkout, action loading, Rust preparation, and artifact services still use network access.
+1. Local project workflow: checksum-gated online Rust preparation with `script/prepare-rust` when needed, then offline Cargo validation through vendored sources. `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/lint`, `script/build`, and `script/server` enforce the offline phase.
+2. GitHub-hosted validation: `lint`, `test`, `coverage`, PR `build`, packaged-artifact `acceptance`, and release build jobs run `script/validate-locks --ci`, then `script/prepare-rust`, then the normal offline scripts. Hosted runners are not air-gapped infrastructure because checkout, action loading, Rust preparation, and artifact services still use network access.
 3. Egress-blocked build/package jobs: after checkout, action loading, and Rust preparation, native Linux x64 build/test/package scripts can run without third-party network access because application crates are committed. Retained cross-build-tool smoke jobs additionally install committed tool artifacts offline. Release publish/sign/verify jobs still need GitHub API access.
 
 Do not describe GitHub-hosted runners as fully air-gapped. They can validate offline script behavior, but they are not an egress-blocked environment.
@@ -125,6 +125,12 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Runs native apply/verify/rollback and bounded NFLOG collection only inside disposable network namespaces and writes test-only evidence beneath `RUNNER_TEMP`.
   - NFLOG handling may inspect at most the configured 64-byte packet prefix transiently in memory and must serialize approved endpoint metadata only.
   - Must not invoke the public `run` command, create a readiness file, mutate host firewall rules, or make a protection claim.
+
+- `script/test-package-smoke`
+  - Linux x64-only offline packaged-artifact acceptance entrypoint; it accepts exactly one already-built Fence binary path.
+  - Uses only a literal-IP/CIDR policy fixture and Python standard-library JSON parsing; it must not resolve hostnames, install tools, or use network access.
+  - Verifies versioned JSON output, deterministic `render-plan`, fail-closed `run`, no `inet fence_v0` table creation, and no `/run/fence/package-acceptance/` state creation.
+  - Proves only the Phase 2 public CLI contract of a packaged binary; it is distinct from privileged network evidence and cannot make a protection claim.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.
@@ -262,11 +268,13 @@ If any version file changes, update docs and verify the corresponding script beh
 ## CI Expectations
 
 - The `build` workflow is the PR-based native Linux x64 package smoke test. It should validate locks, prepare Rust, run `script/bootstrap`, and run `script/build --release --targets "x86_64-unknown-linux-gnu"` on `ubuntu-24.04`.
+- The `acceptance` workflow should run only on `ubuntu-24.04`, build its own Linux x64 package from the current commit, verify its checksum, and invoke `script/test-package-smoke` as the `packaged public contract` check.
 - The `build` workflow should exercise retained Zig/`cargo-zigbuild` artifacts in a distinct offline install/verify smoke job. That job is not a protected release artifact claim.
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
 - Hosted coverage workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/install-test-tools`, then `script/bootstrap`, then `script/test --coverage`.
 - The `privileged-integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, and invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` evidence.
+- `acceptance` and `privileged-integration` must remain separate evidence boundaries: the former exercises the packaged non-enforcing CLI, while the latter proves privileged kernel/network behavior in disposable namespaces.
 - Hosted validation should rely on offline defaults from `script/env` after explicit preparation completes.
 - Do not add Rust toolchain setup actions to hosted lint/test/build workflows; use `script/prepare-rust` so the preparation path stays explicit, checksum-gated, and repo-owned.
 - The first publishable agent release build job should run on `ubuntu-24.04`, run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then `script/build --release --targets "x86_64-unknown-linux-gnu"`.
@@ -297,6 +305,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Preserve public API stability unless the task explicitly calls for a breaking Fence change.
 - If changing CLI output or release archive layout, update README examples.
 - Until the protected lifecycle is implemented, `run` must remain fail-closed and no first-party code may emit a ready-state protection assertion.
+- Do not add a public `action.yml` wrapper until the protected lifecycle can truthfully report readiness; the intended later wrapper lives in this repository, uses an immutable external reference, carries a reviewed Linux binary, and does not download an agent at runtime.
 
 ## Testing Standards
 
@@ -337,6 +346,7 @@ Update docs in the same PR when changing:
 Use the smallest validation set that proves the change:
 
 - Script/workflow/doc changes: `git diff --check`.
+- Packaged Linux public-contract changes: build the Linux x64 artifact on `ubuntu-24.04`, verify its checksum, then run `script/test-package-smoke <artifact>`.
 - Rust behavior changes: `script/bootstrap`, `script/test`, `script/lint`, and `script/build`.
 - Coverage changes: `script/install-test-tools`, then `script/test --coverage`. Do not add a static coverage badge unless CI enforces and publishes the measured result.
 - Dependency updates: `script/update`, then inspect `Cargo.lock` and `vendor/cache`, then rerun offline validation.

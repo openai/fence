@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "mode": "block",
+  "invocation_id": "package-acceptance",
+  "platform_profile": "none",
+  "container_policy": "disable",
+  "allowances": [
+    {
+      "destination_type": "ip",
+      "destination": "192.0.2.10",
+      "protocol": "tcp",
+      "port": 443
+    },
+    {
+      "destination_type": "cidr",
+      "destination": "2001:db8::/64",
+      "protocol": "udp",
+      "port": 53
+    }
+  ]
+}
