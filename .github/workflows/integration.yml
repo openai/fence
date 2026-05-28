@@ -20,6 +20,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  profile-measurement:
+    name: platform profile measurement
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: start non-blocking host audit measurement
+        run: script/measure-platform-egress start
+
+      - name: exercise GitHub metadata path under audit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api "repos/${GITHUB_REPOSITORY}" --silent
+
+      - name: exercise GitHub artifact path under audit
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # pin@v7.0.0
+        with:
+          name: fence-profile-measurement-${{ github.run_id }}-${{ github.run_attempt }}
+          path: tests/fixtures/acceptance/block-literal-policy.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: emit bounded platform-profile evidence
+        run: script/measure-platform-egress report
+
   lockdown:
     name: lockdown ${{ matrix.scenario }} evidence
     strategy:
@@ -51,7 +92,7 @@ jobs:
 
   integration:
     name: integration
-    needs: lockdown
+    needs: [lockdown, profile-measurement]
     runs-on: ubuntu-24.04
 
     steps:
