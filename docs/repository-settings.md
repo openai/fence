@@ -12,6 +12,7 @@ Some security controls cannot be fully represented in tracked files. Configure t
   - `lint (macos-14)`
   - `lint (ubuntu-24.04)`
   - `acceptance`
+  - `action acceptance`
   - `integration`
   - `test (macos-14)`
   - `test (ubuntu-24.04)`
@@ -32,11 +33,12 @@ Some security controls cannot be fully represented in tracked files. Configure t
 - Protected package and release jobs should run only on GitHub-hosted `ubuntu-24.04` x64 and publish only the `x86_64-unknown-linux-gnu` agent artifact until an additional protected target is implemented and tested.
 - Keep the `build` workflow as the PR-based Linux x64 package smoke test: validate locks, prepare Rust, bootstrap, then run native release-mode packaging.
 - Keep the `acceptance` workflow as the distinct Linux x64 packaged public-contract gate: independently package the current commit, verify its checksum, then execute `script/test-package-smoke` to prove direct invocation rejects an untrusted launcher without mutation.
+- Keep the `action acceptance` workflow as the distinct bundled-wrapper gate: validate the committed release-bound bundle, invoke the root Action through `uses: ./`, and prove standard block, degraded `unsafe_preserve`, and audit behavior on disposable GitHub-hosted runners while controls remain resident.
 - Keep the `integration` workflow required as the distinct hosted-runner observation and privileged lifecycle gate. It includes namespace-isolated native network/resident proof, separate disposable-runner lockdown scenarios, composed namespace-network plus host-lockdown ordering evidence, non-blocking host-audit platform-profile measurement around controlled GitHub service traffic, one disposable selected-profile runtime finalization scenario after six non-required terminal-success proofs, and packaged production-shaped standard block, degraded block, and audit observation transient services. Keep its concurrency commit-scoped because a stranded host-block job may be unable to receive cancellation. The selected-profile worker and protected services select `github_hosted_job_status_v1` by omission and record logical policy, base-ruleset, and active ruleset hashes separately.
 - Keep the `platform selected profile runtime evidence` workflow as the separate three-replica measurement surface for the bounded DNS-mediated Actions-suffix design even after one disposable copy joins required `integration`. Its test-only reports must continue disclosing the bounded DNS timing/count, query-label, CNAME-delegation, HTTPS, and address-plus-port egress limitations.
 - Keep the `platform profile candidate` workflow non-required while it tests explicit disposable-host egress candidates. An open HTTPS-plus-platform-channel baseline reached terminal compatibility, an HTTPS-only reduction stranded one replica, and the reduced HTTPS-plus-UDP-DNS candidate reached terminal compatibility while excluding TCP DNS and host-control allowances. It still permits arbitrary outbound TCP `443` plus UDP DNS to the measured platform resolver, so it is not a public protection gate or a default profile. Keep its concurrency commit-scoped because a deliberately blocking failed candidate may be unable to receive cancellation and must not queue a corrected candidate indefinitely.
 - Exercise retained Zig/`cargo-zigbuild` inputs through a separate offline installation/verification smoke job; those inputs are reserved for future cross-platform investigation and are not current release artifacts.
-- Do not add a public root `action.yml` before the reviewed production modes are complete and an attested alpha binary exists. A later wrapper should remain in this repository and be consumed externally only through an immutable reference.
+- Keep the root `action.yml` wrapper in this repository and document external consumption only through immutable commit SHAs. It must carry a checksum-validated attested Linux release binary, launch the root transient service from fixed local inputs, render bounded local evidence, and avoid runtime agent downloads, policy fetches, stop operations, or access restoration.
 - If an egress-blocking action is added, apply it to build/test/package jobs after checkout and before scripts run. Do not apply it to release publishing, signing, or verification jobs unless those jobs are split into an explicitly GitHub-network-allowed phase.
 
 ## CODEOWNERS
@@ -46,6 +48,8 @@ Require CODEOWNER review for sensitive paths:
 - `.github/workflows/**`
 - `.github/dependabot.yml`
 - `.github/CODEOWNERS`
+- `action.yml`
+- `action/**`
 - `script/**`
 - `.cargo/config.toml`
 - `Cargo.toml`

@@ -167,6 +167,7 @@ fi
 
 script/validate-release-tools
 script/validate-test-tools
+script/validate-action-bundle
 validate_cargo_vendor_surface
 validate_workflow_uses_pinned
 

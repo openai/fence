@@ -1,0 +1,70 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+manifest="$DIR/action/bundle-manifest.json"
+binary="$DIR/action/bin/fence"
+
+require_cmd python3
+
+python3 - "$manifest" "$binary" <<'PY'
+import hashlib
+import json
+import pathlib
+import re
+import stat
+import sys
+
+manifest_path = pathlib.Path(sys.argv[1])
+binary_path = pathlib.Path(sys.argv[2])
+if not manifest_path.is_file() or manifest_path.is_symlink():
+    raise SystemExit(f"missing Action bundle manifest: {manifest_path}")
+if not binary_path.is_file() or binary_path.is_symlink():
+    raise SystemExit(f"missing Action bundle binary: {binary_path}")
+if not binary_path.stat().st_mode & stat.S_IXUSR:
+    raise SystemExit(f"Action bundle binary is not executable: {binary_path}")
+
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+expected_keys = {
+    "schema_version",
+    "repository",
+    "release_tag",
+    "release_url",
+    "source_commit",
+    "artifact_name",
+    "artifact_sha256",
+    "bundle_path",
+    "signer_workflow",
+    "attestation_verified",
+}
+if set(manifest) != expected_keys:
+    raise SystemExit("Action bundle manifest fields do not match the reviewed schema")
+if manifest["schema_version"] != 1:
+    raise SystemExit("Action bundle manifest schema_version must be 1")
+if manifest["repository"] != "GrantBirki/fence":
+    raise SystemExit("Action bundle manifest repository mismatch")
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+", manifest["release_tag"]):
+    raise SystemExit("Action bundle manifest release_tag must identify an alpha release")
+if manifest["release_url"] != f"https://github.com/GrantBirki/fence/releases/tag/{manifest['release_tag']}":
+    raise SystemExit("Action bundle manifest release URL mismatch")
+if not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
+    raise SystemExit("Action bundle manifest source_commit must be a full SHA")
+if manifest["artifact_name"] != f"fence_{manifest['release_tag']}_linux-amd64":
+    raise SystemExit("Action bundle manifest artifact name mismatch")
+if not re.fullmatch(r"[0-9a-f]{64}", manifest["artifact_sha256"]):
+    raise SystemExit("Action bundle manifest artifact checksum is invalid")
+if manifest["bundle_path"] != "action/bin/fence":
+    raise SystemExit("Action bundle manifest path mismatch")
+if manifest["signer_workflow"] != "GrantBirki/fence/.github/workflows/release.yml":
+    raise SystemExit("Action bundle signer workflow mismatch")
+if manifest["attestation_verified"] is not True:
+    raise SystemExit("Action bundle manifest must record successful attestation verification")
+
+actual = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+if actual != manifest["artifact_sha256"]:
+    raise SystemExit("Action bundle binary checksum does not match the manifest")
+PY
+
+echo -e "${GREEN}Action bundle verified${OFF}"

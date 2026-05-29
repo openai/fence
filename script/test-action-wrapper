@@ -1,0 +1,13 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+require_cmd node
+
+node --check action/lib.js
+node --check action/main.js
+node --check action/post.js
+node --check action/test.js
+node action/test.js

@@ -355,11 +355,21 @@ descriptor, applies only non-blocking observation rules, routes host and
 Docker DNS through the local root-resident mediator, and preserves sudo and
 container access. Strict `"none"` activation remains deferred.
 
-A public GitHub Action wrapper is deferred until the attested alpha agent has
-been published and verified. That future wrapper is intended to live in this
-repository and carry the reviewed Linux release binary in an immutable action
-reference; the current project does not publish an `action.yml` interface or
-download an agent at workflow runtime.
+The root `action.yml` wrapper carries an exact, checksum-validated copy of the
+attested Linux alpha binary. It accepts one inline strict-JSON configuration,
+writes the untouched bytes into the pinned root-owned runtime path, launches
+the trusted transient service, waits for agent readiness, and renders bounded
+local evidence from its post hook. It does not download an agent, fetch policy,
+stop the resident service, or restore access at workflow runtime. External
+consumers should pin Fence to a full immutable commit SHA rather than a
+floating branch:
+
+```yaml
+- uses: GrantBirki/fence@<full-commit-sha>
+  with:
+    config: >-
+      {"schema_version":1,"mode":"block","invocation_id":"example-run","allowances":[]}
+```
 
 ## Release Baseline
 
