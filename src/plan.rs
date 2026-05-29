@@ -17,23 +17,15 @@ use std::time::Duration;
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
 pub const POLICY_HASH_SCHEMA_VERSION: u32 = 2;
-pub const GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID: &str =
-    "github_hosted_compatibility_candidate_v1";
-const GITHUB_COMPATIBILITY_HOSTS: [&str; 8] = [
-    "actions-results-receiver-production.githubapp.com",
-    "api.github.com",
-    "github.com",
-    "pipelines.actions.githubusercontent.com",
-    "productionresultssa13.blob.core.windows.net",
-    "productionresultssa17.blob.core.windows.net",
-    "results-receiver.actions.githubusercontent.com",
-    "vstoken.actions.githubusercontent.com",
-];
-const HOSTED_RUNNER_INFRASTRUCTURE_CHANNELS: [(&str, Protocol, u16); 4] = [
-    ("168.63.129.16", Protocol::Udp, 53),
-    ("168.63.129.16", Protocol::Tcp, 53),
-    ("168.63.129.16", Protocol::Tcp, 80),
-    ("168.63.129.16", Protocol::Tcp, 32526),
+pub const GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID: &str =
+    "github_hosted_https_baseline_candidate_v1";
+const HOSTED_HTTPS_BASELINE_CHANNELS: [(DestinationType, &str, Protocol, u16); 6] = [
+    (DestinationType::Cidr, "0.0.0.0/0", Protocol::Tcp, 443),
+    (DestinationType::Cidr, "::/0", Protocol::Tcp, 443),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Udp, 53),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 53),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 80),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 32526),
 ];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -208,15 +200,8 @@ pub fn build_plan(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    let platform_resolution_results = frozen_resolution_results
-        .iter()
-        .filter(|result| {
-            platform_requested_policy
-                .iter()
-                .any(|allowance| allowance.destination == result.hostname)
-        })
-        .cloned()
-        .collect();
+    // The current explicit HTTPS baseline uses only literal rules.
+    let platform_resolution_results = Vec::new();
     let platform_profile = platform_plan(
         config.platform_profile,
         platform_requested_policy,
@@ -291,26 +276,17 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
         PlatformProfile::None => Vec::new(),
-        PlatformProfile::GithubHostedCompatibilityCandidateV1 => {
-            let mut allowances = GITHUB_COMPATIBILITY_HOSTS
-                .iter()
-                .map(|hostname| NormalizedAllowance {
-                    destination_type: DestinationType::Hostname,
-                    destination: (*hostname).to_owned(),
-                    protocol: Protocol::Tcp,
-                    port: 443,
-                })
-                .collect::<Vec<_>>();
-            allowances.extend(HOSTED_RUNNER_INFRASTRUCTURE_CHANNELS.iter().map(
-                |(address, protocol, port)| NormalizedAllowance {
-                    destination_type: DestinationType::Ip,
-                    destination: (*address).to_owned(),
+        PlatformProfile::GithubHostedHttpsBaselineCandidateV1 => HOSTED_HTTPS_BASELINE_CHANNELS
+            .iter()
+            .map(
+                |(destination_type, destination, protocol, port)| NormalizedAllowance {
+                    destination_type: *destination_type,
+                    destination: (*destination).to_owned(),
                     protocol: *protocol,
                     port: *port,
                 },
-            ));
-            allowances
-        }
+            )
+            .collect(),
     }
 }
 
@@ -358,20 +334,20 @@ fn platform_plan(
             frozen_resolution_results,
             limitations: Vec::new(),
         },
-        PlatformProfile::GithubHostedCompatibilityCandidateV1 => PlatformProfilePlan {
-            id: GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID,
-            selection_status: "explicit_broad_candidate_not_default",
-            purpose: "github_hosted_runner_finalization_compatibility",
+        PlatformProfile::GithubHostedHttpsBaselineCandidateV1 => PlatformProfilePlan {
+            id: GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID,
+            selection_status: "explicit_open_https_baseline_not_default",
+            purpose: "github_hosted_runner_terminal_https_baseline",
             requested_allowances,
             effective_allowances,
             frozen_resolution_results,
             limitations: vec![
-                "candidate_is_intentionally_broader_than_job_status_only",
+                "candidate_is_intentionally_open_https_baseline_only",
                 "permitted_platform_destinations_are_available_to_later_workflow_code",
-                "candidate_permits_github_api_web_and_results_storage_endpoints",
                 "candidate_permits_measured_hosted_runner_dns_and_host_control_channels",
+                "candidate_permits_arbitrary_https_egress_for_baseline_only",
                 "candidate_dns_channel_allows_later_workflow_exfiltration",
-                "candidate_results_storage_scope_must_be_reduced_after_compatibility_proof",
+                "candidate_must_be_reduced_before_any_default_profile_decision",
             ],
         },
     }
@@ -547,18 +523,12 @@ mod tests {
     }
 
     #[test]
-    fn models_explicit_broad_compatibility_candidate_separately_from_user_policy() {
-        let responses = (10..18)
-            .map(|suffix| {
-                let address = format!("192.0.2.{suffix}");
-                resolved(&[address.as_str()], Duration::from_millis(1))
-            })
-            .collect();
+    fn models_explicit_https_baseline_candidate_separately_from_user_policy() {
         let candidate = build_plan(
             parse(
-                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
+                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
             ),
-            &resolver(responses),
+            &resolver(vec![]),
         )
         .unwrap();
         let none = build_plan(
@@ -571,34 +541,21 @@ mod tests {
         assert_eq!(candidate.limits.declared_user_allowances, 0);
         assert_eq!(
             candidate.platform_profile.id,
-            GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID
+            GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID
         );
         assert_eq!(
             candidate.platform_profile.selection_status,
-            "explicit_broad_candidate_not_default"
+            "explicit_open_https_baseline_not_default"
         );
-        assert_eq!(
-            candidate
-                .platform_profile
-                .requested_allowances
-                .iter()
-                .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
-                .map(|allowance| allowance.destination.as_str())
-                .collect::<Vec<_>>(),
-            GITHUB_COMPATIBILITY_HOSTS.to_vec()
-        );
-        assert_eq!(candidate.platform_profile.requested_allowances.len(), 12);
-        assert_eq!(candidate.platform_profile.effective_allowances.len(), 12);
-        assert_eq!(
+        assert_eq!(candidate.platform_profile.requested_allowances.len(), 6);
+        assert_eq!(candidate.platform_profile.effective_allowances.len(), 6);
+        assert!(
             candidate
                 .platform_profile
                 .frozen_resolution_results
-                .iter()
-                .map(|result| result.hostname.as_str())
-                .collect::<Vec<_>>(),
-            GITHUB_COMPATIBILITY_HOSTS.to_vec()
+                .is_empty()
         );
-        assert_eq!(candidate.effective_policy.len(), 12);
+        assert_eq!(candidate.effective_policy.len(), 6);
         assert!(
             candidate
                 .platform_profile
@@ -610,6 +567,17 @@ mod tests {
                     port: 53,
                 })
         );
+        assert!(
+            candidate
+                .platform_profile
+                .requested_allowances
+                .contains(&NormalizedAllowance {
+                    destination_type: DestinationType::Cidr,
+                    destination: "0.0.0.0/0".to_owned(),
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                })
+        );
         assert_eq!(none.platform_profile.id, "none");
         assert!(none.platform_profile.requested_allowances.is_empty());
         assert_ne!(candidate.policy_hash, none.policy_hash);
@@ -618,7 +586,7 @@ mod tests {
             candidate
                 .platform_profile
                 .limitations
-                .contains(&"candidate_permits_github_api_web_and_results_storage_endpoints")
+                .contains(&"candidate_permits_arbitrary_https_egress_for_baseline_only")
         );
         assert!(
             candidate
@@ -629,16 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn applies_existing_resolution_failures_to_broad_compatibility_candidate() {
+    fn https_baseline_candidate_requires_no_hostname_resolution() {
         let candidate = parse(
-            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
+            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
         );
-        assert_eq!(
-            build_plan(candidate, &resolver(vec![Err(ResolveError::TimedOut)]))
-                .unwrap_err()
-                .code,
-            "dns_resolution_timeout"
-        );
+        assert!(build_plan(candidate, &resolver(vec![])).is_ok());
     }
 
     #[test]

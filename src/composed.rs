@@ -7,7 +7,7 @@ use crate::lifecycle::{
 use crate::lockdown::{LockdownControl, LockdownError, SystemLockdownControl};
 use crate::nft::{NetworkEvidenceCounters, OwnedNftState, expected_owned_state};
 use crate::plan::{
-    AssuranceStatus, GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID, PlanData,
+    AssuranceStatus, GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID, PlanData,
     PlatformProfilePlan,
 };
 use crate::runtime::{RuntimeError, TestRuntimeStore};
@@ -68,11 +68,11 @@ impl EvidenceScope {
             ],
             Self::HostBlockCandidate => vec![
                 "candidate_profile_explicit_not_default",
-                "github_hosted_compatibility_candidate_v1",
-                "candidate_is_intentionally_broader_than_job_status_only",
+                "github_hosted_https_baseline_candidate_v1",
+                "candidate_is_intentionally_open_https_baseline_only",
                 "no_public_activation",
-                "candidate_permits_results_storage_compatibility_scope",
                 "candidate_permits_measured_hosted_runner_infrastructure_channels",
+                "candidate_permits_arbitrary_https_egress_for_baseline_only",
                 "candidate_dns_channel_allows_later_workflow_exfiltration",
                 "permitted_compatibility_channels_are_an_exfiltration_limitation",
                 "packet_prefixes_transiently_inspected_in_memory_not_serialized",
@@ -89,11 +89,11 @@ impl EvidenceScope {
             ],
             Self::HostBlockCandidate => vec![
                 "candidate_profile_explicit_not_default",
-                "github_hosted_compatibility_candidate_v1",
-                "candidate_is_intentionally_broader_than_job_status_only",
+                "github_hosted_https_baseline_candidate_v1",
+                "candidate_is_intentionally_open_https_baseline_only",
                 "no_public_activation",
-                "candidate_permits_results_storage_compatibility_scope",
                 "candidate_permits_measured_hosted_runner_infrastructure_channels",
+                "candidate_permits_arbitrary_https_egress_for_baseline_only",
                 "candidate_dns_channel_allows_later_workflow_exfiltration",
                 "permitted_compatibility_channels_are_an_exfiltration_limitation",
                 "test_ready_is_not_a_public_protection_assertion",
@@ -440,13 +440,13 @@ fn validate_standard_block_plan(plan: &PlanData) -> Result<(), ComposedError> {
 
 fn validate_host_block_candidate_plan(plan: &PlanData) -> Result<(), ComposedError> {
     validate_standard_block_plan(plan)?;
-    if plan.platform_profile.id != GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID
-        || plan.platform_profile.selection_status != "explicit_broad_candidate_not_default"
+    if plan.platform_profile.id != GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID
+        || plan.platform_profile.selection_status != "explicit_open_https_baseline_not_default"
         || !plan.requested_policy.is_empty()
     {
         return Err(ComposedError::new(
             "invalid_host_block_candidate_policy",
-            "host block candidate accepts only the explicit broad GitHub finalization compatibility profile with no user allowances",
+            "host block candidate accepts only the explicit GitHub-hosted HTTPS baseline profile with no user allowances",
         ));
     }
     Ok(())
@@ -510,28 +510,6 @@ mod tests {
     impl Resolver for LiteralResolver {
         fn resolve(&self, _hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
             panic!("composed lifecycle fixtures contain literal destinations only");
-        }
-    }
-
-    struct CompatibilityResolver;
-
-    impl Resolver for CompatibilityResolver {
-        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
-            let address = match hostname {
-                "actions-results-receiver-production.githubapp.com" => "192.0.2.10",
-                "api.github.com" => "192.0.2.11",
-                "github.com" => "192.0.2.12",
-                "pipelines.actions.githubusercontent.com" => "192.0.2.13",
-                "productionresultssa13.blob.core.windows.net" => "192.0.2.14",
-                "productionresultssa17.blob.core.windows.net" => "192.0.2.15",
-                "results-receiver.actions.githubusercontent.com" => "192.0.2.16",
-                "vstoken.actions.githubusercontent.com" => "192.0.2.17",
-                _ => panic!("unexpected broad compatibility candidate hostname"),
-            };
-            Ok(Resolution {
-                addresses: vec![address.parse().unwrap()],
-                elapsed: Duration::from_millis(1),
-            })
         }
     }
 
@@ -644,11 +622,11 @@ mod tests {
 
     fn candidate_plan(invocation: &str) -> PlanData {
         let json = format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation}","platform_profile":"github_hosted_compatibility_candidate_v1","container_policy":"disable","allowances":[]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation}","platform_profile":"github_hosted_https_baseline_candidate_v1","container_policy":"disable","allowances":[]}}"#
         );
         build_plan(
             parse_and_normalize(json.as_bytes()).unwrap(),
-            &CompatibilityResolver,
+            &LiteralResolver,
         )
         .unwrap()
     }
@@ -718,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_broad_compatibility_candidate_without_a_public_protection_assertion() {
+    fn labels_https_baseline_candidate_without_a_public_protection_assertion() {
         let operations = Rc::new(RefCell::new(Vec::new()));
         let (network, lockdown) = fakes(&operations);
         let runtime = runtime("host-candidate");
@@ -742,13 +720,13 @@ mod tests {
         );
         assert_eq!(
             session.evidence.platform_profile.id,
-            GITHUB_HOSTED_COMPATIBILITY_CANDIDATE_PROFILE_ID
+            GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID
         );
         assert!(
             session
                 .evidence
                 .limitations
-                .contains(&"candidate_is_intentionally_broader_than_job_status_only")
+                .contains(&"candidate_is_intentionally_open_https_baseline_only")
         );
         let serialized = fs::read_to_string(ready).unwrap();
         assert!(serialized.contains(HOST_BLOCK_CANDIDATE_READY_STATUS));
@@ -757,15 +735,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_explicit_broad_profile_for_host_block_candidate() {
+    fn accepts_only_explicit_https_baseline_for_host_block_candidate() {
         validate_host_block_candidate_plan(&candidate_plan("candidate-profile")).unwrap();
         let no_profile = validate_host_block_candidate_plan(&plan("candidate-none")).unwrap_err();
         assert_eq!(no_profile.code, "invalid_host_block_candidate_policy");
 
-        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"candidate-user","platform_profile":"github_hosted_compatibility_candidate_v1","container_policy":"disable","allowances":[{"destination_type":"ip","destination":"192.0.2.18","protocol":"tcp","port":443}]}"#;
+        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"candidate-user","platform_profile":"github_hosted_https_baseline_candidate_v1","container_policy":"disable","allowances":[{"destination_type":"ip","destination":"192.0.2.18","protocol":"tcp","port":443}]}"#;
         let with_user_rule = build_plan(
             parse_and_normalize(json.as_bytes()).unwrap(),
-            &CompatibilityResolver,
+            &LiteralResolver,
         )
         .unwrap();
         assert_eq!(

@@ -44,15 +44,16 @@ the controls remained resident. A Phase 4B experiment then permitted exactly
 the GitHub-owned pipelines and results-receiver HTTPS endpoints in three
 independent hosted jobs. All three completed their visible local steps but
 remained non-terminal past the configured five-minute observation limit, so
-that candidate was rejected as insufficient. A subsequent non-required
-compatibility experiment accepts only an explicit
-`github_hosted_compatibility_candidate_v1` plan: fixed GitHub service and
-results-storage hostnames on TCP `443`, plus the measured hosted-runner
-platform DNS and host-control channels needed to test finalization. It is
-intentionally broader than a final status-only allowlist: the DNS, results,
-and platform channels are usable by later workflow code for egress.
-Constraining or eliminating those channels is follow-up work after
-compatibility proof.
+that candidate was rejected as insufficient. A subsequent experiment allowing
+fixed GitHub service/results-storage hosts and measured hosted-runner
+platform DNS/host-control traffic also finished local completion steps without
+yielding a terminal job result. The current non-required experiment accepts
+only an explicit `github_hosted_https_baseline_candidate_v1` plan: arbitrary
+outbound TCP `443` plus the measured hosted-runner DNS and host-control
+channels. It is intentionally an open diagnostic baseline, not a candidate
+final allowlist: its HTTPS and DNS channels are usable by later workflow code
+for egress. Constraining those channels is required follow-up work after a
+passing baseline.
 It remains test-only and non-default until terminal hosted-runner evidence is
 reviewed; no built-in platform profile is selected.
 
@@ -208,14 +209,15 @@ Phase 4B also rejected a static candidate permitting only
 completed visible local assertions and remained non-terminal past the
 five-minute observation limit while controls were resident. These negative
 results do not activate the public agent or justify a default platform
-profile. A follow-up, non-required candidate may be selected explicitly as
-`github_hosted_compatibility_candidate_v1`; it permits fixed GitHub web/API,
-Actions control-service, results-storage hosts, and measured hosted-runner
-platform DNS/host-control channels for disposable-host compatibility
-evidence. This candidate deliberately trades larger disclosed egress channels,
-including a general DNS channel, for a chance to establish terminal
-hosted-job behavior before a later minimization pass. It is neither a public
-enforcement interface nor a default profile.
+profile. A follow-up fixed-host candidate with measured hosted-runner
+platform DNS/host-control channels also failed to become terminal. The current
+non-required candidate may be selected explicitly as
+`github_hosted_https_baseline_candidate_v1`; it permits arbitrary outbound
+TCP `443` and measured hosted-runner platform DNS/host-control channels for
+disposable-host baseline evidence. This candidate deliberately trades broad
+disclosed egress channels, including general HTTPS and DNS channels, for a
+terminal hosted-job baseline before a later minimization pass. It is neither a
+public enforcement interface nor a default profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

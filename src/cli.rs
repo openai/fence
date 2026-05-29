@@ -126,27 +126,6 @@ mod tests {
         }
     }
 
-    struct BroadCompatibilityResolver;
-
-    impl Resolver for BroadCompatibilityResolver {
-        fn resolve(&self, hostname: &str, _timeout: Duration) -> Result<Resolution, ResolveError> {
-            let address = match hostname {
-                "actions-results-receiver-production.githubapp.com" => "192.0.2.10",
-                "api.github.com" => "192.0.2.11",
-                "github.com" => "192.0.2.12",
-                "pipelines.actions.githubusercontent.com" => "192.0.2.13",
-                "productionresultssa13.blob.core.windows.net" => "192.0.2.14",
-                "productionresultssa17.blob.core.windows.net" => "192.0.2.15",
-                "results-receiver.actions.githubusercontent.com" => "192.0.2.16",
-                _ => "192.0.2.17",
-            };
-            Ok(Resolution {
-                addresses: vec![address.parse().unwrap()],
-                elapsed: Duration::from_millis(1),
-            })
-        }
-    }
-
     struct LinuxProvider;
 
     impl SupportProvider for LinuxProvider {
@@ -219,13 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn render_plan_exposes_explicit_broad_compatibility_candidate_without_activation() {
+    fn render_plan_exposes_explicit_https_baseline_candidate_without_activation() {
         let root = std::path::Path::new("target/tmp/cli-unit-tests");
         std::fs::create_dir_all(root).unwrap();
         let config = root.join("broad-compatibility-profile.json");
         std::fs::write(
             &config,
-            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
         )
         .unwrap();
 
@@ -234,7 +213,7 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect(),
-            &BroadCompatibilityResolver,
+            &FailResolver,
             &LinuxProvider,
         );
 
@@ -242,17 +221,17 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_compatibility_candidate_v1\"")
+                .contains("\"id\":\"github_hosted_https_baseline_candidate_v1\"")
         );
         assert!(
             output
                 .json
-                .contains("\"selection_status\":\"explicit_broad_candidate_not_default\"")
+                .contains("\"selection_status\":\"explicit_open_https_baseline_not_default\"")
         );
         assert!(
             output
                 .json
-                .contains("\"candidate_permits_github_api_web_and_results_storage_endpoints\"")
+                .contains("\"candidate_permits_arbitrary_https_egress_for_baseline_only\"")
         );
         assert!(
             output

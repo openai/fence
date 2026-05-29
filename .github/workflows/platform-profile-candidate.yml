@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   candidate:
-    name: broad compatibility candidate ${{ matrix.replica }}
+    name: https baseline candidate ${{ matrix.replica }}
     timeout-minutes: 8
     runs-on: ubuntu-24.04
     strategy:
@@ -45,7 +45,7 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: run broad GitHub compatibility profile candidate
+      - name: run HTTPS baseline profile candidate
         env:
           PROFILE_CANDIDATE_REPLICA: ${{ matrix.replica }}
         run: script/test-profile-candidate

@@ -53,15 +53,15 @@ pub enum ContainerPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum PlatformProfile {
     None,
-    GithubHostedCompatibilityCandidateV1,
+    GithubHostedHttpsBaselineCandidateV1,
 }
 
 impl PlatformProfile {
     pub fn id(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::GithubHostedCompatibilityCandidateV1 => {
-                "github_hosted_compatibility_candidate_v1"
+            Self::GithubHostedHttpsBaselineCandidateV1 => {
+                "github_hosted_https_baseline_candidate_v1"
             }
         }
     }
@@ -159,13 +159,13 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
     }
     let platform_profile = match input.platform_profile.as_deref().unwrap_or("none") {
         "none" => PlatformProfile::None,
-        "github_hosted_compatibility_candidate_v1" => {
-            PlatformProfile::GithubHostedCompatibilityCandidateV1
+        "github_hosted_https_baseline_candidate_v1" => {
+            PlatformProfile::GithubHostedHttpsBaselineCandidateV1
         }
         _ => {
             return Err(ErrorDetail::new(
                 "invalid_platform_profile",
-                "platform_profile must be none or github_hosted_compatibility_candidate_v1",
+                "platform_profile must be none or github_hosted_https_baseline_candidate_v1",
             )
             .field("platform_profile"));
         }
@@ -437,18 +437,18 @@ mod tests {
     #[test]
     fn accepts_audit_without_lockdown_degraded_block_and_explicit_candidate_profile() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_compatibility_candidate_v1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_compatibility_candidate_v1","container_policy":"unsafe_preserve","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_https_baseline_candidate_v1","container_policy":"unsafe_preserve","allowances":[]}"#,
         )
         .unwrap();
 
         assert_eq!(audit.container_policy, None);
         assert_eq!(
             audit.platform_profile,
-            PlatformProfile::GithubHostedCompatibilityCandidateV1
+            PlatformProfile::GithubHostedHttpsBaselineCandidateV1
         );
         assert_eq!(
             degraded.container_policy,
@@ -456,7 +456,7 @@ mod tests {
         );
         assert_eq!(
             degraded.platform_profile,
-            PlatformProfile::GithubHostedCompatibilityCandidateV1
+            PlatformProfile::GithubHostedHttpsBaselineCandidateV1
         );
     }
 
