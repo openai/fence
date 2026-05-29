@@ -61,6 +61,7 @@ Require CODEOWNER review for sensitive paths:
 
 - Maintain the protected `release` environment.
 - Require reviewer approval before jobs using that environment can publish release assets.
+- Keep immutable releases enabled and create each release with its complete asset list before publication.
 - Keep release publication permissions limited to the release job.
 - Verify release assets after publication by re-downloading them, checking `checksums.txt`, and verifying artifact attestations.
 - Release build jobs should prepare Rust through `script/prepare-rust`, package only the native Linux x64 agent artifact, and must not run direct `curl`, `cargo install --version`, `rustup target add`, or Rust toolchain setup actions outside the repo scripts.
