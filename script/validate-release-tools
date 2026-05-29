@@ -197,6 +197,7 @@ if grep -nE "^[[:space:]]*['\"]?workflow_dispatch['\"]?[[:space:]]*:" "$DIR/.git
 fi
 
 require_pattern "$DIR/.github/workflows/release.yml" 'gh release download "\$tag" --repo' "release verify job must download release assets with an explicit repository"
+require_pattern "$DIR/.github/workflows/release.yml" 'release_args[+]=[(]--prerelease[)]' "release workflow must mark prerelease versions as prereleases"
 require_pattern "$DIR/.github/workflows/build.yml" 'runs-on:[[:space:]]+ubuntu-24[.]04' "build workflow must exercise the supported Ubuntu 24.04 environment"
 require_pattern "$DIR/.github/workflows/build.yml" 'script/prepare-rust' "build workflow must prepare the pinned Rust toolchain explicitly before offline package validation"
 require_pattern "$DIR/.github/workflows/build.yml" 'script/build --release --targets "x86_64-unknown-linux-gnu"' "build workflow must run Linux x64 release-mode packaging"

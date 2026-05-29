@@ -11,12 +11,12 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is still unreleased. The current Phase 4 executable strictly validates
-local JSON policy, renders a frozen policy and deterministic native
-`nftables` ruleset preview, and models the selected bounded DNS-mediated
-hosted job-status compatibility descriptor. On supported GitHub-hosted
-`ubuntu-24.04` x64 runners, the Linux binary can now enter a protected block
-lifecycle only when invoked as root inside its matching trusted transient
+Fence is publishing its first Linux x64 alpha prerelease. The current Phase 4
+executable strictly validates local JSON policy, renders a frozen policy and
+deterministic native `nftables` ruleset preview, and models the selected
+bounded DNS-mediated hosted job-status compatibility descriptor. On supported
+GitHub-hosted `ubuntu-24.04` x64 runners, the Linux binary can now enter a
+protected block lifecycle only when invoked as root inside its matching trusted transient
 `systemd` service with a root-owned configuration. Standard block verifies
 the pinned runner shape, applies and verifies host network policy, disables
 measured passwordless sudo and container control paths, writes production
@@ -152,8 +152,9 @@ artifact through the trusted-launcher JSON CLI boundary. The `integration`
 workflow additionally records a bounded, read-only hosted-runner fingerprint
 observation before its namespace and resident-service evidence tests, and
 runs packaged production-shaped standard block, degraded block, and audit
-observation transient services on disposable runners. This does not publish
-an alpha release or create a GitHub Action interface.
+observation transient services on disposable runners. The `0.1.0-alpha.1`
+publication remains limited to the Linux x64 agent artifact; it does not
+create a GitHub Action interface.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -354,19 +355,18 @@ descriptor, applies only non-blocking observation rules, routes host and
 Docker DNS through the local root-resident mediator, and preserves sudo and
 container access. Strict `"none"` activation remains deferred.
 
-A public GitHub Action wrapper is deferred until a later protected lifecycle
-can truthfully establish readiness and an attested alpha agent has been
-published. That future wrapper is intended to live in this repository and
-carry the reviewed Linux release binary in an immutable action reference; the
-current project does not publish an `action.yml` interface or download an
-agent at workflow runtime.
+A public GitHub Action wrapper is deferred until the attested alpha agent has
+been published and verified. That future wrapper is intended to live in this
+repository and carry the reviewed Linux release binary in an immutable action
+reference; the current project does not publish an `action.yml` interface or
+download an agent at workflow runtime.
 
 ## Release Baseline
 
-The initial package version is `0.0.0`. Importing the initial `Cargo.toml` to
-`main` establishes a baseline and does not publish a release. After the
-security boundary and supported behavior are implemented and reviewed, a
-deliberate version bump merged to `main` is the release trigger.
+The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
+to `main` established a baseline without publishing a release. The current
+`0.1.0-alpha.1` version bump is the first Linux x64 alpha publication trigger.
+Future deliberate version bumps merged to `main` remain release triggers.
 
 The first publishable agent artifact is limited to
 `x86_64-unknown-linux-gnu` and must be proved on GitHub-hosted

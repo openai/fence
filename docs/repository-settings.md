@@ -59,7 +59,7 @@ Require CODEOWNER review for sensitive paths:
 
 ## Releases
 
-- Create a protected `release` environment.
+- Maintain the protected `release` environment.
 - Require reviewer approval before jobs using that environment can publish release assets.
 - Keep release publication permissions limited to the release job.
 - Verify release assets after publication by re-downloading them, checking `checksums.txt`, and verifying artifact attestations.
