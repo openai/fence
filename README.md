@@ -92,7 +92,10 @@ Actions service endpoint. The current exact-services candidate therefore
 authorizes only those three documented names and locally refuses
 suffix-shaped lookalike queries. This remains *test-only*: it neither selects
 a default `platform_profile` nor activates public protection, and terminal
-success must be repeated before any promotion decision. Its reported
+success must be repeated before any promotion decision. A following workflow
+step emits a capped sanitized DNS summary so GitHub-related names refused
+after the initial report snapshot can be reviewed without changing policy.
+Its reported
 limitations also state that the approved HTTPS channels remain usable for
 egress and that resolved address grants may represent colocated services.
 

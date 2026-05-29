@@ -49,3 +49,8 @@ jobs:
         env:
           DNS_BLOCK_CANDIDATE_REPLICA: ${{ matrix.replica }}
         run: script/test-dns-block-candidate
+
+      - name: emit bounded late DNS-mediated evidence
+        env:
+          DNS_BLOCK_CANDIDATE_REPLICA: ${{ matrix.replica }}
+        run: script/report-dns-block-candidate

@@ -161,6 +161,11 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Reports that the approved status HTTPS destinations, their resolved IP-address realization, and the root-resident resolver path remain egress limitations; it cannot become a default protected profile without repeated hosted proof and a separate promotion review.
   - Disables and verifies measured sudo/container paths, leaves all controls resident until ephemeral teardown, writes only `dns_mediated_host_block_candidate_test_only` evidence below `/run/fence-dns-block-candidate-*`, and cannot establish a public protection or default-profile claim.
 
+- `script/report-dns-block-candidate`
+  - Linux x64-only, GitHub-Actions-only late-report helper for the destructive DNS-mediated candidate; do not run it on developer machines or reusable runners.
+  - Reads the existing runner-readable test-only report after the blocking step returns and emits a capped sanitized DNS summary so refused GitHub-related names between workflow steps can be reviewed.
+  - Does not use sudo, mutate policy, select a profile, write readiness, or establish a protection claim.
+
 - `script/test-profile-candidate`
   - Linux x64-only, GitHub-Actions-only destructive compatibility entrypoint; do not run it on developer machines or reusable runners.
   - Launches standard block networking plus measured sudo/container lockdown on the disposable workflow host using only explicit `github_hosted_https_udp_dns_candidate_v1` and zero user allowances.
