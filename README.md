@@ -96,7 +96,9 @@ pipeline roots delegate through bounded Microsoft edge aliases. The current
 candidate therefore authorizes four exact root names and bounded TTL-derived
 CNAME descendants while locally refusing arbitrary suffix-shaped lookalike
 queries. Derived aliases are reported even when delegated DNS operator names
-leave GitHub suffixes. This remains *test-only*:
+leave GitHub suffixes. A resident five-second refresh of the four exact roots
+and a fixed thirty-second HTTPS-rule overlap bridge short DNS TTLs without
+authorizing additional names. This remains *test-only*:
 it neither selects a default `platform_profile` nor activates public
 protection, and terminal success must be repeated before any promotion
 decision. A following workflow step emits a capped sanitized DNS summary so

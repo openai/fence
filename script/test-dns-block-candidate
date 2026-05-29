@@ -109,7 +109,7 @@ assert report["network_verification_status"] == "verified"
 assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
-assert report["materialization_status"] == "bounded_ttl_approved_name_or_cname_descendant_https_only"
+assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_approved_name_or_cname_descendant_https_only"
 assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
@@ -129,10 +129,14 @@ assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_
 assert "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile" in dns["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
+assert "exact_candidate_roots_refresh_every_5_seconds" in dns["limitations"]
+assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
 assert "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile" in report["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
+assert "exact_candidate_roots_refresh_every_5_seconds" in report["limitations"]
+assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in report["limitations"]

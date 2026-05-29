@@ -53,6 +53,8 @@ const MAX_DYNAMIC_MATERIALIZATIONS: usize = 128;
 const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize = 32;
 const MAX_DERIVED_CNAME_DEPTH: u8 = 4;
 const MAX_DYNAMIC_TTL_SECONDS: u32 = 300;
+const DNS_CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration = Duration::from_secs(30);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
 const UPSTREAM_DNS: &str = "168.63.129.16:53";
@@ -666,6 +668,7 @@ struct DnsMediatedBlockSession {
     expected_state: OwnedNftState,
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
+    next_dns_refresh: Duration,
     next_verification: Duration,
 }
 
@@ -787,6 +790,7 @@ impl DnsMediatedBlockSession {
             expected_state,
             evidence,
             findings: FindingCollection::empty(),
+            next_dns_refresh: DNS_CANDIDATE_REFRESH_INTERVAL,
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
         })
     }
@@ -810,6 +814,17 @@ impl DnsMediatedBlockSession {
                 );
                 changed = true;
             }
+        }
+
+        if elapsed >= self.next_dns_refresh {
+            if prehydrate_candidate_names().is_err() {
+                self.record_critical(
+                    "dns_candidate_root_refresh_failed",
+                    "DNS-mediated exact-root refresh failed after test readiness",
+                );
+            }
+            self.next_dns_refresh = elapsed + DNS_CANDIDATE_REFRESH_INTERVAL;
+            changed = true;
         }
 
         let mut proposed = self.active.clone();
@@ -956,7 +971,7 @@ fn initial_dns_block_evidence(
         rollback_status: "not_required",
         ruleset_hash,
         dns_upstream_policy: "root_resident_mediator_only_udp_53",
-        materialization_status: "bounded_ttl_approved_name_or_cname_descendant_https_only",
+        materialization_status: "bounded_ttl_plus_refresh_overlap_approved_name_or_cname_descendant_https_only",
         materialized_https_allowances: report_materializations(active),
         materializations_truncated,
         expired_materializations: 0,
@@ -979,6 +994,8 @@ fn dns_block_limitations() -> Vec<&'static str> {
         "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+        "exact_candidate_roots_refresh_every_5_seconds",
+        "https_materialization_expiry_includes_30_second_refresh_overlap",
         "approved_status_https_destinations_remain_egress_channels",
         "resolved_status_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
@@ -1031,7 +1048,9 @@ fn merge_pending_materializations(
                 hostname: materialization.hostname,
                 address: materialization.address,
                 observed_ttl_seconds: materialization.ttl_seconds,
-                expires_at: now + Duration::from_secs(u64::from(materialization.ttl_seconds)),
+                expires_at: now
+                    + Duration::from_secs(u64::from(materialization.ttl_seconds))
+                    + DNS_MATERIALIZATION_REFRESH_OVERLAP,
             },
         );
         changed = true;
@@ -1709,6 +1728,8 @@ fn evidence_from_state_and_authorizations(
                 "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+                "exact_candidate_roots_refresh_every_5_seconds",
+                "https_materialization_expiry_includes_30_second_refresh_overlap",
                 "dns_answers_materialize_only_bounded_candidate_or_cname_descendant_https_addresses",
                 "approved_status_https_destinations_remain_egress_channels",
                 "resolved_status_ip_addresses_may_serve_additional_destinations",
@@ -2105,6 +2126,11 @@ mod tests {
         );
         let (changed, _, expired) =
             merge_pending_materializations(&mut active, &queue, now + Duration::from_secs(31));
+        assert!(!changed);
+        assert_eq!(expired, 0);
+        assert_eq!(active.len(), 1);
+        let (changed, _, expired) =
+            merge_pending_materializations(&mut active, &queue, now + Duration::from_secs(61));
         assert!(changed);
         assert_eq!(expired, 1);
         assert!(active.is_empty());
