@@ -128,10 +128,12 @@ assert dns["proxy_policy_status"] == "block_forwards_exact_candidate_hostnames_a
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
 assert "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile" in dns["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
+assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
 assert "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile" in report["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
+assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in report["limitations"]
 assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]

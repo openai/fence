@@ -387,12 +387,12 @@ impl ObservationRecorder {
     }
 
     fn record_response(&self, hostname: &str, query_type: u16, packet: &[u8]) {
-        let Some(hostname) =
-            normalize_hostname(hostname).filter(|name| reportable_github_hostname(name))
-        else {
+        let Some(hostname) = normalize_hostname(hostname) else {
             return;
         };
-        if self.scope == DnsEvidenceScope::HostBlockCandidate && self.forward_query(&hostname) {
+        let forwardable_block_response =
+            self.scope == DnsEvidenceScope::HostBlockCandidate && self.forward_query(&hostname);
+        if forwardable_block_response {
             let mut authorizations = self
                 .cname_authorizations
                 .lock()
@@ -404,20 +404,15 @@ impl ObservationRecorder {
             );
         }
         let answers = parse_dns_address_answers(packet);
-        if answers.is_empty() {
-            return;
-        }
-        let classification = self.candidate_classification(&hostname);
-        let key = (hostname.clone(), query_type, classification);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
-        let Some(observation) = state.retained.get_mut(&key) else {
-            return;
-        };
-        retain_address_answers(observation, answers.clone());
-        if self.scope == DnsEvidenceScope::HostBlockCandidate
-            && self.forward_query(&hostname)
-            && let Some(queue) = &self.materializations
-        {
+        if reportable_github_hostname(&hostname) {
+            let classification = self.candidate_classification(&hostname);
+            let key = (hostname, query_type, classification);
+            if let Some(observation) = state.retained.get_mut(&key) {
+                retain_address_answers(observation, answers.clone());
+            }
+        }
+        if forwardable_block_response && let Some(queue) = &self.materializations {
             let mut queue = queue.lock().expect("DNS materialization lock poisoned");
             for answer in answers {
                 let Some(ttl_seconds) =
@@ -983,6 +978,7 @@ fn dns_block_limitations() -> Vec<&'static str> {
         "dns_mediated_host_block_candidate_test_only_no_public_activation",
         "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
+        "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "approved_status_https_destinations_remain_egress_channels",
         "resolved_status_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
@@ -1514,9 +1510,6 @@ fn retain_cname_authorizations(
             if alias.ttl_seconds == 0 || depth > MAX_DERIVED_CNAME_DEPTH {
                 return false;
             }
-            if !reportable_github_hostname(&alias.target) {
-                return false;
-            }
             if !state.active.contains_key(&alias.target)
                 && state.active.len() >= MAX_DERIVED_CNAME_AUTHORIZATIONS
             {
@@ -1715,6 +1708,7 @@ fn evidence_from_state_and_authorizations(
                 "dns_mediated_host_block_candidate_test_only_no_public_activation",
                 "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
+                "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
                 "dns_answers_materialize_only_bounded_candidate_or_cname_descendant_https_addresses",
                 "approved_status_https_destinations_remain_egress_channels",
                 "resolved_status_ip_addresses_may_serve_additional_destinations",
@@ -2011,13 +2005,27 @@ mod tests {
             &mut authorizations,
             [DnsCnameAnswer {
                 owner: "payload.pipelines.actions.githubusercontent.com".to_owned(),
-                target: "unrelated.example.com".to_owned(),
+                target: "edge.example.net".to_owned(),
+                ttl_seconds: 60,
+            }],
+            now,
+        );
+        assert!(authorized_block_candidate_hostname(
+            "edge.example.net",
+            &mut authorizations,
+            now,
+        ));
+        retain_cname_authorizations(
+            &mut authorizations,
+            [DnsCnameAnswer {
+                owner: "unrelated.example.net".to_owned(),
+                target: "not-derived.example.net".to_owned(),
                 ttl_seconds: 60,
             }],
             now,
         );
         assert!(!authorized_block_candidate_hostname(
-            "unrelated.example.com",
+            "not-derived.example.net",
             &mut authorizations,
             now,
         ));

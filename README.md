@@ -91,9 +91,12 @@ checks also identify `vstoken.actions.githubusercontent.com` as a required
 Actions service endpoint. Adding that third name still left hosted jobs
 non-terminal. A bounded late report consistently observed the stable
 `payload.pipelines.actions.githubusercontent.com` service name and a generated
-`glb-...github.com` DNS alias. The current candidate therefore authorizes four
-exact root names and bounded TTL-derived CNAME descendants while locally
-refusing arbitrary suffix-shaped lookalike queries. This remains *test-only*:
+`glb-...github.com` DNS alias. Public DNS inspection also shows that the
+pipeline roots delegate through bounded Microsoft edge aliases. The current
+candidate therefore authorizes four exact root names and bounded TTL-derived
+CNAME descendants while locally refusing arbitrary suffix-shaped lookalike
+queries. Derived aliases are reported even when delegated DNS operator names
+leave GitHub suffixes. This remains *test-only*:
 it neither selects a default `platform_profile` nor activates public
 protection, and terminal success must be repeated before any promotion
 decision. A following workflow step emits a capped sanitized DNS summary so
