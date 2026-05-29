@@ -30,8 +30,8 @@ use std::time::{Duration, Instant};
 
 pub const DNS_MEDIATION_EVIDENCE_STATUS: &str = "dns_mediation_audit_test_only";
 pub const DNS_MEDIATED_GITHUB_CANDIDATE_ID: &str = "github_hosted_dns_mediated_candidate_v1";
-pub const DNS_MEDIATED_EXACT_STATUS_CANDIDATE_ID: &str =
-    "github_hosted_dns_mediated_exact_status_candidate_v1";
+pub const DNS_MEDIATED_EXACT_SERVICES_CANDIDATE_ID: &str =
+    "github_hosted_dns_mediated_exact_services_candidate_v1";
 pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
 pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
@@ -41,7 +41,8 @@ pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa*.blob.core.windows.net",
 ];
-pub const DNS_BLOCK_CANDIDATE_HOSTNAMES: [&str; 2] = [
+pub const DNS_BLOCK_CANDIDATE_HOSTNAMES: [&str; 3] = [
+    "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ];
@@ -91,7 +92,7 @@ impl DnsEvidenceScope {
     fn candidate_profile_id(self) -> &'static str {
         match self {
             Self::Audit => DNS_MEDIATED_GITHUB_CANDIDATE_ID,
-            Self::HostBlockCandidate => DNS_MEDIATED_EXACT_STATUS_CANDIDATE_ID,
+            Self::HostBlockCandidate => DNS_MEDIATED_EXACT_SERVICES_CANDIDATE_ID,
         }
     }
 }
@@ -578,7 +579,7 @@ impl DnsMediatedBlockSession {
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedBlockState {
             status: DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
             mode: Mode::Block,
-            candidate_profile_id: DNS_MEDIATED_EXACT_STATUS_CANDIDATE_ID,
+            candidate_profile_id: DNS_MEDIATED_EXACT_SERVICES_CANDIDATE_ID,
             ruleset_hash: &ruleset_hash,
             planned_owned_state: &expected_state,
             readiness_status: "not_emitted",
@@ -642,7 +643,7 @@ impl DnsMediatedBlockSession {
         if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedBlockReady {
             status: DNS_MEDIATED_BLOCK_READY_STATUS,
             mode: Mode::Block,
-            candidate_profile_id: DNS_MEDIATED_EXACT_STATUS_CANDIDATE_ID,
+            candidate_profile_id: DNS_MEDIATED_EXACT_SERVICES_CANDIDATE_ID,
             ruleset_hash: &ruleset_hash,
             protection_available: false,
             limitations: dns_block_limitations(),
@@ -825,7 +826,7 @@ fn initial_dns_block_evidence(
     DnsMediatedBlockEvidence {
         status: DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
         mode: Mode::Block,
-        candidate_profile_id: DNS_MEDIATED_EXACT_STATUS_CANDIDATE_ID,
+        candidate_profile_id: DNS_MEDIATED_EXACT_SERVICES_CANDIDATE_ID,
         candidate_hostnames: DNS_BLOCK_CANDIDATE_HOSTNAMES.to_vec(),
         setup_status: "setting_up",
         network_application_status: "not_applied",
@@ -1553,6 +1554,10 @@ mod tests {
 
     #[test]
     fn blocking_scope_forwards_only_candidate_names_and_refuses_others() {
+        assert!(
+            DnsEvidenceScope::HostBlockCandidate
+                .forward_query("vstoken.actions.githubusercontent.com")
+        );
         assert!(
             DnsEvidenceScope::HostBlockCandidate
                 .forward_query("pipelines.actions.githubusercontent.com")

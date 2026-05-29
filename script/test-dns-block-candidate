@@ -97,8 +97,9 @@ assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "dns_mediated_host_block_candidate_test_only"
 assert report["mode"] == "block"
-assert report["candidate_profile_id"] == "github_hosted_dns_mediated_exact_status_candidate_v1"
+assert report["candidate_profile_id"] == "github_hosted_dns_mediated_exact_services_candidate_v1"
 assert report["candidate_hostnames"] == [
+    "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ]
@@ -113,9 +114,10 @@ assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report[
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
-assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_exact_status_candidate_v1"
+assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_exact_services_candidate_v1"
 assert dns["candidate_domain_patterns"] == []
 assert dns["candidate_hostnames"] == [
+    "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ]

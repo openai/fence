@@ -83,9 +83,13 @@ grants with DNS TTL expiry, and retained verified sudo and container lockdown
 until teardown. Its broad suffix-matched authorization reached terminal
 success on three disposable hosted runners, but remained unsuitable as a
 default because later code could encode data in permitted DNS query labels.
-A follow-up exact-status candidate now forwards and materializes only
+A first exact-name reduction that forwarded and materialized only
 `pipelines.actions.githubusercontent.com` and
-`results-receiver.actions.githubusercontent.com`, and locally refuses
+`results-receiver.actions.githubusercontent.com` completed its visible
+steps but did not publish terminal job conclusions. GitHub's public runner
+checks also identify `vstoken.actions.githubusercontent.com` as a required
+Actions service endpoint. The current exact-services candidate therefore
+authorizes only those three documented names and locally refuses
 suffix-shaped lookalike queries. This remains *test-only*: it neither selects
 a default `platform_profile` nor activates public protection, and terminal
 success must be repeated before any promotion decision. Its reported
