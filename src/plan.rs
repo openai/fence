@@ -29,6 +29,12 @@ const GITHUB_COMPATIBILITY_HOSTS: [&str; 8] = [
     "results-receiver.actions.githubusercontent.com",
     "vstoken.actions.githubusercontent.com",
 ];
+const HOSTED_RUNNER_INFRASTRUCTURE_CHANNELS: [(&str, Protocol, u16); 4] = [
+    ("168.63.129.16", Protocol::Udp, 53),
+    ("168.63.129.16", Protocol::Tcp, 53),
+    ("168.63.129.16", Protocol::Tcp, 80),
+    ("168.63.129.16", Protocol::Tcp, 32526),
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,15 +291,26 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
         PlatformProfile::None => Vec::new(),
-        PlatformProfile::GithubHostedCompatibilityCandidateV1 => GITHUB_COMPATIBILITY_HOSTS
-            .iter()
-            .map(|hostname| NormalizedAllowance {
-                destination_type: DestinationType::Hostname,
-                destination: (*hostname).to_owned(),
-                protocol: Protocol::Tcp,
-                port: 443,
-            })
-            .collect(),
+        PlatformProfile::GithubHostedCompatibilityCandidateV1 => {
+            let mut allowances = GITHUB_COMPATIBILITY_HOSTS
+                .iter()
+                .map(|hostname| NormalizedAllowance {
+                    destination_type: DestinationType::Hostname,
+                    destination: (*hostname).to_owned(),
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                })
+                .collect::<Vec<_>>();
+            allowances.extend(HOSTED_RUNNER_INFRASTRUCTURE_CHANNELS.iter().map(
+                |(address, protocol, port)| NormalizedAllowance {
+                    destination_type: DestinationType::Ip,
+                    destination: (*address).to_owned(),
+                    protocol: *protocol,
+                    port: *port,
+                },
+            ));
+            allowances
+        }
     }
 }
 
@@ -352,6 +369,8 @@ fn platform_plan(
                 "candidate_is_intentionally_broader_than_job_status_only",
                 "permitted_platform_destinations_are_available_to_later_workflow_code",
                 "candidate_permits_github_api_web_and_results_storage_endpoints",
+                "candidate_permits_measured_hosted_runner_dns_and_host_control_channels",
+                "candidate_dns_channel_allows_later_workflow_exfiltration",
                 "candidate_results_storage_scope_must_be_reduced_after_compatibility_proof",
             ],
         },
@@ -563,11 +582,13 @@ mod tests {
                 .platform_profile
                 .requested_allowances
                 .iter()
+                .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
                 .map(|allowance| allowance.destination.as_str())
                 .collect::<Vec<_>>(),
             GITHUB_COMPATIBILITY_HOSTS.to_vec()
         );
-        assert_eq!(candidate.platform_profile.effective_allowances.len(), 8);
+        assert_eq!(candidate.platform_profile.requested_allowances.len(), 12);
+        assert_eq!(candidate.platform_profile.effective_allowances.len(), 12);
         assert_eq!(
             candidate
                 .platform_profile
@@ -577,7 +598,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             GITHUB_COMPATIBILITY_HOSTS.to_vec()
         );
-        assert_eq!(candidate.effective_policy.len(), 8);
+        assert_eq!(candidate.effective_policy.len(), 12);
+        assert!(
+            candidate
+                .platform_profile
+                .requested_allowances
+                .contains(&NormalizedAllowance {
+                    destination_type: DestinationType::Ip,
+                    destination: "168.63.129.16".to_owned(),
+                    protocol: Protocol::Udp,
+                    port: 53,
+                })
+        );
         assert_eq!(none.platform_profile.id, "none");
         assert!(none.platform_profile.requested_allowances.is_empty());
         assert_ne!(candidate.policy_hash, none.policy_hash);
@@ -587,6 +619,12 @@ mod tests {
                 .platform_profile
                 .limitations
                 .contains(&"candidate_permits_github_api_web_and_results_storage_endpoints")
+        );
+        assert!(
+            candidate
+                .platform_profile
+                .limitations
+                .contains(&"candidate_dns_channel_allows_later_workflow_exfiltration")
         );
     }
 

@@ -257,6 +257,11 @@ mod tests {
         assert!(
             output
                 .json
+                .contains("\"candidate_dns_channel_allows_later_workflow_exfiltration\"")
+        );
+        assert!(
+            output
+                .json
                 .contains("\"application_status\":\"not_applied\"")
         );
     }
