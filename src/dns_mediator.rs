@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 pub const DNS_MEDIATION_EVIDENCE_STATUS: &str = "dns_mediation_audit_test_only";
 pub const DNS_MEDIATED_GITHUB_CANDIDATE_ID: &str = "github_hosted_dns_mediated_candidate_v1";
 pub const DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID: &str =
-    "github_hosted_dns_mediated_no_codeload_candidate_v4";
+    "github_hosted_dns_mediated_no_storage_candidate_v5";
 pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
 pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
@@ -41,10 +41,9 @@ pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa*.blob.core.windows.net",
 ];
-pub const DNS_BLOCK_COMPATIBILITY_PATTERNS: [&str; 3] = [
+pub const DNS_BLOCK_COMPATIBILITY_PATTERNS: [&str; 2] = [
     "*.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
-    "productionresultssa*.blob.core.windows.net",
 ];
 pub const DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES: [&str; 4] = [
     "vstoken.actions.githubusercontent.com",
@@ -999,6 +998,7 @@ fn dns_block_limitations() -> Vec<&'static str> {
         "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
         "wildcard_dns_authorization_is_an_egress_limitation",
         "post_ready_codeload_traffic_is_not_authorized",
+        "post_ready_results_storage_traffic_is_not_authorized",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "candidate_bootstrap_roots_refresh_every_5_seconds",
@@ -1622,8 +1622,6 @@ fn matches_block_candidate_pattern(hostname: &str) -> bool {
     (hostname.ends_with(".actions.githubusercontent.com")
         && hostname != "actions.githubusercontent.com")
         || hostname == "actions-results-receiver-production.githubapp.com"
-        || (hostname.starts_with("productionresultssa")
-            && hostname.ends_with(".blob.core.windows.net"))
 }
 
 fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
@@ -1739,6 +1737,7 @@ fn evidence_from_state_and_authorizations(
                 "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
                 "wildcard_dns_authorization_is_an_egress_limitation",
                 "post_ready_codeload_traffic_is_not_authorized",
+                "post_ready_results_storage_traffic_is_not_authorized",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
                 "candidate_bootstrap_roots_refresh_every_5_seconds",
@@ -1955,7 +1954,14 @@ mod tests {
             "the compatibility candidate intentionally retains the documented wildcard class"
         );
         assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("codeload.github.com"));
+        assert!(
+            !DnsEvidenceScope::HostBlockCandidate
+                .forward_query("productionresultssa17.blob.core.windows.net")
+        );
         assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("api.github.com"));
+        assert!(
+            DnsEvidenceScope::Audit.forward_query("productionresultssa17.blob.core.windows.net")
+        );
         assert!(DnsEvidenceScope::Audit.forward_query("api.github.com"));
         let response = refused_response(&query("api.github.com", 1)).unwrap();
         assert_eq!(u16::from_be_bytes([response[2], response[3]]) & 0x000f, 5);
