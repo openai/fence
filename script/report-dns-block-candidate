@@ -1,0 +1,82 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/report-dns-block-candidate"
+fi
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "DNS-mediated block candidate late reporting runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "DNS-mediated block candidate late reporting requires Linux x86_64"
+fi
+
+require_cmd python3
+
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
+invocation="dns-block-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
+directory="/run/fence-dns-block-candidate-${suffix}/$invocation"
+report="$directory/report.json"
+dns_report="$directory/dns-report.json"
+production_ready="/run/fence/$invocation/ready.json"
+
+for sample in 1 2 3 4; do
+  sleep 5
+  echo "collecting bounded late DNS-mediated candidate evidence ($sample/4)"
+done
+python3 - "$report" "$dns_report" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+
+report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+report = json.loads(report_path.read_text(encoding="utf-8"))
+dns = json.loads(dns_path.read_text(encoding="utf-8"))
+assert report["status"] == "dns_mediated_host_block_candidate_test_only", report
+assert report["network_verification_status"] == "verified", report
+assert report["sudo_status"] == "disabled_verified", report
+assert report["container_status"] == "disabled_verified", report
+assert report["critical_findings"] == [], report
+assert dns["status"] == "dns_mediated_host_block_candidate_test_only", dns
+assert not production_path.exists()
+
+observations = dns["observations"]
+derived_cname_authorizations = dns["derived_cname_authorizations"]
+summary = {
+    "schema_version": 1,
+    "status": "dns_mediated_host_block_candidate_late_report_test_only",
+    "candidate_profile_id": dns["candidate_profile_id"],
+    "candidate_hostnames": dns["candidate_hostnames"],
+    "excluded_non_github_query_count": dns["excluded_non_github_query_count"],
+    "blocked_non_candidate_query_count": dns["blocked_non_candidate_query_count"],
+    "network_counters": report["counters"],
+    "network_findings": report["findings"][:64],
+    "network_findings_truncated": report["findings_truncated"] or len(report["findings"]) > 64,
+    "critical_findings": report["critical_findings"][:64],
+    "critical_findings_truncated": (
+        report["critical_findings_truncated"]
+        or len(report["critical_findings"]) > 64
+    ),
+    "observations": observations[:64],
+    "observations_truncated": dns["observations_truncated"] or len(observations) > 64,
+    "derived_cname_authorizations": derived_cname_authorizations[:32],
+    "derived_cname_authorizations_truncated": (
+        dns["derived_cname_authorizations_truncated"]
+        or len(derived_cname_authorizations) > 32
+    ),
+    "protection_available": False,
+    "limitations": [
+        "bounded_late_step_dns_evidence_only",
+        "no_public_activation_or_profile_selection",
+    ],
+}
+encoded = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+assert len(encoded.encode("utf-8")) <= 256 * 1024
+print(encoded)
+PY
+
+echo -e "${GREEN}bounded late DNS-mediated candidate evidence emitted${OFF}"

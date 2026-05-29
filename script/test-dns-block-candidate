@@ -97,26 +97,77 @@ assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "dns_mediated_host_block_candidate_test_only"
 assert report["mode"] == "block"
-assert report["candidate_profile_id"] == "github_hosted_dns_mediated_candidate_v1"
+assert report["candidate_profile_id"] == "github_hosted_dns_mediated_compatibility_candidate_v3"
+assert report["candidate_hostnames"] == [
+    "vstoken.actions.githubusercontent.com",
+    "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
+    "results-receiver.actions.githubusercontent.com",
+]
 assert report["network_application_status"] == "applied"
 assert report["network_verification_status"] == "verified"
 assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
-assert report["materialization_status"] == "bounded_ttl_approved_name_https_only"
+assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_github_compatibility_or_cname_descendant_https_only"
 assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
+assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_compatibility_candidate_v3"
+assert dns["candidate_domain_patterns"] == [
+    "*.actions.githubusercontent.com",
+    "codeload.github.com",
+    "actions-results-receiver-production.githubapp.com",
+    "productionresultssa*.blob.core.windows.net",
+]
+assert dns["candidate_hostnames"] == [
+    "vstoken.actions.githubusercontent.com",
+    "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
+    "results-receiver.actions.githubusercontent.com",
+]
 assert dns["mode"] == "block"
-assert dns["proxy_policy_status"] == "block_forwards_only_fixed_candidate_name_matches"
+assert dns["proxy_policy_status"] == "block_forwards_github_compatibility_patterns_and_bounded_cname_descendants"
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
-assert "candidate_wildcard_dns_names_allow_query_label_egress" in dns["limitations"]
-assert "candidate_patterns_are_fixed_and_not_a_default_platform_profile" in report["limitations"]
-assert "candidate_wildcard_dns_names_allow_query_label_egress" in report["limitations"]
+assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in dns["limitations"]
+assert "wildcard_dns_authorization_is_an_egress_limitation" in dns["limitations"]
+assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
+assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
+assert "candidate_bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
+assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"]
+assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
+assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
+assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in report["limitations"]
+assert "wildcard_dns_authorization_is_an_egress_limitation" in report["limitations"]
+assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
+assert "candidate_bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
+assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]
+assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
+assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]
+assert "resolved_status_ip_addresses_may_serve_additional_destinations" in report["limitations"]
 assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
 assert not production_path.exists()
+PY
+
+# The compatibility candidate remains intentionally broader than a final
+# profile, but unrelated GitHub API traffic must still be refused locally.
+python3 <<'PY'
+import random
+import socket
+import struct
+
+identifier = random.randrange(0, 65536)
+hostname = b"api.github.com"
+question = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
+packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2)
+sock.sendto(packet, ("127.0.0.1", 53))
+response, _ = sock.recvfrom(4096)
+assert struct.unpack("!H", response[:2])[0] == identifier
+assert struct.unpack("!H", response[2:4])[0] & 0x000F == 5
 PY
 
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
@@ -127,17 +178,19 @@ if docker ps --quiet >/dev/null 2>&1; then
 fi
 
 sleep 6
-python3 - "$report" "$production_ready" <<'PY'
+python3 - "$report" "$dns_report" "$production_ready" <<'PY'
 import json
 import pathlib
 import sys
 
-report_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
 report = json.loads(report_path.read_text(encoding="utf-8"))
+dns = json.loads(dns_path.read_text(encoding="utf-8"))
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
+assert dns["blocked_non_candidate_query_count"] >= 1, dns
 assert not production_path.exists()
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY

@@ -76,18 +76,37 @@ support any protection claim. The experiment sends only a fixed non-GitHub
 DNS probe to prove host and Docker-address forwarding; that name is counted
 but not retained as platform evidence.
 
-A separate non-required DNS-mediated host-block candidate now exercises the
-next constrained design step on disposable hosted runners. It pre-resolves
-only fixed approved job-status names through the local mediator, permits
-upstream UDP DNS only from the root-resident mediator, materializes bounded
-TCP `443` address grants with DNS TTL expiry, and retains verified sudo and
-container lockdown until teardown. This is still *test-only*: it neither
-selects a default `platform_profile` nor activates public protection, and a
-failure to reach terminal job success requires design review rather than
-silent policy expansion. Its suffix-matched DNS candidate class is also
-explicitly treated as an egress channel because later code could encode data
-in permitted query labels; it cannot become a protected default without a
-separate constrained-policy decision.
+A non-required DNS-mediated host-block experiment then pre-resolved approved
+job-status names through the local mediator, permitted upstream UDP DNS only
+from that root-resident mediator, materialized bounded TCP `443` address
+grants with DNS TTL expiry, and retained verified sudo and container lockdown
+until teardown. Its broad suffix-matched authorization reached terminal
+success on three disposable hosted runners, but remained unsuitable as a
+default because later code could encode data in permitted DNS query labels.
+A first exact-name reduction that forwarded and materialized only
+`pipelines.actions.githubusercontent.com` and
+`results-receiver.actions.githubusercontent.com` completed its visible
+steps but did not publish terminal job conclusions. GitHub's public runner
+checks also identify `vstoken.actions.githubusercontent.com` as a required
+Actions service endpoint. Adding that third name still left hosted jobs
+non-terminal. A bounded late report consistently observed the stable
+`payload.pipelines.actions.githubusercontent.com` service name and a generated
+`glb-...github.com` DNS alias. Public DNS inspection also shows that the
+pipeline roots delegate through bounded Microsoft edge aliases. Authorizing
+four exact root names plus bounded TTL-derived CNAME descendants and retaining
+their HTTPS rules for DNS TTL plus a fixed thirty-second refresh overlap still
+left three hosted jobs non-terminal after their visible completion steps.
+The current compatibility-first diagnostic therefore forwards the four
+GitHub-related DNS classes already modeled by the audit experiment, refreshes
+the four bootstrap roots every five seconds, and continues to materialize
+only TTL-bounded TCP `443` address rules. This remains *test-only*:
+it neither selects a default `platform_profile` nor activates public
+protection, and its wildcard DNS authorization is an egress limitation that
+cannot become a default profile without another reduction pass. A following
+workflow step emits a capped sanitized DNS summary so late DNS and network
+findings can be reviewed without changing policy. Its reported limitations
+also state that the approved DNS and HTTPS channels remain usable for egress
+and that resolved address grants may represent colocated services.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
