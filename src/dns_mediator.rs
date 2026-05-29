@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 pub const DNS_MEDIATION_EVIDENCE_STATUS: &str = "dns_mediation_audit_test_only";
 pub const DNS_MEDIATED_GITHUB_CANDIDATE_ID: &str = "github_hosted_dns_mediated_candidate_v1";
 pub const DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID: &str =
-    "github_hosted_dns_mediated_exact_status_receiver_candidate_v6";
+    "github_hosted_dns_mediated_no_storage_candidate_v5";
 pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
 pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
@@ -41,11 +41,8 @@ pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa*.blob.core.windows.net",
 ];
-pub const DNS_BLOCK_COMPATIBILITY_NAMES: [&str; 5] = [
-    "vstoken.actions.githubusercontent.com",
-    "pipelines.actions.githubusercontent.com",
-    "payload.pipelines.actions.githubusercontent.com",
-    "results-receiver.actions.githubusercontent.com",
+pub const DNS_BLOCK_COMPATIBILITY_PATTERNS: [&str; 2] = [
+    "*.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
 ];
 pub const DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES: [&str; 4] = [
@@ -91,7 +88,7 @@ impl DnsEvidenceScope {
     fn forward_query(self, hostname: &str) -> bool {
         match self {
             Self::Audit => true,
-            Self::HostBlockCandidate => matches_block_candidate_name(hostname),
+            Self::HostBlockCandidate => matches_block_candidate_pattern(hostname),
         }
     }
 
@@ -324,7 +321,7 @@ impl ObservationRecorder {
     }
 
     fn materialization_ttl_seconds(&self, hostname: &str, ttl_seconds: u32) -> Option<u32> {
-        if matches_block_candidate_name(hostname) {
+        if matches_block_candidate_pattern(hostname) {
             return bound_materialization_ttl(ttl_seconds, None);
         }
         let now = Instant::now();
@@ -998,7 +995,8 @@ fn initial_dns_block_evidence(
 fn dns_block_limitations() -> Vec<&'static str> {
     vec![
         "dns_mediated_host_block_candidate_test_only_no_public_activation",
-        "exact_github_compatibility_names_are_test_only_and_not_a_default_platform_profile",
+        "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
+        "wildcard_dns_authorization_is_an_egress_limitation",
         "post_ready_codeload_traffic_is_not_authorized",
         "post_ready_results_storage_traffic_is_not_authorized",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -1510,7 +1508,7 @@ fn authorized_block_candidate_hostname(
     now: Instant,
 ) -> bool {
     remove_expired_cname_authorizations(state, now);
-    matches_block_candidate_name(hostname) || state.active.contains_key(hostname)
+    matches_block_candidate_pattern(hostname) || state.active.contains_key(hostname)
 }
 
 fn retain_cname_authorizations(
@@ -1523,7 +1521,7 @@ fn retain_cname_authorizations(
     for _ in 0..MAX_DERIVED_CNAME_DEPTH {
         let mut progressed = false;
         pending.retain(|alias| {
-            let source_depth = if matches_block_candidate_name(&alias.owner) {
+            let source_depth = if matches_block_candidate_pattern(&alias.owner) {
                 Some(0)
             } else {
                 state
@@ -1620,8 +1618,9 @@ fn matches_candidate_pattern(hostname: &str) -> bool {
             && hostname.ends_with(".blob.core.windows.net"))
 }
 
-fn matches_block_candidate_name(hostname: &str) -> bool {
-    DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.contains(&hostname)
+fn matches_block_candidate_pattern(hostname: &str) -> bool {
+    (hostname.ends_with(".actions.githubusercontent.com")
+        && hostname != "actions.githubusercontent.com")
         || hostname == "actions-results-receiver-production.githubapp.com"
 }
 
@@ -1630,7 +1629,7 @@ fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static
         DnsEvidenceScope::Audit if matches_candidate_pattern(hostname) => {
             "matches_candidate_pattern"
         }
-        DnsEvidenceScope::HostBlockCandidate if matches_block_candidate_name(hostname) => {
+        DnsEvidenceScope::HostBlockCandidate if matches_block_candidate_pattern(hostname) => {
             "matches_candidate_pattern"
         }
         _ => "github_related_outside_candidate",
@@ -1670,7 +1669,7 @@ fn evidence_from_state_and_authorizations(
         candidate_profile_id: scope.candidate_profile_id(),
         candidate_domain_patterns: match scope {
             DnsEvidenceScope::Audit => DNS_CANDIDATE_PATTERNS.to_vec(),
-            DnsEvidenceScope::HostBlockCandidate => DNS_BLOCK_COMPATIBILITY_NAMES.to_vec(),
+            DnsEvidenceScope::HostBlockCandidate => DNS_BLOCK_COMPATIBILITY_PATTERNS.to_vec(),
         },
         candidate_hostnames: match scope {
             DnsEvidenceScope::Audit => Vec::new(),
@@ -1687,7 +1686,7 @@ fn evidence_from_state_and_authorizations(
         proxy_policy_status: match scope {
             DnsEvidenceScope::Audit => "audit_forwards_without_name_authorization",
             DnsEvidenceScope::HostBlockCandidate => {
-                "block_forwards_exact_github_compatibility_names_and_bounded_cname_descendants"
+                "block_forwards_github_compatibility_patterns_and_bounded_cname_descendants"
             }
         },
         observations: state
@@ -1735,7 +1734,8 @@ fn evidence_from_state_and_authorizations(
             ],
             DnsEvidenceScope::HostBlockCandidate => vec![
                 "dns_mediated_host_block_candidate_test_only_no_public_activation",
-                "exact_github_compatibility_names_are_test_only_and_not_a_default_platform_profile",
+                "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
+                "wildcard_dns_authorization_is_an_egress_limitation",
                 "post_ready_codeload_traffic_is_not_authorized",
                 "post_ready_results_storage_traffic_is_not_authorized",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -1953,8 +1953,9 @@ mod tests {
                 .forward_query("actions-results-receiver-production.githubapp.com")
         );
         assert!(
-            !DnsEvidenceScope::HostBlockCandidate
-                .forward_query("lookalike.payload.pipelines.actions.githubusercontent.com")
+            DnsEvidenceScope::HostBlockCandidate
+                .forward_query("lookalike.payload.pipelines.actions.githubusercontent.com"),
+            "the compatibility candidate intentionally retains the documented wildcard class"
         );
         assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("codeload.github.com"));
         assert!(
