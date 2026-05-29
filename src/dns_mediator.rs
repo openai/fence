@@ -12,6 +12,17 @@ use crate::nft::{
 };
 use crate::nft_backend::{NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData};
+use crate::platform_profile::{
+    GITHUB_HOSTED_JOB_STATUS_ACTIONS_SUFFIX_PATTERN, GITHUB_HOSTED_JOB_STATUS_BOOTSTRAP_HOSTNAMES,
+    GITHUB_HOSTED_JOB_STATUS_EXACT_COMPATIBILITY_HOSTNAMES,
+    GITHUB_HOSTED_JOB_STATUS_HTTPS_REFRESH_OVERLAP_SECONDS,
+    GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_AUTHORIZATIONS,
+    GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_DEPTH,
+    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
+    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
+    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS,
+    GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS, GITHUB_HOSTED_JOB_STATUS_UPSTREAM_DNS,
+};
 use crate::runtime::{RuntimeError, TestRuntimeStore};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -42,28 +53,29 @@ pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "productionresultssa*.blob.core.windows.net",
 ];
 pub const DNS_BLOCK_COMPATIBILITY_PATTERNS: [&str; 2] = [
-    "*.actions.githubusercontent.com",
-    "actions-results-receiver-production.githubapp.com",
+    GITHUB_HOSTED_JOB_STATUS_ACTIONS_SUFFIX_PATTERN,
+    GITHUB_HOSTED_JOB_STATUS_EXACT_COMPATIBILITY_HOSTNAMES[0],
 ];
-pub const DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES: [&str; 4] = [
-    "vstoken.actions.githubusercontent.com",
-    "pipelines.actions.githubusercontent.com",
-    "payload.pipelines.actions.githubusercontent.com",
-    "results-receiver.actions.githubusercontent.com",
-];
+pub const DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES: [&str; 4] =
+    GITHUB_HOSTED_JOB_STATUS_BOOTSTRAP_HOSTNAMES;
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_DYNAMIC_MATERIALIZATIONS: usize = 128;
-const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize = 8;
-const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize = 2;
-const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize = 32;
-const MAX_DERIVED_CNAME_DEPTH: u8 = 4;
-const MAX_DYNAMIC_TTL_SECONDS: u32 = 300;
-const DNS_CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration = Duration::from_secs(30);
+const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize =
+    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
+const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize =
+    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS;
+const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize =
+    GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_AUTHORIZATIONS;
+const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_DEPTH;
+const MAX_DYNAMIC_TTL_SECONDS: u32 = GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS;
+const DNS_CANDIDATE_REFRESH_INTERVAL: Duration =
+    Duration::from_secs(GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS);
+const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
+    Duration::from_secs(GITHUB_HOSTED_JOB_STATUS_HTTPS_REFRESH_OVERLAP_SECONDS);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
-const UPSTREAM_DNS: &str = "168.63.129.16:53";
+const UPSTREAM_DNS: &str = GITHUB_HOSTED_JOB_STATUS_UPSTREAM_DNS;
 const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
 const RESOLVED_DROP_IN_DIR: &str = "/etc/systemd/resolved.conf.d";
@@ -1018,7 +1030,7 @@ fn initial_dns_block_evidence(
 fn dns_block_limitations() -> Vec<&'static str> {
     vec![
         "dns_mediated_host_block_candidate_test_only_no_public_activation",
-        "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
+        "test_only_evidence_path_does_not_activate_default_planning_descriptor",
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
         "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
         "block_dns_queries_are_canonicalized_before_upstream_forwarding",
@@ -1033,7 +1045,7 @@ fn dns_block_limitations() -> Vec<&'static str> {
         "resolved_status_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
-        "terminal_job_success_required_before_profile_selection",
+        "planner_selection_does_not_activate_runtime_materialization",
     ]
 }
 
@@ -1872,16 +1884,16 @@ fn evidence_from_state_and_authorizations(
         limitations: match scope {
             DnsEvidenceScope::Audit => vec![
                 "dns_mediation_audit_test_only_no_public_activation",
-                "candidate_patterns_not_selected_as_platform_profile",
+                "audit_measurement_patterns_do_not_define_default_descriptor",
                 "audit_observes_queries_without_blocking_names",
                 "dns_answers_attribute_addresses_without_authorizing_firewall_rules",
                 "dns_ttls_are_evidence_for_future_bounded_refresh_design_only",
                 "evidence_collected_before_hosted_job_teardown",
-                "terminal_block_success_required_before_default_selection",
+                "audit_measurement_does_not_activate_runtime_materialization",
             ],
             DnsEvidenceScope::HostBlockCandidate => vec![
                 "dns_mediated_host_block_candidate_test_only_no_public_activation",
-                "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
+                "test_only_evidence_path_does_not_activate_default_planning_descriptor",
                 "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
                 "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
                 "block_dns_queries_are_canonicalized_before_upstream_forwarding",
@@ -1896,7 +1908,7 @@ fn evidence_from_state_and_authorizations(
                 "approved_status_https_destinations_remain_egress_channels",
                 "resolved_status_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
-                "terminal_job_success_required_before_profile_selection",
+                "planner_selection_does_not_activate_runtime_materialization",
             ],
         },
     }

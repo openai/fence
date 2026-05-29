@@ -25,6 +25,7 @@ pub mod nft;
 pub mod nft_backend;
 pub mod output;
 pub mod plan;
+pub mod platform_profile;
 pub mod resolver;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]

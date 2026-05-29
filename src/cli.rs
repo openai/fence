@@ -244,4 +244,47 @@ mod tests {
                 .contains("\"application_status\":\"not_applied\"")
         );
     }
+
+    #[test]
+    fn render_plan_exposes_default_bounded_dns_mediated_profile_without_activation() {
+        let root = std::path::Path::new("target/tmp/cli-unit-tests");
+        std::fs::create_dir_all(root).unwrap();
+        let config = root.join("default-job-status-profile.json");
+        std::fs::write(
+            &config,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"default-1","allowances":[]}"#,
+        )
+        .unwrap();
+
+        let output = execute(
+            ["fence", "render-plan", "--config", config.to_str().unwrap()]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &FailResolver,
+            &LinuxProvider,
+        );
+
+        assert_eq!(output.exit_code, 0);
+        assert!(
+            output
+                .json
+                .contains("\"id\":\"github_hosted_job_status_v1\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"selection_status\":\"default_bounded_dns_mediated\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"trusted_launcher_runtime_materialization_required\"")
+        );
+        assert!(
+            output
+                .json
+                .contains("\"application_status\":\"not_applied\"")
+        );
+    }
 }
