@@ -9,10 +9,10 @@ if [[ $# -ne 0 ]]; then
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
-  die "DNS-mediated block candidate late reporting runs only on disposable GitHub Actions runners"
+  die "DNS-mediated selected-profile runtime late reporting runs only on disposable GitHub Actions runners"
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
-  die "DNS-mediated block candidate late reporting requires Linux x86_64"
+  die "DNS-mediated selected-profile runtime late reporting requires Linux x86_64"
 fi
 
 require_cmd python3
@@ -26,11 +26,12 @@ production_ready="/run/fence/$invocation/ready.json"
 
 for sample in 1 2 3 4; do
   sleep 5
-  echo "collecting bounded late DNS-mediated candidate evidence ($sample/4)"
+  echo "collecting bounded late DNS-mediated selected-profile evidence ($sample/4)"
 done
 python3 - "$report" "$dns_report" "$production_ready" <<'PY'
 import json
 import pathlib
+import re
 import sys
 
 report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
@@ -42,6 +43,12 @@ assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only", dns
+assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
+assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1", dns
+assert report["policy_hash_schema_version"] == 3, report
+assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
+assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
+assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
 assert not production_path.exists()
 
 observations = dns["observations"]
@@ -50,6 +57,11 @@ summary = {
     "schema_version": 1,
     "status": "dns_mediated_host_block_candidate_late_report_test_only",
     "candidate_profile_id": dns["candidate_profile_id"],
+    "selected_platform_profile_id": dns["selected_platform_profile_id"],
+    "policy_hash_schema_version": report["policy_hash_schema_version"],
+    "policy_hash": report["policy_hash"],
+    "base_ruleset_hash": report["base_ruleset_hash"],
+    "active_ruleset_hash": report["ruleset_hash"],
     "candidate_hostnames": dns["candidate_hostnames"],
     "excluded_non_github_query_count": dns["excluded_non_github_query_count"],
     "blocked_non_candidate_query_count": dns["blocked_non_candidate_query_count"],
@@ -84,4 +96,4 @@ assert len(encoded.encode("utf-8")) <= 256 * 1024
 print(encoded)
 PY
 
-echo -e "${GREEN}bounded late DNS-mediated candidate evidence emitted${OFF}"
+echo -e "${GREEN}bounded late DNS-mediated selected-profile evidence emitted${OFF}"

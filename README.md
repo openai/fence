@@ -128,12 +128,13 @@ findings can be reviewed without changing policy. Its reported limitations
 also state that the approved DNS and HTTPS channels remain usable for egress
 and that resolved address grants may represent colocated services. Six
 disposable-host replicas across two executions reached terminal success. One
-bounded DNS-mediated host-block scenario now runs behind the stable required
-`integration` aggregate so future compatibility regressions fail closed. This
+selected-profile runtime scenario now runs behind the stable required
+`integration` aggregate so future compatibility regressions fail closed. It
+plans `github_hosted_job_status_v1` by omission, reports the schema-`3` logical
+policy hash separately from the active TTL-derived ruleset hash, and still
+emits only test-only readiness below a non-production runtime root. This
 promotes the evidence gate, not the product interface: public `run` remains
-disabled. The non-enforcing planner now selects this bounded compatibility
-model as `github_hosted_job_status_v1` when `platform_profile` is omitted,
-while explicit `"none"` remains available for strict no-implicit-egress
+disabled. Explicit `"none"` remains available for strict no-implicit-egress
 planning.
 
 Pull requests also build a Linux x64 package independently and execute that
@@ -258,8 +259,10 @@ confined to a disposable namespace while the associated host lockdown remains
 test-only evidence on an ephemeral runner.
 It also runs one disposable-host `script/test-dns-block-candidate` scenario
 through the required aggregate after six non-required terminal-success proofs.
-That scenario applies bounded DNS-mediated host blocking and measured
-sudo/container lockdown while retaining only test-only readiness and reports.
+Despite the historical script name, that worker plans the selected
+`github_hosted_job_status_v1` descriptor by omission, applies bounded
+DNS-mediated host blocking and measured sudo/container lockdown, and retains
+only test-only readiness and reports below a non-production runtime root.
 
 ## Phase 4 Evidence Boundary
 
@@ -313,13 +316,12 @@ names with no more than two prefix labels, canonicalizes block-mode upstream
 `A`/`AAAA` questions, and retains bounded TTL-derived CNAME descendants. Six
 disposable-host replicas across two executions reached terminal success. The
 required `integration` aggregate now exercises one copy of this test-only
-host-block evidence. Its DNS timing/count channel, bounded query-label channel,
-approved HTTPS destinations, CNAME delegation, and address-plus-port
-realization remain disclosed limitations. This does not activate public
-`run` or establish production readiness. The non-enforcing planner now selects
-the versioned `github_hosted_job_status_v1` descriptor by omission and retains
-explicit `"none"` as the strict override. Runtime TTL-derived materialization
-still requires the future trusted launcher.
+selected-profile runtime evidence. Its DNS timing/count channel, bounded
+query-label channel, approved HTTPS destinations, CNAME delegation, and
+address-plus-port realization remain disclosed limitations. This does not
+activate public `run` or establish production readiness. Explicit `"none"`
+remains the strict override. Production TTL-derived materialization still
+requires the future trusted launcher.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

@@ -14,7 +14,7 @@ fn dns_mediated_host_block_candidate_worker() {
     }
     let invocation_id = std::env::var("FENCE_DNS_BLOCK_CANDIDATE_INVOCATION").unwrap();
     let config = format!(
-        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","platform_profile":"none","container_policy":"disable","allowances":[]}}"#
+        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","container_policy":"disable","allowances":[]}}"#
     );
     let plan = build_plan(
         parse_and_normalize(config.as_bytes()).unwrap(),

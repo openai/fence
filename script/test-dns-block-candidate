@@ -9,10 +9,10 @@ if [[ $# -ne 0 ]]; then
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
-  die "DNS-mediated block candidate runs only on disposable GitHub Actions runners"
+  die "DNS-mediated selected-profile runtime evidence runs only on disposable GitHub Actions runners"
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
-  die "DNS-mediated block candidate requires Linux x86_64"
+  die "DNS-mediated selected-profile runtime evidence requires Linux x86_64"
 fi
 
 ensure_rust_toolchain
@@ -23,7 +23,7 @@ require_cmd sudo
 
 for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/resolvectl /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
-    die "DNS-mediated block candidate requires executable $required"
+    die "DNS-mediated selected-profile runtime evidence requires executable $required"
   fi
 done
 
@@ -50,18 +50,19 @@ for candidate in "$target_root"/debug/deps/dns_block_candidate-*; do
   fi
 done
 if [[ "${#test_binaries[@]}" -ne 1 ]]; then
-  die "expected exactly one compiled DNS-mediated block candidate binary"
+  die "expected exactly one compiled DNS-mediated selected-profile runtime binary"
 fi
 
 if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
-  die "DNS-mediated block candidate requires absent host inet fence_v0 table"
+  die "DNS-mediated selected-profile runtime evidence requires absent host inet fence_v0 table"
 fi
 if [[ -e "$production_ready" ]]; then
-  die "DNS-mediated block candidate requires absent production readiness path"
+  die "DNS-mediated selected-profile runtime evidence requires absent production readiness path"
 fi
 
-# This applies block policy on a disposable runner and intentionally leaves
-# controls resident so the platform conclusion tests the candidate.
+# This applies the planner-selected profile on a disposable runner and
+# intentionally leaves controls resident so the platform conclusion tests the
+# test-only runtime realization.
 sudo /usr/bin/systemd-run \
   --quiet \
   --collect \
@@ -76,6 +77,7 @@ sudo /usr/bin/systemd-run \
 python3 - "$report" "$dns_report" "$ready" "$production_ready" <<'PY'
 import json
 import pathlib
+import re
 import sys
 import time
 
@@ -98,6 +100,11 @@ assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "dns_mediated_host_block_candidate_test_only"
 assert report["mode"] == "block"
 assert report["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
+assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1"
+assert report["policy_hash_schema_version"] == 3
+assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"])
+assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"])
+assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"])
 assert report["candidate_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
@@ -114,8 +121,13 @@ assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
+assert ready["selected_platform_profile_id"] == "github_hosted_job_status_v1"
+assert ready["policy_hash_schema_version"] == 3
+assert ready["policy_hash"] == report["policy_hash"]
+assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
 assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
+assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1"
 assert dns["candidate_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
@@ -165,8 +177,8 @@ assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in repo
 assert not production_path.exists()
 PY
 
-# Removed and unrelated GitHub traffic must be refused locally even though
-# the compatibility candidate remains test-only pending promotion review.
+# Removed and unrelated GitHub traffic must be refused locally even though the
+# selected-profile runtime realization remains test-only pending activation.
 python3 <<'PY'
 import random
 import socket
@@ -190,10 +202,10 @@ for hostname in (
 PY
 
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
-  die "DNS-mediated block candidate did not disable runner passwordless sudo"
+  die "DNS-mediated selected-profile runtime evidence did not disable runner passwordless sudo"
 fi
 if docker ps --quiet >/dev/null 2>&1; then
-  die "DNS-mediated block candidate did not disable runner Docker access"
+  die "DNS-mediated selected-profile runtime evidence did not disable runner Docker access"
 fi
 
 sleep 6
@@ -214,4 +226,4 @@ assert not production_path.exists()
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY
 
-echo -e "${GREEN}DNS-mediated host-block candidate evidence verified${OFF}"
+echo -e "${GREEN}DNS-mediated selected-profile runtime evidence verified${OFF}"
