@@ -4,6 +4,8 @@
 /.github/dependabot.yml @GrantBirki
 /.github/CODEOWNERS @GrantBirki
 
+/action.yml @GrantBirki
+/action/** @GrantBirki
 /script/** @GrantBirki
 /.cargo/config.toml @GrantBirki
 /.cargo/tooling/** @GrantBirki

@@ -1,0 +1,69 @@
+name: action acceptance
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  # A stranded protected host job may be unable to receive cancellation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  action:
+    name: action ${{ matrix.scenario }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: standard
+            config: '{"schema_version":1,"mode":"block","invocation_id":"action-standard","container_policy":"disable","allowances":[]}'
+          - scenario: unsafe-preserve
+            config: '{"schema_version":1,"mode":"block","invocation_id":"action-unsafe-preserve","container_policy":"unsafe_preserve","allowances":[]}'
+          - scenario: audit
+            config: '{"schema_version":1,"mode":"audit","invocation_id":"action-audit","allowances":[]}'
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
+
+      - name: activate bundled Fence agent
+        uses: ./
+        with:
+          config: ${{ matrix.config }}
+
+      - name: verify Action lifecycle
+        run: script/test-action-acceptance "${{ matrix.scenario }}"
+
+  acceptance:
+    name: action acceptance
+    needs: [action]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: confirm bundled Action acceptance
+        run: echo "bundled Action acceptance passed"
