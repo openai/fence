@@ -97,7 +97,7 @@ assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "dns_mediated_host_block_candidate_test_only"
 assert report["mode"] == "block"
-assert report["candidate_profile_id"] == "github_hosted_dns_mediated_exact_services_candidate_v2"
+assert report["candidate_profile_id"] == "github_hosted_dns_mediated_compatibility_candidate_v3"
 assert report["candidate_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
@@ -109,14 +109,19 @@ assert report["network_verification_status"] == "verified"
 assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
-assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_approved_name_or_cname_descendant_https_only"
+assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_github_compatibility_or_cname_descendant_https_only"
 assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
-assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_exact_services_candidate_v2"
-assert dns["candidate_domain_patterns"] == []
+assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_compatibility_candidate_v3"
+assert dns["candidate_domain_patterns"] == [
+    "*.actions.githubusercontent.com",
+    "codeload.github.com",
+    "actions-results-receiver-production.githubapp.com",
+    "productionresultssa*.blob.core.windows.net",
+]
 assert dns["candidate_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
@@ -124,18 +129,20 @@ assert dns["candidate_hostnames"] == [
     "results-receiver.actions.githubusercontent.com",
 ]
 assert dns["mode"] == "block"
-assert dns["proxy_policy_status"] == "block_forwards_exact_candidate_hostnames_and_bounded_cname_descendants"
+assert dns["proxy_policy_status"] == "block_forwards_github_compatibility_patterns_and_bounded_cname_descendants"
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
-assert "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile" in dns["limitations"]
+assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in dns["limitations"]
+assert "wildcard_dns_authorization_is_an_egress_limitation" in dns["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
-assert "exact_candidate_roots_refresh_every_5_seconds" in dns["limitations"]
+assert "candidate_bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
-assert "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile" in report["limitations"]
+assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in report["limitations"]
+assert "wildcard_dns_authorization_is_an_egress_limitation" in report["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
-assert "exact_candidate_roots_refresh_every_5_seconds" in report["limitations"]
+assert "candidate_bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]
@@ -144,15 +151,15 @@ assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in repo
 assert not production_path.exists()
 PY
 
-# A suffix-shaped hostname would have been forwarded by the preceding broad
-# hypothesis. The exact-host candidate must reject it locally after readiness.
+# The compatibility candidate remains intentionally broader than a final
+# profile, but unrelated GitHub API traffic must still be refused locally.
 python3 <<'PY'
 import random
 import socket
 import struct
 
 identifier = random.randrange(0, 65536)
-hostname = b"lookalike.payload.pipelines.actions.githubusercontent.com"
+hostname = b"api.github.com"
 question = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
 packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

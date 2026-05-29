@@ -92,22 +92,21 @@ Actions service endpoint. Adding that third name still left hosted jobs
 non-terminal. A bounded late report consistently observed the stable
 `payload.pipelines.actions.githubusercontent.com` service name and a generated
 `glb-...github.com` DNS alias. Public DNS inspection also shows that the
-pipeline roots delegate through bounded Microsoft edge aliases. The current
-candidate therefore authorizes four exact root names and bounded TTL-derived
-CNAME descendants while locally refusing arbitrary suffix-shaped lookalike
-queries. Derived aliases are reported even when delegated DNS operator names
-leave GitHub suffixes. A resident five-second refresh of the four exact roots
-and a fixed thirty-second HTTPS-rule overlap bridge short DNS TTLs without
-authorizing additional names. This remains *test-only*:
+pipeline roots delegate through bounded Microsoft edge aliases. Authorizing
+four exact root names plus bounded TTL-derived CNAME descendants and retaining
+their HTTPS rules for DNS TTL plus a fixed thirty-second refresh overlap still
+left three hosted jobs non-terminal after their visible completion steps.
+The current compatibility-first diagnostic therefore forwards the four
+GitHub-related DNS classes already modeled by the audit experiment, refreshes
+the four bootstrap roots every five seconds, and continues to materialize
+only TTL-bounded TCP `443` address rules. This remains *test-only*:
 it neither selects a default `platform_profile` nor activates public
-protection, and terminal success must be repeated before any promotion
-decision. A following workflow step emits a capped sanitized DNS summary so
-GitHub-related names refused after the initial report snapshot and derived
-CNAME authorizations can be reviewed without changing policy. It also retains
-a short bounded heartbeat window and emits capped network findings so late
-connection failures can be reviewed without widening the candidate. Its reported
-limitations also state that the approved HTTPS channels remain usable for
-egress and that resolved address grants may represent colocated services.
+protection, and its wildcard DNS authorization is an egress limitation that
+cannot become a default profile without another reduction pass. A following
+workflow step emits a capped sanitized DNS summary so late DNS and network
+findings can be reviewed without changing policy. Its reported limitations
+also state that the approved DNS and HTTPS channels remain usable for egress
+and that resolved address grants may represent colocated services.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`

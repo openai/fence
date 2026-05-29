@@ -51,6 +51,7 @@ summary = {
     "status": "dns_mediated_host_block_candidate_late_report_test_only",
     "candidate_profile_id": dns["candidate_profile_id"],
     "candidate_hostnames": dns["candidate_hostnames"],
+    "excluded_non_github_query_count": dns["excluded_non_github_query_count"],
     "blocked_non_candidate_query_count": dns["blocked_non_candidate_query_count"],
     "network_counters": report["counters"],
     "network_findings": report["findings"][:64],
