@@ -11,14 +11,17 @@ CI runners against undeclared outbound network access and ordinary
 runner-privilege bypass paths. The intended first enforcement target is a
 GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 
-Fence is not an enforcement agent yet. The current Phase 3 non-enforcing executable builds
-on the Phase 2 network-evidence backend: it strictly validates local JSON
-policy, renders a frozen policy and deterministic native `nftables` ruleset
-preview, models the selected bounded DNS-mediated hosted job-status
-compatibility descriptor, and reports an accepted but not runtime-checked
-hosted-runner fingerprint reference needed before the privileged lifecycle can
-be activated. It never applies a network boundary, changes privilege state,
-writes readiness, or reports protection as available.
+Fence is still unreleased. The current Phase 4 executable strictly validates
+local JSON policy, renders a frozen policy and deterministic native
+`nftables` ruleset preview, and models the selected bounded DNS-mediated
+hosted job-status compatibility descriptor. On supported GitHub-hosted
+`ubuntu-24.04` x64 runners, the Linux binary can now enter one protected
+standard-block lifecycle only when invoked as root inside its matching
+trusted transient `systemd` service with a root-owned configuration. That
+path verifies the pinned runner shape, applies and verifies host network
+policy, disables measured passwordless sudo and container control paths,
+writes production readiness, and remains resident without restoring access.
+Ordinary direct execution is rejected before configuration intake.
 
 The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -133,15 +136,18 @@ selected-profile runtime scenario now runs behind the stable required
 plans `github_hosted_job_status_v1` by omission, reports the schema-`3` logical
 policy hash separately from the active TTL-derived ruleset hash, and still
 emits only test-only readiness below a non-production runtime root. This
-promotes the evidence gate, not the product interface: public `run` remains
-disabled. Explicit `"none"` remains available for strict no-implicit-egress
-planning.
+established the evidence gate used by the trusted-launcher activation. The
+production standard-block path now applies the same reviewed mechanism.
+Explicit `"none"` remains available for strict no-implicit-egress planning
+but is not accepted by the production activation slice.
 
 Pull requests also build a Linux x64 package independently and execute that
-artifact through the non-enforcing JSON CLI contract. The `integration`
+artifact through the trusted-launcher JSON CLI boundary. The `integration`
 workflow additionally records a bounded, read-only hosted-runner fingerprint
-observation before its namespace and resident-service evidence tests. These
-checks do not establish public protection or create a GitHub Action interface.
+observation before its namespace and resident-service evidence tests, and
+runs a packaged production-shaped standard-block transient service on a
+disposable runner. This does not publish an alpha release or create a GitHub
+Action interface.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -248,7 +254,7 @@ CI additionally runs `script/validate-locks --ci` and
 runners are not fully air-gapped: checkout, action loading, Rust preparation,
 artifact operations, and release publication still require network access.
 On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
-artifact's public non-enforcing contract separately from
+artifact's public trusted-launcher boundary separately from
 `script/observe-hosted-runner` and the privileged namespace evidence workflow.
 The `integration` workflow may intentionally exercise GitHub-hosted metadata
 and artifact services while `script/measure-platform-egress` keeps a
@@ -270,8 +276,9 @@ The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` base-ruleset preview, policy hash schema version `3`, a ruleset
 hash, and the selected bounded DNS-mediated hosted job-status descriptor.
 `check-support` reports a versioned hosted-runner fingerprint gate as an
-accepted reference that is not yet checked or enforced by public execution.
-`run` fails closed until the privileged lifecycle is implemented and proved.
+accepted reference that is checked during activation rather than by the
+read-only support probe. `run` rejects ordinary direct execution and accepts
+only the supported production-shaped standard-block transient service.
 
 ```console
 script/build
@@ -281,11 +288,13 @@ script/build
 ./target/release/fence run --config /run/fence/example/config.json
 ```
 
-The last command intentionally returns an `enforcement_not_implemented` error
-through the Phase 4 evidence-only slices. Privileged hosted tests may emit
-explicitly test-only resident, lockdown, or composed evidence. Resident
-network measurement and composed namespace-network evidence may emit
-non-protecting test readiness; public CLI execution cannot. The composed
+The last command succeeds only when a trusted launcher has already created
+the pinned root-owned configuration and invoked the binary as the root
+`MainPID` of `fence-<invocation-id>.service`. Ordinary direct invocation
+returns `trusted_launcher_required` without reading configuration. Privileged
+hosted tests may still emit explicitly test-only resident, lockdown, or
+composed evidence. Resident network measurement and composed
+namespace-network evidence may emit non-protecting test readiness. The composed
 evidence does not protect the workflow host network and cannot be used as a
 runner security control. Phase 4A host-block finalization experiments are
 recorded as negative evidence: strict zero-egress and a candidate permitting
@@ -318,21 +327,22 @@ disposable-host replicas across two executions reached terminal success. The
 required `integration` aggregate now exercises one copy of this test-only
 selected-profile runtime evidence. Its DNS timing/count channel, bounded
 query-label channel, approved HTTPS destinations, CNAME delegation, and
-address-plus-port realization remain disclosed limitations. This does not
-activate public `run` or establish production readiness. Explicit `"none"`
-remains the strict override. Production TTL-derived materialization still
-requires the future trusted launcher.
+address-plus-port realization remain disclosed limitations. This evidence
+preceded activation of the standard production path. Explicit `"none"`
+remains the strict planning override but is not accepted for production
+activation in this slice.
 
-The dormant trusted-launcher foundation now models that next boundary
-explicitly without making it reachable from the public CLI. Production
+The trusted-launcher standard-block path now makes that boundary reachable
+from the Linux CLI under a narrowly validated service context. Production
 runtime intake accepts only a root-owned `/run/fence/<invocation-id>/config.json`
 file as the only initial invocation-directory entry beneath pinned root-owned
 directories, opens it with no-follow and close-on-exec protections, and
 derives the fixed state/report/readiness paths.
 The matching service validator accepts only a root process running as the
-`MainPID` of `fence-<invocation-id>.service`. Public `run` remains fail-closed
-until a later reviewed change composes the complete lifecycle onto those
-primitives and proves it on disposable hosted runners.
+`MainPID` of `fence-<invocation-id>.service`. The activated lifecycle accepts
+only standard block with disabled container access and the selected
+`github_hosted_job_status_v1` descriptor. Production audit, degraded
+`unsafe_preserve`, and strict `"none"` activation remain deferred.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

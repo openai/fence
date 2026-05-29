@@ -1,7 +1,11 @@
-use crate::config::{DestinationType, MAX_REPORT_BYTES, Mode, Protocol};
+use crate::config::{
+    ContainerPolicy, DestinationType, MAX_REPORT_BYTES, Mode, Protocol, parse_and_normalize,
+};
+use crate::error::ErrorDetail;
 use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
 use crate::lifecycle::{
     CriticalFinding, NativeResidentNetwork, RESIDENT_VERIFICATION_INTERVAL, ResidentSession,
+    require_production_root_process, validate_production_service_context,
     validate_test_service_context,
 };
 use crate::lockdown::{LockdownControl, SystemLockdownControl};
@@ -11,7 +15,7 @@ use crate::nft::{
     render_dns_mediated_replacement_ruleset, render_dns_mediated_ruleset,
 };
 use crate::nft_backend::{NativeNftBackend, SystemNftExecutor};
-use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData};
+use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_plan};
 use crate::platform_profile::{
     GITHUB_HOSTED_JOB_STATUS_ACTIONS_SUFFIX_PATTERN, GITHUB_HOSTED_JOB_STATUS_BOOTSTRAP_HOSTNAMES,
     GITHUB_HOSTED_JOB_STATUS_EXACT_COMPATIBILITY_HOSTNAMES,
@@ -24,7 +28,10 @@ use crate::platform_profile::{
     GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS, GITHUB_HOSTED_JOB_STATUS_UPSTREAM_DNS,
     github_hosted_job_status_dns_mediation_plan,
 };
-use crate::runtime::{RuntimeError, TestRuntimeStore};
+use crate::resolver::SystemResolver;
+use crate::runtime::{
+    ProductionRuntimeStore, RuntimeDocumentStore, RuntimeError, TestRuntimeStore,
+};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -47,6 +54,8 @@ pub const DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID: &str =
 pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
 pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
+pub const PROTECTED_BLOCK_STATUS: &str = "protected_host_block";
+pub const PROTECTED_BLOCK_READY_STATUS: &str = "ready";
 pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "*.actions.githubusercontent.com",
     "codeload.github.com",
@@ -89,21 +98,26 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 enum DnsEvidenceScope {
     Audit,
     HostBlockCandidate,
+    ProtectedHostBlock,
 }
 
 impl DnsEvidenceScope {
     fn mode(self) -> Mode {
         match self {
             Self::Audit => Mode::Audit,
-            Self::HostBlockCandidate => Mode::Block,
+            Self::HostBlockCandidate | Self::ProtectedHostBlock => Mode::Block,
         }
+    }
+
+    fn is_block(self) -> bool {
+        matches!(self, Self::HostBlockCandidate | Self::ProtectedHostBlock)
     }
 
     #[cfg(test)]
     fn forward_query(self, hostname: &str, query_type: u16) -> bool {
         match self {
             Self::Audit => true,
-            Self::HostBlockCandidate => {
+            Self::HostBlockCandidate | Self::ProtectedHostBlock => {
                 matches_supported_block_query_type(query_type)
                     && authorized_block_candidate_hostname(
                         hostname,
@@ -118,13 +132,70 @@ impl DnsEvidenceScope {
         match self {
             Self::Audit => DNS_MEDIATION_EVIDENCE_STATUS,
             Self::HostBlockCandidate => DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
+            Self::ProtectedHostBlock => PROTECTED_BLOCK_STATUS,
         }
     }
 
     fn candidate_profile_id(self) -> &'static str {
         match self {
             Self::Audit => DNS_MEDIATED_GITHUB_CANDIDATE_ID,
-            Self::HostBlockCandidate => DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
+            Self::HostBlockCandidate | Self::ProtectedHostBlock => {
+                DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID
+            }
+        }
+    }
+
+    fn active_routing_status(self) -> &'static str {
+        match self {
+            Self::Audit | Self::HostBlockCandidate => "active_test_only",
+            Self::ProtectedHostBlock => "active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DnsBlockRuntimeScope {
+    TestEvidence,
+    ProductionProtected,
+}
+
+impl DnsBlockRuntimeScope {
+    fn evidence_status(self) -> &'static str {
+        match self {
+            Self::TestEvidence => DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
+            Self::ProductionProtected => PROTECTED_BLOCK_STATUS,
+        }
+    }
+
+    fn ready_status(self) -> &'static str {
+        match self {
+            Self::TestEvidence => DNS_MEDIATED_BLOCK_READY_STATUS,
+            Self::ProductionProtected => PROTECTED_BLOCK_READY_STATUS,
+        }
+    }
+
+    fn resident_status(self) -> &'static str {
+        match self {
+            Self::TestEvidence => "resident_dns_mediated_host_block_candidate_test_only",
+            Self::ProductionProtected => "resident_protected",
+        }
+    }
+
+    fn protection_available(self) -> bool {
+        matches!(self, Self::ProductionProtected)
+    }
+
+    fn dns_scope(self) -> DnsEvidenceScope {
+        match self {
+            Self::TestEvidence => DnsEvidenceScope::HostBlockCandidate,
+            Self::ProductionProtected => DnsEvidenceScope::ProtectedHostBlock,
+        }
+    }
+
+    fn limitations(self) -> Vec<&'static str> {
+        match self {
+            Self::TestEvidence => dns_block_test_limitations(),
+            Self::ProductionProtected => protected_block_limitations(),
         }
     }
 }
@@ -337,7 +408,7 @@ impl ObservationRecorder {
     fn forward_query(&self, hostname: &str, query_type: u16) -> bool {
         match self.scope {
             DnsEvidenceScope::Audit => true,
-            DnsEvidenceScope::HostBlockCandidate => {
+            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
                 if !matches_supported_block_query_type(query_type) {
                     return false;
                 }
@@ -431,11 +502,11 @@ impl ObservationRecorder {
             state.excluded_non_github_query_count =
                 state.excluded_non_github_query_count.saturating_add(1);
         }
-        if self.scope == DnsEvidenceScope::HostBlockCandidate && !forwarded {
+        if self.scope.is_block() && !forwarded {
             state.blocked_non_candidate_query_count =
                 state.blocked_non_candidate_query_count.saturating_add(1);
         }
-        let evidence = self.evidence_from_state(&state, "active_test_only");
+        let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         let _ = write_result;
@@ -445,8 +516,8 @@ impl ObservationRecorder {
         let Some(hostname) = normalize_hostname(hostname) else {
             return;
         };
-        let forwardable_block_response = self.scope == DnsEvidenceScope::HostBlockCandidate
-            && self.forward_query(&hostname, query_type);
+        let forwardable_block_response =
+            self.scope.is_block() && self.forward_query(&hostname, query_type);
         if forwardable_block_response {
             let mut authorizations = self
                 .cname_authorizations
@@ -486,7 +557,7 @@ impl ObservationRecorder {
                 });
             }
         }
-        let evidence = self.evidence_from_state(&state, "active_test_only");
+        let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         let _ = write_result;
@@ -710,13 +781,14 @@ pub fn run_dns_mediation_audit_test_service(
     }
 }
 
-struct DnsMediatedBlockSession {
+struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     _mediation: DnsMediationSession,
     queue: Arc<Mutex<MaterializationQueue>>,
     backend: NativeNftBackend<SystemNftExecutor>,
     lockdown: SystemLockdownControl,
     reader: NflogReader,
-    runtime: TestRuntimeStore,
+    runtime: R,
+    base_allowances: Vec<EffectiveAllowance>,
     active: BTreeMap<(String, IpAddr), ActiveMaterialization>,
     expected_state: OwnedNftState,
     evidence: DnsMediatedBlockEvidence,
@@ -725,12 +797,13 @@ struct DnsMediatedBlockSession {
     next_verification: Duration,
 }
 
-impl DnsMediatedBlockSession {
+impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
     fn establish(
-        runtime: TestRuntimeStore,
+        runtime: R,
         mut mediation: DnsMediationSession,
         queue: Arc<Mutex<MaterializationQueue>>,
         plan: &PlanData,
+        scope: DnsBlockRuntimeScope,
     ) -> Result<Self, DnsMediationError> {
         if let Err(error) = prehydrate_candidate_names() {
             let _ = mediation.routing.rollback();
@@ -742,11 +815,12 @@ impl DnsMediatedBlockSession {
         if !changed || active.is_empty() {
             let _ = mediation.routing.rollback();
             return Err(DnsMediationError::new(
-                "dns_candidate_prehydration_failed",
-                "DNS-mediated block candidate did not materialize fixed bootstrap names",
+                "dns_block_prehydration_failed",
+                "DNS-mediated block lifecycle did not materialize fixed bootstrap names",
             ));
         }
-        let allowances = materialized_effective_allowances(&active);
+        let allowances =
+            effective_allowances_with_materializations(&plan.effective_policy, &active);
         let ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
         let expected_state = expected_dns_mediated_owned_state(Mode::Block, &allowances);
@@ -755,9 +829,10 @@ impl DnsMediatedBlockSession {
             &active,
             materializations_truncated,
             ruleset_hash.clone(),
+            scope,
         );
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedBlockState {
-            status: DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
+            status: scope.evidence_status(),
             mode: Mode::Block,
             candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
             selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
@@ -777,7 +852,7 @@ impl DnsMediatedBlockSession {
         }
 
         let mut backend = NativeNftBackend::new(SystemNftExecutor::host());
-        let mut lockdown = SystemLockdownControl::new(&runtime.directory);
+        let mut lockdown = SystemLockdownControl::new(runtime.directory());
         let reader = match NflogReader::bind(Mode::Block) {
             Ok(reader) => reader,
             Err(error) => {
@@ -825,7 +900,7 @@ impl DnsMediatedBlockSession {
             return Err(runtime_error(error));
         }
         if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedBlockReady {
-            status: DNS_MEDIATED_BLOCK_READY_STATUS,
+            status: scope.ready_status(),
             mode: Mode::Block,
             candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
             selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
@@ -833,8 +908,8 @@ impl DnsMediatedBlockSession {
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
             ruleset_hash: &ruleset_hash,
-            protection_available: false,
-            limitations: dns_block_limitations(),
+            protection_available: scope.protection_available(),
+            limitations: scope.limitations(),
         }) {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status =
@@ -842,8 +917,8 @@ impl DnsMediatedBlockSession {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        evidence.setup_status = "resident_dns_mediated_host_block_candidate_test_only";
-        evidence.readiness_status = DNS_MEDIATED_BLOCK_READY_STATUS;
+        evidence.setup_status = scope.resident_status();
+        evidence.readiness_status = scope.ready_status();
         runtime.replace_report(&evidence).map_err(runtime_error)?;
         Ok(Self {
             _mediation: mediation,
@@ -852,6 +927,7 @@ impl DnsMediatedBlockSession {
             lockdown,
             reader,
             runtime,
+            base_allowances: plan.effective_policy.clone(),
             active,
             expected_state,
             evidence,
@@ -875,8 +951,8 @@ impl DnsMediatedBlockSession {
             Ok(None) => {}
             Err(_) => {
                 self.record_critical(
-                    "dns_candidate_nflog_failure",
-                    "DNS-mediated block candidate NFLOG collection failed after test readiness",
+                    "dns_block_nflog_failure",
+                    "DNS-mediated block NFLOG collection failed after readiness",
                 );
                 changed = true;
             }
@@ -885,8 +961,8 @@ impl DnsMediatedBlockSession {
         if elapsed >= self.next_dns_refresh {
             if prehydrate_candidate_names().is_err() {
                 self.record_critical(
-                    "dns_candidate_root_refresh_failed",
-                    "DNS-mediated exact-root refresh failed after test readiness",
+                    "dns_block_root_refresh_failed",
+                    "DNS-mediated exact-root refresh failed after readiness",
                 );
             }
             self.next_dns_refresh = elapsed + DNS_CANDIDATE_REFRESH_INTERVAL;
@@ -898,7 +974,8 @@ impl DnsMediatedBlockSession {
             merge_pending_materializations(&mut proposed, &self.queue, Instant::now());
         self.evidence.materializations_truncated |= truncated;
         if materialization_changed {
-            let allowances = materialized_effective_allowances(&proposed);
+            let allowances =
+                effective_allowances_with_materializations(&self.base_allowances, &proposed);
             let ruleset = render_dns_mediated_replacement_ruleset(Mode::Block, &allowances);
             let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
             let expected = expected_dns_mediated_owned_state(Mode::Block, &allowances);
@@ -918,8 +995,8 @@ impl DnsMediatedBlockSession {
             } else {
                 self.evidence.network_verification_status = "critical_dynamic_update_failed";
                 self.record_critical(
-                    "dns_candidate_dynamic_update_failed",
-                    "approved DNS-derived owned nftables replacement failed after test readiness",
+                    "dns_block_dynamic_update_failed",
+                    "approved DNS-derived owned nftables replacement failed after readiness",
                 );
             }
             changed = true;
@@ -933,22 +1010,22 @@ impl DnsMediatedBlockSession {
             {
                 self.evidence.network_verification_status = "critical_drift";
                 self.record_critical(
-                    "dns_candidate_network_drift",
-                    "DNS-mediated owned nftables state drifted after test readiness",
+                    "dns_block_network_drift",
+                    "DNS-mediated owned nftables state drifted after readiness",
                 );
             }
             if self.lockdown.verify_sudo_disabled().is_err() {
                 self.evidence.sudo_status = "critical_drift";
                 self.record_critical(
-                    "dns_candidate_sudo_drift",
-                    "measured passwordless sudo state drifted after test readiness",
+                    "dns_block_sudo_drift",
+                    "measured passwordless sudo state drifted after readiness",
                 );
             }
             if self.lockdown.verify_containers_disabled().is_err() {
                 self.evidence.container_status = "critical_drift";
                 self.record_critical(
-                    "dns_candidate_container_drift",
-                    "measured container control state drifted after test readiness",
+                    "dns_block_container_drift",
+                    "measured container control state drifted after readiness",
                 );
             }
             self.next_verification = elapsed + RESIDENT_VERIFICATION_INTERVAL;
@@ -961,8 +1038,8 @@ impl DnsMediatedBlockSession {
             self.evidence.counters.total_violations =
                 self.backend.total_violation_packets().unwrap_or_else(|_| {
                     self.record_critical(
-                        "dns_candidate_counter_read_failed",
-                        "DNS-mediated violation counter could not be read after test readiness",
+                        "dns_block_counter_read_failed",
+                        "DNS-mediated violation counter could not be read after readiness",
                     );
                     self.evidence.counters.total_violations
                 });
@@ -983,6 +1060,57 @@ impl DnsMediatedBlockSession {
             code,
             message,
         });
+    }
+}
+
+pub fn run_protected_standard_block_service(config: &Path) -> Result<(), DnsMediationError> {
+    require_production_root_process()
+        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+    let runtime = ProductionRuntimeStore::open(config).map_err(runtime_error)?;
+    validate_production_service_context(&runtime.invocation_id)
+        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+    let normalized = parse_and_normalize(&runtime.read_config_bounded().map_err(runtime_error)?)
+        .map_err(config_error)?;
+    if normalized.invocation_id != runtime.invocation_id {
+        return Err(DnsMediationError::new(
+            "unsafe_runtime_config",
+            "trusted launcher configuration invocation identifier must match its runtime directory",
+        ));
+    }
+    let plan = build_plan(normalized, &SystemResolver).map_err(config_error)?;
+    if plan.selected_mode != Mode::Block
+        || plan.assurance_status != AssuranceStatus::PlannedBlockContainment
+        || plan.container_policy != Some(ContainerPolicy::Disable)
+        || plan.platform_profile.id != GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+        || plan.platform_profile.dns_mediated_compatibility.as_ref()
+            != Some(&github_hosted_job_status_dns_mediation_plan())
+    {
+        return Err(DnsMediationError::new(
+            "protected_run_policy_not_activated",
+            "protected run currently accepts only standard block with the reviewed hosted job-status profile",
+        ));
+    }
+    let mut fingerprint = SystemLockdownControl::new(runtime.directory());
+    fingerprint
+        .verify_supported_host()
+        .map_err(lockdown_error)?;
+
+    let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
+    let mediation = DnsMediationSession::establish(
+        runtime.directory(),
+        DnsBlockRuntimeScope::ProductionProtected.dns_scope(),
+        Some(queue.clone()),
+    )?;
+    let mut session = DnsMediatedBlockSession::establish(
+        runtime,
+        mediation,
+        queue,
+        &plan,
+        DnsBlockRuntimeScope::ProductionProtected,
+    )?;
+    let start = Instant::now();
+    loop {
+        session.poll_once(start.elapsed(), POLL_INTERVAL)?;
     }
 }
 
@@ -1010,10 +1138,16 @@ pub fn run_dns_mediated_host_block_candidate_test_service(
     let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
     let mediation = DnsMediationSession::establish(
         &runtime.directory,
-        DnsEvidenceScope::HostBlockCandidate,
+        DnsBlockRuntimeScope::TestEvidence.dns_scope(),
         Some(queue.clone()),
     )?;
-    let mut session = DnsMediatedBlockSession::establish(runtime, mediation, queue, plan)?;
+    let mut session = DnsMediatedBlockSession::establish(
+        runtime,
+        mediation,
+        queue,
+        plan,
+        DnsBlockRuntimeScope::TestEvidence,
+    )?;
     let start = Instant::now();
     loop {
         session.poll_once(start.elapsed(), POLL_INTERVAL)?;
@@ -1025,9 +1159,10 @@ fn initial_dns_block_evidence(
     active: &BTreeMap<(String, IpAddr), ActiveMaterialization>,
     materializations_truncated: bool,
     ruleset_hash: String,
+    scope: DnsBlockRuntimeScope,
 ) -> DnsMediatedBlockEvidence {
     DnsMediatedBlockEvidence {
-        status: DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
+        status: scope.evidence_status(),
         mode: Mode::Block,
         candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
         selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
@@ -1056,12 +1191,12 @@ fn initial_dns_block_evidence(
         findings_truncated: false,
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
-        protection_available: false,
-        limitations: dns_block_limitations(),
+        protection_available: scope.protection_available(),
+        limitations: scope.limitations(),
     }
 }
 
-fn dns_block_limitations() -> Vec<&'static str> {
+fn dns_block_test_limitations() -> Vec<&'static str> {
     vec![
         "dns_mediated_host_block_candidate_test_only_no_public_activation",
         "test_only_evidence_path_does_not_activate_default_planning_descriptor",
@@ -1083,13 +1218,33 @@ fn dns_block_limitations() -> Vec<&'static str> {
     ]
 }
 
+fn protected_block_limitations() -> Vec<&'static str> {
+    vec![
+        "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
+        "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
+        "block_dns_queries_are_canonicalized_before_upstream_forwarding",
+        "dns_query_timing_and_count_remain_egress_limitations",
+        "post_ready_codeload_traffic_is_not_authorized",
+        "post_ready_results_storage_traffic_is_not_authorized",
+        "cname_descendants_are_bounded_ttl_derived_authorizations",
+        "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+        "bootstrap_roots_refresh_every_5_seconds",
+        "https_materialization_expiry_includes_30_second_refresh_overlap",
+        "approved_status_https_destinations_remain_egress_channels",
+        "resolved_status_ip_addresses_may_serve_additional_destinations",
+        "root_resident_dns_upstream_channel_remains_an_egress_limitation",
+        "dynamic_owned_table_replacement_resets_network_counters",
+        "standard_block_only_until_audit_and_unsafe_preserve_are_activated",
+    ]
+}
+
 fn prehydrate_candidate_names() -> Result<(), DnsMediationError> {
     for hostname in DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES {
         if (hostname, 443_u16)
             .to_socket_addrs()
             .map_err(|_| {
                 DnsMediationError::new(
-                    "dns_candidate_prehydration_failed",
+                    "dns_block_prehydration_failed",
                     "failed to resolve a fixed DNS-mediated bootstrap hostname",
                 )
             })?
@@ -1097,7 +1252,7 @@ fn prehydrate_candidate_names() -> Result<(), DnsMediationError> {
             .is_none()
         {
             return Err(DnsMediationError::new(
-                "dns_candidate_prehydration_failed",
+                "dns_block_prehydration_failed",
                 "a fixed DNS-mediated bootstrap hostname returned no addresses",
             ));
         }
@@ -1137,17 +1292,19 @@ fn merge_pending_materializations(
     (changed, truncated, expired)
 }
 
-fn materialized_effective_allowances(
+fn effective_allowances_with_materializations(
+    base_allowances: &[EffectiveAllowance],
     active: &BTreeMap<(String, IpAddr), ActiveMaterialization>,
 ) -> Vec<EffectiveAllowance> {
-    active
-        .values()
-        .map(|materialization| EffectiveAllowance {
+    base_allowances
+        .iter()
+        .cloned()
+        .chain(active.values().map(|materialization| EffectiveAllowance {
             destination_type: DestinationType::Ip,
             destination: materialization.address.to_string(),
             protocol: Protocol::Tcp,
             port: 443,
-        })
+        }))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -1188,6 +1345,10 @@ fn rollback_dns_block_setup(
 }
 
 fn runtime_error(error: RuntimeError) -> DnsMediationError {
+    DnsMediationError::new(error.code, error.message)
+}
+
+fn config_error(error: ErrorDetail) -> DnsMediationError {
     DnsMediationError::new(error.code, error.message)
 }
 
@@ -1341,13 +1502,16 @@ fn query_for_upstream(
 ) -> Option<Vec<u8>> {
     match (recorder.scope, parsed_question) {
         (DnsEvidenceScope::Audit, _) => Some(query.to_vec()),
-        (DnsEvidenceScope::HostBlockCandidate, Some((hostname, query_type))) => {
+        (
+            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock,
+            Some((hostname, query_type)),
+        ) => {
             let canonical = canonical_block_query(hostname, *query_type, query)?;
             recorder
                 .forward_query(hostname, *query_type)
                 .then_some(canonical)
         }
-        (DnsEvidenceScope::HostBlockCandidate, None) => None,
+        (DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock, None) => None,
     }
 }
 
@@ -1813,7 +1977,7 @@ fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static
         DnsEvidenceScope::Audit if matches_candidate_pattern(hostname) => {
             "matches_candidate_pattern"
         }
-        DnsEvidenceScope::HostBlockCandidate
+        DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock
             if matches_exact_block_candidate_hostname(hostname) =>
         {
             "matches_candidate_pattern"
@@ -1855,27 +2019,37 @@ fn evidence_from_state_and_authorizations(
         candidate_profile_id: scope.candidate_profile_id(),
         selected_platform_profile_id: match scope {
             DnsEvidenceScope::Audit => None,
-            DnsEvidenceScope::HostBlockCandidate => Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID),
+            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+                Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID)
+            }
         },
         candidate_domain_patterns: match scope {
             DnsEvidenceScope::Audit => DNS_CANDIDATE_PATTERNS.to_vec(),
-            DnsEvidenceScope::HostBlockCandidate => DNS_BLOCK_COMPATIBILITY_PATTERNS.to_vec(),
+            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+                DNS_BLOCK_COMPATIBILITY_PATTERNS.to_vec()
+            }
         },
         candidate_hostnames: match scope {
             DnsEvidenceScope::Audit => Vec::new(),
-            DnsEvidenceScope::HostBlockCandidate => {
+            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
                 DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.to_vec()
             }
         },
         mode: scope.mode(),
-        protection_available: false,
+        protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
         routing_status,
-        host_dns_routing: "local_mediator_test_only",
-        docker_dns_routing: "local_mediator_test_only",
+        host_dns_routing: match scope {
+            DnsEvidenceScope::ProtectedHostBlock => "local_root_resident_mediator",
+            _ => "local_mediator_test_only",
+        },
+        docker_dns_routing: match scope {
+            DnsEvidenceScope::ProtectedHostBlock => "local_root_resident_mediator",
+            _ => "local_mediator_test_only",
+        },
         answer_attribution_status: "bounded_reportable_hostname_answers_only",
         proxy_policy_status: match scope {
             DnsEvidenceScope::Audit => "audit_forwards_without_name_authorization",
-            DnsEvidenceScope::HostBlockCandidate => {
+            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
                 "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
             }
         },
@@ -1947,6 +2121,22 @@ fn evidence_from_state_and_authorizations(
                 "resolved_status_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
                 "planner_selection_does_not_activate_runtime_materialization",
+            ],
+            DnsEvidenceScope::ProtectedHostBlock => vec![
+                "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
+                "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
+                "block_dns_queries_are_canonicalized_before_upstream_forwarding",
+                "dns_query_timing_and_count_remain_egress_limitations",
+                "post_ready_codeload_traffic_is_not_authorized",
+                "post_ready_results_storage_traffic_is_not_authorized",
+                "cname_descendants_are_bounded_ttl_derived_authorizations",
+                "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+                "bootstrap_roots_refresh_every_5_seconds",
+                "https_materialization_expiry_includes_30_second_refresh_overlap",
+                "dns_answers_materialize_only_bounded_status_or_cname_descendant_https_addresses",
+                "approved_status_https_destinations_remain_egress_channels",
+                "resolved_status_ip_addresses_may_serve_additional_destinations",
+                "root_resident_dns_upstream_channel_remains_an_egress_limitation",
             ],
         },
     }
@@ -2464,7 +2654,7 @@ mod tests {
         assert!(!truncated);
         assert_eq!(expired, 0);
         assert_eq!(
-            materialized_effective_allowances(&active),
+            effective_allowances_with_materializations(&[], &active),
             vec![EffectiveAllowance {
                 destination_type: DestinationType::Ip,
                 destination: "192.0.2.10".to_owned(),

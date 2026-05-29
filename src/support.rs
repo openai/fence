@@ -70,14 +70,14 @@ pub fn inspect_support(provider: &dyn SupportProvider) -> SupportData {
         host_architecture: identity.architecture,
         protection_available: false,
         reasons: vec![
-            "public_enforcement_not_activated",
-            "hosted_runner_fingerprint_not_checked",
-            "lockdown_not_implemented",
+            "protected_standard_block_requires_trusted_launcher",
+            "hosted_runner_fingerprint_checked_during_activation",
+            "activation_readiness_not_established_by_support_probe",
         ],
         deferred_capability_probes: vec![
-            "transient_systemd_service",
-            "sudo_lockdown",
-            "container_lockdown",
+            "trusted_transient_systemd_service_activation",
+            "hosted_runner_fingerprint_activation_check",
+            "standard_block_readiness",
         ],
         network_backend: provider.network_backend_observation(),
         hosted_runner_fingerprint: hosted_runner_fingerprint_requirement(),
@@ -113,7 +113,7 @@ mod tests {
     }
 
     #[test]
-    fn intended_target_still_reports_no_protection_in_phase3a() {
+    fn intended_target_still_reports_no_active_protection_from_read_only_probe() {
         let data = inspect_support(&FixedProvider {
             os: "linux",
             architecture: "x86_64",
@@ -124,9 +124,9 @@ mod tests {
         assert_eq!(
             data.reasons,
             vec![
-                "public_enforcement_not_activated",
-                "hosted_runner_fingerprint_not_checked",
-                "lockdown_not_implemented"
+                "protected_standard_block_requires_trusted_launcher",
+                "hosted_runner_fingerprint_checked_during_activation",
+                "activation_readiness_not_established_by_support_probe"
             ]
         );
         assert!(data.network_backend.nft_binary_present);
