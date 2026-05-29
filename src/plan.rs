@@ -394,13 +394,17 @@ fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> As
 }
 
 fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
-    let mut limitations = vec!["phase3_lifecycle_not_activated_no_public_enforcement"];
+    let mut limitations = vec!["render_plan_does_not_apply_or_verify_security_state"];
     match status {
-        AssuranceStatus::PlannedBlockContainment => {}
+        AssuranceStatus::PlannedBlockContainment => {
+            limitations.push("standard_block_requires_supported_trusted_launcher_for_activation");
+        }
         AssuranceStatus::PlannedBlockDegradedContainerAccess => {
+            limitations.push("unsafe_preserve_production_activation_not_implemented");
             limitations.push("container_access_would_invalidate_ordinary_containment");
         }
         AssuranceStatus::AuditObservationOnly => {
+            limitations.push("audit_production_activation_not_implemented");
             limitations.push("audit_observes_only_and_never_contains");
         }
     }
@@ -552,8 +556,29 @@ mod tests {
         );
         assert_ne!(standard.policy_hash, audit.policy_hash);
         assert_ne!(standard.ruleset_hash, audit.ruleset_hash);
-        assert_eq!(degraded.limitations.len(), 2);
-        assert_eq!(audit.limitations.len(), 2);
+        assert_eq!(
+            standard.limitations,
+            vec![
+                "render_plan_does_not_apply_or_verify_security_state",
+                "standard_block_requires_supported_trusted_launcher_for_activation"
+            ]
+        );
+        assert_eq!(
+            degraded.limitations,
+            vec![
+                "render_plan_does_not_apply_or_verify_security_state",
+                "unsafe_preserve_production_activation_not_implemented",
+                "container_access_would_invalidate_ordinary_containment"
+            ]
+        );
+        assert_eq!(
+            audit.limitations,
+            vec![
+                "render_plan_does_not_apply_or_verify_security_state",
+                "audit_production_activation_not_implemented",
+                "audit_observes_only_and_never_contains"
+            ]
+        );
     }
 
     #[test]

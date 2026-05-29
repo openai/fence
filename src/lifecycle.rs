@@ -387,15 +387,30 @@ pub fn validate_test_service_context(unit_name: &str) -> Result<(), LifecycleErr
 
 pub fn validate_production_service_context(invocation_id: &str) -> Result<(), LifecycleError> {
     let unit_name = production_service_name(invocation_id)?;
-    let effective_uid = fs::metadata("/proc/self")
-        .map_err(|error| LifecycleError::new("trusted_launcher_required", error.to_string()))?
-        .uid();
+    let effective_uid = production_effective_uid()?;
     validate_production_service_identity(
         invocation_id,
         effective_uid,
         query_service_main_pid(&unit_name)?,
         std::process::id(),
     )
+}
+
+pub fn require_production_root_process() -> Result<(), LifecycleError> {
+    if production_effective_uid()? == 0 {
+        Ok(())
+    } else {
+        Err(LifecycleError::new(
+            "trusted_launcher_required",
+            "protected lifecycle must execute as root inside its matching transient service",
+        ))
+    }
+}
+
+fn production_effective_uid() -> Result<u32, LifecycleError> {
+    fs::metadata("/proc/self")
+        .map_err(|error| LifecycleError::new("trusted_launcher_required", error.to_string()))
+        .map(|metadata| metadata.uid())
 }
 
 fn query_service_main_pid(unit_name: &str) -> Result<Option<u32>, LifecycleError> {

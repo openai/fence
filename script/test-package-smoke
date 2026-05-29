@@ -56,7 +56,7 @@ PY
 
 assert_no_runtime_state() {
   if [[ -e "$runtime_directory" ]]; then
-    die "public non-enforcing command unexpectedly created runtime state: $runtime_directory"
+    die "public command unexpectedly created runtime state: $runtime_directory"
   fi
 }
 
@@ -113,7 +113,7 @@ require(result["schema_version"] == 1, "version response schema mismatch")
 require(result["command"] == "version", "version command field mismatch")
 require(result["status"] == "success", "version response status mismatch")
 require(result["fence_version"] == "0.0.0", "version envelope version mismatch")
-require(result["data"]["implementation_phase"] == "phase3", "version phase mismatch")
+require(result["data"]["implementation_phase"] == "phase4", "version phase mismatch")
 require(result["data"]["protection_available"] is False, "version reported protection")
 PY
 
@@ -136,18 +136,21 @@ require(result["schema_version"] == 1, "support response schema mismatch")
 require(result["command"] == "check-support", "support command field mismatch")
 require(result["status"] == "success", "support response status mismatch")
 require(result["fence_version"] == "0.0.0", "support envelope version mismatch")
-require(data["implementation_phase"] == "phase3", "support phase mismatch")
+require(data["implementation_phase"] == "phase4", "support phase mismatch")
 require(data["intended_protected_target_match"] is True, "support target mismatch")
 require(data["protection_available"] is False, "support reported protection")
 require(
-    "public_enforcement_not_activated" in data["reasons"],
-    "support omitted public-enforcement reason",
+    "protected_standard_block_requires_trusted_launcher" in data["reasons"],
+    "support omitted trusted-launcher reason",
 )
 require(
-    "hosted_runner_fingerprint_not_checked" in data["reasons"],
-    "support omitted fingerprint reason",
+    "hosted_runner_fingerprint_checked_during_activation" in data["reasons"],
+    "support omitted activation fingerprint reason",
 )
-require("lockdown_not_implemented" in data["reasons"], "support omitted lockdown reason")
+require(
+    "activation_readiness_not_established_by_support_probe" in data["reasons"],
+    "support omitted readiness reason",
+)
 require(
     data["network_backend"]["required"] == "native_nftables",
     "support backend requirement mismatch",
@@ -198,7 +201,7 @@ require(result["schema_version"] == 1, "plan response schema mismatch")
 require(result["command"] == "render-plan", "plan command field mismatch")
 require(result["status"] == "success", "plan response status mismatch")
 require(result["fence_version"] == "0.0.0", "plan envelope version mismatch")
-require(data["implementation_phase"] == "phase3", "plan phase mismatch")
+require(data["implementation_phase"] == "phase4", "plan phase mismatch")
 require(data["policy_hash_schema_version"] == 3, "plan policy hash schema mismatch")
 require(re.fullmatch(r"[0-9a-f]{64}", data["policy_hash"]), "invalid policy hash")
 require(re.fullmatch(r"[0-9a-f]{64}", data["ruleset_hash"]), "invalid ruleset hash")
@@ -240,8 +243,8 @@ require(result["command"] == "run", "run command field mismatch")
 require(result["status"] == "error", "run response status mismatch")
 require(result["fence_version"] == "0.0.0", "run envelope version mismatch")
 require(
-    result["error"]["code"] == "enforcement_not_implemented",
-    "run did not fail closed",
+    result["error"]["code"] == "trusted_launcher_required",
+    "run did not reject direct execution outside the trusted launcher",
 )
 PY
 if [[ -e "$sentinel" ]]; then
@@ -251,4 +254,4 @@ fi
 assert_no_owned_table after
 assert_no_runtime_state
 
-echo -e "${GREEN}packaged public non-enforcing CLI contract verified${OFF}"
+echo -e "${GREEN}packaged public trusted-launcher CLI boundary verified${OFF}"

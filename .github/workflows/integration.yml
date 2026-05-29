@@ -149,9 +149,35 @@ jobs:
           DNS_BLOCK_CANDIDATE_REPLICA: required
         run: script/report-dns-block-candidate
 
+  protected-run:
+    name: protected standard block
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: run packaged trusted-launcher standard block
+        run: script/test-protected-run
+
   integration:
     name: integration
-    needs: [lockdown, profile-measurement, composed, dns-mediated-host-block]
+    needs: [lockdown, profile-measurement, composed, dns-mediated-host-block, protected-run]
     runs-on: ubuntu-24.04
 
     steps:

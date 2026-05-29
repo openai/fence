@@ -43,7 +43,7 @@ fn version_is_json_and_does_not_claim_protection() {
 
     assert_eq!(response["command"], "version");
     assert_eq!(response["status"], "success");
-    assert_eq!(response["data"]["implementation_phase"], "phase3");
+    assert_eq!(response["data"]["implementation_phase"], "phase4");
     assert_eq!(response["data"]["protection_available"], false);
 }
 
@@ -52,7 +52,7 @@ fn support_is_read_only_and_not_protective() {
     let response = success_json(&["check-support"]);
 
     assert_eq!(response["command"], "check-support");
-    assert_eq!(response["data"]["implementation_phase"], "phase3");
+    assert_eq!(response["data"]["implementation_phase"], "phase4");
     assert_eq!(response["data"]["protection_available"], false);
     assert_eq!(
         response["data"]["hosted_runner_fingerprint"]["status"],
@@ -64,7 +64,7 @@ fn support_is_read_only_and_not_protective() {
     );
     assert_eq!(
         response["data"]["reasons"][0],
-        "public_enforcement_not_activated"
+        "protected_standard_block_requires_trusted_launcher"
     );
     assert_eq!(
         response["data"]["network_backend"]["nft_binary_expected_path"],
@@ -146,7 +146,14 @@ fn run_fails_closed_without_reading_config() {
     let response = error_json(&["run", "--config", "/not/a/real/config.json"], 1);
 
     assert_eq!(response["command"], "run");
-    assert_eq!(response["error"]["code"], "enforcement_not_implemented");
+    assert_eq!(
+        response["error"]["code"],
+        if cfg!(target_os = "linux") {
+            "trusted_launcher_required"
+        } else {
+            "enforcement_not_implemented"
+        }
+    );
 }
 
 #[test]

@@ -34,7 +34,7 @@ pub mod support;
 
 use serde::Serialize;
 
-pub const IMPLEMENTATION_PHASE: &str = "phase3";
+pub const IMPLEMENTATION_PHASE: &str = "phase4";
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct VersionInfo {
@@ -64,12 +64,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_identifies_non_enforcing_phase() {
+    fn version_identifies_current_phase_without_global_protection_claim() {
         let info = version_info();
 
         assert_eq!(info.name, env!("CARGO_PKG_NAME"));
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.implementation_phase, "phase3");
+        assert_eq!(info.implementation_phase, "phase4");
         assert!(!info.protection_available);
     }
 }

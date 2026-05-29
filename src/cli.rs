@@ -7,12 +7,13 @@ use crate::support::{SupportProvider, SystemSupportProvider, inspect_support};
 use crate::version_info;
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "fence",
-    about = "Fence phase3 hosted-runner lifecycle design agent",
+    about = "Fence phase4 hosted-runner lifecycle agent",
     disable_help_flag = true,
     disable_version_flag = true
 )]
@@ -42,10 +43,11 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    execute(
+    execute_with_run_provider(
         args.into_iter().map(Into::into).collect(),
         &SystemResolver,
         &SystemSupportProvider,
+        &SystemRunProvider,
     )
 }
 
@@ -53,6 +55,50 @@ pub fn execute(
     args: Vec<OsString>,
     resolver: &dyn Resolver,
     support_provider: &dyn SupportProvider,
+) -> CommandOutput {
+    execute_with_run_provider(args, resolver, support_provider, &DisabledRunProvider)
+}
+
+trait RunProvider {
+    fn run(&self, config: &Path) -> Result<(), ErrorDetail>;
+}
+
+struct DisabledRunProvider;
+
+impl RunProvider for DisabledRunProvider {
+    fn run(&self, _config: &Path) -> Result<(), ErrorDetail> {
+        Err(ErrorDetail::new(
+            "enforcement_not_implemented",
+            "run is unavailable until privileged enforcement is implemented",
+        ))
+    }
+}
+
+struct SystemRunProvider;
+
+impl RunProvider for SystemRunProvider {
+    fn run(&self, config: &Path) -> Result<(), ErrorDetail> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::dns_mediator::run_protected_standard_block_service(config)
+                .map_err(|error| ErrorDetail::new(error.code, "protected lifecycle setup failed"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = config;
+            Err(ErrorDetail::new(
+                "enforcement_not_implemented",
+                "run is unavailable on this target",
+            ))
+        }
+    }
+}
+
+fn execute_with_run_provider(
+    args: Vec<OsString>,
+    resolver: &dyn Resolver,
+    support_provider: &dyn SupportProvider,
+    run_provider: &dyn RunProvider,
 ) -> CommandOutput {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -82,14 +128,17 @@ pub fn execute(
             success("check-support", inspect_support(support_provider))
         }
         (false, Some(Commands::RenderPlan { config })) => render_plan(&config, resolver),
-        (false, Some(Commands::Run { config: _ })) => failure(
-            "run",
-            ErrorDetail::new(
-                "enforcement_not_implemented",
-                "run is unavailable until privileged enforcement is implemented",
+        (false, Some(Commands::Run { config })) => match run_provider.run(&config) {
+            Ok(()) => failure(
+                "run",
+                ErrorDetail::new(
+                    "protected_lifecycle_exited",
+                    "protected lifecycle exited unexpectedly",
+                ),
+                1,
             ),
-            1,
-        ),
+            Err(error) => failure("run", error, 1),
+        },
         (false, None) => failure(
             "cli",
             ErrorDetail::new(
@@ -147,6 +196,14 @@ mod tests {
         }
     }
 
+    struct ExitedRunProvider;
+
+    impl RunProvider for ExitedRunProvider {
+        fn run(&self, _config: &Path) -> Result<(), ErrorDetail> {
+            Ok(())
+        }
+    }
+
     fn execute_test(args: &[&str]) -> CommandOutput {
         execute(
             args.iter().map(OsString::from).collect(),
@@ -161,7 +218,7 @@ mod tests {
         let support = execute_test(&["fence", "check-support"]);
 
         assert_eq!(version.exit_code, 0);
-        assert!(version.json.contains("\"implementation_phase\":\"phase3\""));
+        assert!(version.json.contains("\"implementation_phase\":\"phase4\""));
         assert_eq!(support.exit_code, 0);
         assert!(support.json.contains("\"protection_available\":false"));
     }
@@ -178,6 +235,22 @@ mod tests {
         assert_eq!(mixed.exit_code, 2);
         assert_eq!(run.exit_code, 1);
         assert!(run.json.contains("enforcement_not_implemented"));
+    }
+
+    #[test]
+    fn unexpected_protected_lifecycle_exit_is_a_structured_failure() {
+        let output = execute_with_run_provider(
+            ["fence", "run", "--config", "/must/not/be/read"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+            &FailResolver,
+            &LinuxProvider,
+            &ExitedRunProvider,
+        );
+
+        assert_eq!(output.exit_code, 1);
+        assert!(output.json.contains("protected_lifecycle_exited"));
     }
 
     #[test]
