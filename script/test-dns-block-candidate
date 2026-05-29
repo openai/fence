@@ -97,7 +97,7 @@ assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "dns_mediated_host_block_candidate_test_only"
 assert report["mode"] == "block"
-assert report["candidate_profile_id"] == "github_hosted_dns_mediated_compatibility_candidate_v3"
+assert report["candidate_profile_id"] == "github_hosted_dns_mediated_no_codeload_candidate_v4"
 assert report["candidate_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
@@ -115,10 +115,9 @@ assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report[
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
-assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_compatibility_candidate_v3"
+assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_no_codeload_candidate_v4"
 assert dns["candidate_domain_patterns"] == [
     "*.actions.githubusercontent.com",
-    "codeload.github.com",
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa*.blob.core.windows.net",
 ]
@@ -133,6 +132,7 @@ assert dns["proxy_policy_status"] == "block_forwards_github_compatibility_patter
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
 assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in dns["limitations"]
 assert "wildcard_dns_authorization_is_an_egress_limitation" in dns["limitations"]
+assert "post_ready_codeload_traffic_is_not_authorized" in dns["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
 assert "candidate_bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
@@ -141,6 +141,7 @@ assert "approved_status_https_destinations_remain_egress_channels" in dns["limit
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
 assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in report["limitations"]
 assert "wildcard_dns_authorization_is_an_egress_limitation" in report["limitations"]
+assert "post_ready_codeload_traffic_is_not_authorized" in report["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
 assert "candidate_bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]

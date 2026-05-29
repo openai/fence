@@ -96,10 +96,12 @@ pipeline roots delegate through bounded Microsoft edge aliases. Authorizing
 four exact root names plus bounded TTL-derived CNAME descendants and retaining
 their HTTPS rules for DNS TTL plus a fixed thirty-second refresh overlap still
 left three hosted jobs non-terminal after their visible completion steps.
-The current compatibility-first diagnostic therefore forwards the four
-GitHub-related DNS classes already modeled by the audit experiment, refreshes
-the four bootstrap roots every five seconds, and continues to materialize
-only TTL-bounded TCP `443` address rules. This remains *test-only*:
+The compatibility-first diagnostic therefore forwarded the four
+GitHub-related DNS classes already modeled by the audit experiment, refreshed
+the four bootstrap roots every five seconds, and continued to materialize
+only TTL-bounded TCP `443` address rules. All three hosted jobs reached
+terminal success. The current reduction removes `codeload.github.com` because
+v0 does not support post-ready action downloads. This remains *test-only*:
 it neither selects a default `platform_profile` nor activates public
 protection, and its wildcard DNS authorization is an egress limitation that
 cannot become a default profile without another reduction pass. A following
