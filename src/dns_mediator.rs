@@ -4,10 +4,10 @@ use crate::plan::PlanData;
 use crate::runtime::TestRuntimeStore;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,6 +24,7 @@ pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "productionresultssa*.blob.core.windows.net",
 ];
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
+const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
 const UPSTREAM_DNS: &str = "168.63.129.16:53";
 const HOST_DNS_BIND: &str = "127.0.0.1:53";
@@ -55,6 +56,9 @@ pub struct DnsObservation {
     pub query_type: String,
     pub candidate_classification: &'static str,
     pub occurrences: u64,
+    pub resolved_addresses: Vec<String>,
+    pub minimum_observed_ttl_seconds: Option<u32>,
+    pub addresses_truncated: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -67,6 +71,7 @@ pub struct DnsMediationEvidence {
     pub routing_status: &'static str,
     pub host_dns_routing: &'static str,
     pub docker_dns_routing: &'static str,
+    pub answer_attribution_status: &'static str,
     pub observations: Vec<DnsObservation>,
     pub observations_truncated: bool,
     pub excluded_non_github_query_count: u64,
@@ -75,9 +80,23 @@ pub struct DnsMediationEvidence {
 
 #[derive(Debug, Default)]
 struct ObservationState {
-    retained: BTreeMap<(String, u16, &'static str), u64>,
+    retained: BTreeMap<(String, u16, &'static str), RetainedObservation>,
     truncated: bool,
     excluded_non_github_query_count: u64,
+}
+
+#[derive(Debug, Default)]
+struct RetainedObservation {
+    occurrences: u64,
+    resolved_addresses: BTreeSet<IpAddr>,
+    minimum_observed_ttl_seconds: Option<u32>,
+    addresses_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DnsAddressAnswer {
+    address: IpAddr,
+    ttl_seconds: u32,
 }
 
 #[derive(Clone)]
@@ -97,10 +116,16 @@ impl ObservationRecorder {
                 "github_related_outside_candidate"
             };
             let key = (hostname, query_type, classification);
-            if let Some(count) = state.retained.get_mut(&key) {
-                *count = count.saturating_add(1);
+            if let Some(observation) = state.retained.get_mut(&key) {
+                observation.occurrences = observation.occurrences.saturating_add(1);
             } else if state.retained.len() < MAX_RETAINED_DNS_OBSERVATIONS {
-                state.retained.insert(key, 1);
+                state.retained.insert(
+                    key,
+                    RetainedObservation {
+                        occurrences: 1,
+                        ..RetainedObservation::default()
+                    },
+                );
             } else {
                 state.truncated = true;
             }
@@ -108,6 +133,33 @@ impl ObservationRecorder {
             state.excluded_non_github_query_count =
                 state.excluded_non_github_query_count.saturating_add(1);
         }
+        let evidence = evidence_from_state(&state, "active_test_only");
+        let write_result = write_report(&self.report_path, &evidence);
+        drop(state);
+        let _ = write_result;
+    }
+
+    fn record_response(&self, hostname: &str, query_type: u16, packet: &[u8]) {
+        let Some(hostname) =
+            normalize_hostname(hostname).filter(|name| reportable_github_hostname(name))
+        else {
+            return;
+        };
+        let answers = parse_dns_address_answers(packet);
+        if answers.is_empty() {
+            return;
+        }
+        let classification = if matches_candidate_pattern(&hostname) {
+            "matches_candidate_pattern"
+        } else {
+            "github_related_outside_candidate"
+        };
+        let key = (hostname, query_type, classification);
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        let Some(observation) = state.retained.get_mut(&key) else {
+            return;
+        };
+        retain_address_answers(observation, answers);
         let evidence = evidence_from_state(&state, "active_test_only");
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
@@ -339,8 +391,9 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
             continue;
         };
         let bytes = &query[..length];
-        if let Some((hostname, query_type)) = parse_dns_question(bytes) {
-            recorder.record_query(&hostname, query_type);
+        let parsed_question = parse_dns_question(bytes);
+        if let Some((hostname, query_type)) = &parsed_question {
+            recorder.record_query(hostname, *query_type);
         }
         let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
             continue;
@@ -351,7 +404,11 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
         }
         let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
         if let Ok((response_length, _)) = upstream.recv_from(&mut response) {
-            let _ = socket.send_to(&response[..response_length], peer);
+            let response = &response[..response_length];
+            if let Some((hostname, query_type)) = &parsed_question {
+                recorder.record_response(hostname, *query_type, response);
+            }
+            let _ = socket.send_to(response, peer);
         }
     }
 }
@@ -370,8 +427,9 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         if client.read_exact(&mut query).is_err() {
             continue;
         }
-        if let Some((hostname, query_type)) = parse_dns_question(&query) {
-            recorder.record_query(&hostname, query_type);
+        let parsed_question = parse_dns_question(&query);
+        if let Some((hostname, query_type)) = &parsed_question {
+            recorder.record_query(hostname, *query_type);
         }
         let Ok(mut upstream) = TcpStream::connect(UPSTREAM_DNS) else {
             continue;
@@ -391,6 +449,9 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         let mut response = vec![0_u8; size];
         if upstream.read_exact(&mut response).is_err() {
             continue;
+        }
+        if let Some((hostname, query_type)) = &parsed_question {
+            recorder.record_response(hostname, *query_type, &response);
         }
         let _ = client.write_all(&response_length);
         let _ = client.write_all(&response);
@@ -429,6 +490,111 @@ fn parse_dns_question(packet: &[u8]) -> Option<(String, u16)> {
         labels.join("."),
         u16::from_be_bytes([packet[offset], packet[offset + 1]]),
     ))
+}
+
+fn parse_dns_address_answers(packet: &[u8]) -> Vec<DnsAddressAnswer> {
+    if packet.len() < 12 {
+        return Vec::new();
+    }
+    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let answer_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let mut offset = 12;
+    for _ in 0..question_count {
+        let Some(next) = skip_dns_name(packet, offset) else {
+            return Vec::new();
+        };
+        if next + 4 > packet.len() {
+            return Vec::new();
+        }
+        offset = next + 4;
+    }
+    let mut addresses = Vec::new();
+    for _ in 0..answer_count {
+        let Some(next) = skip_dns_name(packet, offset) else {
+            return Vec::new();
+        };
+        if next + 10 > packet.len() {
+            return Vec::new();
+        }
+        let answer_type = u16::from_be_bytes([packet[next], packet[next + 1]]);
+        let answer_class = u16::from_be_bytes([packet[next + 2], packet[next + 3]]);
+        let ttl_seconds = u32::from_be_bytes([
+            packet[next + 4],
+            packet[next + 5],
+            packet[next + 6],
+            packet[next + 7],
+        ]);
+        let data_length = usize::from(u16::from_be_bytes([packet[next + 8], packet[next + 9]]));
+        let data_offset = next + 10;
+        if data_offset + data_length > packet.len() {
+            return Vec::new();
+        }
+        let address = match (answer_type, answer_class, data_length) {
+            (1, 1, 4) => Some(IpAddr::V4(Ipv4Addr::new(
+                packet[data_offset],
+                packet[data_offset + 1],
+                packet[data_offset + 2],
+                packet[data_offset + 3],
+            ))),
+            (28, 1, 16) => {
+                let mut bytes = [0_u8; 16];
+                bytes.copy_from_slice(&packet[data_offset..data_offset + 16]);
+                Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+            }
+            _ => None,
+        };
+        if let Some(address) = address {
+            addresses.push(DnsAddressAnswer {
+                address,
+                ttl_seconds,
+            });
+        }
+        offset = data_offset + data_length;
+    }
+    addresses
+}
+
+fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
+    loop {
+        let length = *packet.get(offset)?;
+        if length == 0 {
+            return Some(offset + 1);
+        }
+        if length & 0xc0 == 0xc0 {
+            packet.get(offset + 1)?;
+            return Some(offset + 2);
+        }
+        if length & 0xc0 != 0 || length > 63 {
+            return None;
+        }
+        offset = offset.checked_add(usize::from(length) + 1)?;
+        if offset > packet.len() {
+            return None;
+        }
+    }
+}
+
+fn retain_address_answers(
+    observation: &mut RetainedObservation,
+    answers: impl IntoIterator<Item = DnsAddressAnswer>,
+) {
+    for answer in answers {
+        observation.minimum_observed_ttl_seconds = Some(
+            observation
+                .minimum_observed_ttl_seconds
+                .map_or(answer.ttl_seconds, |existing| {
+                    existing.min(answer.ttl_seconds)
+                }),
+        );
+        if observation.resolved_addresses.contains(&answer.address) {
+            continue;
+        }
+        if observation.resolved_addresses.len() < MAX_RETAINED_ADDRESSES_PER_OBSERVATION {
+            observation.resolved_addresses.insert(answer.address);
+        } else {
+            observation.addresses_truncated = true;
+        }
+    }
 }
 
 fn normalize_hostname(hostname: &str) -> Option<String> {
@@ -484,15 +650,23 @@ fn evidence_from_state(
         routing_status,
         host_dns_routing: "local_mediator_test_only",
         docker_dns_routing: "local_mediator_test_only",
+        answer_attribution_status: "bounded_reportable_hostname_answers_only",
         observations: state
             .retained
             .iter()
             .map(
-                |((hostname, query_type, classification), occurrences)| DnsObservation {
+                |((hostname, query_type, classification), observation)| DnsObservation {
                     hostname: hostname.clone(),
                     query_type: query_type_name(*query_type),
                     candidate_classification: classification,
-                    occurrences: *occurrences,
+                    occurrences: observation.occurrences,
+                    resolved_addresses: observation
+                        .resolved_addresses
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    minimum_observed_ttl_seconds: observation.minimum_observed_ttl_seconds,
+                    addresses_truncated: observation.addresses_truncated,
                 },
             )
             .collect(),
@@ -502,6 +676,8 @@ fn evidence_from_state(
             "dns_mediation_audit_test_only_no_public_activation",
             "candidate_patterns_not_selected_as_platform_profile",
             "audit_observes_queries_without_blocking_names",
+            "dns_answers_attribute_addresses_without_authorizing_firewall_rules",
+            "dns_ttls_are_evidence_for_future_bounded_refresh_design_only",
             "evidence_collected_before_hosted_job_teardown",
             "terminal_block_success_required_before_default_selection",
         ],
@@ -617,6 +793,24 @@ mod tests {
         bytes
     }
 
+    fn response_with_address(
+        name: &str,
+        query_type: u16,
+        ttl_seconds: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = query(name, query_type);
+        bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0xc0, 0x0c]);
+        bytes.extend_from_slice(&query_type.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
+        bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
     #[test]
     fn parses_and_normalizes_bounded_dns_questions() {
         assert_eq!(
@@ -650,6 +844,71 @@ mod tests {
     }
 
     #[test]
+    fn extracts_bounded_dns_answer_addresses_and_ttls() {
+        assert_eq!(
+            parse_dns_address_answers(&response_with_address(
+                "pipelines.actions.githubusercontent.com",
+                1,
+                30,
+                &[192, 0, 2, 10],
+            )),
+            vec![DnsAddressAnswer {
+                address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
+                ttl_seconds: 30,
+            }]
+        );
+        assert_eq!(
+            parse_dns_address_answers(&response_with_address(
+                "pipelines.actions.githubusercontent.com",
+                28,
+                60,
+                &"2001:db8::1"
+                    .parse::<Ipv6Addr>()
+                    .expect("IPv6 fixture must parse")
+                    .octets(),
+            )),
+            vec![DnsAddressAnswer {
+                address: "2001:db8::1".parse().expect("IPv6 fixture must parse"),
+                ttl_seconds: 60,
+            }]
+        );
+        assert!(parse_dns_address_answers(&[]).is_empty());
+    }
+
+    #[test]
+    fn bounds_and_deduplicates_retained_address_attribution() {
+        let mut observation = RetainedObservation::default();
+        retain_address_answers(
+            &mut observation,
+            [
+                DnsAddressAnswer {
+                    address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
+                    ttl_seconds: 60,
+                },
+                DnsAddressAnswer {
+                    address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
+                    ttl_seconds: 30,
+                },
+            ],
+        );
+        for value in 0..=MAX_RETAINED_ADDRESSES_PER_OBSERVATION {
+            retain_address_answers(
+                &mut observation,
+                [DnsAddressAnswer {
+                    address: IpAddr::V4(Ipv4Addr::new(198, 51, 100, value as u8)),
+                    ttl_seconds: 45,
+                }],
+            );
+        }
+        assert_eq!(
+            observation.resolved_addresses.len(),
+            MAX_RETAINED_ADDRESSES_PER_OBSERVATION
+        );
+        assert_eq!(observation.minimum_observed_ttl_seconds, Some(30));
+        assert!(observation.addresses_truncated);
+    }
+
+    #[test]
     fn builds_bounded_sanitized_evidence() {
         let mut state = ObservationState::default();
         state.retained.insert(
@@ -658,13 +917,30 @@ mod tests {
                 1,
                 "matches_candidate_pattern",
             ),
-            2,
+            RetainedObservation {
+                occurrences: 2,
+                resolved_addresses: BTreeSet::from([
+                    "192.0.2.10".parse().expect("IPv4 fixture must parse"),
+                    "2001:db8::1".parse().expect("IPv6 fixture must parse"),
+                ]),
+                minimum_observed_ttl_seconds: Some(30),
+                addresses_truncated: false,
+            },
         );
         state.excluded_non_github_query_count = 1;
         let evidence = evidence_from_state(&state, "active_test_only");
         assert_eq!(evidence.observations.len(), 1);
         assert_eq!(evidence.observations[0].query_type, "a");
         assert_eq!(evidence.observations[0].occurrences, 2);
+        assert_eq!(
+            evidence.observations[0].resolved_addresses,
+            vec!["192.0.2.10", "2001:db8::1"]
+        );
+        assert_eq!(
+            evidence.observations[0].minimum_observed_ttl_seconds,
+            Some(30)
+        );
+        assert!(!evidence.observations[0].addresses_truncated);
         assert_eq!(evidence.excluded_non_github_query_count, 1);
         assert!(!evidence.protection_available);
     }

@@ -62,8 +62,11 @@ replaced with a constrained design before any default profile decision. It
 remains test-only and non-default; no built-in platform profile is selected.
 A separate, non-required DNS-mediated audit experiment routes host and Docker
 resolver traffic through a local test-only mediator and records only bounded
-GitHub-related queried hostnames. It classifies observations against a fixed
-GitHub compatibility hypothesis consisting of
+GitHub-related queried hostnames. For those retained names only, it records
+bounded canonical answer addresses and the minimum observed DNS TTL to support
+later correlation and refresh design; it does not use those answers to add
+firewall authorization. It classifies observations against a fixed GitHub
+compatibility hypothesis consisting of
 `*.actions.githubusercontent.com`, `codeload.github.com`,
 `actions-results-receiver-production.githubapp.com`, and
 `productionresultssa*.blob.core.windows.net`. That hypothesis is not an

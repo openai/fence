@@ -101,6 +101,7 @@ assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_candidate_v1"
 assert dns["routing_status"] == "active_test_only"
 assert dns["host_dns_routing"] == "local_mediator_test_only"
 assert dns["docker_dns_routing"] == "local_mediator_test_only"
+assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
 assert dns["candidate_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "codeload.github.com",
@@ -143,6 +144,8 @@ report = json.loads(report_path.read_text(encoding="utf-8"))
 assert dns["routing_status"] == "active_test_only", dns
 assert dns["protection_available"] is False, dns
 assert "candidate_patterns_not_selected_as_platform_profile" in dns["limitations"], dns
+assert "dns_answers_attribute_addresses_without_authorizing_firewall_rules" in dns["limitations"], dns
+assert "dns_ttls_are_evidence_for_future_bounded_refresh_design_only" in dns["limitations"], dns
 assert "terminal_block_success_required_before_default_selection" in dns["limitations"], dns
 assert dns["excluded_non_github_query_count"] >= 2, dns
 assert report["verification_status"] == "verified", report
