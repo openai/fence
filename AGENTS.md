@@ -34,6 +34,7 @@ Production runtime intake accepts only `/run/fence/<invocation-id>/config.json`,
 - No network calls during `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/test-action-wrapper`, `script/validate-action-bundle`, `script/lint`, `script/build`, or `script/server`.
 - `script/test-lockdown` is intentionally restricted to disposable GitHub-hosted Linux evidence jobs because its successful block and degraded scenarios disable host access without restore.
 - `script/test-protected-run` is intentionally restricted to disposable GitHub-hosted Linux integration jobs because it launches a production lifecycle and leaves owned host network state plus DNS mediation resident without restore; standard block also disables sudo/container controls, degraded block disables sudo while preserving containers, and audit preserves sudo/containers while applying non-blocking observation rules.
+- `script/test-action-setup-failure` and `script/test-action-tamper` are intentionally restricted to disposable GitHub-hosted Linux Action-acceptance jobs. The former proves malformed wrapper input fails before mutation. The latter launches the bundled audit lifecycle, deletes owned network state after readiness, proves resident critical drift, invokes the post hook expecting failure, and never restores access.
 - `script/update` is the only normal Cargo dependency update path and is intentionally online-only.
 - `script/vendor-rust` is the only normal Rust distribution lock refresh path and is intentionally online-only.
 - `script/prepare-rust` is the only normal Rust installation path. It is intentionally online, checksum-gated, and must validate `.cargo/tooling/rust-toolchain.lock.toml` before invoking `rustup`.
@@ -219,6 +220,14 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled alpha binary while controls remain resident until ephemeral teardown.
   - Must not stop the service, restore controls, download an agent, or fetch policy.
 
+- `script/test-action-setup-failure`
+  - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
+  - Invokes the dependency-free Action launcher with a malformed invocation slug and proves rejection occurs before Action state, runtime directories, or owned nftables state are created.
+
+- `script/test-action-tamper`
+  - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
+  - Launches the bundled audit lifecycle through the Action entrypoint, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the post hook fails without stopping the service or restoring network state.
+
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.
   - Uses frozen Cargo commands for lint/doc generation.
@@ -329,7 +338,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - New dependency governance tools must be pinned and either preinstalled for offline paths or limited to `script/update`.
 - Phase 2C uses exact-pinned, Linux-target-only `netlink-packet-netfilter` and `netlink-sys` dependencies for privileged NFLOG evidence. Keep them scoped to Linux because netlink is unavailable on portable macOS validation hosts, and keep `netlink-sys` default features disabled.
 - Phase 3B uses exact-pinned, Linux-target-only `libc` constants for `O_NOFOLLOW` and `O_CLOEXEC` on secure test-lifecycle evidence files. Fence code still forbids first-party `unsafe_code`; the crate was already present transitively in the vendored Linux graph before becoming an explicit runtime-safety input.
-- The selected typed netlink message stack currently pulls the unmaintained `paste` crate transitively through `netlink-packet-utils`; `cargo audit` reports `RUSTSEC-2024-0436` as an allowed maintenance warning rather than a known vulnerability. The initial alpha accepts that reviewed warning; reassess or replace the surface before promotion beyond alpha.
+- The selected typed netlink message stack currently pulls the unmaintained `paste` crate transitively through `netlink-packet-utils`; `cargo audit` reports `RUSTSEC-2024-0436` as an allowed maintenance warning rather than a known vulnerability. The Phase 5B review reconfirmed that single warning and no locked-graph vulnerability. The initial alpha accepts that reviewed warning; reassess or replace the surface before promotion beyond alpha.
 - `cargo-vet`, SBOM generation, and auditable binaries are intended staged follow-ups. Do not quietly add online release downloads for those tools.
 
 ## Version Files
@@ -357,7 +366,7 @@ If any version file changes, update docs and verify the corresponding script beh
 
 - The `build` workflow is the PR-based native Linux x64 package smoke test. It should validate locks, prepare Rust, run `script/bootstrap`, and run `script/build --release --targets "x86_64-unknown-linux-gnu"` on `ubuntu-24.04`.
 - The `acceptance` workflow should run only on `ubuntu-24.04`, build its own Linux x64 package from the current commit, verify its checksum, and invoke `script/test-package-smoke` as the `acceptance` check.
-- The `action acceptance` workflow should run only on disposable `ubuntu-24.04` runners, validate the committed release-bound Action bundle, invoke the root wrapper through `uses: ./`, and prove standard block, degraded `unsafe_preserve`, and audit behavior while controls remain resident.
+- The `action acceptance` workflow should run only on disposable `ubuntu-24.04` runners, validate the committed release-bound Action bundle, invoke the root wrapper through `uses: ./`, and prove standard block, degraded `unsafe_preserve`, and audit behavior while controls remain resident. Separate jobs under the same stable aggregate must prove setup rejection before mutation and post-ready critical-drift failure propagation without restore.
 - The `build` workflow should exercise retained Zig/`cargo-zigbuild` artifacts in a distinct offline install/verify smoke job. That job is not a protected release artifact claim.
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
@@ -439,7 +448,7 @@ Use the smallest validation set that proves the change:
 
 - Script/workflow/doc changes: `git diff --check`.
 - Packaged Linux public-contract changes: build the Linux x64 artifact on `ubuntu-24.04`, verify its checksum, then run `script/test-package-smoke <artifact>`.
-- Action-wrapper changes: run `script/validate-action-bundle` and `script/test-action-wrapper`, then rely on the disposable hosted `action acceptance` workflow for `uses: ./` lifecycle proof.
+- Action-wrapper changes: run `script/validate-action-bundle` and `script/test-action-wrapper`, then rely on the disposable hosted `action acceptance` workflow for `uses: ./` lifecycle proof plus setup-failure and post-ready tamper evidence.
 - Rust behavior changes: `script/bootstrap`, `script/test`, `script/lint`, and `script/build`.
 - Coverage changes: `script/install-test-tools`, then `script/test --coverage`. Do not add a static coverage badge unless CI enforces and publishes the measured result.
 - Dependency updates: `script/update`, then inspect `Cargo.lock` and `vendor/cache`, then rerun offline validation.

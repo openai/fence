@@ -53,6 +53,11 @@ validateReady({
 }, report);
 assert.match(summaryLines(report).join("\n"), /critical findings \\| `0`/);
 assert.throws(() => validateReport({ ...report, critical_findings: [{}] }), /critical resident findings/);
+assert.throws(
+  () => validateReport({ ...report, network_verification_status: "critical_drift", critical_findings: [{}] }),
+  /critical resident findings/,
+);
+assert.throws(() => validateReport({ ...report, network_verification_status: "critical_drift" }), /verified network state/);
 assert.throws(() => validateReport({ ...report, critical_findings_truncated: true }), /bounded critical findings/);
 assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
 assert.throws(() => validateReady({ status: "ready" }, report), /identity/);

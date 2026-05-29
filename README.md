@@ -4,6 +4,7 @@
 [![test](https://github.com/GrantBirki/fence/actions/workflows/test.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/test.yml)
 [![build](https://github.com/GrantBirki/fence/actions/workflows/build.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/build.yml)
 [![acceptance](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)
+[![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
 Fence is an early-stage, source-auditable Rust project for hardening supported
@@ -28,6 +29,12 @@ rules and local DNS mediation while preserving passwordless sudo,
 Docker/containerd access, and arbitrary outbound traffic. It reports
 observation-only readiness and never claims containment. Ordinary direct
 execution is rejected before configuration intake.
+
+The bundled root Action is also exercised on disposable hosted runners. Its
+acceptance gate proves standard, degraded, and audit activation through
+`uses: ./`, setup rejection before mutation, and post-ready drift propagation:
+critical resident findings fail the post hook without stopping the service or
+restoring access.
 
 The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable

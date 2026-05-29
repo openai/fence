@@ -59,9 +59,55 @@ jobs:
       - name: verify Action lifecycle
         run: script/test-action-acceptance "${{ matrix.scenario }}"
 
+  setup-failure:
+    name: action setup failure evidence
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
+
+      - name: reject invalid setup before mutation
+        run: script/test-action-setup-failure
+
+  tamper:
+    name: action post-ready tamper evidence
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
+
+      - name: fail the post hook on post-ready drift
+        run: script/test-action-tamper
+
   acceptance:
     name: action acceptance
-    needs: [action]
+    needs: [action, setup-failure, tamper]
     runs-on: ubuntu-24.04
 
     steps:
