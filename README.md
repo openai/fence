@@ -96,13 +96,22 @@ pipeline roots delegate through bounded Microsoft edge aliases. Authorizing
 four exact root names plus bounded TTL-derived CNAME descendants and retaining
 their HTTPS rules for DNS TTL plus a fixed thirty-second refresh overlap still
 left three hosted jobs non-terminal after their visible completion steps.
-The current compatibility-first diagnostic therefore forwards the four
-GitHub-related DNS classes already modeled by the audit experiment, refreshes
-the four bootstrap roots every five seconds, and continues to materialize
-only TTL-bounded TCP `443` address rules. This remains *test-only*:
-it neither selects a default `platform_profile` nor activates public
-protection, and its wildcard DNS authorization is an egress limitation that
-cannot become a default profile without another reduction pass. A following
+The compatibility-first diagnostic therefore forwarded the four
+GitHub-related DNS classes already modeled by the audit experiment, refreshed
+the four bootstrap roots every five seconds, and continued to materialize
+only TTL-bounded TCP `443` address rules. All three hosted jobs reached
+terminal success. Removing `codeload.github.com` because v0 does not support
+post-ready action downloads also reached terminal success in three hosted
+jobs. Removing the results-storage wildcard because v0 does not support
+post-ready artifact or cache storage traffic also reached terminal success in
+three hosted jobs. A further reduction replaced the remaining Actions DNS
+wildcard with the four measured bootstrap roots while retaining the exact
+GitHub app receiver compatibility name and bounded TTL-derived CNAME
+descendants, but all three hosted jobs again completed visible steps without
+publishing terminal conclusions. The retained no-storage candidate therefore
+still includes the Actions wildcard. This remains *test-only*: it neither
+selects a default `platform_profile` nor activates public protection, and the
+wildcard query-label channel is a disclosed egress limitation. A following
 workflow step emits a capped sanitized DNS summary so late DNS and network
 findings can be reviewed without changing policy. Its reported limitations
 also state that the approved DNS and HTTPS channels remain usable for egress
