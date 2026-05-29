@@ -4,7 +4,7 @@ This repository is the Rust implementation scaffold for Fence, a security agent 
 
 Fence must pass the "airplane test": a normal developer or CI worker should be able to build, test, lint, and package the project without reaching the network after dependencies and toolchains have been explicitly prepared.
 
-The current binary is the initial `0.1.0-alpha.2` Linux x64 release candidate. `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes an accepted hosted-runner fingerprint reference without claiming active protection, and ordinary direct `run` execution fails with `trusted_launcher_required` before reading configuration. On matching GitHub-hosted `ubuntu-24.04` x64 runners, Linux `run` accepts standard `block` mode with disabled container access, explicit degraded `unsafe_preserve` block mode with preserved container access, or `audit` observation mode with the selected `github_hosted_job_status_v1` descriptor when it executes as root inside the matching `fence-<invocation-id>.service` transient unit with pinned root-owned runtime input. Block paths apply the bounded DNS-mediated host-network policy, write production readiness only after required verification, remain resident, and never restore access after readiness. Standard block disables and verifies measured passwordless sudo plus container control paths. Degraded `unsafe_preserve` disables passwordless sudo and reports that retained Docker/containerd access invalidates the ordinary containment claim. Audit applies owned non-blocking observation rules and local DNS mediation, preserves passwordless sudo and container access, and emits observation-only readiness without a containment claim. Explicit `"none"` activation and the Action wrapper remain separate reviewed work.
+The current binary is the initial `0.1.0-alpha.2` Linux x64 release candidate. `render-plan` emits a deterministic native `nftables` preview, `check-support` exposes an accepted hosted-runner fingerprint reference without claiming active protection, and ordinary direct `run` execution fails with `trusted_launcher_required` before reading configuration. On matching GitHub-hosted `ubuntu-24.04` x64 runners, Linux `run` accepts standard `block` mode with disabled container access, explicit degraded `unsafe_preserve` block mode with preserved container access, or `audit` observation mode with the selected `github_hosted_job_status_v1` descriptor when it executes as root inside the matching `fence-<invocation-id>.service` transient unit with pinned root-owned runtime input. Block paths apply the bounded DNS-mediated host-network policy, write production readiness only after required verification, remain resident, and never restore access after readiness. Standard block disables and verifies measured passwordless sudo plus container control paths. Degraded `unsafe_preserve` disables passwordless sudo and reports that retained Docker/containerd access invalidates the ordinary containment claim. Audit applies owned non-blocking observation rules and local DNS mediation, preserves passwordless sudo and container access, and emits observation-only readiness without a containment claim. Explicit `"none"` activation remains separate reviewed work. The root `action.yml` wrapper carries the attested Linux binary, delegates policy validation and enforcement to the agent, and checks bounded local evidence without downloading an agent, fetching policy, stopping the service, or restoring access.
 
 The compatibility-first diagnostic reached terminal success in three hosted jobs. Removing `codeload.github.com` because v0 does not support post-ready action downloads also reached terminal success in three hosted jobs. Removing the results-storage wildcard because v0 does not support post-ready artifact or cache storage traffic also reached terminal success in three hosted jobs. Replacing the remaining Actions wildcard with four exact bootstrap roots while retaining the exact GitHub app receiver compatibility name and bounded TTL-derived CNAME descendants again left all three jobs non-terminal after visible completion. The constrained follow-up replaces the unrestricted Actions suffix with a bounded model: fixed bootstrap roots remain explicit, previously unseen suffix names are limited to eight unique lifetime authorizations and at most two prefix labels, only `A` and `AAAA` questions are forwarded in block mode, outbound questions are rebuilt into a canonical lowercase form before forwarding upstream, and derived CNAME authorizations retain their existing TTL and depth bounds. Six disposable-host replicas across two executions reached terminal success. The required `integration` aggregate includes one disposable-host selected-profile evidence scenario and packaged production-shaped standard block, degraded block, and audit observation scenarios so compatibility regressions fail the stable gate. The planner selects the versioned `github_hosted_job_status_v1` descriptor when `platform_profile` is omitted and retains explicit `"none"` as the strict planning override.
 
@@ -31,15 +31,17 @@ Production runtime intake accepts only `/run/fence/<invocation-id>/config.json`,
 
 ## Non-Negotiable Policy
 
-- No network calls during `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/lint`, `script/build`, or `script/server`.
+- No network calls during `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/test-action-wrapper`, `script/validate-action-bundle`, `script/lint`, `script/build`, or `script/server`.
 - `script/test-lockdown` is intentionally restricted to disposable GitHub-hosted Linux evidence jobs because its successful block and degraded scenarios disable host access without restore.
 - `script/test-protected-run` is intentionally restricted to disposable GitHub-hosted Linux integration jobs because it launches a production lifecycle and leaves owned host network state plus DNS mediation resident without restore; standard block also disables sudo/container controls, degraded block disables sudo while preserving containers, and audit preserves sudo/containers while applying non-blocking observation rules.
+- `script/test-action-setup-failure` and `script/test-action-tamper` are intentionally restricted to disposable GitHub-hosted Linux Action-acceptance jobs. The former proves malformed wrapper input fails before mutation. The latter launches the bundled audit lifecycle, deletes owned network state after readiness, proves resident critical drift, invokes the post hook expecting failure, and never restores access.
 - `script/update` is the only normal Cargo dependency update path and is intentionally online-only.
 - `script/vendor-rust` is the only normal Rust distribution lock refresh path and is intentionally online-only.
 - `script/prepare-rust` is the only normal Rust installation path. It is intentionally online, checksum-gated, and must validate `.cargo/tooling/rust-toolchain.lock.toml` before invoking `rustup`.
 - `script/vendor-update-tools` is the only normal `cargo-audit` / `cargo-deny` lock refresh path and is intentionally online-only.
 - `script/vendor-release-tools` is the only retained cross-build-tool refresh path and is intentionally online-only.
 - `script/vendor-test-tools` is the only `cargo-llvm-cov` refresh path and is intentionally online-only.
+- `script/update-action-bundle` is the only normal Action-binary refresh path and is intentionally online-only.
 - `script/install-zig` must stay offline-only. It installs retained Zig and `cargo-zigbuild` tooling from committed artifacts under `vendor/release-tools`.
 - `script/install-test-tools` must stay offline-only. It installs `cargo-llvm-cov` from committed artifacts under `vendor/test-tools`.
 - Release build jobs must not run direct `curl`, `cargo install --version`, `rustup target add`, or Rust toolchain setup actions outside the repo scripts.
@@ -60,8 +62,8 @@ Production runtime intake accepts only `/run/fence/<invocation-id>/config.json`,
 
 There are three different levels in this repository. Keep them distinct when editing docs or workflows.
 
-1. Local project workflow: checksum-gated online Rust preparation with `script/prepare-rust` when needed, then offline Cargo validation through vendored sources. `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/lint`, `script/build`, and `script/server` enforce the offline phase.
-2. GitHub-hosted validation: `lint`, `test`, `coverage`, PR `build`, packaged-artifact `acceptance`, and release build jobs run `script/validate-locks --ci`, then `script/prepare-rust`, then the normal offline scripts. Hosted runners are not air-gapped infrastructure because checkout, action loading, Rust preparation, and artifact services still use network access.
+1. Local project workflow: checksum-gated online Rust preparation with `script/prepare-rust` when needed, then offline Cargo validation through vendored sources. `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/test-action-wrapper`, `script/validate-action-bundle`, `script/lint`, `script/build`, and `script/server` enforce the offline phase.
+2. GitHub-hosted validation: `lint`, `test`, `coverage`, PR `build`, packaged-artifact `acceptance`, bundled `action acceptance`, and release build jobs run the relevant prepared-input validation paths. Hosted runners are not air-gapped infrastructure because checkout, action loading, Rust preparation, and artifact services still use network access.
 3. Egress-blocked build/package jobs: after checkout, action loading, and Rust preparation, native Linux x64 build/test/package scripts can run without third-party network access because application crates are committed. Retained cross-build-tool smoke jobs additionally install committed tool artifacts offline. Release publish/sign/verify jobs still need GitHub API access.
 
 Do not describe GitHub-hosted runners as fully air-gapped. They can validate offline script behavior, but they are not an egress-blocked environment.
@@ -200,6 +202,32 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Verifies versioned JSON output, deterministic `render-plan`, direct-invocation `trusted_launcher_required` failure before config read, no `inet fence_v0` table creation, and no `/run/fence/package-acceptance/` state creation.
   - Proves only the public trusted-launcher boundary of a packaged binary; production readiness and controls are proved separately by `script/test-protected-run`.
 
+- `script/validate-action-bundle`
+  - Offline-only validation for the committed Action binary and provenance manifest.
+  - Verifies the fixed manifest schema, immutable alpha release identity, Linux x64 artifact name, source commit, signer workflow, executable mode, and SHA-256 match.
+  - Runs from `script/validate-locks`; it must not fetch releases, attestations, agents, or policy.
+
+- `script/update-action-bundle`
+  - Intentional online-only maintainer path for refreshing the Action binary from an already-published alpha release.
+  - Downloads the selected Linux x64 release asset and `checksums.txt`, verifies the checksum, verifies GitHub provenance against `.github/workflows/release.yml`, installs the binary under `action/bin/fence`, and writes `action/bundle-manifest.json`.
+  - Must never become an Action runtime step.
+
+- `script/test-action-wrapper`
+  - Offline-only dependency-free Node syntax and unit checks for the Action launcher, report validation, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+
+- `script/test-action-acceptance`
+  - Linux x64-only, GitHub-Actions-only hosted acceptance entrypoint invoked after `uses: ./`.
+  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled alpha binary while controls remain resident until ephemeral teardown.
+  - Must not stop the service, restore controls, download an agent, or fetch policy.
+
+- `script/test-action-setup-failure`
+  - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
+  - Invokes the dependency-free Action launcher with a malformed invocation slug and proves rejection occurs before Action state, runtime directories, or owned nftables state are created.
+
+- `script/test-action-tamper`
+  - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
+  - Launches the bundled audit lifecycle through the Action entrypoint, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the post hook fails without stopping the service or restoring network state.
+
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.
   - Uses frozen Cargo commands for lint/doc generation.
@@ -310,7 +338,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - New dependency governance tools must be pinned and either preinstalled for offline paths or limited to `script/update`.
 - Phase 2C uses exact-pinned, Linux-target-only `netlink-packet-netfilter` and `netlink-sys` dependencies for privileged NFLOG evidence. Keep them scoped to Linux because netlink is unavailable on portable macOS validation hosts, and keep `netlink-sys` default features disabled.
 - Phase 3B uses exact-pinned, Linux-target-only `libc` constants for `O_NOFOLLOW` and `O_CLOEXEC` on secure test-lifecycle evidence files. Fence code still forbids first-party `unsafe_code`; the crate was already present transitively in the vendored Linux graph before becoming an explicit runtime-safety input.
-- The selected typed netlink message stack currently pulls the unmaintained `paste` crate transitively through `netlink-packet-utils`; `cargo audit` reports `RUSTSEC-2024-0436` as an allowed maintenance warning rather than a known vulnerability. The initial alpha accepts that reviewed warning; reassess or replace the surface before promotion beyond alpha.
+- The selected typed netlink message stack currently pulls the unmaintained `paste` crate transitively through `netlink-packet-utils`; `cargo audit` reports `RUSTSEC-2024-0436` as an allowed maintenance warning rather than a known vulnerability. The Phase 5B review reconfirmed that single warning and no locked-graph vulnerability. The initial alpha accepts that reviewed warning; reassess or replace the surface before promotion beyond alpha.
 - `cargo-vet`, SBOM generation, and auditable binaries are intended staged follow-ups. Do not quietly add online release downloads for those tools.
 
 ## Version Files
@@ -338,6 +366,7 @@ If any version file changes, update docs and verify the corresponding script beh
 
 - The `build` workflow is the PR-based native Linux x64 package smoke test. It should validate locks, prepare Rust, run `script/bootstrap`, and run `script/build --release --targets "x86_64-unknown-linux-gnu"` on `ubuntu-24.04`.
 - The `acceptance` workflow should run only on `ubuntu-24.04`, build its own Linux x64 package from the current commit, verify its checksum, and invoke `script/test-package-smoke` as the `acceptance` check.
+- The `action acceptance` workflow should run only on disposable `ubuntu-24.04` runners, validate the committed release-bound Action bundle, invoke the root wrapper through `uses: ./`, and prove standard block, degraded `unsafe_preserve`, and audit behavior while controls remain resident. Separate jobs under the same stable aggregate must prove setup rejection before mutation and post-ready critical-drift failure propagation without restore.
 - The `build` workflow should exercise retained Zig/`cargo-zigbuild` artifacts in a distinct offline install/verify smoke job. That job is not a protected release artifact claim.
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
@@ -377,7 +406,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Preserve public API stability unless the task explicitly calls for a breaking Fence change.
 - If changing CLI output or release archive layout, update README examples.
 - Keep unsupported `run` modes fail-closed. Production readiness may be emitted only by reviewed trusted-launcher lifecycles after their mode-specific controls or observation state verify.
-- Do not add a public `action.yml` wrapper until production audit, standard block, and degraded block lifecycle evidence is green and an attested alpha binary exists. The intended later wrapper lives in this repository, uses an immutable external reference, carries a reviewed Linux binary, and does not download an agent at runtime.
+- Keep the root `action.yml` wrapper thin: it must use the committed attested Linux binary, delegate policy semantics to the agent, use immutable external references in documentation, and avoid runtime agent downloads, policy fetches, service stop operations, or access restoration.
 
 ## Testing Standards
 
@@ -419,6 +448,7 @@ Use the smallest validation set that proves the change:
 
 - Script/workflow/doc changes: `git diff --check`.
 - Packaged Linux public-contract changes: build the Linux x64 artifact on `ubuntu-24.04`, verify its checksum, then run `script/test-package-smoke <artifact>`.
+- Action-wrapper changes: run `script/validate-action-bundle` and `script/test-action-wrapper`, then rely on the disposable hosted `action acceptance` workflow for `uses: ./` lifecycle proof plus setup-failure and post-ready tamper evidence.
 - Rust behavior changes: `script/bootstrap`, `script/test`, `script/lint`, and `script/build`.
 - Coverage changes: `script/install-test-tools`, then `script/test --coverage`. Do not add a static coverage badge unless CI enforces and publishes the measured result.
 - Dependency updates: `script/update`, then inspect `Cargo.lock` and `vendor/cache`, then rerun offline validation.

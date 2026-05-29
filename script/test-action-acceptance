@@ -1,0 +1,114 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 1 ]]; then
+  die "usage: script/test-action-acceptance <standard|unsafe-preserve|audit>"
+fi
+
+scenario="$1"
+case "$scenario" in
+  standard|unsafe-preserve|audit) ;;
+  *) die "unknown Action acceptance scenario: $scenario" ;;
+esac
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "Action acceptance runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "Action acceptance requires Linux x86_64"
+fi
+
+require_cmd docker
+require_cmd python3
+require_cmd sudo
+
+invocation="action-$scenario"
+directory="/run/fence/$invocation"
+ready="$directory/ready.json"
+report="$directory/report.json"
+dns_report="$directory/dns-report.json"
+
+python3 - "$scenario" "$report" "$dns_report" "$ready" <<'PY'
+import json
+import pathlib
+import sys
+
+scenario = sys.argv[1]
+report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:])
+expected = {
+    "standard": ("block", "protected_host_block", "resident_protected", "ready", True, "disabled_verified", "disabled_verified"),
+    "unsafe-preserve": ("block", "protected_host_block_degraded", "resident_degraded", "ready_degraded", False, "disabled_verified", "preserved_unsafe"),
+    "audit": ("audit", "protected_host_audit_observation", "resident_observation_only", "ready_observation_only", False, "preserved_verified", "preserved_verified"),
+}[scenario]
+mode, status, resident, readiness, protection, sudo_status, container_status = expected
+report = json.loads(report_path.read_text(encoding="utf-8"))
+dns = json.loads(dns_path.read_text(encoding="utf-8"))
+ready = json.loads(ready_path.read_text(encoding="utf-8"))
+assert report["mode"] == mode, report
+assert report["status"] == status, report
+assert report["setup_status"] == resident, report
+assert report["readiness_status"] == readiness, report
+assert report["protection_available"] is protection, report
+assert report["sudo_status"] == sudo_status, report
+assert report["container_status"] == container_status, report
+assert report["network_verification_status"] == "verified", report
+assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
+assert report["critical_findings"] == [], report
+assert ready["status"] == readiness, ready
+assert dns["routing_status"] == "active", dns
+PY
+
+case "$scenario" in
+  standard|unsafe-preserve)
+    if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
+      die "Fence Action did not disable runner passwordless sudo"
+    fi
+    ;;
+  audit)
+    sudo --non-interactive /usr/bin/true >/dev/null
+    ;;
+esac
+case "$scenario" in
+  standard)
+    if docker ps --quiet >/dev/null 2>&1; then
+      die "Fence Action standard block did not disable Docker access"
+    fi
+    ;;
+  unsafe-preserve|audit)
+    docker ps --quiet >/dev/null
+    ;;
+esac
+
+if [[ "$scenario" == "audit" ]]; then
+  python3 <<'PY'
+import socket
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.sendto(b"fence-action-audit-probe", ("192.0.2.10", 443))
+PY
+fi
+
+sleep 6
+python3 - "$scenario" "$report" "$dns_report" <<'PY'
+import json
+import pathlib
+import sys
+
+scenario = sys.argv[1]
+report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
+report = json.loads(report_path.read_text(encoding="utf-8"))
+dns = json.loads(dns_path.read_text(encoding="utf-8"))
+assert report["network_verification_status"] == "verified", report
+assert report["critical_findings"] == [], report
+assert "fence-action-audit-probe" not in json.dumps(report, sort_keys=True), report
+assert "fence-action-audit-probe" not in json.dumps(dns, sort_keys=True), dns
+if scenario == "audit":
+    assert report["counters"]["total_violations"] >= 1, report
+    assert report["counters"]["sampled_violations"] >= 1, report
+    assert any(item["classification"] == "would_block" for item in report["findings"]), report
+PY
+
+echo -e "${GREEN}Action acceptance verified:${OFF} $scenario"

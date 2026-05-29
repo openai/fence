@@ -1,0 +1,55 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "Action setup-failure evidence runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "Action setup-failure evidence requires Linux x86_64"
+fi
+
+require_cmd node
+require_cmd sudo
+if [[ ! -x /usr/sbin/nft ]]; then
+  die "Action setup-failure evidence requires /usr/sbin/nft"
+fi
+
+temporary_directory="$(make_temp_dir fence-action-setup-failure "$RUNNER_TEMP")"
+trap 'remove_generated_path "$temporary_directory" "Action setup-failure scratch directory"' EXIT
+
+state="$temporary_directory/state"
+summary="$temporary_directory/summary"
+stdout="$temporary_directory/stdout"
+stderr="$temporary_directory/stderr"
+: >"$state"
+: >"$summary"
+
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action setup-failure evidence requires no preexisting inet fence_v0 table"
+fi
+if [[ -e /run/fence/Action_Invalid || -e /run/fence/action-invalid ]]; then
+  die "Action setup-failure evidence requires no preexisting invalid runtime directory"
+fi
+
+if INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"Action_Invalid","allowances":[]}' \
+  GITHUB_STATE="$state" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/main.js >"$stdout" 2>"$stderr"; then
+  die "Action setup unexpectedly accepted an invalid invocation slug"
+fi
+
+grep -q "config invocation_id must use the Fence lowercase slug grammar" "$stderr"
+if [[ -s "$stdout" || -s "$state" || -s "$summary" ]]; then
+  die "Action setup-failure evidence unexpectedly emitted success state"
+fi
+if [[ -e /run/fence/Action_Invalid || -e /run/fence/action-invalid ]]; then
+  die "Action setup-failure evidence unexpectedly created a runtime directory"
+fi
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action setup-failure evidence unexpectedly created inet fence_v0"
+fi
+
+echo -e "${GREEN}Action setup-failure evidence verified:${OFF} rejected before mutation"

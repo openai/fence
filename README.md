@@ -4,6 +4,7 @@
 [![test](https://github.com/GrantBirki/fence/actions/workflows/test.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/test.yml)
 [![build](https://github.com/GrantBirki/fence/actions/workflows/build.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/build.yml)
 [![acceptance](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)
+[![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
 Fence is an early-stage, source-auditable Rust project for hardening supported
@@ -28,6 +29,12 @@ rules and local DNS mediation while preserving passwordless sudo,
 Docker/containerd access, and arbitrary outbound traffic. It reports
 observation-only readiness and never claims containment. Ordinary direct
 execution is rejected before configuration intake.
+
+The bundled root Action is also exercised on disposable hosted runners. Its
+acceptance gate proves standard, degraded, and audit activation through
+`uses: ./`, setup rejection before mutation, and post-ready drift propagation:
+critical resident findings fail the post hook without stopping the service or
+restoring access.
 
 The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -355,11 +362,21 @@ descriptor, applies only non-blocking observation rules, routes host and
 Docker DNS through the local root-resident mediator, and preserves sudo and
 container access. Strict `"none"` activation remains deferred.
 
-A public GitHub Action wrapper is deferred until the attested alpha agent has
-been published and verified. That future wrapper is intended to live in this
-repository and carry the reviewed Linux release binary in an immutable action
-reference; the current project does not publish an `action.yml` interface or
-download an agent at workflow runtime.
+The root `action.yml` wrapper carries an exact, checksum-validated copy of the
+attested Linux alpha binary. It accepts one inline strict-JSON configuration,
+writes the untouched bytes into the pinned root-owned runtime path, launches
+the trusted transient service, waits for agent readiness, and renders bounded
+local evidence from its post hook. It does not download an agent, fetch policy,
+stop the resident service, or restore access at workflow runtime. External
+consumers should pin Fence to a full immutable commit SHA rather than a
+floating branch:
+
+```yaml
+- uses: GrantBirki/fence@<full-commit-sha>
+  with:
+    config: >-
+      {"schema_version":1,"mode":"block","invocation_id":"example-run","allowances":[]}
+```
 
 ## Release Baseline
 
