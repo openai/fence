@@ -323,6 +323,17 @@ activate public `run` or establish production readiness. Explicit `"none"`
 remains the strict override. Production TTL-derived materialization still
 requires the future trusted launcher.
 
+The dormant trusted-launcher foundation now models that next boundary
+explicitly without making it reachable from the public CLI. Production
+runtime intake accepts only a root-owned `/run/fence/<invocation-id>/config.json`
+file as the only initial invocation-directory entry beneath pinned root-owned
+directories, opens it with no-follow and close-on-exec protections, and
+derives the fixed state/report/readiness paths.
+The matching service validator accepts only a root process running as the
+`MainPID` of `fence-<invocation-id>.service`. Public `run` remains fail-closed
+until a later reviewed change composes the complete lifecycle onto those
+primitives and proves it on disposable hosted runners.
+
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
 published. That future wrapper is intended to live in this repository and

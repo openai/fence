@@ -1,12 +1,13 @@
-use crate::config::MAX_REPORT_BYTES;
+use crate::config::{MAX_CONFIG_BYTES, MAX_REPORT_BYTES};
 use serde::Serialize;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 pub const RESIDENT_EVIDENCE_STATUS: &str = "resident_lifecycle_test_only";
 pub const TEST_READY_STATUS: &str = "test_only_ready_no_protection";
+pub const PRODUCTION_RUNTIME_ROOT: &str = "/run/fence";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuntimeError {
@@ -29,6 +30,13 @@ pub struct TestRuntimeStore {
     pub state: PathBuf,
     pub report: PathBuf,
     pub ready: PathBuf,
+}
+
+pub trait RuntimeDocumentStore {
+    fn directory(&self) -> &Path;
+    fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
+    fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
+    fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
 }
 
 impl TestRuntimeStore {
@@ -62,12 +70,141 @@ impl TestRuntimeStore {
     }
 
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        let bytes = bounded_json(value)?;
-        let pending = self.directory.join("report.json.next");
-        write_bytes_exclusive(&pending, &bytes, 0o644)?;
-        fs::rename(&pending, &self.report)
-            .map_err(|error| io_error("runtime_atomic_write_failed", error))
+        replace_report(&self.directory, &self.report, value)
     }
+}
+
+impl RuntimeDocumentStore for TestRuntimeStore {
+    fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        self.write_state_exclusive(value)
+    }
+
+    fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        self.write_ready_exclusive(value)
+    }
+
+    fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        self.replace_report(value)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProductionRuntimeStore {
+    pub invocation_id: String,
+    pub directory: PathBuf,
+    pub config: PathBuf,
+    pub state: PathBuf,
+    pub report: PathBuf,
+    pub ready: PathBuf,
+    expected_uid: u32,
+}
+
+impl ProductionRuntimeStore {
+    pub fn open(config: &Path) -> Result<Self, RuntimeError> {
+        Self::open_under(Path::new(PRODUCTION_RUNTIME_ROOT), config, 0)
+    }
+
+    fn open_under(root: &Path, config: &Path, expected_uid: u32) -> Result<Self, RuntimeError> {
+        let invocation_id = production_invocation_id(root, config)?;
+        let directory = root.join(&invocation_id);
+        require_owned_directory(root, expected_uid, 0o755)?;
+        require_owned_directory(&directory, expected_uid, 0o755)?;
+        require_owned_file(config, expected_uid, 0o600)?;
+        require_initial_production_directory(&directory)?;
+        Ok(Self {
+            state: directory.join("state.json"),
+            report: directory.join("report.json"),
+            ready: directory.join("ready.json"),
+            invocation_id,
+            directory,
+            config: config.to_path_buf(),
+            expected_uid,
+        })
+    }
+
+    pub fn read_config_bounded(&self) -> Result<Vec<u8>, RuntimeError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&self.config)
+            .map_err(|error| io_error("trusted_config_read_failed", error))?;
+        require_owned_file_metadata(
+            &file
+                .metadata()
+                .map_err(|error| io_error("trusted_config_metadata_failed", error))?,
+            self.expected_uid,
+            0o600,
+        )?;
+        let mut bytes = Vec::new();
+        file.take((MAX_CONFIG_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("trusted_config_read_failed", error))?;
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(RuntimeError::new(
+                "trusted_config_too_large",
+                "trusted launcher configuration exceeds the fixed input limit",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        write_json_exclusive(&self.state, value, 0o600)
+    }
+
+    pub fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        write_json_exclusive(&self.ready, value, 0o644)
+    }
+
+    pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        replace_report(&self.directory, &self.report, value)
+    }
+}
+
+impl RuntimeDocumentStore for ProductionRuntimeStore {
+    fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        self.write_state_exclusive(value)
+    }
+
+    fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        self.write_ready_exclusive(value)
+    }
+
+    fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
+        self.replace_report(value)
+    }
+}
+
+fn production_invocation_id(root: &Path, config: &Path) -> Result<String, RuntimeError> {
+    let relative = config.strip_prefix(root).map_err(|_| {
+        RuntimeError::new(
+            "unsafe_runtime_config_path",
+            "trusted launcher configuration must be below the fixed runtime root",
+        )
+    })?;
+    let mut components = relative.components();
+    let invocation_id = match components.next() {
+        Some(Component::Normal(value)) => value.to_str().unwrap_or_default(),
+        _ => "",
+    };
+    if components.next() != Some(Component::Normal("config.json".as_ref()))
+        || components.next().is_some()
+    {
+        return Err(RuntimeError::new(
+            "unsafe_runtime_config_path",
+            "trusted launcher configuration must use the fixed invocation config path",
+        ));
+    }
+    validate_slug(invocation_id)?;
+    Ok(invocation_id.to_owned())
 }
 
 fn create_owned_reportable_directory_root(root: &Path) -> Result<(), RuntimeError> {
@@ -90,6 +227,66 @@ fn require_real_directory(path: &Path) -> Result<(), RuntimeError> {
         ));
     }
     Ok(())
+}
+
+fn require_owned_directory(path: &Path, expected_uid: u32, mode: u32) -> Result<(), RuntimeError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_error("runtime_metadata_failed", error))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o777 != mode
+    {
+        return Err(RuntimeError::new(
+            "unsafe_runtime_directory",
+            "trusted launcher runtime storage must be a pinned root-owned directory",
+        ));
+    }
+    Ok(())
+}
+
+fn require_owned_file(path: &Path, expected_uid: u32, mode: u32) -> Result<(), RuntimeError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_error("runtime_metadata_failed", error))?;
+    require_owned_file_metadata(&metadata, expected_uid, mode)
+}
+
+fn require_owned_file_metadata(
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    mode: u32,
+) -> Result<(), RuntimeError> {
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o777 != mode
+    {
+        return Err(RuntimeError::new(
+            "unsafe_runtime_config",
+            "trusted launcher configuration must be a pinned root-owned regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn require_initial_production_directory(directory: &Path) -> Result<(), RuntimeError> {
+    let mut entries = fs::read_dir(directory)
+        .map_err(|error| io_error("runtime_metadata_failed", error))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| io_error("runtime_metadata_failed", error))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.sort();
+    if entries == ["config.json"] {
+        Ok(())
+    } else {
+        Err(RuntimeError::new(
+            "unsafe_runtime_state",
+            "trusted launcher runtime directory must initially contain only config.json",
+        ))
+    }
 }
 
 fn validate_slug(value: &str) -> Result<(), RuntimeError> {
@@ -135,6 +332,17 @@ fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, RuntimeError> {
     Ok(bytes)
 }
 
+fn replace_report(
+    directory: &Path,
+    report: &Path,
+    value: &impl Serialize,
+) -> Result<(), RuntimeError> {
+    let bytes = bounded_json(value)?;
+    let pending = directory.join("report.json.next");
+    write_bytes_exclusive(&pending, &bytes, 0o644)?;
+    fs::rename(&pending, report).map_err(|error| io_error("runtime_atomic_write_failed", error))
+}
+
 fn write_bytes_exclusive(path: &Path, bytes: &[u8], mode: u32) -> Result<(), RuntimeError> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -177,6 +385,19 @@ mod tests {
             "target/tmp/runtime-unit-{}",
             TEST_INDEX.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    fn production_fixture(config: &[u8]) -> (PathBuf, PathBuf, u32) {
+        let root = root();
+        let directory = root.join("trusted-run");
+        let config_path = directory.join("config.json");
+        fs::create_dir_all(&directory).unwrap();
+        set_directory_mode(&root, 0o755).unwrap();
+        set_directory_mode(&directory, 0o755).unwrap();
+        fs::write(&config_path, config).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = fs::metadata(&root).unwrap().uid();
+        (root, config_path, uid)
     }
 
     #[test]
@@ -273,6 +494,104 @@ mod tests {
                 .unwrap_err()
                 .code,
             "runtime_document_too_large"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opens_pinned_production_runtime_and_reads_bounded_trusted_config() {
+        let (root, config, uid) = production_fixture(b"{\"schema_version\":1}");
+        let store = ProductionRuntimeStore::open_under(&root, &config, uid).unwrap();
+
+        assert_eq!(store.invocation_id, "trusted-run");
+        assert_eq!(store.directory, root.join("trusted-run"));
+        assert_eq!(
+            store.read_config_bounded().unwrap(),
+            b"{\"schema_version\":1}"
+        );
+        store
+            .write_state_exclusive(&Document {
+                value: "state".to_owned(),
+            })
+            .unwrap();
+        store
+            .replace_report(&Document {
+                value: "report".to_owned(),
+            })
+            .unwrap();
+        store
+            .write_ready_exclusive(&Document {
+                value: "ready".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(&store.state).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&store.report).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(&store.ready).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_untrusted_production_config_paths_modes_ownership_and_size() {
+        let (root, config, uid) = production_fixture(b"{}");
+        assert_eq!(
+            ProductionRuntimeStore::open_under(&root, &root.join("config.json"), uid)
+                .unwrap_err()
+                .code,
+            "unsafe_runtime_config_path"
+        );
+        assert_eq!(
+            ProductionRuntimeStore::open_under(&root, &config, uid.saturating_add(1))
+                .unwrap_err()
+                .code,
+            "unsafe_runtime_directory"
+        );
+
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            ProductionRuntimeStore::open_under(&root, &config, uid)
+                .unwrap_err()
+                .code,
+            "unsafe_runtime_config"
+        );
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(root.join("trusted-run").join("stale.json"), b"{}").unwrap();
+        assert_eq!(
+            ProductionRuntimeStore::open_under(&root, &config, uid)
+                .unwrap_err()
+                .code,
+            "unsafe_runtime_state"
+        );
+        fs::remove_file(root.join("trusted-run").join("stale.json")).unwrap();
+        fs::write(&config, vec![b'x'; MAX_CONFIG_BYTES + 1]).unwrap();
+        assert_eq!(
+            ProductionRuntimeStore::open_under(&root, &config, uid)
+                .unwrap()
+                .read_config_bounded()
+                .unwrap_err()
+                .code,
+            "trusted_config_too_large"
+        );
+
+        fs::remove_file(&config).unwrap();
+        let target = root.join("config-target.json");
+        fs::write(&target, b"{}").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &config).unwrap();
+        assert_eq!(
+            ProductionRuntimeStore::open_under(&root, &config, uid)
+                .unwrap_err()
+                .code,
+            "unsafe_runtime_config"
         );
         fs::remove_dir_all(root).unwrap();
     }

@@ -6,11 +6,14 @@ use crate::nft_backend::{BackendError, NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, PlanData};
 use crate::runtime::{RESIDENT_EVIDENCE_STATUS, RuntimeError, TEST_READY_STATUS, TestRuntimeStore};
 use serde::Serialize;
+use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub const RESIDENT_VERIFICATION_INTERVAL: Duration = Duration::from_secs(5);
+pub const PRODUCTION_SERVICE_PREFIX: &str = "fence-";
 const FINDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 
@@ -374,6 +377,28 @@ pub fn validate_test_service_context(unit_name: &str) -> Result<(), LifecycleErr
             "resident test service name must use the bounded Fence evidence prefix",
         ));
     }
+    validate_service_main_pid(
+        query_service_main_pid(unit_name)?,
+        std::process::id(),
+        "trusted_test_service_required",
+        "resident test lifecycle must execute as the matching transient service main process",
+    )
+}
+
+pub fn validate_production_service_context(invocation_id: &str) -> Result<(), LifecycleError> {
+    let unit_name = production_service_name(invocation_id)?;
+    let effective_uid = fs::metadata("/proc/self")
+        .map_err(|error| LifecycleError::new("trusted_launcher_required", error.to_string()))?
+        .uid();
+    validate_production_service_identity(
+        invocation_id,
+        effective_uid,
+        query_service_main_pid(&unit_name)?,
+        std::process::id(),
+    )
+}
+
+fn query_service_main_pid(unit_name: &str) -> Result<Option<u32>, LifecycleError> {
     let output = Command::new("/usr/bin/systemctl")
         .args(["show", "--property=MainPID", "--value", unit_name])
         .env_clear()
@@ -389,7 +414,7 @@ pub fn validate_test_service_context(unit_name: &str) -> Result<(), LifecycleErr
     let observed = std::str::from_utf8(&output.stdout)
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok());
-    validate_service_main_pid(observed, std::process::id())
+    Ok(observed)
 }
 
 fn valid_test_service_name(name: &str) -> bool {
@@ -408,14 +433,59 @@ fn valid_test_service_name(name: &str) -> bool {
         && !slug.ends_with('-')
 }
 
-fn validate_service_main_pid(observed: Option<u32>, current: u32) -> Result<(), LifecycleError> {
+fn production_service_name(invocation_id: &str) -> Result<String, LifecycleError> {
+    if !valid_service_slug(invocation_id, 64) {
+        return Err(LifecycleError::new(
+            "invalid_runtime_identifier",
+            "trusted launcher invocation identifier must use the bounded lowercase slug format",
+        ));
+    }
+    Ok(format!(
+        "{PRODUCTION_SERVICE_PREFIX}{invocation_id}.service"
+    ))
+}
+
+fn valid_service_slug(value: &str, maximum_length: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum_length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+}
+
+fn validate_production_service_identity(
+    invocation_id: &str,
+    effective_uid: u32,
+    observed: Option<u32>,
+    current: u32,
+) -> Result<(), LifecycleError> {
+    production_service_name(invocation_id)?;
+    if effective_uid != 0 {
+        return Err(LifecycleError::new(
+            "trusted_launcher_required",
+            "protected lifecycle must execute as root inside its matching transient service",
+        ));
+    }
+    validate_service_main_pid(
+        observed,
+        current,
+        "trusted_launcher_required",
+        "protected lifecycle must execute as root inside its matching transient service",
+    )
+}
+
+fn validate_service_main_pid(
+    observed: Option<u32>,
+    current: u32,
+    code: &'static str,
+    message: &'static str,
+) -> Result<(), LifecycleError> {
     if observed == Some(current) {
         Ok(())
     } else {
-        Err(LifecycleError::new(
-            "trusted_test_service_required",
-            "resident test lifecycle must execute as the matching transient service main process",
-        ))
+        Err(LifecycleError::new(code, message))
     }
 }
 
@@ -622,10 +692,48 @@ mod tests {
     fn bounds_critical_findings_and_checks_transient_service_identity() {
         assert!(valid_test_service_name("fence-evidence-proof-1.service"));
         assert!(!valid_test_service_name("fence.service"));
-        assert!(validate_service_main_pid(Some(12), 12).is_ok());
+        assert!(
+            validate_service_main_pid(
+                Some(12),
+                12,
+                "trusted_test_service_required",
+                "test message",
+            )
+            .is_ok()
+        );
         assert_eq!(
-            validate_service_main_pid(Some(13), 12).unwrap_err().code,
+            validate_service_main_pid(
+                Some(13),
+                12,
+                "trusted_test_service_required",
+                "test message",
+            )
+            .unwrap_err()
+            .code,
             "trusted_test_service_required"
+        );
+        assert_eq!(
+            production_service_name("protected-run").unwrap(),
+            "fence-protected-run.service"
+        );
+        assert!(validate_production_service_identity("protected-run", 0, Some(12), 12).is_ok());
+        assert_eq!(
+            validate_production_service_identity("protected-run", 501, Some(12), 12)
+                .unwrap_err()
+                .code,
+            "trusted_launcher_required"
+        );
+        assert_eq!(
+            validate_production_service_identity("protected-run", 0, Some(13), 12)
+                .unwrap_err()
+                .code,
+            "trusted_launcher_required"
+        );
+        assert_eq!(
+            validate_production_service_identity("../bad", 0, Some(12), 12)
+                .unwrap_err()
+                .code,
+            "invalid_runtime_identifier"
         );
 
         let root = root();
