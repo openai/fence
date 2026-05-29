@@ -145,6 +145,18 @@ impl<E: NftExecutor> NativeNftBackend<E> {
         Ok(())
     }
 
+    pub fn replace_owned_state(&mut self, program: &str) -> Result<(), BackendError> {
+        if !self.created_table {
+            return Err(BackendError::new(
+                "owned_nft_state_not_created",
+                "cannot replace owned nftables state before provisional activation",
+            ));
+        }
+        self.executor
+            .execute(NftOperation::ApplyProvisional, program.as_bytes())?;
+        Ok(())
+    }
+
     pub fn read_owned_state(&self) -> Result<OwnedNftState, BackendError> {
         let bytes = self.executor.execute(NftOperation::ReadOwnedState, &[])?;
         parse_owned_state(&bytes)
@@ -481,6 +493,9 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
             Ok(OwnedRule::ClassifyDispatch { chain })
         }
         "fence:allowance" if has_accept(expressions) => parse_allowance_rule(chain, expressions),
+        "fence:dns_mediator_upstream" if has_accept(expressions) => {
+            parse_dns_mediator_upstream_rule(chain, expressions)
+        }
         "fence:violation" if has_jump(expressions, NFT_VIOLATION_CHAIN) => {
             Ok(OwnedRule::ViolationDispatch { chain })
         }
@@ -526,6 +541,41 @@ fn parse_allowance_rule(chain: String, expressions: &[Value]) -> Result<OwnedRul
     Ok(OwnedRule::Allowance {
         chain,
         address_family,
+        destination,
+        protocol,
+        port,
+    })
+}
+
+fn parse_dns_mediator_upstream_rule(
+    chain: String,
+    expressions: &[Value],
+) -> Result<OwnedRule, BackendError> {
+    if expressions.len() != 4
+        || !has_meta_uid(expressions.first(), 0)
+        || expressions[3].get("accept").is_none()
+    {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "DNS mediator upstream rule does not have the exact expected expression shape",
+        ));
+    }
+    let (address_family, destination) = extract_destination(&expressions[1..2])?;
+    let (protocol, port) = extract_transport(&expressions[2..3])?;
+    if chain != NFT_CLASSIFY_CHAIN
+        || address_family != "ip"
+        || destination != crate::nft::DNS_MEDIATOR_UPSTREAM_ADDRESS
+        || protocol != "udp"
+        || port != crate::nft::DNS_MEDIATOR_UPSTREAM_PORT
+    {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "DNS mediator upstream rule does not match its fixed destination",
+        ));
+    }
+    Ok(OwnedRule::DnsMediatorUpstream {
+        chain,
+        uid: 0,
         destination,
         protocol,
         port,
@@ -688,6 +738,20 @@ fn extract_transport(expressions: &[Value]) -> Result<(String, u16), BackendErro
 
 fn has_accept(expressions: &[Value]) -> bool {
     has_key(expressions, "accept")
+}
+
+fn has_meta_uid(expression: Option<&Value>, expected: u64) -> bool {
+    let Some(matcher) = expression.and_then(|expression| expression.get("match")) else {
+        return false;
+    };
+    matcher
+        .get("left")
+        .and_then(|left| left.get("meta"))
+        .and_then(|meta| meta.get("key"))
+        .and_then(Value::as_str)
+        == Some("skuid")
+        && matcher.get("op").and_then(Value::as_str) == Some("==")
+        && matcher.get("right").and_then(Value::as_u64) == Some(expected)
 }
 
 fn has_established_related_state(expressions: &[Value]) -> bool {
@@ -1092,6 +1156,43 @@ mod tests {
                 NftOperation::ApplyProvisional,
                 NftOperation::ReadOwnedState,
                 NftOperation::DeleteOwnedState
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_fixed_root_only_dns_mediator_upstream_rule_and_replaces_owned_state() {
+        let expressions = json!([
+            {"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": 0}},
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "168.63.129.16"}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "op": "==", "right": 53}},
+            {"accept": null}
+        ]);
+        assert!(matches!(
+            parse_dns_mediator_upstream_rule(
+                NFT_CLASSIFY_CHAIN.to_owned(),
+                expressions.as_array().unwrap()
+            )
+            .unwrap(),
+            OwnedRule::DnsMediatorUpstream { uid: 0, .. }
+        ));
+        let mut bad = expressions.as_array().unwrap().clone();
+        bad[0] = json!({"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": 1001}});
+        assert!(parse_dns_mediator_upstream_rule(NFT_CLASSIFY_CHAIN.to_owned(), &bad).is_err());
+
+        let executor = FakeExecutor::with_responses(vec![Ok(Vec::new()), Ok(Vec::new())]);
+        let mut backend = NativeNftBackend::new(executor);
+        assert_eq!(
+            backend.replace_owned_state("replacement").unwrap_err().code,
+            "owned_nft_state_not_created"
+        );
+        backend.apply_provisional("initial").unwrap();
+        backend.replace_owned_state("replacement").unwrap();
+        assert_eq!(
+            *backend.executor.operations.borrow(),
+            vec![
+                NftOperation::ApplyProvisional,
+                NftOperation::ApplyProvisional
             ]
         );
     }

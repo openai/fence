@@ -21,6 +21,8 @@ pub const NFLOG_PACKET_PREFIX_BYTES: u32 = 64;
 pub const NFLOG_SAMPLE_RATE_PER_SECOND: u32 = 100;
 pub const NFLOG_SAMPLE_BURST: u32 = 100;
 pub const NETWORK_EVIDENCE_STATUS: &str = "network_enforcement_test_only";
+pub const DNS_MEDIATOR_UPSTREAM_ADDRESS: &str = "168.63.129.16";
+pub const DNS_MEDIATOR_UPSTREAM_PORT: u16 = 53;
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct OwnedTablePreview {
@@ -132,6 +134,13 @@ pub enum OwnedRule {
         protocol: String,
         port: u16,
     },
+    DnsMediatorUpstream {
+        chain: String,
+        uid: u32,
+        destination: String,
+        protocol: String,
+        port: u16,
+    },
     ViolationDispatch {
         chain: String,
     },
@@ -217,6 +226,21 @@ pub fn unapplied_test_evidence_model(
 }
 
 pub fn expected_owned_state(mode: Mode, allowances: &[EffectiveAllowance]) -> OwnedNftState {
+    expected_owned_state_with_dns_mediator(mode, allowances, false)
+}
+
+pub fn expected_dns_mediated_owned_state(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+) -> OwnedNftState {
+    expected_owned_state_with_dns_mediator(mode, allowances, true)
+}
+
+fn expected_owned_state_with_dns_mediator(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+    dns_mediator_upstream: bool,
+) -> OwnedNftState {
     OwnedNftState {
         family: NFT_FAMILY.to_owned(),
         table: NFT_TABLE.to_owned(),
@@ -246,7 +270,7 @@ pub fn expected_owned_state(mode: Mode, allowances: &[EffectiveAllowance]) -> Ow
             NFT_SAMPLED_VIOLATIONS_COUNTER.to_owned(),
             NFT_TOTAL_VIOLATIONS_COUNTER.to_owned(),
         ],
-        rules: build_rules(mode, allowances),
+        rules: build_rules(mode, allowances, dns_mediator_upstream),
     }
 }
 
@@ -265,7 +289,30 @@ pub fn verify_owned_state(
 }
 
 pub fn render_ruleset(mode: Mode, allowances: &[EffectiveAllowance]) -> String {
+    render_ruleset_with_dns_mediator(mode, allowances, false, false)
+}
+
+pub fn render_dns_mediated_ruleset(mode: Mode, allowances: &[EffectiveAllowance]) -> String {
+    render_ruleset_with_dns_mediator(mode, allowances, true, false)
+}
+
+pub fn render_dns_mediated_replacement_ruleset(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+) -> String {
+    render_ruleset_with_dns_mediator(mode, allowances, true, true)
+}
+
+fn render_ruleset_with_dns_mediator(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+    dns_mediator_upstream: bool,
+    replace_owned_table: bool,
+) -> String {
     let mut program = String::new();
+    if replace_owned_table {
+        writeln!(&mut program, "delete table {NFT_FAMILY} {NFT_TABLE}").unwrap();
+    }
     writeln!(&mut program, "create table {NFT_FAMILY} {NFT_TABLE}").unwrap();
     writeln!(
         &mut program,
@@ -297,7 +344,7 @@ pub fn render_ruleset(mode: Mode, allowances: &[EffectiveAllowance]) -> String {
         "add chain {NFT_FAMILY} {NFT_TABLE} {NFT_VIOLATION_CHAIN}"
     )
     .unwrap();
-    for rule in build_rules(mode, allowances) {
+    for rule in build_rules(mode, allowances, dns_mediator_upstream) {
         render_rule(&mut program, &rule);
     }
     program
@@ -325,7 +372,11 @@ fn nflog_prefix(mode: Mode) -> &'static str {
     }
 }
 
-fn build_rules(mode: Mode, allowances: &[EffectiveAllowance]) -> Vec<OwnedRule> {
+fn build_rules(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+    dns_mediator_upstream: bool,
+) -> Vec<OwnedRule> {
     let control = implicit_ipv6_control();
     let mut rules = vec![
         OwnedRule::Loopback {
@@ -353,6 +404,15 @@ fn build_rules(mode: Mode, allowances: &[EffectiveAllowance]) -> Vec<OwnedRule> 
             chain: NFT_FORWARD_CHAIN.to_owned(),
         },
     ];
+    if dns_mediator_upstream {
+        rules.push(OwnedRule::DnsMediatorUpstream {
+            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            uid: 0,
+            destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
+            protocol: "udp".to_owned(),
+            port: DNS_MEDIATOR_UPSTREAM_PORT,
+        });
+    }
     rules.extend(allowances.iter().map(|allowance| OwnedRule::Allowance {
         chain: NFT_CLASSIFY_CHAIN.to_owned(),
         address_family: if allowance.destination.contains(':') {
@@ -432,6 +492,19 @@ fn render_rule(program: &mut String, rule: &OwnedRule) {
             writeln!(
                 program,
                 "add rule {NFT_FAMILY} {NFT_TABLE} {chain} {address_family} daddr {destination} {protocol} dport {port} accept comment \"fence:allowance\""
+            )
+            .unwrap();
+        }
+        OwnedRule::DnsMediatorUpstream {
+            chain,
+            uid,
+            destination,
+            protocol,
+            port,
+        } => {
+            writeln!(
+                program,
+                "add rule {NFT_FAMILY} {NFT_TABLE} {chain} meta skuid {uid} ip daddr {destination} {protocol} dport {port} accept comment \"fence:dns_mediator_upstream\""
             )
             .unwrap();
         }
@@ -530,6 +603,29 @@ mod tests {
         assert!(program.contains("prefix \"fence-v0-audit\""));
         assert!(program.contains("counter name fence_total_violations accept"));
         assert!(!program.contains("counter name fence_total_violations reject"));
+    }
+
+    #[test]
+    fn renders_dns_mediator_upstream_as_root_only_owned_backend_rule() {
+        let program = render_dns_mediated_ruleset(Mode::Block, &allowances());
+        let replacement = render_dns_mediated_replacement_ruleset(Mode::Block, &allowances());
+        let expected = expected_dns_mediated_owned_state(Mode::Block, &allowances());
+
+        assert!(program.contains(
+            "meta skuid 0 ip daddr 168.63.129.16 udp dport 53 accept comment \"fence:dns_mediator_upstream\""
+        ));
+        assert!(
+            replacement.starts_with("delete table inet fence_v0\ncreate table inet fence_v0\n")
+        );
+        assert!(expected.rules.iter().any(|rule| matches!(
+            rule,
+            OwnedRule::DnsMediatorUpstream {
+                uid: 0,
+                destination,
+                port: 53,
+                ..
+            } if destination == "168.63.129.16"
+        )));
     }
 
     #[test]

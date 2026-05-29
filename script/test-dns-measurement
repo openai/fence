@@ -102,6 +102,7 @@ assert dns["routing_status"] == "active_test_only"
 assert dns["host_dns_routing"] == "local_mediator_test_only"
 assert dns["docker_dns_routing"] == "local_mediator_test_only"
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
+assert dns["proxy_policy_status"] == "audit_forwards_without_name_authorization"
 assert dns["candidate_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "codeload.github.com",
