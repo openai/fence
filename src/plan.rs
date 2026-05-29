@@ -17,15 +17,11 @@ use std::time::Duration;
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
 pub const POLICY_HASH_SCHEMA_VERSION: u32 = 2;
-pub const GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID: &str =
-    "github_hosted_https_baseline_candidate_v1";
-const HOSTED_HTTPS_BASELINE_CHANNELS: [(DestinationType, &str, Protocol, u16); 6] = [
+pub const GITHUB_HOSTED_HTTPS_ONLY_CANDIDATE_PROFILE_ID: &str =
+    "github_hosted_https_only_candidate_v1";
+const HOSTED_HTTPS_ONLY_CHANNELS: [(DestinationType, &str, Protocol, u16); 2] = [
     (DestinationType::Cidr, "0.0.0.0/0", Protocol::Tcp, 443),
     (DestinationType::Cidr, "::/0", Protocol::Tcp, 443),
-    (DestinationType::Ip, "168.63.129.16", Protocol::Udp, 53),
-    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 53),
-    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 80),
-    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 32526),
 ];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -200,7 +196,7 @@ pub fn build_plan(
                 .collect(),
         })
         .collect::<Vec<_>>();
-    // The current explicit HTTPS baseline uses only literal rules.
+    // The current explicit HTTPS-only candidate uses only literal rules.
     let platform_resolution_results = Vec::new();
     let platform_profile = platform_plan(
         config.platform_profile,
@@ -276,7 +272,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
         PlatformProfile::None => Vec::new(),
-        PlatformProfile::GithubHostedHttpsBaselineCandidateV1 => HOSTED_HTTPS_BASELINE_CHANNELS
+        PlatformProfile::GithubHostedHttpsOnlyCandidateV1 => HOSTED_HTTPS_ONLY_CHANNELS
             .iter()
             .map(
                 |(destination_type, destination, protocol, port)| NormalizedAllowance {
@@ -334,19 +330,18 @@ fn platform_plan(
             frozen_resolution_results,
             limitations: Vec::new(),
         },
-        PlatformProfile::GithubHostedHttpsBaselineCandidateV1 => PlatformProfilePlan {
-            id: GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID,
-            selection_status: "explicit_open_https_baseline_not_default",
-            purpose: "github_hosted_runner_terminal_https_baseline",
+        PlatformProfile::GithubHostedHttpsOnlyCandidateV1 => PlatformProfilePlan {
+            id: GITHUB_HOSTED_HTTPS_ONLY_CANDIDATE_PROFILE_ID,
+            selection_status: "explicit_open_https_only_not_default",
+            purpose: "github_hosted_runner_terminal_https_reduction",
             requested_allowances,
             effective_allowances,
             frozen_resolution_results,
             limitations: vec![
-                "candidate_is_intentionally_open_https_baseline_only",
+                "candidate_is_intentionally_open_https_only",
                 "permitted_platform_destinations_are_available_to_later_workflow_code",
-                "candidate_permits_measured_hosted_runner_dns_and_host_control_channels",
                 "candidate_permits_arbitrary_https_egress_for_baseline_only",
-                "candidate_dns_channel_allows_later_workflow_exfiltration",
+                "candidate_removes_explicit_dns_and_host_control_channels",
                 "candidate_must_be_reduced_before_any_default_profile_decision",
             ],
         },
@@ -523,10 +518,10 @@ mod tests {
     }
 
     #[test]
-    fn models_explicit_https_baseline_candidate_separately_from_user_policy() {
+    fn models_explicit_https_only_candidate_separately_from_user_policy() {
         let candidate = build_plan(
             parse(
-                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
+                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_https_only_candidate_v1","allowances":[]}"#,
             ),
             &resolver(vec![]),
         )
@@ -541,32 +536,21 @@ mod tests {
         assert_eq!(candidate.limits.declared_user_allowances, 0);
         assert_eq!(
             candidate.platform_profile.id,
-            GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID
+            GITHUB_HOSTED_HTTPS_ONLY_CANDIDATE_PROFILE_ID
         );
         assert_eq!(
             candidate.platform_profile.selection_status,
-            "explicit_open_https_baseline_not_default"
+            "explicit_open_https_only_not_default"
         );
-        assert_eq!(candidate.platform_profile.requested_allowances.len(), 6);
-        assert_eq!(candidate.platform_profile.effective_allowances.len(), 6);
+        assert_eq!(candidate.platform_profile.requested_allowances.len(), 2);
+        assert_eq!(candidate.platform_profile.effective_allowances.len(), 2);
         assert!(
             candidate
                 .platform_profile
                 .frozen_resolution_results
                 .is_empty()
         );
-        assert_eq!(candidate.effective_policy.len(), 6);
-        assert!(
-            candidate
-                .platform_profile
-                .requested_allowances
-                .contains(&NormalizedAllowance {
-                    destination_type: DestinationType::Ip,
-                    destination: "168.63.129.16".to_owned(),
-                    protocol: Protocol::Udp,
-                    port: 53,
-                })
-        );
+        assert_eq!(candidate.effective_policy.len(), 2);
         assert!(
             candidate
                 .platform_profile
@@ -592,14 +576,14 @@ mod tests {
             candidate
                 .platform_profile
                 .limitations
-                .contains(&"candidate_dns_channel_allows_later_workflow_exfiltration")
+                .contains(&"candidate_removes_explicit_dns_and_host_control_channels")
         );
     }
 
     #[test]
-    fn https_baseline_candidate_requires_no_hostname_resolution() {
+    fn https_only_candidate_requires_no_hostname_resolution() {
         let candidate = parse(
-            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
+            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_https_only_candidate_v1","allowances":[]}"#,
         );
         assert!(build_plan(candidate, &resolver(vec![])).is_ok());
     }

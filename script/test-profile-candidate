@@ -9,10 +9,10 @@ if [[ $# -ne 0 ]]; then
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
-  die "GitHub-hosted HTTPS baseline evidence runs only on disposable GitHub Actions runners"
+  die "GitHub-hosted HTTPS-only evidence runs only on disposable GitHub Actions runners"
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
-  die "GitHub-hosted HTTPS baseline evidence requires Linux x86_64"
+  die "GitHub-hosted HTTPS-only evidence requires Linux x86_64"
 fi
 
 ensure_rust_toolchain
@@ -23,7 +23,7 @@ require_cmd sudo
 
 for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
-    die "GitHub-hosted HTTPS baseline evidence requires executable $required"
+    die "GitHub-hosted HTTPS-only evidence requires executable $required"
   fi
 done
 
@@ -48,18 +48,18 @@ for candidate in "$target_root"/debug/deps/profile_candidate-*; do
   fi
 done
 if [[ "${#test_binaries[@]}" -ne 1 ]]; then
-  die "expected exactly one compiled GitHub-hosted HTTPS baseline test binary"
+  die "expected exactly one compiled GitHub-hosted HTTPS-only test binary"
 fi
 
 if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
-  die "GitHub-hosted HTTPS baseline evidence requires absent host inet fence_v0 table"
+  die "GitHub-hosted HTTPS-only evidence requires absent host inet fence_v0 table"
 fi
 if [[ -e "$production_ready" ]]; then
-  die "GitHub-hosted HTTPS baseline evidence requires absent production readiness path"
+  die "GitHub-hosted HTTPS-only evidence requires absent production readiness path"
 fi
 
 # This applies block policy on a disposable hosted runner using only the
-# explicit, non-default HTTPS baseline candidate. The resident controls are
+# explicit, non-default HTTPS-only candidate. The resident controls are
 # deliberately left installed for GitHub to prove terminal job completion.
 sudo /usr/bin/systemd-run \
   --quiet \
@@ -70,7 +70,7 @@ sudo /usr/bin/systemd-run \
   "--setenv=FENCE_PROFILE_CANDIDATE_UNIT=$unit" \
   "--setenv=FENCE_PROFILE_CANDIDATE_ROOT=$runtime_root" \
   "--setenv=FENCE_PROFILE_CANDIDATE_INVOCATION=$invocation" \
-  "${test_binaries[0]}" --ignored --exact https_baseline_profile_host_block_candidate_worker --nocapture
+  "${test_binaries[0]}" --ignored --exact https_only_profile_host_block_candidate_worker --nocapture
 
 python3 - "$report" "$ready" "$production_ready" <<'PY'
 import json
@@ -92,8 +92,8 @@ while time.monotonic() < deadline:
         ):
             break
     time.sleep(0.1)
-assert ready is not None, "GitHub-hosted HTTPS baseline readiness was not emitted"
-assert report is not None, "GitHub-hosted HTTPS baseline report was not emitted"
+assert ready is not None, "GitHub-hosted HTTPS-only readiness was not emitted"
+assert report is not None, "GitHub-hosted HTTPS-only report was not emitted"
 assert ready["status"] == "host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert report["status"] == "host_block_candidate_test_only"
@@ -105,26 +105,25 @@ assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["readiness_status"] == "host_block_candidate_ready_no_public_activation"
 assert report["protection_available"] is False
-assert report["platform_profile"]["id"] == "github_hosted_https_baseline_candidate_v1"
-assert report["platform_profile"]["selection_status"] == "explicit_open_https_baseline_not_default"
-assert len(report["platform_profile"]["requested_allowances"]) == 6
+assert report["platform_profile"]["id"] == "github_hosted_https_only_candidate_v1"
+assert report["platform_profile"]["selection_status"] == "explicit_open_https_only_not_default"
+assert len(report["platform_profile"]["requested_allowances"]) == 2
 assert len(report["platform_profile"]["effective_allowances"]) >= 1
 assert len(report["platform_profile"]["frozen_resolution_results"]) == 0
 assert "candidate_profile_explicit_not_default" in report["limitations"]
-assert "candidate_is_intentionally_open_https_baseline_only" in report["limitations"]
+assert "candidate_is_intentionally_open_https_only" in report["limitations"]
 assert "no_public_activation" in report["limitations"]
-assert "candidate_permits_measured_hosted_runner_infrastructure_channels" in report["limitations"]
 assert "candidate_permits_arbitrary_https_egress_for_baseline_only" in report["limitations"]
-assert "candidate_dns_channel_allows_later_workflow_exfiltration" in report["limitations"]
+assert "candidate_removes_explicit_dns_and_host_control_channels" in report["limitations"]
 assert "permitted_compatibility_channels_are_an_exfiltration_limitation" in report["limitations"]
 assert not production_ready_path.exists()
 PY
 
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
-  die "GitHub-hosted HTTPS baseline did not disable runner passwordless sudo"
+  die "GitHub-hosted HTTPS-only did not disable runner passwordless sudo"
 fi
 if docker ps --quiet >/dev/null 2>&1; then
-  die "GitHub-hosted HTTPS baseline did not disable runner Docker access"
+  die "GitHub-hosted HTTPS-only did not disable runner Docker access"
 fi
 
 sleep 6
@@ -140,4 +139,4 @@ assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 PY
 
-echo -e "${GREEN}GitHub-hosted HTTPS baseline evidence verified${OFF}"
+echo -e "${GREEN}GitHub-hosted HTTPS-only evidence verified${OFF}"
