@@ -23,8 +23,11 @@ measured passwordless sudo and container control paths, writes production
 readiness, and remains resident without restoring access. Explicit
 `unsafe_preserve` keeps the same network and sudo controls while preserving
 Docker/containerd access and reporting degraded assurance without an
-ordinary containment claim. Ordinary direct execution is rejected before
-configuration intake.
+ordinary containment claim. Audit installs owned non-blocking observation
+rules and local DNS mediation while preserving passwordless sudo,
+Docker/containerd access, and arbitrary outbound traffic. It reports
+observation-only readiness and never claims containment. Ordinary direct
+execution is rejected before configuration intake.
 
 The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -148,9 +151,9 @@ Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The `integration`
 workflow additionally records a bounded, read-only hosted-runner fingerprint
 observation before its namespace and resident-service evidence tests, and
-runs packaged production-shaped standard and degraded block transient
-services on disposable runners. This does not publish an alpha release or
-create a GitHub Action interface.
+runs packaged production-shaped standard block, degraded block, and audit
+observation transient services on disposable runners. This does not publish
+an alpha release or create a GitHub Action interface.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -281,8 +284,8 @@ hash, and the selected bounded DNS-mediated hosted job-status descriptor.
 `check-support` reports a versioned hosted-runner fingerprint gate as an
 accepted reference that is checked during activation rather than by the
 read-only support probe. `run` rejects ordinary direct execution and accepts
-only the supported production-shaped standard or explicit degraded block
-transient service.
+only the supported production-shaped standard block, explicit degraded block,
+or audit observation transient service.
 
 ```console
 script/build
@@ -336,7 +339,7 @@ preceded activation of the standard production path. Explicit `"none"`
 remains the strict planning override but is not accepted for production
 activation in this slice.
 
-The trusted-launcher block path now makes that boundary reachable from the
+The trusted-launcher paths now make that boundary reachable from the
 Linux CLI under a narrowly validated service context. Production
 runtime intake accepts only a root-owned `/run/fence/<invocation-id>/config.json`
 file as the only initial invocation-directory entry beneath pinned root-owned
@@ -346,8 +349,10 @@ The matching service validator accepts only a root process running as the
 `MainPID` of `fence-<invocation-id>.service`. The activated lifecycle accepts
 standard block with disabled container access or explicit degraded
 `unsafe_preserve` with preserved container access, always with the selected
-`github_hosted_job_status_v1` descriptor. Production audit and strict
-`"none"` activation remain deferred.
+`github_hosted_job_status_v1` descriptor. Audit accepts the same selected
+descriptor, applies only non-blocking observation rules, routes host and
+Docker DNS through the local root-resident mediator, and preserves sudo and
+container access. Strict `"none"` activation remains deferred.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

@@ -154,7 +154,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [standard, unsafe-preserve]
+        scenario: [standard, unsafe-preserve, audit]
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
