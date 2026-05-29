@@ -117,7 +117,7 @@ jobs:
         run: script/test-composed
 
   dns-mediated-host-block:
-    name: bounded DNS-mediated host-block evidence
+    name: selected profile runtime evidence
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -139,12 +139,12 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: run bounded DNS-mediated host-block evidence
+      - name: run selected profile runtime evidence
         env:
           DNS_BLOCK_CANDIDATE_REPLICA: required
         run: script/test-dns-block-candidate
 
-      - name: emit bounded late DNS-mediated evidence
+      - name: emit bounded late selected profile evidence
         env:
           DNS_BLOCK_CANDIDATE_REPLICA: required
         run: script/report-dns-block-candidate

@@ -20,8 +20,9 @@ use crate::platform_profile::{
     GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_DEPTH,
     GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
     GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
-    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS,
+    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS, GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
     GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS, GITHUB_HOSTED_JOB_STATUS_UPSTREAM_DNS,
+    github_hosted_job_status_dns_mediation_plan,
 };
 use crate::runtime::{RuntimeError, TestRuntimeStore};
 use serde::Serialize;
@@ -158,6 +159,7 @@ pub struct DnsObservation {
 pub struct DnsMediationEvidence {
     pub status: &'static str,
     pub candidate_profile_id: &'static str,
+    pub selected_platform_profile_id: Option<&'static str>,
     pub candidate_domain_patterns: Vec<&'static str>,
     pub candidate_hostnames: Vec<&'static str>,
     pub mode: Mode,
@@ -200,6 +202,10 @@ pub struct DnsMediatedBlockEvidence {
     pub status: &'static str,
     pub mode: Mode,
     pub candidate_profile_id: &'static str,
+    pub selected_platform_profile_id: &'static str,
+    pub policy_hash_schema_version: u32,
+    pub policy_hash: String,
+    pub base_ruleset_hash: String,
     pub candidate_hostnames: Vec<&'static str>,
     pub setup_status: &'static str,
     pub network_application_status: &'static str,
@@ -228,6 +234,10 @@ struct DnsMediatedBlockState<'a> {
     status: &'static str,
     mode: Mode,
     candidate_profile_id: &'static str,
+    selected_platform_profile_id: &'static str,
+    policy_hash_schema_version: u32,
+    policy_hash: &'a str,
+    base_ruleset_hash: &'a str,
     ruleset_hash: &'a str,
     planned_owned_state: &'a OwnedNftState,
     readiness_status: &'static str,
@@ -238,6 +248,10 @@ struct DnsMediatedBlockReady<'a> {
     status: &'static str,
     mode: Mode,
     candidate_profile_id: &'static str,
+    selected_platform_profile_id: &'static str,
+    policy_hash_schema_version: u32,
+    policy_hash: &'a str,
+    base_ruleset_hash: &'a str,
     ruleset_hash: &'a str,
     protection_available: bool,
     limitations: Vec<&'static str>,
@@ -716,6 +730,7 @@ impl DnsMediatedBlockSession {
         runtime: TestRuntimeStore,
         mut mediation: DnsMediationSession,
         queue: Arc<Mutex<MaterializationQueue>>,
+        plan: &PlanData,
     ) -> Result<Self, DnsMediationError> {
         if let Err(error) = prehydrate_candidate_names() {
             let _ = mediation.routing.rollback();
@@ -735,12 +750,20 @@ impl DnsMediatedBlockSession {
         let ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
         let expected_state = expected_dns_mediated_owned_state(Mode::Block, &allowances);
-        let mut evidence =
-            initial_dns_block_evidence(&active, materializations_truncated, ruleset_hash.clone());
+        let mut evidence = initial_dns_block_evidence(
+            plan,
+            &active,
+            materializations_truncated,
+            ruleset_hash.clone(),
+        );
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedBlockState {
             status: DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
             mode: Mode::Block,
             candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
+            selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            policy_hash_schema_version: plan.policy_hash_schema_version,
+            policy_hash: &plan.policy_hash,
+            base_ruleset_hash: &plan.ruleset_hash,
             ruleset_hash: &ruleset_hash,
             planned_owned_state: &expected_state,
             readiness_status: "not_emitted",
@@ -805,6 +828,10 @@ impl DnsMediatedBlockSession {
             status: DNS_MEDIATED_BLOCK_READY_STATUS,
             mode: Mode::Block,
             candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
+            selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            policy_hash_schema_version: plan.policy_hash_schema_version,
+            policy_hash: &plan.policy_hash,
+            base_ruleset_hash: &plan.ruleset_hash,
             ruleset_hash: &ruleset_hash,
             protection_available: false,
             limitations: dns_block_limitations(),
@@ -968,12 +995,14 @@ pub fn run_dns_mediated_host_block_candidate_test_service(
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     if plan.selected_mode != Mode::Block
         || plan.assurance_status != AssuranceStatus::PlannedBlockContainment
-        || plan.platform_profile.id != "none"
+        || plan.platform_profile.id != GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+        || plan.platform_profile.dns_mediated_compatibility.as_ref()
+            != Some(&github_hosted_job_status_dns_mediation_plan())
         || !plan.requested_policy.is_empty()
     {
         return Err(DnsMediationError::new(
-            "invalid_dns_block_candidate_policy",
-            "DNS-mediated block candidate accepts only standard block with no selected profile or user allowances",
+            "invalid_selected_profile_runtime_policy",
+            "DNS-mediated block evidence accepts only standard block with the reviewed hosted job-status profile and no user allowances",
         ));
     }
     let runtime =
@@ -984,7 +1013,7 @@ pub fn run_dns_mediated_host_block_candidate_test_service(
         DnsEvidenceScope::HostBlockCandidate,
         Some(queue.clone()),
     )?;
-    let mut session = DnsMediatedBlockSession::establish(runtime, mediation, queue)?;
+    let mut session = DnsMediatedBlockSession::establish(runtime, mediation, queue, plan)?;
     let start = Instant::now();
     loop {
         session.poll_once(start.elapsed(), POLL_INTERVAL)?;
@@ -992,6 +1021,7 @@ pub fn run_dns_mediated_host_block_candidate_test_service(
 }
 
 fn initial_dns_block_evidence(
+    plan: &PlanData,
     active: &BTreeMap<(String, IpAddr), ActiveMaterialization>,
     materializations_truncated: bool,
     ruleset_hash: String,
@@ -1000,6 +1030,10 @@ fn initial_dns_block_evidence(
         status: DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
         mode: Mode::Block,
         candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
+        selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        policy_hash_schema_version: plan.policy_hash_schema_version,
+        policy_hash: plan.policy_hash.clone(),
+        base_ruleset_hash: plan.ruleset_hash.clone(),
         candidate_hostnames: DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.to_vec(),
         setup_status: "setting_up",
         network_application_status: "not_applied",
@@ -1819,6 +1853,10 @@ fn evidence_from_state_and_authorizations(
     DnsMediationEvidence {
         status: scope.status(),
         candidate_profile_id: scope.candidate_profile_id(),
+        selected_platform_profile_id: match scope {
+            DnsEvidenceScope::Audit => None,
+            DnsEvidenceScope::HostBlockCandidate => Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID),
+        },
         candidate_domain_patterns: match scope {
             DnsEvidenceScope::Audit => DNS_CANDIDATE_PATTERNS.to_vec(),
             DnsEvidenceScope::HostBlockCandidate => DNS_BLOCK_COMPATIBILITY_PATTERNS.to_vec(),
