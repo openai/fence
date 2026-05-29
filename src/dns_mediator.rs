@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 pub const DNS_MEDIATION_EVIDENCE_STATUS: &str = "dns_mediation_audit_test_only";
 pub const DNS_MEDIATED_GITHUB_CANDIDATE_ID: &str = "github_hosted_dns_mediated_candidate_v1";
 pub const DNS_MEDIATED_EXACT_SERVICES_CANDIDATE_ID: &str =
-    "github_hosted_dns_mediated_exact_services_candidate_v1";
+    "github_hosted_dns_mediated_exact_services_candidate_v2";
 pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
 pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
@@ -41,14 +41,17 @@ pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa*.blob.core.windows.net",
 ];
-pub const DNS_BLOCK_CANDIDATE_HOSTNAMES: [&str; 3] = [
+pub const DNS_BLOCK_CANDIDATE_HOSTNAMES: [&str; 4] = [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ];
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_DYNAMIC_MATERIALIZATIONS: usize = 128;
+const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize = 32;
+const MAX_DERIVED_CNAME_DEPTH: u8 = 4;
 const MAX_DYNAMIC_TTL_SECONDS: u32 = 300;
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
@@ -75,6 +78,7 @@ impl DnsEvidenceScope {
         }
     }
 
+    #[cfg(test)]
     fn forward_query(self, hostname: &str) -> bool {
         match self {
             Self::Audit => true,
@@ -138,9 +142,19 @@ pub struct DnsMediationEvidence {
     pub proxy_policy_status: &'static str,
     pub observations: Vec<DnsObservation>,
     pub observations_truncated: bool,
+    pub derived_cname_authorizations: Vec<DnsDerivedCnameAuthorization>,
+    pub derived_cname_authorizations_truncated: bool,
     pub excluded_non_github_query_count: u64,
     pub blocked_non_candidate_query_count: u64,
     pub limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct DnsDerivedCnameAuthorization {
+    pub hostname: String,
+    pub source_hostname: String,
+    pub observed_ttl_seconds: u32,
+    pub depth: u8,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -216,9 +230,17 @@ struct RetainedObservation {
     addresses_truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct DnsAddressAnswer {
+    hostname: String,
     address: IpAddr,
+    ttl_seconds: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DnsCnameAnswer {
+    owner: String,
+    target: String,
     ttl_seconds: u32,
 }
 
@@ -243,15 +265,86 @@ struct ActiveMaterialization {
     expires_at: Instant,
 }
 
+#[derive(Debug, Default)]
+struct CnameAuthorizationState {
+    active: BTreeMap<String, ActiveCnameAuthorization>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct ActiveCnameAuthorization {
+    source_hostname: String,
+    observed_ttl_seconds: u32,
+    depth: u8,
+    expires_at: Instant,
+}
+
 #[derive(Clone)]
 struct ObservationRecorder {
     state: Arc<Mutex<ObservationState>>,
+    cname_authorizations: Arc<Mutex<CnameAuthorizationState>>,
     report_path: PathBuf,
     scope: DnsEvidenceScope,
     materializations: Option<Arc<Mutex<MaterializationQueue>>>,
 }
 
 impl ObservationRecorder {
+    fn forward_query(&self, hostname: &str) -> bool {
+        match self.scope {
+            DnsEvidenceScope::Audit => true,
+            DnsEvidenceScope::HostBlockCandidate => {
+                let mut authorizations = self
+                    .cname_authorizations
+                    .lock()
+                    .expect("DNS CNAME authorization lock poisoned");
+                authorized_block_candidate_hostname(hostname, &mut authorizations, Instant::now())
+            }
+        }
+    }
+
+    fn candidate_classification(&self, hostname: &str) -> &'static str {
+        let classification = candidate_classification(self.scope, hostname);
+        if classification != "github_related_outside_candidate" {
+            classification
+        } else if self.scope == DnsEvidenceScope::HostBlockCandidate && self.forward_query(hostname)
+        {
+            "matches_ttl_bounded_cname_descendant"
+        } else {
+            classification
+        }
+    }
+
+    fn materialization_ttl_seconds(&self, hostname: &str, ttl_seconds: u32) -> Option<u32> {
+        if matches_exact_block_candidate_hostname(hostname) {
+            return bound_materialization_ttl(ttl_seconds, None);
+        }
+        let now = Instant::now();
+        let mut authorizations = self
+            .cname_authorizations
+            .lock()
+            .expect("DNS CNAME authorization lock poisoned");
+        remove_expired_cname_authorizations(&mut authorizations, now);
+        let remaining_seconds = authorizations
+            .active
+            .get(hostname)?
+            .expires_at
+            .saturating_duration_since(now);
+        bound_materialization_ttl(ttl_seconds, Some(remaining_seconds))
+    }
+
+    fn evidence_from_state(
+        &self,
+        state: &ObservationState,
+        routing_status: &'static str,
+    ) -> DnsMediationEvidence {
+        let mut authorizations = self
+            .cname_authorizations
+            .lock()
+            .expect("DNS CNAME authorization lock poisoned");
+        remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+        evidence_from_state_and_authorizations(state, routing_status, self.scope, &authorizations)
+    }
+
     fn record_query(&self, hostname: &str, query_type: u16) {
         let normalized = normalize_hostname(hostname);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
@@ -260,7 +353,7 @@ impl ObservationRecorder {
             .filter(|name| reportable_github_hostname(name))
             .cloned()
         {
-            let classification = candidate_classification(self.scope, &hostname);
+            let classification = self.candidate_classification(&hostname);
             let key = (hostname, query_type, classification);
             if let Some(observation) = state.retained.get_mut(&key) {
                 observation.occurrences = observation.occurrences.saturating_add(1);
@@ -282,12 +375,12 @@ impl ObservationRecorder {
         if self.scope == DnsEvidenceScope::HostBlockCandidate
             && normalized
                 .as_deref()
-                .is_some_and(|hostname| !self.scope.forward_query(hostname))
+                .is_some_and(|hostname| !self.forward_query(hostname))
         {
             state.blocked_non_candidate_query_count =
                 state.blocked_non_candidate_query_count.saturating_add(1);
         }
-        let evidence = evidence_from_state(&state, "active_test_only", self.scope);
+        let evidence = self.evidence_from_state(&state, "active_test_only");
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         let _ = write_result;
@@ -299,38 +392,51 @@ impl ObservationRecorder {
         else {
             return;
         };
+        if self.scope == DnsEvidenceScope::HostBlockCandidate && self.forward_query(&hostname) {
+            let mut authorizations = self
+                .cname_authorizations
+                .lock()
+                .expect("DNS CNAME authorization lock poisoned");
+            retain_cname_authorizations(
+                &mut authorizations,
+                parse_dns_cname_answers(packet),
+                Instant::now(),
+            );
+        }
         let answers = parse_dns_address_answers(packet);
         if answers.is_empty() {
             return;
         }
-        let classification = candidate_classification(self.scope, &hostname);
+        let classification = self.candidate_classification(&hostname);
         let key = (hostname.clone(), query_type, classification);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         let Some(observation) = state.retained.get_mut(&key) else {
             return;
         };
-        retain_address_answers(observation, answers);
+        retain_address_answers(observation, answers.clone());
         if self.scope == DnsEvidenceScope::HostBlockCandidate
-            && matches_exact_block_candidate_hostname(&hostname)
+            && self.forward_query(&hostname)
             && let Some(queue) = &self.materializations
         {
             let mut queue = queue.lock().expect("DNS materialization lock poisoned");
-            for answer in parse_dns_address_answers(packet) {
-                if answer.ttl_seconds == 0 {
+            for answer in answers {
+                let Some(ttl_seconds) =
+                    self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)
+                else {
                     continue;
-                }
+                };
                 if queue.pending.len() >= MAX_DYNAMIC_MATERIALIZATIONS {
                     queue.truncated = true;
                     break;
                 }
                 queue.pending.insert(PendingMaterialization {
-                    hostname: hostname.clone(),
+                    hostname: answer.hostname,
                     address: answer.address,
-                    ttl_seconds: answer.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS),
+                    ttl_seconds,
                 });
             }
         }
-        let evidence = evidence_from_state(&state, "active_test_only", self.scope);
+        let evidence = self.evidence_from_state(&state, "active_test_only");
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         let _ = write_result;
@@ -344,7 +450,20 @@ impl ObservationRecorder {
             )
         })?;
         *state = ObservationState::default();
-        let evidence = evidence_from_state(&state, "active_test_only", self.scope);
+        let mut authorizations = self.cname_authorizations.lock().map_err(|_| {
+            DnsMediationError::new(
+                "dns_cname_authorization_state_failed",
+                "DNS CNAME authorization state could not be reset after setup",
+            )
+        })?;
+        *authorizations = CnameAuthorizationState::default();
+        let evidence = evidence_from_state_and_authorizations(
+            &state,
+            "active_test_only",
+            self.scope,
+            &authorizations,
+        );
+        drop(authorizations);
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         write_result
@@ -474,19 +593,24 @@ impl DnsMediationSession {
         let report_path = runtime_directory.join("dns-report.json");
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
+            cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_path,
             scope,
             materializations,
         };
         write_report(
             &recorder.report_path,
-            &evidence_from_state(
+            &evidence_from_state_and_authorizations(
                 &recorder
                     .state
                     .lock()
                     .expect("DNS observation lock poisoned"),
                 "setting_up",
                 scope,
+                &recorder
+                    .cname_authorizations
+                    .lock()
+                    .expect("DNS CNAME authorization lock poisoned"),
             ),
         )?;
         let threads = start_dns_proxy(recorder.clone())?;
@@ -837,7 +961,7 @@ fn initial_dns_block_evidence(
         rollback_status: "not_required",
         ruleset_hash,
         dns_upstream_policy: "root_resident_mediator_only_udp_53",
-        materialization_status: "bounded_ttl_approved_name_https_only",
+        materialization_status: "bounded_ttl_approved_name_or_cname_descendant_https_only",
         materialized_https_allowances: report_materializations(active),
         materializations_truncated,
         expired_materializations: 0,
@@ -857,7 +981,8 @@ fn initial_dns_block_evidence(
 fn dns_block_limitations() -> Vec<&'static str> {
     vec![
         "dns_mediated_host_block_candidate_test_only_no_public_activation",
-        "candidate_hostnames_are_exact_and_not_a_default_platform_profile",
+        "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile",
+        "cname_descendants_are_bounded_ttl_derived_authorizations",
         "approved_status_https_destinations_remain_egress_channels",
         "resolved_status_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
@@ -1108,7 +1233,7 @@ fn query_is_forwardable(
     match (recorder.scope, parsed_question) {
         (DnsEvidenceScope::Audit, _) => true,
         (DnsEvidenceScope::HostBlockCandidate, Some((hostname, _))) => {
-            recorder.scope.forward_query(hostname)
+            recorder.forward_query(hostname)
         }
         (DnsEvidenceScope::HostBlockCandidate, None) => false,
     }
@@ -1177,6 +1302,9 @@ fn parse_dns_address_answers(packet: &[u8]) -> Vec<DnsAddressAnswer> {
     }
     let mut addresses = Vec::new();
     for _ in 0..answer_count {
+        let Some(hostname) = parse_dns_name(packet, offset) else {
+            return Vec::new();
+        };
         let Some(next) = skip_dns_name(packet, offset) else {
             return Vec::new();
         };
@@ -1212,6 +1340,7 @@ fn parse_dns_address_answers(packet: &[u8]) -> Vec<DnsAddressAnswer> {
         };
         if let Some(address) = address {
             addresses.push(DnsAddressAnswer {
+                hostname,
                 address,
                 ttl_seconds,
             });
@@ -1219,6 +1348,98 @@ fn parse_dns_address_answers(packet: &[u8]) -> Vec<DnsAddressAnswer> {
         offset = data_offset + data_length;
     }
     addresses
+}
+
+fn parse_dns_cname_answers(packet: &[u8]) -> Vec<DnsCnameAnswer> {
+    if packet.len() < 12 {
+        return Vec::new();
+    }
+    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
+    let answer_count = u16::from_be_bytes([packet[6], packet[7]]);
+    let mut offset = 12;
+    for _ in 0..question_count {
+        let Some(next) = skip_dns_name(packet, offset) else {
+            return Vec::new();
+        };
+        if next + 4 > packet.len() {
+            return Vec::new();
+        }
+        offset = next + 4;
+    }
+    let mut aliases = Vec::new();
+    for _ in 0..answer_count {
+        let Some(owner) = parse_dns_name(packet, offset) else {
+            return Vec::new();
+        };
+        let Some(next) = skip_dns_name(packet, offset) else {
+            return Vec::new();
+        };
+        if next + 10 > packet.len() {
+            return Vec::new();
+        }
+        let answer_type = u16::from_be_bytes([packet[next], packet[next + 1]]);
+        let answer_class = u16::from_be_bytes([packet[next + 2], packet[next + 3]]);
+        let ttl_seconds = u32::from_be_bytes([
+            packet[next + 4],
+            packet[next + 5],
+            packet[next + 6],
+            packet[next + 7],
+        ]);
+        let data_length = usize::from(u16::from_be_bytes([packet[next + 8], packet[next + 9]]));
+        let data_offset = next + 10;
+        if data_offset + data_length > packet.len() {
+            return Vec::new();
+        }
+        if answer_type == 5
+            && answer_class == 1
+            && skip_dns_name(packet, data_offset) == Some(data_offset + data_length)
+            && let Some(target) = parse_dns_name(packet, data_offset)
+        {
+            aliases.push(DnsCnameAnswer {
+                owner,
+                target,
+                ttl_seconds,
+            });
+        }
+        offset = data_offset + data_length;
+    }
+    aliases
+}
+
+fn parse_dns_name(packet: &[u8], offset: usize) -> Option<String> {
+    let mut current = offset;
+    let mut labels = Vec::new();
+    let mut pointers_followed = 0;
+    loop {
+        let length = *packet.get(current)?;
+        if length == 0 {
+            break;
+        }
+        if length & 0xc0 == 0xc0 {
+            let next = *packet.get(current + 1)?;
+            current = usize::from(length & 0x3f) << 8 | usize::from(next);
+            pointers_followed += 1;
+            if pointers_followed > MAX_DERIVED_CNAME_DEPTH as usize {
+                return None;
+            }
+            continue;
+        }
+        if length & 0xc0 != 0 || length > 63 {
+            return None;
+        }
+        current += 1;
+        let end = current.checked_add(usize::from(length))?;
+        let label = std::str::from_utf8(packet.get(current..end)?).ok()?;
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return None;
+        }
+        labels.push(label.to_ascii_lowercase());
+        current = end;
+    }
+    normalize_hostname(&labels.join("."))
 }
 
 fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
@@ -1237,6 +1458,88 @@ fn skip_dns_name(packet: &[u8], mut offset: usize) -> Option<usize> {
         offset = offset.checked_add(usize::from(length) + 1)?;
         if offset > packet.len() {
             return None;
+        }
+    }
+}
+
+fn remove_expired_cname_authorizations(state: &mut CnameAuthorizationState, now: Instant) {
+    state
+        .active
+        .retain(|_, authorization| authorization.expires_at > now);
+}
+
+fn bound_materialization_ttl(
+    ttl_seconds: u32,
+    authorization_remaining: Option<Duration>,
+) -> Option<u32> {
+    let mut bounded_ttl = ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS);
+    if let Some(remaining) = authorization_remaining {
+        let remaining_seconds = u32::try_from(remaining.as_secs()).unwrap_or(u32::MAX);
+        bounded_ttl = bounded_ttl.min(remaining_seconds);
+    }
+    (bounded_ttl > 0).then_some(bounded_ttl)
+}
+
+fn authorized_block_candidate_hostname(
+    hostname: &str,
+    state: &mut CnameAuthorizationState,
+    now: Instant,
+) -> bool {
+    remove_expired_cname_authorizations(state, now);
+    matches_exact_block_candidate_hostname(hostname) || state.active.contains_key(hostname)
+}
+
+fn retain_cname_authorizations(
+    state: &mut CnameAuthorizationState,
+    aliases: impl IntoIterator<Item = DnsCnameAnswer>,
+    now: Instant,
+) {
+    remove_expired_cname_authorizations(state, now);
+    let mut pending: Vec<DnsCnameAnswer> = aliases.into_iter().collect();
+    for _ in 0..MAX_DERIVED_CNAME_DEPTH {
+        let mut progressed = false;
+        pending.retain(|alias| {
+            let source_depth = if matches_exact_block_candidate_hostname(&alias.owner) {
+                Some(0)
+            } else {
+                state
+                    .active
+                    .get(&alias.owner)
+                    .map(|authorization| authorization.depth)
+            };
+            let Some(source_depth) = source_depth else {
+                return true;
+            };
+            let depth = source_depth.saturating_add(1);
+            if alias.ttl_seconds == 0 || depth > MAX_DERIVED_CNAME_DEPTH {
+                return false;
+            }
+            if !reportable_github_hostname(&alias.target) {
+                return false;
+            }
+            if !state.active.contains_key(&alias.target)
+                && state.active.len() >= MAX_DERIVED_CNAME_AUTHORIZATIONS
+            {
+                state.truncated = true;
+                return false;
+            }
+            state.active.insert(
+                alias.target.clone(),
+                ActiveCnameAuthorization {
+                    source_hostname: alias.owner.clone(),
+                    observed_ttl_seconds: alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS),
+                    depth,
+                    expires_at: now
+                        + Duration::from_secs(u64::from(
+                            alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS),
+                        )),
+                },
+            );
+            progressed = true;
+            false
+        });
+        if !progressed {
+            break;
         }
     }
 }
@@ -1322,10 +1625,25 @@ fn query_type_name(query_type: u16) -> String {
     }
 }
 
+#[cfg(test)]
 fn evidence_from_state(
     state: &ObservationState,
     routing_status: &'static str,
     scope: DnsEvidenceScope,
+) -> DnsMediationEvidence {
+    evidence_from_state_and_authorizations(
+        state,
+        routing_status,
+        scope,
+        &CnameAuthorizationState::default(),
+    )
+}
+
+fn evidence_from_state_and_authorizations(
+    state: &ObservationState,
+    routing_status: &'static str,
+    scope: DnsEvidenceScope,
+    cname_authorizations: &CnameAuthorizationState,
 ) -> DnsMediationEvidence {
     DnsMediationEvidence {
         status: scope.status(),
@@ -1346,7 +1664,9 @@ fn evidence_from_state(
         answer_attribution_status: "bounded_reportable_hostname_answers_only",
         proxy_policy_status: match scope {
             DnsEvidenceScope::Audit => "audit_forwards_without_name_authorization",
-            DnsEvidenceScope::HostBlockCandidate => "block_forwards_only_exact_candidate_hostnames",
+            DnsEvidenceScope::HostBlockCandidate => {
+                "block_forwards_exact_candidate_hostnames_and_bounded_cname_descendants"
+            }
         },
         observations: state
             .retained
@@ -1368,6 +1688,17 @@ fn evidence_from_state(
             )
             .collect(),
         observations_truncated: state.truncated,
+        derived_cname_authorizations: cname_authorizations
+            .active
+            .iter()
+            .map(|(hostname, authorization)| DnsDerivedCnameAuthorization {
+                hostname: hostname.clone(),
+                source_hostname: authorization.source_hostname.clone(),
+                observed_ttl_seconds: authorization.observed_ttl_seconds,
+                depth: authorization.depth,
+            })
+            .collect(),
+        derived_cname_authorizations_truncated: cname_authorizations.truncated,
         excluded_non_github_query_count: state.excluded_non_github_query_count,
         blocked_non_candidate_query_count: state.blocked_non_candidate_query_count,
         limitations: match scope {
@@ -1382,8 +1713,9 @@ fn evidence_from_state(
             ],
             DnsEvidenceScope::HostBlockCandidate => vec![
                 "dns_mediated_host_block_candidate_test_only_no_public_activation",
-                "candidate_hostnames_are_exact_and_not_a_default_platform_profile",
-                "dns_answers_materialize_only_bounded_candidate_https_addresses",
+                "candidate_root_hostnames_are_exact_and_not_a_default_platform_profile",
+                "cname_descendants_are_bounded_ttl_derived_authorizations",
+                "dns_answers_materialize_only_bounded_candidate_or_cname_descendant_https_addresses",
                 "approved_status_https_destinations_remain_egress_channels",
                 "resolved_status_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
@@ -1520,6 +1852,25 @@ mod tests {
         bytes
     }
 
+    fn response_with_cname(name: &str, target: &str, ttl_seconds: u32) -> Vec<u8> {
+        let mut bytes = query(name, 1);
+        bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0xc0, 0x0c]);
+        bytes.extend_from_slice(&5_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
+        let mut target_bytes = Vec::new();
+        for label in target.split('.') {
+            target_bytes.push(label.len() as u8);
+            target_bytes.extend_from_slice(label.as_bytes());
+        }
+        target_bytes.push(0);
+        bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&target_bytes);
+        bytes
+    }
+
     #[test]
     fn parses_and_normalizes_bounded_dns_questions() {
         assert_eq!(
@@ -1567,11 +1918,15 @@ mod tests {
                 .forward_query("results-receiver.actions.githubusercontent.com")
         );
         assert!(
-            !DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::HostBlockCandidate
                 .forward_query("payload.pipelines.actions.githubusercontent.com")
         );
         assert!(
-            matches_candidate_pattern("payload.pipelines.actions.githubusercontent.com"),
+            !DnsEvidenceScope::HostBlockCandidate
+                .forward_query("lookalike.payload.pipelines.actions.githubusercontent.com")
+        );
+        assert!(
+            matches_candidate_pattern("lookalike.payload.pipelines.actions.githubusercontent.com"),
             "the audit hypothesis remains broader than block authorization"
         );
         assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("api.github.com"));
@@ -1591,6 +1946,7 @@ mod tests {
                 &[192, 0, 2, 10],
             )),
             vec![DnsAddressAnswer {
+                hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                 address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
                 ttl_seconds: 30,
             }]
@@ -1606,11 +1962,72 @@ mod tests {
                     .octets(),
             )),
             vec![DnsAddressAnswer {
+                hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                 address: "2001:db8::1".parse().expect("IPv6 fixture must parse"),
                 ttl_seconds: 60,
             }]
         );
         assert!(parse_dns_address_answers(&[]).is_empty());
+    }
+
+    #[test]
+    fn authorizes_only_bounded_ttl_cname_descendants_of_exact_roots() {
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        assert_eq!(bound_materialization_ttl(600, None), Some(300));
+        assert_eq!(
+            bound_materialization_ttl(300, Some(Duration::from_secs(20))),
+            Some(20)
+        );
+        assert_eq!(
+            bound_materialization_ttl(300, Some(Duration::from_millis(999))),
+            None
+        );
+        assert!(!authorized_block_candidate_hostname(
+            "glb-example.github.com",
+            &mut authorizations,
+            now,
+        ));
+        retain_cname_authorizations(
+            &mut authorizations,
+            parse_dns_cname_answers(&response_with_cname(
+                "payload.pipelines.actions.githubusercontent.com",
+                "glb-example.github.com",
+                60,
+            )),
+            now,
+        );
+        assert!(authorized_block_candidate_hostname(
+            "glb-example.github.com",
+            &mut authorizations,
+            now,
+        ));
+        assert!(!authorized_block_candidate_hostname(
+            "glb-example.github.com",
+            &mut authorizations,
+            now + Duration::from_secs(61),
+        ));
+        retain_cname_authorizations(
+            &mut authorizations,
+            [DnsCnameAnswer {
+                owner: "payload.pipelines.actions.githubusercontent.com".to_owned(),
+                target: "unrelated.example.com".to_owned(),
+                ttl_seconds: 60,
+            }],
+            now,
+        );
+        assert!(!authorized_block_candidate_hostname(
+            "unrelated.example.com",
+            &mut authorizations,
+            now,
+        ));
+        let mut truncated = response_with_cname(
+            "payload.pipelines.actions.githubusercontent.com",
+            "glb-example.github.com",
+            60,
+        );
+        truncated.pop();
+        assert!(parse_dns_cname_answers(&truncated).is_empty());
     }
 
     #[test]
@@ -1620,10 +2037,12 @@ mod tests {
             &mut observation,
             [
                 DnsAddressAnswer {
+                    hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                     address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
                     ttl_seconds: 60,
                 },
                 DnsAddressAnswer {
+                    hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                     address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
                     ttl_seconds: 30,
                 },
@@ -1633,6 +2052,7 @@ mod tests {
             retain_address_answers(
                 &mut observation,
                 [DnsAddressAnswer {
+                    hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                     address: IpAddr::V4(Ipv4Addr::new(198, 51, 100, value as u8)),
                     ttl_seconds: 45,
                 }],

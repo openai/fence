@@ -42,6 +42,7 @@ assert dns["status"] == "dns_mediated_host_block_candidate_test_only", dns
 assert not production_path.exists()
 
 observations = dns["observations"]
+derived_cname_authorizations = dns["derived_cname_authorizations"]
 summary = {
     "schema_version": 1,
     "status": "dns_mediated_host_block_candidate_late_report_test_only",
@@ -50,6 +51,11 @@ summary = {
     "blocked_non_candidate_query_count": dns["blocked_non_candidate_query_count"],
     "observations": observations[:64],
     "observations_truncated": dns["observations_truncated"] or len(observations) > 64,
+    "derived_cname_authorizations": derived_cname_authorizations[:32],
+    "derived_cname_authorizations_truncated": (
+        dns["derived_cname_authorizations_truncated"]
+        or len(derived_cname_authorizations) > 32
+    ),
     "protection_available": False,
     "limitations": [
         "bounded_late_step_dns_evidence_only",

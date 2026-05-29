@@ -88,14 +88,17 @@ A first exact-name reduction that forwarded and materialized only
 `results-receiver.actions.githubusercontent.com` completed its visible
 steps but did not publish terminal job conclusions. GitHub's public runner
 checks also identify `vstoken.actions.githubusercontent.com` as a required
-Actions service endpoint. The current exact-services candidate therefore
-authorizes only those three documented names and locally refuses
-suffix-shaped lookalike queries. This remains *test-only*: it neither selects
-a default `platform_profile` nor activates public protection, and terminal
-success must be repeated before any promotion decision. A following workflow
-step emits a capped sanitized DNS summary so GitHub-related names refused
-after the initial report snapshot can be reviewed without changing policy.
-Its reported
+Actions service endpoint. Adding that third name still left hosted jobs
+non-terminal. A bounded late report consistently observed the stable
+`payload.pipelines.actions.githubusercontent.com` service name and a generated
+`glb-...github.com` DNS alias. The current candidate therefore authorizes four
+exact root names and bounded TTL-derived CNAME descendants while locally
+refusing arbitrary suffix-shaped lookalike queries. This remains *test-only*:
+it neither selects a default `platform_profile` nor activates public
+protection, and terminal success must be repeated before any promotion
+decision. A following workflow step emits a capped sanitized DNS summary so
+GitHub-related names refused after the initial report snapshot and derived
+CNAME authorizations can be reviewed without changing policy. Its reported
 limitations also state that the approved HTTPS channels remain usable for
 egress and that resolved address grants may represent colocated services.
 
