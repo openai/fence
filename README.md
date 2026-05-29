@@ -76,18 +76,21 @@ support any protection claim. The experiment sends only a fixed non-GitHub
 DNS probe to prove host and Docker-address forwarding; that name is counted
 but not retained as platform evidence.
 
-A separate non-required DNS-mediated host-block candidate now exercises the
-next constrained design step on disposable hosted runners. It pre-resolves
-only fixed approved job-status names through the local mediator, permits
-upstream UDP DNS only from the root-resident mediator, materializes bounded
-TCP `443` address grants with DNS TTL expiry, and retains verified sudo and
-container lockdown until teardown. This is still *test-only*: it neither
-selects a default `platform_profile` nor activates public protection, and a
-failure to reach terminal job success requires design review rather than
-silent policy expansion. Its suffix-matched DNS candidate class is also
-explicitly treated as an egress channel because later code could encode data
-in permitted query labels; it cannot become a protected default without a
-separate constrained-policy decision.
+A non-required DNS-mediated host-block experiment then pre-resolved approved
+job-status names through the local mediator, permitted upstream UDP DNS only
+from that root-resident mediator, materialized bounded TCP `443` address
+grants with DNS TTL expiry, and retained verified sudo and container lockdown
+until teardown. Its broad suffix-matched authorization reached terminal
+success on three disposable hosted runners, but remained unsuitable as a
+default because later code could encode data in permitted DNS query labels.
+A follow-up exact-status candidate now forwards and materializes only
+`pipelines.actions.githubusercontent.com` and
+`results-receiver.actions.githubusercontent.com`, and locally refuses
+suffix-shaped lookalike queries. This remains *test-only*: it neither selects
+a default `platform_profile` nor activates public protection, and terminal
+success must be repeated before any promotion decision. Its reported
+limitations also state that the approved HTTPS channels remain usable for
+egress and that resolved address grants may represent colocated services.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
