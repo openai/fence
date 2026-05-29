@@ -151,7 +151,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Linux x64-only, GitHub-Actions-only DNS-mediated audit experiment entrypoint; do not run it on developer machines or reusable runners.
   - Launches a root transient service that forwards host and Docker DNS through fixed local listeners to the measured platform resolver, while applying only non-blocking host `audit` rules.
   - Retains only bounded normalized GitHub-related query names and classifies them against the fixed test-only compatibility hypothesis `*.actions.githubusercontent.com`, `codeload.github.com`, `actions-results-receiver-production.githubapp.com`, and `productionresultssa*.blob.core.windows.net`.
-  - Performs no intentional post-activation API, cache, artifact, or action-download operation, writes evidence only below non-production `/run/fence-dns-measurement-*`, and cannot select a platform profile or claim protection.
+  - Uses only a fixed non-GitHub DNS probe to prove host and Docker-address forwarding after activation; that probe is counted but its hostname is not retained. It performs no intentional post-activation API, cache, artifact, or action-download operation, writes evidence only below non-production `/run/fence-dns-measurement-*`, and cannot select a platform profile or claim protection.
 
 - `script/test-profile-candidate`
   - Linux x64-only, GitHub-Actions-only destructive compatibility entrypoint; do not run it on developer machines or reusable runners.

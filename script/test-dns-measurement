@@ -17,6 +17,7 @@ fi
 
 ensure_rust_toolchain
 require_cmd cargo
+require_cmd getent
 require_cmd python3
 require_cmd sudo
 
@@ -110,8 +111,26 @@ assert dns["protection_available"] is False
 assert not production_path.exists()
 PY
 
-# Keep this as a status-only observation: no API request, cache operation,
-# artifact upload, action download, or intentional post-activation lookup.
+# Validate both local forwarders with a non-GitHub DNS name that is counted but
+# cannot enter retained hostname evidence. Do not exercise API, cache,
+# artifact-upload, or action-download traffic after activation.
+getent ahostsv4 example.com >/dev/null
+python3 <<'PY'
+import random
+import socket
+import struct
+
+identifier = random.randrange(0, 65536)
+question = b"".join(bytes([len(label)]) + label for label in b"example.com".split(b".")) + b"\x00"
+packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2)
+sock.sendto(packet, ("172.17.0.1", 53))
+response, _ = sock.recvfrom(4096)
+assert len(response) >= 12
+assert struct.unpack("!H", response[:2])[0] == identifier
+assert struct.unpack("!H", response[2:4])[0] & 0x8000
+PY
 sleep 8
 python3 - "$dns_report" "$report" "$production_ready" <<'PY'
 import json
@@ -125,6 +144,7 @@ assert dns["routing_status"] == "active_test_only", dns
 assert dns["protection_available"] is False, dns
 assert "candidate_patterns_not_selected_as_platform_profile" in dns["limitations"], dns
 assert "terminal_block_success_required_before_default_selection" in dns["limitations"], dns
+assert dns["excluded_non_github_query_count"] >= 2, dns
 assert report["verification_status"] == "verified", report
 assert report["critical_findings"] == [], report
 assert not production_path.exists()

@@ -69,7 +69,9 @@ GitHub compatibility hypothesis consisting of
 `productionresultssa*.blob.core.windows.net`. That hypothesis is not an
 accepted `platform_profile`, does not change the default policy, and must be
 proved by a later blocking terminal-completion experiment before it can
-support any protection claim.
+support any protection claim. The experiment sends only a fixed non-GitHub
+DNS probe to prove host and Docker-address forwarding; that name is counted
+but not retained as platform evidence.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
