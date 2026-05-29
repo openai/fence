@@ -44,8 +44,18 @@ the controls remained resident. A Phase 4B experiment then permitted exactly
 the GitHub-owned pipelines and results-receiver HTTPS endpoints in three
 independent hosted jobs. All three completed their visible local steps but
 remained non-terminal past the configured five-minute observation limit, so
-that candidate was rejected as insufficient. No built-in platform profile is
-selected.
+that candidate was rejected as insufficient. A subsequent experiment allowing
+fixed GitHub service/results-storage hosts and measured hosted-runner
+platform DNS/host-control traffic also finished local completion steps without
+yielding a terminal job result. The current non-required experiment accepts
+only an explicit `github_hosted_https_baseline_candidate_v1` plan: arbitrary
+outbound TCP `443` plus the measured hosted-runner DNS and host-control
+channels. It is intentionally an open diagnostic baseline, not a candidate
+final allowlist: its HTTPS and DNS channels are usable by later workflow code
+for egress. Constraining those channels is required follow-up work after a
+passing baseline.
+It remains test-only and non-default until terminal hosted-runner evidence is
+reviewed; no built-in platform profile is selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -168,7 +178,7 @@ It separately runs `script/test-composed`, whose block-mode network rules are
 confined to a disposable namespace while the associated host lockdown remains
 test-only evidence on an ephemeral runner.
 
-## Phase 4A Evidence Boundary
+## Phase 4 Evidence Boundary
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
@@ -185,7 +195,7 @@ script/build
 ```
 
 The last command intentionally returns an `enforcement_not_implemented` error
-through the Phase 4A evidence-only slices. Privileged hosted tests may emit
+through the Phase 4 evidence-only slices. Privileged hosted tests may emit
 explicitly test-only resident, lockdown, or composed evidence. Resident
 network measurement and composed namespace-network evidence may emit
 non-protecting test readiness; public CLI execution cannot. The composed
@@ -199,7 +209,15 @@ Phase 4B also rejected a static candidate permitting only
 completed visible local assertions and remained non-terminal past the
 five-minute observation limit while controls were resident. These negative
 results do not activate the public agent or justify a default platform
-profile.
+profile. A follow-up fixed-host candidate with measured hosted-runner
+platform DNS/host-control channels also failed to become terminal. The current
+non-required candidate may be selected explicitly as
+`github_hosted_https_baseline_candidate_v1`; it permits arbitrary outbound
+TCP `443` and measured hosted-runner platform DNS/host-control channels for
+disposable-host baseline evidence. This candidate deliberately trades broad
+disclosed egress channels, including general HTTPS and DNS channels, for a
+terminal hosted-job baseline before a later minimization pass. It is neither a
+public enforcement interface nor a default profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

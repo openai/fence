@@ -2,7 +2,7 @@ use crate::IMPLEMENTATION_PHASE;
 use crate::config::{
     ContainerPolicy, DestinationType, MAX_ALLOWANCES, MAX_EXPANDED_RULES, MAX_FINDINGS,
     MAX_REPORT_BYTES, MAX_RESOLVED_ADDRESSES, Mode, NormalizedAllowance, NormalizedConfig,
-    Protocol,
+    PlatformProfile, Protocol,
 };
 use crate::error::ErrorDetail;
 use crate::nft::{NetworkEnforcementPreview, build_preview, implicit_ipv6_control};
@@ -17,6 +17,16 @@ use std::time::Duration;
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
 pub const POLICY_HASH_SCHEMA_VERSION: u32 = 2;
+pub const GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID: &str =
+    "github_hosted_https_baseline_candidate_v1";
+const HOSTED_HTTPS_BASELINE_CHANNELS: [(DestinationType, &str, Protocol, u16); 6] = [
+    (DestinationType::Cidr, "0.0.0.0/0", Protocol::Tcp, 443),
+    (DestinationType::Cidr, "::/0", Protocol::Tcp, 443),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Udp, 53),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 53),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 80),
+    (DestinationType::Ip, "168.63.129.16", Protocol::Tcp, 32526),
+];
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,13 +80,24 @@ pub struct FindingState {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct PlatformProfilePlan {
+    pub id: &'static str,
+    pub selection_status: &'static str,
+    pub purpose: &'static str,
+    pub requested_allowances: Vec<NormalizedAllowance>,
+    pub effective_allowances: Vec<EffectiveAllowance>,
+    pub frozen_resolution_results: Vec<ResolutionResult>,
+    pub limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct PlanData {
     pub implementation_phase: &'static str,
     pub configuration_schema_version: u32,
     pub selected_mode: Mode,
     pub assurance_status: AssuranceStatus,
     pub invocation_id: String,
-    pub platform_profile: String,
+    pub platform_profile: PlatformProfilePlan,
     pub container_policy: Option<ContainerPolicy>,
     pub requested_policy: Vec<NormalizedAllowance>,
     pub effective_policy: Vec<EffectiveAllowance>,
@@ -107,10 +128,12 @@ pub fn build_plan(
     config: NormalizedConfig,
     resolver: &dyn Resolver,
 ) -> Result<PlanData, ErrorDetail> {
+    let platform_requested_policy = platform_requested_allowances(config.platform_profile);
     let mut resolved = BTreeMap::new();
     let hosts = config
         .requested_allowances
         .iter()
+        .chain(platform_requested_policy.iter())
         .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
         .map(|allowance| allowance.destination.clone())
         .collect::<BTreeSet<_>>();
@@ -150,27 +173,11 @@ pub fn build_plan(
         resolved.insert(host, addresses);
     }
 
-    let mut effective_policy = Vec::new();
-    for allowance in &config.requested_allowances {
-        match allowance.destination_type {
-            DestinationType::Hostname => {
-                let addresses = resolved
-                    .get(&allowance.destination)
-                    .expect("each validated hostname is resolved before expansion");
-                for address in addresses {
-                    effective_policy.push(effective_from_ip(*address, allowance));
-                }
-            }
-            DestinationType::Ip | DestinationType::Cidr => {
-                effective_policy.push(EffectiveAllowance {
-                    destination_type: allowance.destination_type,
-                    destination: allowance.destination.clone(),
-                    protocol: allowance.protocol,
-                    port: allowance.port,
-                });
-            }
-        }
-    }
+    let mut platform_effective_policy = expand_allowances(&platform_requested_policy, &resolved);
+    platform_effective_policy.sort();
+    platform_effective_policy.dedup();
+    let mut effective_policy = expand_allowances(&config.requested_allowances, &resolved);
+    effective_policy.extend(expand_allowances(&platform_requested_policy, &resolved));
 
     let expanded_rules_before_deduplication = effective_policy.len();
     if expanded_rules_before_deduplication > MAX_EXPANDED_RULES {
@@ -184,15 +191,23 @@ pub fn build_plan(
     effective_policy.dedup();
 
     let frozen_resolution_results = resolved
-        .into_iter()
+        .iter()
         .map(|(hostname, addresses)| ResolutionResult {
-            hostname,
+            hostname: hostname.clone(),
             addresses: addresses
-                .into_iter()
+                .iter()
                 .map(|address| address.to_string())
                 .collect(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // The current explicit HTTPS baseline uses only literal rules.
+    let platform_resolution_results = Vec::new();
+    let platform_profile = platform_plan(
+        config.platform_profile,
+        platform_requested_policy,
+        platform_effective_policy,
+        platform_resolution_results,
+    );
     let policy_hash = policy_hash(&config, &effective_policy);
     let network_enforcement_preview = build_preview(config.mode, &effective_policy);
     let ruleset_hash = sha256_hex(network_enforcement_preview.ruleset.as_bytes());
@@ -208,7 +223,7 @@ pub fn build_plan(
         selected_mode: config.mode,
         assurance_status,
         invocation_id: config.invocation_id,
-        platform_profile: config.platform_profile,
+        platform_profile,
         container_policy: config.container_policy,
         requested_policy: config.requested_allowances,
         effective_policy,
@@ -258,6 +273,86 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
     }
 }
 
+fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
+    match profile {
+        PlatformProfile::None => Vec::new(),
+        PlatformProfile::GithubHostedHttpsBaselineCandidateV1 => HOSTED_HTTPS_BASELINE_CHANNELS
+            .iter()
+            .map(
+                |(destination_type, destination, protocol, port)| NormalizedAllowance {
+                    destination_type: *destination_type,
+                    destination: (*destination).to_owned(),
+                    protocol: *protocol,
+                    port: *port,
+                },
+            )
+            .collect(),
+    }
+}
+
+fn expand_allowances(
+    allowances: &[NormalizedAllowance],
+    resolved: &BTreeMap<String, Vec<IpAddr>>,
+) -> Vec<EffectiveAllowance> {
+    let mut effective = Vec::new();
+    for allowance in allowances {
+        match allowance.destination_type {
+            DestinationType::Hostname => {
+                let addresses = resolved
+                    .get(&allowance.destination)
+                    .expect("each validated hostname is resolved before expansion");
+                for address in addresses {
+                    effective.push(effective_from_ip(*address, allowance));
+                }
+            }
+            DestinationType::Ip | DestinationType::Cidr => {
+                effective.push(EffectiveAllowance {
+                    destination_type: allowance.destination_type,
+                    destination: allowance.destination.clone(),
+                    protocol: allowance.protocol,
+                    port: allowance.port,
+                });
+            }
+        }
+    }
+    effective
+}
+
+fn platform_plan(
+    profile: PlatformProfile,
+    requested_allowances: Vec<NormalizedAllowance>,
+    effective_allowances: Vec<EffectiveAllowance>,
+    frozen_resolution_results: Vec<ResolutionResult>,
+) -> PlatformProfilePlan {
+    match profile {
+        PlatformProfile::None => PlatformProfilePlan {
+            id: profile.id(),
+            selection_status: "none_current_default",
+            purpose: "no_implicit_platform_egress",
+            requested_allowances,
+            effective_allowances,
+            frozen_resolution_results,
+            limitations: Vec::new(),
+        },
+        PlatformProfile::GithubHostedHttpsBaselineCandidateV1 => PlatformProfilePlan {
+            id: GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID,
+            selection_status: "explicit_open_https_baseline_not_default",
+            purpose: "github_hosted_runner_terminal_https_baseline",
+            requested_allowances,
+            effective_allowances,
+            frozen_resolution_results,
+            limitations: vec![
+                "candidate_is_intentionally_open_https_baseline_only",
+                "permitted_platform_destinations_are_available_to_later_workflow_code",
+                "candidate_permits_measured_hosted_runner_dns_and_host_control_channels",
+                "candidate_permits_arbitrary_https_egress_for_baseline_only",
+                "candidate_dns_channel_allows_later_workflow_exfiltration",
+                "candidate_must_be_reduced_before_any_default_profile_decision",
+            ],
+        },
+    }
+}
+
 fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> AssuranceStatus {
     match (mode, container_policy) {
         (Mode::Block, Some(ContainerPolicy::UnsafePreserve)) => {
@@ -300,7 +395,7 @@ fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance
         policy_hash_schema_version: POLICY_HASH_SCHEMA_VERSION,
         mode: config.mode,
         container_policy: config.container_policy,
-        platform_profile: &config.platform_profile,
+        platform_profile: config.platform_profile.id(),
         allowances: effective_policy,
         implicit_ipv6_control: implicit_ipv6_control(),
     })
@@ -425,6 +520,88 @@ mod tests {
         assert_ne!(standard.ruleset_hash, audit.ruleset_hash);
         assert_eq!(degraded.limitations.len(), 2);
         assert_eq!(audit.limitations.len(), 2);
+    }
+
+    #[test]
+    fn models_explicit_https_baseline_candidate_separately_from_user_policy() {
+        let candidate = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let none = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"candidate","platform_profile":"none","allowances":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+
+        assert!(candidate.requested_policy.is_empty());
+        assert_eq!(candidate.limits.declared_user_allowances, 0);
+        assert_eq!(
+            candidate.platform_profile.id,
+            GITHUB_HOSTED_HTTPS_BASELINE_CANDIDATE_PROFILE_ID
+        );
+        assert_eq!(
+            candidate.platform_profile.selection_status,
+            "explicit_open_https_baseline_not_default"
+        );
+        assert_eq!(candidate.platform_profile.requested_allowances.len(), 6);
+        assert_eq!(candidate.platform_profile.effective_allowances.len(), 6);
+        assert!(
+            candidate
+                .platform_profile
+                .frozen_resolution_results
+                .is_empty()
+        );
+        assert_eq!(candidate.effective_policy.len(), 6);
+        assert!(
+            candidate
+                .platform_profile
+                .requested_allowances
+                .contains(&NormalizedAllowance {
+                    destination_type: DestinationType::Ip,
+                    destination: "168.63.129.16".to_owned(),
+                    protocol: Protocol::Udp,
+                    port: 53,
+                })
+        );
+        assert!(
+            candidate
+                .platform_profile
+                .requested_allowances
+                .contains(&NormalizedAllowance {
+                    destination_type: DestinationType::Cidr,
+                    destination: "0.0.0.0/0".to_owned(),
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                })
+        );
+        assert_eq!(none.platform_profile.id, "none");
+        assert!(none.platform_profile.requested_allowances.is_empty());
+        assert_ne!(candidate.policy_hash, none.policy_hash);
+        assert_ne!(candidate.ruleset_hash, none.ruleset_hash);
+        assert!(
+            candidate
+                .platform_profile
+                .limitations
+                .contains(&"candidate_permits_arbitrary_https_egress_for_baseline_only")
+        );
+        assert!(
+            candidate
+                .platform_profile
+                .limitations
+                .contains(&"candidate_dns_channel_allows_later_workflow_exfiltration")
+        );
+    }
+
+    #[test]
+    fn https_baseline_candidate_requires_no_hostname_resolution() {
+        let candidate = parse(
+            r#"{"schema_version":1,"mode":"audit","invocation_id":"candidate","platform_profile":"github_hosted_https_baseline_candidate_v1","allowances":[]}"#,
+        );
+        assert!(build_plan(candidate, &resolver(vec![])).is_ok());
     }
 
     #[test]
