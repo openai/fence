@@ -251,7 +251,11 @@ jobs:
           set -euo pipefail
           tag="$RELEASE_TAG"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --title "$tag" --notes "Release $tag" --target "${{ github.sha }}"
+            release_args=(--title "$tag" --notes "Release $tag" --target "${{ github.sha }}")
+            if [[ "$tag" == *-* ]]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "$tag" "${release_args[@]}"
           fi
 
       - name: publish release assets

@@ -19,6 +19,30 @@ fi
 require_cmd python3
 require_cmd sudo
 
+expected_version="$(
+  awk '
+    /^[[:space:]]*\[[[:space:]]*package[[:space:]]*\][[:space:]]*$/ {
+      in_package = 1
+      next
+    }
+    /^[[:space:]]*\[/ {
+      if (in_package) {
+        exit
+      }
+      next
+    }
+    in_package && /^[[:space:]]*version[[:space:]]*=/ {
+      if (match($0, /"[^"]+"/)) {
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        exit
+      }
+    }
+  ' "$DIR/Cargo.toml"
+)"
+if [[ -z "$expected_version" ]]; then
+  die "could not determine the Fence package version"
+fi
+
 if [[ ! -x /usr/sbin/nft ]]; then
   die "packaged public-contract smoke tests require executable /usr/sbin/nft"
 fi
@@ -98,7 +122,7 @@ assert_no_runtime_state
 capture_command version --version
 assert_status version 0
 assert_empty_file "$temporary_directory/version.stderr" "version stderr"
-python3 - "$temporary_directory/version.stdout" <<'PY'
+python3 - "$temporary_directory/version.stdout" "$expected_version" <<'PY'
 import json
 import sys
 
@@ -112,7 +136,7 @@ def require(condition, message):
 require(result["schema_version"] == 1, "version response schema mismatch")
 require(result["command"] == "version", "version command field mismatch")
 require(result["status"] == "success", "version response status mismatch")
-require(result["fence_version"] == "0.0.0", "version envelope version mismatch")
+require(result["fence_version"] == sys.argv[2], "version envelope version mismatch")
 require(result["data"]["implementation_phase"] == "phase4", "version phase mismatch")
 require(result["data"]["protection_available"] is False, "version reported protection")
 PY
@@ -120,7 +144,7 @@ PY
 capture_command support check-support
 assert_status support 0
 assert_empty_file "$temporary_directory/support.stderr" "check-support stderr"
-python3 - "$temporary_directory/support.stdout" <<'PY'
+python3 - "$temporary_directory/support.stdout" "$expected_version" <<'PY'
 import json
 import sys
 
@@ -135,7 +159,7 @@ def require(condition, message):
 require(result["schema_version"] == 1, "support response schema mismatch")
 require(result["command"] == "check-support", "support command field mismatch")
 require(result["status"] == "success", "support response status mismatch")
-require(result["fence_version"] == "0.0.0", "support envelope version mismatch")
+require(result["fence_version"] == sys.argv[2], "support envelope version mismatch")
 require(data["implementation_phase"] == "phase4", "support phase mismatch")
 require(data["intended_protected_target_match"] is True, "support target mismatch")
 require(data["protection_available"] is False, "support reported protection")
@@ -184,7 +208,7 @@ assert_empty_file "$temporary_directory/plan-first.stderr" "first render-plan st
 assert_empty_file "$temporary_directory/plan-second.stderr" "second render-plan stderr"
 cmp -s "$temporary_directory/plan-first.stdout" "$temporary_directory/plan-second.stdout" ||
   die "render-plan output must be deterministic for the literal-address fixture"
-python3 - "$temporary_directory/plan-first.stdout" <<'PY'
+python3 - "$temporary_directory/plan-first.stdout" "$expected_version" <<'PY'
 import json
 import re
 import sys
@@ -200,7 +224,7 @@ def require(condition, message):
 require(result["schema_version"] == 1, "plan response schema mismatch")
 require(result["command"] == "render-plan", "plan command field mismatch")
 require(result["status"] == "success", "plan response status mismatch")
-require(result["fence_version"] == "0.0.0", "plan envelope version mismatch")
+require(result["fence_version"] == sys.argv[2], "plan envelope version mismatch")
 require(data["implementation_phase"] == "phase4", "plan phase mismatch")
 require(data["policy_hash_schema_version"] == 3, "plan policy hash schema mismatch")
 require(re.fullmatch(r"[0-9a-f]{64}", data["policy_hash"]), "invalid policy hash")
@@ -227,7 +251,7 @@ sentinel="$temporary_directory/nonexistent-run-config.json"
 capture_command run run --config "$sentinel"
 assert_status run 1
 assert_empty_file "$temporary_directory/run.stdout" "run stdout"
-python3 - "$temporary_directory/run.stderr" <<'PY'
+python3 - "$temporary_directory/run.stderr" "$expected_version" <<'PY'
 import json
 import sys
 
@@ -241,7 +265,7 @@ def require(condition, message):
 require(result["schema_version"] == 1, "run response schema mismatch")
 require(result["command"] == "run", "run command field mismatch")
 require(result["status"] == "error", "run response status mismatch")
-require(result["fence_version"] == "0.0.0", "run envelope version mismatch")
+require(result["fence_version"] == sys.argv[2], "run envelope version mismatch")
 require(
     result["error"]["code"] == "trusted_launcher_required",
     "run did not reject direct execution outside the trusted launcher",
