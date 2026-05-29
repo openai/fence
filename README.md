@@ -152,7 +152,7 @@ artifact through the trusted-launcher JSON CLI boundary. The `integration`
 workflow additionally records a bounded, read-only hosted-runner fingerprint
 observation before its namespace and resident-service evidence tests, and
 runs packaged production-shaped standard block, degraded block, and audit
-observation transient services on disposable runners. The `0.1.0-alpha.1`
+observation transient services on disposable runners. The `0.1.0-alpha.2`
 publication remains limited to the Linux x64 agent artifact; it does not
 create a GitHub Action interface.
 
@@ -365,7 +365,8 @@ download an agent at workflow runtime.
 
 The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
 to `main` established a baseline without publishing a release. The current
-`0.1.0-alpha.1` version bump is the first Linux x64 alpha publication trigger.
+`0.1.0-alpha.2` version bump is the first usable Linux x64 alpha publication
+trigger.
 Future deliberate version bumps merged to `main` remain release triggers.
 
 The first publishable agent artifact is limited to
