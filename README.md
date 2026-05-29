@@ -125,7 +125,12 @@ compatible. A following
 workflow step emits a capped sanitized DNS summary so late DNS and network
 findings can be reviewed without changing policy. Its reported limitations
 also state that the approved DNS and HTTPS channels remain usable for egress
-and that resolved address grants may represent colocated services.
+and that resolved address grants may represent colocated services. Six
+disposable-host replicas across two executions reached terminal success. One
+bounded DNS-mediated host-block scenario now runs behind the stable required
+`integration` aggregate so future compatibility regressions fail closed. This
+promotes the evidence gate, not the product interface: public `run` remains
+disabled and no default `platform_profile` is selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -247,6 +252,10 @@ evidence, not part of the offline developer script contract.
 It separately runs `script/test-composed`, whose block-mode network rules are
 confined to a disposable namespace while the associated host lockdown remains
 test-only evidence on an ephemeral runner.
+It also runs one disposable-host `script/test-dns-block-candidate` scenario
+through the required aggregate after six non-required terminal-success proofs.
+That scenario applies bounded DNS-mediated host blocking and measured
+sudo/container lockdown while retaining only test-only readiness and reports.
 
 ## Phase 4 Evidence Boundary
 
@@ -292,6 +301,17 @@ outbound TCP `443` and excluding TCP DNS and host-control paths. Its three
 replicas reached terminal success, but general HTTPS and DNS remain broad
 disclosed egress channels. It is neither a public enforcement interface nor a
 default profile.
+
+The later DNS-mediated reduction now constrains dynamic
+`*.actions.githubusercontent.com` authorization to eight unique lifetime
+names with no more than two prefix labels, canonicalizes block-mode upstream
+`A`/`AAAA` questions, and retains bounded TTL-derived CNAME descendants. Six
+disposable-host replicas across two executions reached terminal success. The
+required `integration` aggregate now exercises one copy of this test-only
+host-block evidence. Its DNS timing/count channel, bounded query-label channel,
+approved HTTPS destinations, CNAME delegation, and address-plus-port
+realization remain disclosed limitations. This does not activate public
+`run`, establish production readiness, or select a default profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
