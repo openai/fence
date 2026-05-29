@@ -80,7 +80,7 @@ impl RunProvider for SystemRunProvider {
     fn run(&self, config: &Path) -> Result<(), ErrorDetail> {
         #[cfg(target_os = "linux")]
         {
-            crate::dns_mediator::run_protected_block_service(config)
+            crate::dns_mediator::run_protected_service(config)
                 .map_err(|error| ErrorDetail::new(error.code, "protected lifecycle setup failed"))
         }
         #[cfg(not(target_os = "linux"))]

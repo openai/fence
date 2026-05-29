@@ -404,7 +404,7 @@ fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
             limitations.push("container_access_would_invalidate_ordinary_containment");
         }
         AssuranceStatus::AuditObservationOnly => {
-            limitations.push("audit_production_activation_not_implemented");
+            limitations.push("audit_requires_supported_trusted_launcher_for_activation");
             limitations.push("audit_observes_only_and_never_contains");
         }
     }
@@ -575,7 +575,7 @@ mod tests {
             audit.limitations,
             vec![
                 "render_plan_does_not_apply_or_verify_security_state",
-                "audit_production_activation_not_implemented",
+                "audit_requires_supported_trusted_launcher_for_activation",
                 "audit_observes_only_and_never_contains"
             ]
         );
