@@ -1,0 +1,145 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-dns-block-candidate"
+fi
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "DNS-mediated block candidate runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "DNS-mediated block candidate requires Linux x86_64"
+fi
+
+ensure_rust_toolchain
+require_cmd cargo
+require_cmd docker
+require_cmd python3
+require_cmd sudo
+
+for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/resolvectl /usr/sbin/nft; do
+  if [[ ! -x "$required" ]]; then
+    die "DNS-mediated block candidate requires executable $required"
+  fi
+done
+
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
+invocation="dns-block-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
+unit="fence-evidence-${invocation}.service"
+runtime_root="/run/fence-dns-block-candidate-${suffix}"
+directory="$runtime_root/$invocation"
+report="$directory/report.json"
+dns_report="$directory/dns-report.json"
+ready="$directory/ready.json"
+production_ready="/run/fence/$invocation/ready.json"
+target_root="$RUNNER_TEMP/fence-dns-block-candidate-target"
+
+mkdir -p "$target_root"
+export CARGO_TARGET_DIR="$target_root"
+cargo test --frozen --test dns_block_candidate --no-run
+
+shopt -s nullglob
+test_binaries=()
+for candidate in "$target_root"/debug/deps/dns_block_candidate-*; do
+  if [[ -f "$candidate" && -x "$candidate" ]]; then
+    test_binaries+=("$candidate")
+  fi
+done
+if [[ "${#test_binaries[@]}" -ne 1 ]]; then
+  die "expected exactly one compiled DNS-mediated block candidate binary"
+fi
+
+if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "DNS-mediated block candidate requires absent host inet fence_v0 table"
+fi
+if [[ -e "$production_ready" ]]; then
+  die "DNS-mediated block candidate requires absent production readiness path"
+fi
+
+# This applies block policy on a disposable runner and intentionally leaves
+# controls resident so the platform conclusion tests the candidate.
+sudo /usr/bin/systemd-run \
+  --quiet \
+  --collect \
+  --property=Type=exec \
+  --unit "$unit" \
+  --setenv=FENCE_DNS_BLOCK_CANDIDATE_WORKER=1 \
+  "--setenv=FENCE_DNS_BLOCK_CANDIDATE_UNIT=$unit" \
+  "--setenv=FENCE_DNS_BLOCK_CANDIDATE_ROOT=$runtime_root" \
+  "--setenv=FENCE_DNS_BLOCK_CANDIDATE_INVOCATION=$invocation" \
+  "${test_binaries[0]}" --ignored --exact dns_mediated_host_block_candidate_worker --nocapture
+
+python3 - "$report" "$dns_report" "$ready" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+report_path, dns_path, ready_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+deadline = time.monotonic() + 30
+report = None
+dns = None
+ready = None
+while time.monotonic() < deadline:
+    if report_path.exists() and dns_path.exists() and ready_path.exists():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        dns = json.loads(dns_path.read_text(encoding="utf-8"))
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        if report.get("setup_status") == "resident_dns_mediated_host_block_candidate_test_only":
+            break
+    time.sleep(0.1)
+assert report is not None, "DNS-mediated block report was not emitted"
+assert dns is not None, "DNS-mediated block DNS report was not emitted"
+assert ready is not None, "DNS-mediated block test readiness was not emitted"
+assert report["status"] == "dns_mediated_host_block_candidate_test_only"
+assert report["mode"] == "block"
+assert report["candidate_profile_id"] == "github_hosted_dns_mediated_candidate_v1"
+assert report["network_application_status"] == "applied"
+assert report["network_verification_status"] == "verified"
+assert report["sudo_status"] == "disabled_verified"
+assert report["container_status"] == "disabled_verified"
+assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
+assert report["materialization_status"] == "bounded_ttl_approved_name_https_only"
+assert len(report["materialized_https_allowances"]) >= 1
+assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
+assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
+assert ready["protection_available"] is False
+assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
+assert dns["mode"] == "block"
+assert dns["proxy_policy_status"] == "block_forwards_only_fixed_candidate_name_matches"
+assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
+assert "candidate_wildcard_dns_names_allow_query_label_egress" in dns["limitations"]
+assert "candidate_patterns_are_fixed_and_not_a_default_platform_profile" in report["limitations"]
+assert "candidate_wildcard_dns_names_allow_query_label_egress" in report["limitations"]
+assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
+assert not production_path.exists()
+PY
+
+if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
+  die "DNS-mediated block candidate did not disable runner passwordless sudo"
+fi
+if docker ps --quiet >/dev/null 2>&1; then
+  die "DNS-mediated block candidate did not disable runner Docker access"
+fi
+
+sleep 6
+python3 - "$report" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+
+report_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+report = json.loads(report_path.read_text(encoding="utf-8"))
+assert report["network_verification_status"] == "verified", report
+assert report["sudo_status"] == "disabled_verified", report
+assert report["container_status"] == "disabled_verified", report
+assert report["critical_findings"] == [], report
+assert not production_path.exists()
+print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+PY
+
+echo -e "${GREEN}DNS-mediated host-block candidate evidence verified${OFF}"

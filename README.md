@@ -60,6 +60,34 @@ disposable-host jobs. It is not a candidate final allowlist: general HTTPS
 and DNS are usable by later workflow code for egress and still must be
 replaced with a constrained design before any default profile decision. It
 remains test-only and non-default; no built-in platform profile is selected.
+A separate, non-required DNS-mediated audit experiment routes host and Docker
+resolver traffic through a local test-only mediator and records only bounded
+GitHub-related queried hostnames. For those retained names only, it records
+bounded canonical answer addresses and the minimum observed DNS TTL to support
+later correlation and refresh design; it does not use those answers to add
+firewall authorization. It classifies observations against a fixed GitHub
+compatibility hypothesis consisting of
+`*.actions.githubusercontent.com`, `codeload.github.com`,
+`actions-results-receiver-production.githubapp.com`, and
+`productionresultssa*.blob.core.windows.net`. That hypothesis is not an
+accepted `platform_profile`, does not change the default policy, and must be
+proved by a later blocking terminal-completion experiment before it can
+support any protection claim. The experiment sends only a fixed non-GitHub
+DNS probe to prove host and Docker-address forwarding; that name is counted
+but not retained as platform evidence.
+
+A separate non-required DNS-mediated host-block candidate now exercises the
+next constrained design step on disposable hosted runners. It pre-resolves
+only fixed approved job-status names through the local mediator, permits
+upstream UDP DNS only from the root-resident mediator, materializes bounded
+TCP `443` address grants with DNS TTL expiry, and retains verified sudo and
+container lockdown until teardown. This is still *test-only*: it neither
+selects a default `platform_profile` nor activates public protection, and a
+failure to reach terminal job success requires design review rather than
+silent policy expansion. Its suffix-matched DNS candidate class is also
+explicitly treated as an egress channel because later code could encode data
+in permitted query labels; it cannot become a protected default without a
+separate constrained-policy decision.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`

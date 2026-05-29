@@ -1,0 +1,158 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-dns-measurement"
+fi
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "DNS-mediated audit measurement runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "DNS-mediated audit measurement requires Linux x86_64"
+fi
+
+ensure_rust_toolchain
+require_cmd cargo
+require_cmd getent
+require_cmd python3
+require_cmd sudo
+
+for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/resolvectl /usr/sbin/nft; do
+  if [[ ! -x "$required" ]]; then
+    die "DNS-mediated audit measurement requires executable $required"
+  fi
+done
+
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_MEASUREMENT_REPLICA:-trial}"
+invocation="dns-audit-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_MEASUREMENT_REPLICA:-trial}"
+unit="fence-evidence-${invocation}.service"
+runtime_root="/run/fence-dns-measurement-${suffix}"
+directory="$runtime_root/$invocation"
+report="$directory/report.json"
+dns_report="$directory/dns-report.json"
+ready="$directory/ready.json"
+production_ready="/run/fence/$invocation/ready.json"
+target_root="$RUNNER_TEMP/fence-dns-measurement-target"
+
+mkdir -p "$target_root"
+export CARGO_TARGET_DIR="$target_root"
+cargo test --frozen --test dns_measurement --no-run
+
+shopt -s nullglob
+test_binaries=()
+for candidate in "$target_root"/debug/deps/dns_measurement-*; do
+  if [[ -f "$candidate" && -x "$candidate" ]]; then
+    test_binaries+=("$candidate")
+  fi
+done
+if [[ "${#test_binaries[@]}" -ne 1 ]]; then
+  die "expected exactly one compiled DNS-mediated audit test binary"
+fi
+
+if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "DNS-mediated audit measurement requires absent host inet fence_v0 table"
+fi
+if [[ -e "$production_ready" ]]; then
+  die "DNS-mediated audit measurement requires absent production readiness path"
+fi
+
+sudo /usr/bin/systemd-run \
+  --quiet \
+  --collect \
+  --property=Type=exec \
+  --unit "$unit" \
+  --setenv=FENCE_DNS_MEDIATION_WORKER=1 \
+  "--setenv=FENCE_DNS_MEDIATION_UNIT=$unit" \
+  "--setenv=FENCE_DNS_MEDIATION_ROOT=$runtime_root" \
+  "--setenv=FENCE_DNS_MEDIATION_INVOCATION=$invocation" \
+  "${test_binaries[0]}" --ignored --exact dns_mediation_audit_worker --nocapture
+
+python3 - "$report" "$dns_report" "$ready" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+import time
+
+report_path, dns_path, ready_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+deadline = time.monotonic() + 20
+report = None
+dns = None
+ready = None
+while time.monotonic() < deadline:
+    if report_path.exists() and dns_path.exists() and ready_path.exists():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        dns = json.loads(dns_path.read_text(encoding="utf-8"))
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        if dns.get("routing_status") == "active_test_only":
+            break
+    time.sleep(0.1)
+assert report is not None, "resident audit report was not emitted"
+assert dns is not None, "DNS mediation report was not emitted"
+assert ready is not None, "test-only audit readiness was not emitted"
+assert report["status"] == "resident_lifecycle_test_only"
+assert report["mode"] == "audit"
+assert ready["protection_available"] is False
+assert dns["status"] == "dns_mediation_audit_test_only"
+assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_candidate_v1"
+assert dns["routing_status"] == "active_test_only"
+assert dns["host_dns_routing"] == "local_mediator_test_only"
+assert dns["docker_dns_routing"] == "local_mediator_test_only"
+assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
+assert dns["proxy_policy_status"] == "audit_forwards_without_name_authorization"
+assert dns["candidate_domain_patterns"] == [
+    "*.actions.githubusercontent.com",
+    "codeload.github.com",
+    "actions-results-receiver-production.githubapp.com",
+    "productionresultssa*.blob.core.windows.net",
+]
+assert dns["protection_available"] is False
+assert not production_path.exists()
+PY
+
+# Validate both local forwarders with a non-GitHub DNS name that is counted but
+# cannot enter retained hostname evidence. Do not exercise API, cache,
+# artifact-upload, or action-download traffic after activation.
+getent ahostsv4 example.com >/dev/null
+python3 <<'PY'
+import random
+import socket
+import struct
+
+identifier = random.randrange(0, 65536)
+question = b"".join(bytes([len(label)]) + label for label in b"example.com".split(b".")) + b"\x00"
+packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2)
+sock.sendto(packet, ("172.17.0.1", 53))
+response, _ = sock.recvfrom(4096)
+assert len(response) >= 12
+assert struct.unpack("!H", response[:2])[0] == identifier
+assert struct.unpack("!H", response[2:4])[0] & 0x8000
+PY
+sleep 8
+python3 - "$dns_report" "$report" "$production_ready" <<'PY'
+import json
+import pathlib
+import sys
+
+dns_path, report_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+dns = json.loads(dns_path.read_text(encoding="utf-8"))
+report = json.loads(report_path.read_text(encoding="utf-8"))
+assert dns["routing_status"] == "active_test_only", dns
+assert dns["protection_available"] is False, dns
+assert "candidate_patterns_not_selected_as_platform_profile" in dns["limitations"], dns
+assert "dns_answers_attribute_addresses_without_authorizing_firewall_rules" in dns["limitations"], dns
+assert "dns_ttls_are_evidence_for_future_bounded_refresh_design_only" in dns["limitations"], dns
+assert "terminal_block_success_required_before_default_selection" in dns["limitations"], dns
+assert dns["excluded_non_github_query_count"] >= 2, dns
+assert report["verification_status"] == "verified", report
+assert report["critical_findings"] == [], report
+assert not production_path.exists()
+print(json.dumps(dns, sort_keys=True, separators=(",", ":")))
+PY
+
+echo -e "${GREEN}DNS-mediated status-only audit evidence emitted${OFF}"
