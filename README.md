@@ -51,14 +51,15 @@ yielding a terminal job result. An intentionally open diagnostic baseline,
 `github_hosted_https_baseline_candidate_v1`, then permitted arbitrary outbound
 TCP `443` plus those measured platform channels and reached terminal success
 in three independent disposable-host jobs. A follow-up HTTPS-only reduction
-stranded one of three jobs after visible completion, so the current
-non-required experiment accepts only explicit
+stranded one of three jobs after visible completion. A reduced non-required
+experiment using explicit
 `github_hosted_https_udp_dns_candidate_v1`: arbitrary outbound TCP `443` plus
 UDP DNS to the measured platform resolver, with TCP DNS and host-control
-allowances removed. It is not a candidate final allowlist: general HTTPS and
-DNS are usable by later workflow code for egress and still must be replaced
-with a constrained design before any default profile decision. It remains
-test-only and non-default; no built-in platform profile is selected.
+allowances removed, then reached terminal success in three independent
+disposable-host jobs. It is not a candidate final allowlist: general HTTPS
+and DNS are usable by later workflow code for egress and still must be
+replaced with a constrained design before any default profile decision. It
+remains test-only and non-default; no built-in platform profile is selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -218,12 +219,13 @@ explicit `github_hosted_https_baseline_candidate_v1` diagnostic baseline
 subsequently reached terminal success in three disposable-host jobs by
 permitting arbitrary outbound TCP `443` and the measured platform channels.
 An HTTPS-only reduction then left one of three replicas non-terminal past the
-observation limit. The current non-required candidate may be selected
-explicitly as `github_hosted_https_udp_dns_candidate_v1`; it adds back only
-UDP DNS to the measured platform resolver while retaining arbitrary outbound
-TCP `443` and excluding TCP DNS and host-control paths. Even if it succeeds,
-general HTTPS and DNS are broad disclosed egress channels. It is neither a
-public enforcement interface nor a default profile.
+observation limit. The narrower passing non-required candidate may be
+selected explicitly as `github_hosted_https_udp_dns_candidate_v1`; it adds
+back only UDP DNS to the measured platform resolver while retaining arbitrary
+outbound TCP `443` and excluding TCP DNS and host-control paths. Its three
+replicas reached terminal success, but general HTTPS and DNS remain broad
+disclosed egress channels. It is neither a public enforcement interface nor a
+default profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
