@@ -111,7 +111,17 @@ descendants, but all three hosted jobs again completed visible steps without
 publishing terminal conclusions. The retained no-storage candidate therefore
 still includes the Actions wildcard. This remains *test-only*: it neither
 selects a default `platform_profile` nor activates public protection, and the
-wildcard query-label channel is a disclosed egress limitation. A following
+wildcard query-label channel is a disclosed egress limitation. The current
+follow-up replaces that unrestricted wildcard with a constrained suffix
+experiment: exact bootstrap roots remain explicit, previously unseen
+`*.actions.githubusercontent.com` names are limited to eight unique names for
+the candidate lifetime and at most two labels before the suffix, only `A` and
+`AAAA` questions are forwarded in block mode, outbound questions are rebuilt
+into a canonical lowercase form before upstream forwarding, and bounded
+TTL-derived CNAME descendants remain available. This test-only design still
+has disclosed DNS query timing and count channels, but bounds caller-controlled
+query content while testing whether GitHub-hosted job finalization remains
+compatible. A following
 workflow step emits a capped sanitized DNS summary so late DNS and network
 findings can be reviewed without changing policy. Its reported limitations
 also state that the approved DNS and HTTPS channels remain usable for egress

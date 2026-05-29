@@ -63,6 +63,11 @@ summary = {
     ),
     "observations": observations[:64],
     "observations_truncated": dns["observations_truncated"] or len(observations) > 64,
+    "bounded_actions_suffix_authorizations": dns["bounded_actions_suffix_authorizations"][:8],
+    "bounded_actions_suffix_authorizations_truncated": (
+        dns["bounded_actions_suffix_authorizations_truncated"]
+        or len(dns["bounded_actions_suffix_authorizations"]) > 8
+    ),
     "derived_cname_authorizations": derived_cname_authorizations[:32],
     "derived_cname_authorizations_truncated": (
         dns["derived_cname_authorizations_truncated"]

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 pub const DNS_MEDIATION_EVIDENCE_STATUS: &str = "dns_mediation_audit_test_only";
 pub const DNS_MEDIATED_GITHUB_CANDIDATE_ID: &str = "github_hosted_dns_mediated_candidate_v1";
 pub const DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID: &str =
-    "github_hosted_dns_mediated_no_storage_candidate_v5";
+    "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6";
 pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
 pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
@@ -54,6 +54,8 @@ pub const DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES: [&str; 4] = [
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_DYNAMIC_MATERIALIZATIONS: usize = 128;
+const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize = 8;
+const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize = 2;
 const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize = 32;
 const MAX_DERIVED_CNAME_DEPTH: u8 = 4;
 const MAX_DYNAMIC_TTL_SECONDS: u32 = 300;
@@ -85,10 +87,17 @@ impl DnsEvidenceScope {
     }
 
     #[cfg(test)]
-    fn forward_query(self, hostname: &str) -> bool {
+    fn forward_query(self, hostname: &str, query_type: u16) -> bool {
         match self {
             Self::Audit => true,
-            Self::HostBlockCandidate => matches_block_candidate_pattern(hostname),
+            Self::HostBlockCandidate => {
+                matches_supported_block_query_type(query_type)
+                    && authorized_block_candidate_hostname(
+                        hostname,
+                        &mut CnameAuthorizationState::default(),
+                        Instant::now(),
+                    )
+            }
         }
     }
 
@@ -148,6 +157,8 @@ pub struct DnsMediationEvidence {
     pub proxy_policy_status: &'static str,
     pub observations: Vec<DnsObservation>,
     pub observations_truncated: bool,
+    pub bounded_actions_suffix_authorizations: Vec<String>,
+    pub bounded_actions_suffix_authorizations_truncated: bool,
     pub derived_cname_authorizations: Vec<DnsDerivedCnameAuthorization>,
     pub derived_cname_authorizations_truncated: bool,
     pub excluded_non_github_query_count: u64,
@@ -273,6 +284,8 @@ struct ActiveMaterialization {
 
 #[derive(Debug, Default)]
 struct CnameAuthorizationState {
+    bounded_actions_suffix: BTreeSet<String>,
+    bounded_actions_suffix_truncated: bool,
     active: BTreeMap<String, ActiveCnameAuthorization>,
     truncated: bool,
 }
@@ -295,10 +308,13 @@ struct ObservationRecorder {
 }
 
 impl ObservationRecorder {
-    fn forward_query(&self, hostname: &str) -> bool {
+    fn forward_query(&self, hostname: &str, query_type: u16) -> bool {
         match self.scope {
             DnsEvidenceScope::Audit => true,
             DnsEvidenceScope::HostBlockCandidate => {
+                if !matches_supported_block_query_type(query_type) {
+                    return false;
+                }
                 let mut authorizations = self
                     .cname_authorizations
                     .lock()
@@ -312,16 +328,24 @@ impl ObservationRecorder {
         let classification = candidate_classification(self.scope, hostname);
         if classification != "github_related_outside_candidate" {
             classification
-        } else if self.scope == DnsEvidenceScope::HostBlockCandidate && self.forward_query(hostname)
-        {
-            "matches_ttl_bounded_cname_descendant"
         } else {
-            classification
+            let mut authorizations = self
+                .cname_authorizations
+                .lock()
+                .expect("DNS CNAME authorization lock poisoned");
+            remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+            if authorizations.bounded_actions_suffix.contains(hostname) {
+                "matches_bounded_actions_suffix_authorization"
+            } else if authorizations.active.contains_key(hostname) {
+                "matches_ttl_bounded_cname_descendant"
+            } else {
+                classification
+            }
         }
     }
 
     fn materialization_ttl_seconds(&self, hostname: &str, ttl_seconds: u32) -> Option<u32> {
-        if matches_block_candidate_pattern(hostname) {
+        if matches_exact_block_candidate_hostname(hostname) {
             return bound_materialization_ttl(ttl_seconds, None);
         }
         let now = Instant::now();
@@ -330,6 +354,9 @@ impl ObservationRecorder {
             .lock()
             .expect("DNS CNAME authorization lock poisoned");
         remove_expired_cname_authorizations(&mut authorizations, now);
+        if authorizations.bounded_actions_suffix.contains(hostname) {
+            return bound_materialization_ttl(ttl_seconds, None);
+        }
         let remaining_seconds = authorizations
             .active
             .get(hostname)?
@@ -351,7 +378,7 @@ impl ObservationRecorder {
         evidence_from_state_and_authorizations(state, routing_status, self.scope, &authorizations)
     }
 
-    fn record_query(&self, hostname: &str, query_type: u16) {
+    fn record_query(&self, hostname: &str, query_type: u16, forwarded: bool) {
         let normalized = normalize_hostname(hostname);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         if let Some(hostname) = normalized
@@ -378,11 +405,7 @@ impl ObservationRecorder {
             state.excluded_non_github_query_count =
                 state.excluded_non_github_query_count.saturating_add(1);
         }
-        if self.scope == DnsEvidenceScope::HostBlockCandidate
-            && normalized
-                .as_deref()
-                .is_some_and(|hostname| !self.forward_query(hostname))
-        {
+        if self.scope == DnsEvidenceScope::HostBlockCandidate && !forwarded {
             state.blocked_non_candidate_query_count =
                 state.blocked_non_candidate_query_count.saturating_add(1);
         }
@@ -396,8 +419,8 @@ impl ObservationRecorder {
         let Some(hostname) = normalize_hostname(hostname) else {
             return;
         };
-        let forwardable_block_response =
-            self.scope == DnsEvidenceScope::HostBlockCandidate && self.forward_query(&hostname);
+        let forwardable_block_response = self.scope == DnsEvidenceScope::HostBlockCandidate
+            && self.forward_query(&hostname, query_type);
         if forwardable_block_response {
             let mut authorizations = self
                 .cname_authorizations
@@ -975,7 +998,7 @@ fn initial_dns_block_evidence(
         rollback_status: "not_required",
         ruleset_hash,
         dns_upstream_policy: "root_resident_mediator_only_udp_53",
-        materialization_status: "bounded_ttl_plus_refresh_overlap_github_compatibility_or_cname_descendant_https_only",
+        materialization_status: "bounded_ttl_plus_refresh_overlap_constrained_actions_or_cname_descendant_https_only",
         materialized_https_allowances: report_materializations(active),
         materializations_truncated,
         expired_materializations: 0,
@@ -996,7 +1019,10 @@ fn dns_block_limitations() -> Vec<&'static str> {
     vec![
         "dns_mediated_host_block_candidate_test_only_no_public_activation",
         "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
-        "wildcard_dns_authorization_is_an_egress_limitation",
+        "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
+        "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
+        "block_dns_queries_are_canonicalized_before_upstream_forwarding",
+        "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
         "post_ready_results_storage_traffic_is_not_authorized",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -1169,25 +1195,30 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
         };
         let bytes = &query[..length];
         let parsed_question = parse_dns_question(bytes);
-        if let Some((hostname, query_type)) = &parsed_question {
-            recorder.record_query(hostname, *query_type);
-        }
-        if !query_is_forwardable(&recorder, parsed_question.as_ref()) {
+        let Some(upstream_query) = query_for_upstream(&recorder, bytes, parsed_question.as_ref())
+        else {
+            if let Some((hostname, query_type)) = &parsed_question {
+                recorder.record_query(hostname, *query_type, false);
+            }
             if let Some(response) = refused_response(bytes) {
                 let _ = socket.send_to(&response, peer);
             }
             continue;
+        };
+        if let Some((hostname, query_type)) = &parsed_question {
+            recorder.record_query(hostname, *query_type, true);
         }
         let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
             continue;
         };
         let _ = upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT));
-        if upstream.send_to(bytes, UPSTREAM_DNS).is_err() {
+        if upstream.send_to(&upstream_query, UPSTREAM_DNS).is_err() {
             continue;
         }
         let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
         if let Ok((response_length, _)) = upstream.recv_from(&mut response) {
-            let response = &response[..response_length];
+            let response = &mut response[..response_length];
+            restore_client_query_id(response, bytes);
             if let Some((hostname, query_type)) = &parsed_question {
                 recorder.record_response(hostname, *query_type, response);
             }
@@ -1211,21 +1242,29 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
             continue;
         }
         let parsed_question = parse_dns_question(&query);
-        if let Some((hostname, query_type)) = &parsed_question {
-            recorder.record_query(hostname, *query_type);
-        }
-        if !query_is_forwardable(&recorder, parsed_question.as_ref()) {
+        let Some(upstream_query) = query_for_upstream(&recorder, &query, parsed_question.as_ref())
+        else {
+            if let Some((hostname, query_type)) = &parsed_question {
+                recorder.record_query(hostname, *query_type, false);
+            }
             if let Some(response) = refused_response(&query) {
                 let _ = client.write_all(&(response.len() as u16).to_be_bytes());
                 let _ = client.write_all(&response);
             }
             continue;
+        };
+        if let Some((hostname, query_type)) = &parsed_question {
+            recorder.record_query(hostname, *query_type, true);
         }
         let Ok(mut upstream) = TcpStream::connect(UPSTREAM_DNS) else {
             continue;
         };
         let _ = upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT));
-        if upstream.write_all(&length).is_err() || upstream.write_all(&query).is_err() {
+        if upstream
+            .write_all(&(upstream_query.len() as u16).to_be_bytes())
+            .is_err()
+            || upstream.write_all(&upstream_query).is_err()
+        {
             continue;
         }
         let mut response_length = [0_u8; 2];
@@ -1240,6 +1279,7 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         if upstream.read_exact(&mut response).is_err() {
             continue;
         }
+        restore_client_query_id(&mut response, &query);
         if let Some((hostname, query_type)) = &parsed_question {
             recorder.record_response(hostname, *query_type, &response);
         }
@@ -1248,16 +1288,72 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
     }
 }
 
-fn query_is_forwardable(
+fn query_for_upstream(
     recorder: &ObservationRecorder,
+    query: &[u8],
     parsed_question: Option<&(String, u16)>,
-) -> bool {
+) -> Option<Vec<u8>> {
     match (recorder.scope, parsed_question) {
-        (DnsEvidenceScope::Audit, _) => true,
-        (DnsEvidenceScope::HostBlockCandidate, Some((hostname, _))) => {
-            recorder.forward_query(hostname)
+        (DnsEvidenceScope::Audit, _) => Some(query.to_vec()),
+        (DnsEvidenceScope::HostBlockCandidate, Some((hostname, query_type))) => {
+            let canonical = canonical_block_query(hostname, *query_type, query)?;
+            recorder
+                .forward_query(hostname, *query_type)
+                .then_some(canonical)
         }
-        (DnsEvidenceScope::HostBlockCandidate, None) => false,
+        (DnsEvidenceScope::HostBlockCandidate, None) => None,
+    }
+}
+
+fn canonical_block_query(hostname: &str, query_type: u16, query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12
+        || u16::from_be_bytes([query[4], query[5]]) != 1
+        || !matches_supported_block_query_type(query_type)
+    {
+        return None;
+    }
+    let flags = u16::from_be_bytes([query[2], query[3]]);
+    if flags & 0xf800 != 0 {
+        return None;
+    }
+    let mut offset = 12;
+    loop {
+        let length = usize::from(*query.get(offset)?);
+        offset += 1;
+        if length == 0 {
+            break;
+        }
+        if length > 63 || offset.checked_add(length)? > query.len() {
+            return None;
+        }
+        offset += length;
+    }
+    if offset + 4 > query.len()
+        || u16::from_be_bytes([query[offset], query[offset + 1]]) != query_type
+        || u16::from_be_bytes([query[offset + 2], query[offset + 3]]) != 1
+    {
+        return None;
+    }
+    let mut canonical = Vec::with_capacity(hostname.len() + 18);
+    canonical.extend_from_slice(&0_u16.to_be_bytes());
+    canonical.extend_from_slice(&(flags & 0x0110).to_be_bytes());
+    canonical.extend_from_slice(&1_u16.to_be_bytes());
+    canonical.extend_from_slice(&0_u16.to_be_bytes());
+    canonical.extend_from_slice(&0_u16.to_be_bytes());
+    canonical.extend_from_slice(&0_u16.to_be_bytes());
+    for label in hostname.split('.') {
+        canonical.push(u8::try_from(label.len()).ok()?);
+        canonical.extend_from_slice(label.as_bytes());
+    }
+    canonical.push(0);
+    canonical.extend_from_slice(&query_type.to_be_bytes());
+    canonical.extend_from_slice(&1_u16.to_be_bytes());
+    Some(canonical)
+}
+
+fn restore_client_query_id(response: &mut [u8], query: &[u8]) {
+    if response.len() >= 2 && query.len() >= 2 {
+        response[..2].copy_from_slice(&query[..2]);
     }
 }
 
@@ -1508,7 +1604,21 @@ fn authorized_block_candidate_hostname(
     now: Instant,
 ) -> bool {
     remove_expired_cname_authorizations(state, now);
-    matches_block_candidate_pattern(hostname) || state.active.contains_key(hostname)
+    if matches_exact_block_candidate_hostname(hostname) || state.active.contains_key(hostname) {
+        return true;
+    }
+    if !matches_constrained_dynamic_actions_suffix_hostname(hostname) {
+        return false;
+    }
+    if state.bounded_actions_suffix.contains(hostname) {
+        return true;
+    }
+    if state.bounded_actions_suffix.len() >= MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
+        state.bounded_actions_suffix_truncated = true;
+        return false;
+    }
+    state.bounded_actions_suffix.insert(hostname.to_owned());
+    true
 }
 
 fn retain_cname_authorizations(
@@ -1521,7 +1631,9 @@ fn retain_cname_authorizations(
     for _ in 0..MAX_DERIVED_CNAME_DEPTH {
         let mut progressed = false;
         pending.retain(|alias| {
-            let source_depth = if matches_block_candidate_pattern(&alias.owner) {
+            let source_depth = if matches_exact_block_candidate_hostname(&alias.owner)
+                || state.bounded_actions_suffix.contains(&alias.owner)
+            {
                 Some(0)
             } else {
                 state
@@ -1610,18 +1722,44 @@ fn reportable_github_hostname(hostname: &str) -> bool {
 }
 
 fn matches_candidate_pattern(hostname: &str) -> bool {
-    (hostname.ends_with(".actions.githubusercontent.com")
-        && hostname != "actions.githubusercontent.com")
+    matches_actions_suffix_hostname(hostname)
         || hostname == "codeload.github.com"
         || hostname == "actions-results-receiver-production.githubapp.com"
         || (hostname.starts_with("productionresultssa")
             && hostname.ends_with(".blob.core.windows.net"))
 }
 
-fn matches_block_candidate_pattern(hostname: &str) -> bool {
-    (hostname.ends_with(".actions.githubusercontent.com")
-        && hostname != "actions.githubusercontent.com")
+fn matches_exact_block_candidate_hostname(hostname: &str) -> bool {
+    DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.contains(&hostname)
         || hostname == "actions-results-receiver-production.githubapp.com"
+}
+
+fn matches_actions_suffix_hostname(hostname: &str) -> bool {
+    hostname.ends_with(".actions.githubusercontent.com")
+        && hostname != "actions.githubusercontent.com"
+}
+
+fn matches_constrained_dynamic_actions_suffix_hostname(hostname: &str) -> bool {
+    let Some(prefix) = hostname.strip_suffix(".actions.githubusercontent.com") else {
+        return false;
+    };
+    let labels: Vec<&str> = prefix.split('.').collect();
+    !matches_exact_block_candidate_hostname(hostname)
+        && !labels.is_empty()
+        && labels.len() <= MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
+fn matches_supported_block_query_type(query_type: u16) -> bool {
+    matches!(query_type, 1 | 28)
 }
 
 fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
@@ -1629,7 +1767,9 @@ fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static
         DnsEvidenceScope::Audit if matches_candidate_pattern(hostname) => {
             "matches_candidate_pattern"
         }
-        DnsEvidenceScope::HostBlockCandidate if matches_block_candidate_pattern(hostname) => {
+        DnsEvidenceScope::HostBlockCandidate
+            if matches_exact_block_candidate_hostname(hostname) =>
+        {
             "matches_candidate_pattern"
         }
         _ => "github_related_outside_candidate",
@@ -1686,7 +1826,7 @@ fn evidence_from_state_and_authorizations(
         proxy_policy_status: match scope {
             DnsEvidenceScope::Audit => "audit_forwards_without_name_authorization",
             DnsEvidenceScope::HostBlockCandidate => {
-                "block_forwards_github_compatibility_patterns_and_bounded_cname_descendants"
+                "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
             }
         },
         observations: state
@@ -1709,6 +1849,13 @@ fn evidence_from_state_and_authorizations(
             )
             .collect(),
         observations_truncated: state.truncated,
+        bounded_actions_suffix_authorizations: cname_authorizations
+            .bounded_actions_suffix
+            .iter()
+            .cloned()
+            .collect(),
+        bounded_actions_suffix_authorizations_truncated: cname_authorizations
+            .bounded_actions_suffix_truncated,
         derived_cname_authorizations: cname_authorizations
             .active
             .iter()
@@ -1735,7 +1882,10 @@ fn evidence_from_state_and_authorizations(
             DnsEvidenceScope::HostBlockCandidate => vec![
                 "dns_mediated_host_block_candidate_test_only_no_public_activation",
                 "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile",
-                "wildcard_dns_authorization_is_an_egress_limitation",
+                "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
+                "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
+                "block_dns_queries_are_canonicalized_before_upstream_forwarding",
+                "dns_query_timing_and_count_remain_egress_limitations",
                 "post_ready_codeload_traffic_is_not_authorized",
                 "post_ready_results_storage_traffic_is_not_authorized",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -1911,6 +2061,84 @@ mod tests {
     }
 
     #[test]
+    fn canonicalizes_block_queries_before_upstream_forwarding() {
+        let mut mixed_case = query("MiXeD.Actions.GitHubusercontent.Com", 1);
+        mixed_case[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
+        mixed_case[2..4].copy_from_slice(&0x0110_u16.to_be_bytes());
+        mixed_case.extend_from_slice(b"caller-controlled-additional-bytes");
+        let canonical =
+            canonical_block_query("mixed.actions.githubusercontent.com", 1, &mixed_case)
+                .expect("valid block query must canonicalize");
+        assert_eq!(&canonical[..2], &[0, 0]);
+        assert_eq!(
+            parse_dns_question(&canonical),
+            Some(("mixed.actions.githubusercontent.com".to_owned(), 1))
+        );
+        assert!(
+            !canonical
+                .windows(b"caller-controlled-additional-bytes".len())
+                .any(|window| window == b"caller-controlled-additional-bytes")
+        );
+        let mut response = canonical.clone();
+        restore_client_query_id(&mut response, &mixed_case);
+        assert_eq!(&response[..2], &0x1234_u16.to_be_bytes());
+
+        let mut multiple_questions = query("mixed.actions.githubusercontent.com", 1);
+        multiple_questions[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        assert!(
+            canonical_block_query(
+                "mixed.actions.githubusercontent.com",
+                1,
+                &multiple_questions,
+            )
+            .is_none()
+        );
+        assert!(
+            canonical_block_query(
+                "mixed.actions.githubusercontent.com",
+                16,
+                &query("mixed.actions.githubusercontent.com", 16),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_block_queries_do_not_consume_dynamic_authorizations() {
+        let recorder = ObservationRecorder {
+            state: Arc::new(Mutex::new(ObservationState::default())),
+            cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
+            report_path: PathBuf::from("unused-test-report.json"),
+            scope: DnsEvidenceScope::HostBlockCandidate,
+            materializations: None,
+        };
+        let mut malformed = query("malformed.actions.githubusercontent.com", 1);
+        malformed[4..6].copy_from_slice(&2_u16.to_be_bytes());
+        let parsed = parse_dns_question(&malformed);
+        assert!(query_for_upstream(&recorder, &malformed, parsed.as_ref()).is_none());
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .bounded_actions_suffix
+                .is_empty()
+        );
+
+        let valid = query("validated.actions.githubusercontent.com", 1);
+        let parsed = parse_dns_question(&valid);
+        assert!(query_for_upstream(&recorder, &valid, parsed.as_ref()).is_some());
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .bounded_actions_suffix
+                .contains("validated.actions.githubusercontent.com")
+        );
+    }
+
+    #[test]
     fn classifies_fixed_candidate_patterns_without_authorizing_extra_hosts() {
         assert!(matches_candidate_pattern(
             "pipelines.actions.githubusercontent.com"
@@ -1934,42 +2162,91 @@ mod tests {
     fn blocking_scope_forwards_only_candidate_names_and_refuses_others() {
         assert!(
             DnsEvidenceScope::HostBlockCandidate
-                .forward_query("vstoken.actions.githubusercontent.com")
+                .forward_query("vstoken.actions.githubusercontent.com", 1)
         );
         assert!(
             DnsEvidenceScope::HostBlockCandidate
-                .forward_query("pipelines.actions.githubusercontent.com")
+                .forward_query("pipelines.actions.githubusercontent.com", 1)
         );
         assert!(
             DnsEvidenceScope::HostBlockCandidate
-                .forward_query("results-receiver.actions.githubusercontent.com")
+                .forward_query("results-receiver.actions.githubusercontent.com", 1)
         );
         assert!(
             DnsEvidenceScope::HostBlockCandidate
-                .forward_query("payload.pipelines.actions.githubusercontent.com")
+                .forward_query("payload.pipelines.actions.githubusercontent.com", 1)
         );
         assert!(
             DnsEvidenceScope::HostBlockCandidate
-                .forward_query("actions-results-receiver-production.githubapp.com")
+                .forward_query("actions-results-receiver-production.githubapp.com", 1)
         );
         assert!(
             DnsEvidenceScope::HostBlockCandidate
-                .forward_query("lookalike.payload.pipelines.actions.githubusercontent.com"),
-            "the compatibility candidate intentionally retains the documented wildcard class"
+                .forward_query("bounded-dynamic.pipelines.actions.githubusercontent.com", 1,),
+            "the candidate permits only bounded dynamic names in the documented suffix class"
         );
-        assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("codeload.github.com"));
+        assert!(
+            !DnsEvidenceScope::HostBlockCandidate.forward_query(
+                "lookalike.payload.pipelines.actions.githubusercontent.com",
+                1,
+            ),
+            "dynamic suffix names may have at most two prefix labels"
+        );
+        assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("codeload.github.com", 1));
         assert!(
             !DnsEvidenceScope::HostBlockCandidate
-                .forward_query("productionresultssa17.blob.core.windows.net")
+                .forward_query("productionresultssa17.blob.core.windows.net", 1)
         );
-        assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("api.github.com"));
+        assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("api.github.com", 1));
         assert!(
-            DnsEvidenceScope::Audit.forward_query("productionresultssa17.blob.core.windows.net")
+            !DnsEvidenceScope::HostBlockCandidate
+                .forward_query("bounded-dynamic.actions.githubusercontent.com", 16,)
         );
-        assert!(DnsEvidenceScope::Audit.forward_query("api.github.com"));
+        assert!(
+            DnsEvidenceScope::Audit.forward_query("productionresultssa17.blob.core.windows.net", 1)
+        );
+        assert!(DnsEvidenceScope::Audit.forward_query("api.github.com", 16));
         let response = refused_response(&query("api.github.com", 1)).unwrap();
         assert_eq!(u16::from_be_bytes([response[2], response[3]]) & 0x000f, 5);
         assert_ne!(u16::from_be_bytes([response[2], response[3]]) & 0x8000, 0);
+    }
+
+    #[test]
+    fn bounds_dynamic_actions_suffix_names_for_the_candidate_lifetime() {
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        for index in 0..MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
+            assert!(authorized_block_candidate_hostname(
+                &format!("dynamic-{index}.actions.githubusercontent.com"),
+                &mut authorizations,
+                now,
+            ));
+        }
+        assert_eq!(
+            authorizations.bounded_actions_suffix.len(),
+            MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS
+        );
+        assert!(authorized_block_candidate_hostname(
+            "dynamic-0.actions.githubusercontent.com",
+            &mut authorizations,
+            now + Duration::from_secs(600),
+        ));
+        assert!(!authorized_block_candidate_hostname(
+            "dynamic-overflow.actions.githubusercontent.com",
+            &mut authorizations,
+            now,
+        ));
+        assert!(authorizations.bounded_actions_suffix_truncated);
+        assert!(!authorized_block_candidate_hostname(
+            "three.labels.deep.actions.githubusercontent.com",
+            &mut CnameAuthorizationState::default(),
+            now,
+        ));
+        assert!(!authorized_block_candidate_hostname(
+            "-invalid.actions.githubusercontent.com",
+            &mut CnameAuthorizationState::default(),
+            now,
+        ));
     }
 
     #[test]
