@@ -5,6 +5,9 @@ pub mod cli;
 #[doc(hidden)]
 pub mod composed;
 pub mod config;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub mod dns_mediator;
 pub mod error;
 pub mod findings;
 pub mod hosted_runner;

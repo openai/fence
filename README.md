@@ -60,6 +60,16 @@ disposable-host jobs. It is not a candidate final allowlist: general HTTPS
 and DNS are usable by later workflow code for egress and still must be
 replaced with a constrained design before any default profile decision. It
 remains test-only and non-default; no built-in platform profile is selected.
+A separate, non-required DNS-mediated audit experiment routes host and Docker
+resolver traffic through a local test-only mediator and records only bounded
+GitHub-related queried hostnames. It classifies observations against a fixed
+GitHub compatibility hypothesis consisting of
+`*.actions.githubusercontent.com`, `codeload.github.com`,
+`actions-results-receiver-production.githubapp.com`, and
+`productionresultssa*.blob.core.windows.net`. That hypothesis is not an
+accepted `platform_profile`, does not change the default policy, and must be
+proved by a later blocking terminal-completion experiment before it can
+support any protection claim.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
