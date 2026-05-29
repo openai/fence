@@ -97,7 +97,7 @@ assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "dns_mediated_host_block_candidate_test_only"
 assert report["mode"] == "block"
-assert report["candidate_profile_id"] == "github_hosted_dns_mediated_no_storage_candidate_v5"
+assert report["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
 assert report["candidate_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
@@ -109,13 +109,13 @@ assert report["network_verification_status"] == "verified"
 assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
-assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_github_compatibility_or_cname_descendant_https_only"
+assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_constrained_actions_or_cname_descendant_https_only"
 assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
 assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
-assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_no_storage_candidate_v5"
+assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
 assert dns["candidate_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
@@ -127,10 +127,19 @@ assert dns["candidate_hostnames"] == [
     "results-receiver.actions.githubusercontent.com",
 ]
 assert dns["mode"] == "block"
-assert dns["proxy_policy_status"] == "block_forwards_github_compatibility_patterns_and_bounded_cname_descendants"
+assert dns["proxy_policy_status"] == "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
+assert len(dns["bounded_actions_suffix_authorizations"]) <= 8
+assert dns["bounded_actions_suffix_authorizations_truncated"] is False
+assert all(
+    1 <= len(hostname.removesuffix(".actions.githubusercontent.com").split(".")) <= 2
+    for hostname in dns["bounded_actions_suffix_authorizations"]
+)
 assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in dns["limitations"]
-assert "wildcard_dns_authorization_is_an_egress_limitation" in dns["limitations"]
+assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in dns["limitations"]
+assert "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in dns["limitations"]
+assert "block_dns_queries_are_canonicalized_before_upstream_forwarding" in dns["limitations"]
+assert "dns_query_timing_and_count_remain_egress_limitations" in dns["limitations"]
 assert "post_ready_codeload_traffic_is_not_authorized" in dns["limitations"]
 assert "post_ready_results_storage_traffic_is_not_authorized" in dns["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
@@ -140,7 +149,10 @@ assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns[
 assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
 assert "github_compatibility_patterns_are_test_only_and_not_a_default_platform_profile" in report["limitations"]
-assert "wildcard_dns_authorization_is_an_egress_limitation" in report["limitations"]
+assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
+assert "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in report["limitations"]
+assert "block_dns_queries_are_canonicalized_before_upstream_forwarding" in report["limitations"]
+assert "dns_query_timing_and_count_remain_egress_limitations" in report["limitations"]
 assert "post_ready_codeload_traffic_is_not_authorized" in report["limitations"]
 assert "post_ready_results_storage_traffic_is_not_authorized" in report["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
@@ -164,6 +176,7 @@ for hostname in (
     b"codeload.github.com",
     b"productionresultssa17.blob.core.windows.net",
     b"api.github.com",
+    b"lookalike.payload.pipelines.actions.githubusercontent.com",
 ):
     identifier = random.randrange(0, 65536)
     question = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
@@ -196,7 +209,7 @@ assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
-assert dns["blocked_non_candidate_query_count"] >= 3, dns
+assert dns["blocked_non_candidate_query_count"] >= 4, dns
 assert not production_path.exists()
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY
