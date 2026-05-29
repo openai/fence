@@ -47,15 +47,18 @@ remained non-terminal past the configured five-minute observation limit, so
 that candidate was rejected as insufficient. A subsequent experiment allowing
 fixed GitHub service/results-storage hosts and measured hosted-runner
 platform DNS/host-control traffic also finished local completion steps without
-yielding a terminal job result. The current non-required experiment accepts
-only an explicit `github_hosted_https_baseline_candidate_v1` plan: arbitrary
-outbound TCP `443` plus the measured hosted-runner DNS and host-control
-channels. It is intentionally an open diagnostic baseline, not a candidate
-final allowlist: its HTTPS and DNS channels are usable by later workflow code
-for egress. Constraining those channels is required follow-up work after a
-passing baseline.
-It remains test-only and non-default until terminal hosted-runner evidence is
-reviewed; no built-in platform profile is selected.
+yielding a terminal job result. An intentionally open diagnostic baseline,
+`github_hosted_https_baseline_candidate_v1`, then permitted arbitrary outbound
+TCP `443` plus those measured platform channels and reached terminal success
+in three independent disposable-host jobs. A follow-up HTTPS-only reduction
+stranded one of three jobs after visible completion, so the current
+non-required experiment accepts only explicit
+`github_hosted_https_udp_dns_candidate_v1`: arbitrary outbound TCP `443` plus
+UDP DNS to the measured platform resolver, with TCP DNS and host-control
+allowances removed. It is not a candidate final allowlist: general HTTPS and
+DNS are usable by later workflow code for egress and still must be replaced
+with a constrained design before any default profile decision. It remains
+test-only and non-default; no built-in platform profile is selected.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -210,13 +213,16 @@ completed visible local assertions and remained non-terminal past the
 five-minute observation limit while controls were resident. These negative
 results do not activate the public agent or justify a default platform
 profile. A follow-up fixed-host candidate with measured hosted-runner
-platform DNS/host-control channels also failed to become terminal. The current
-non-required candidate may be selected explicitly as
-`github_hosted_https_baseline_candidate_v1`; it permits arbitrary outbound
-TCP `443` and measured hosted-runner platform DNS/host-control channels for
-disposable-host baseline evidence. This candidate deliberately trades broad
-disclosed egress channels, including general HTTPS and DNS channels, for a
-terminal hosted-job baseline before a later minimization pass. It is neither a
+platform DNS/host-control channels also failed to become terminal. The
+explicit `github_hosted_https_baseline_candidate_v1` diagnostic baseline
+subsequently reached terminal success in three disposable-host jobs by
+permitting arbitrary outbound TCP `443` and the measured platform channels.
+An HTTPS-only reduction then left one of three replicas non-terminal past the
+observation limit. The current non-required candidate may be selected
+explicitly as `github_hosted_https_udp_dns_candidate_v1`; it adds back only
+UDP DNS to the measured platform resolver while retaining arbitrary outbound
+TCP `443` and excluding TCP DNS and host-control paths. Even if it succeeds,
+general HTTPS and DNS are broad disclosed egress channels. It is neither a
 public enforcement interface nor a default profile.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
