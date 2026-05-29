@@ -24,7 +24,10 @@ report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 production_ready="/run/fence/$invocation/ready.json"
 
-sleep 2
+for sample in 1 2 3 4; do
+  sleep 5
+  echo "collecting bounded late DNS-mediated candidate evidence ($sample/4)"
+done
 python3 - "$report" "$dns_report" "$production_ready" <<'PY'
 import json
 import pathlib
@@ -49,6 +52,14 @@ summary = {
     "candidate_profile_id": dns["candidate_profile_id"],
     "candidate_hostnames": dns["candidate_hostnames"],
     "blocked_non_candidate_query_count": dns["blocked_non_candidate_query_count"],
+    "network_counters": report["counters"],
+    "network_findings": report["findings"][:64],
+    "network_findings_truncated": report["findings_truncated"] or len(report["findings"]) > 64,
+    "critical_findings": report["critical_findings"][:64],
+    "critical_findings_truncated": (
+        report["critical_findings_truncated"]
+        or len(report["critical_findings"]) > 64
+    ),
     "observations": observations[:64],
     "observations_truncated": dns["observations_truncated"] or len(observations) > 64,
     "derived_cname_authorizations": derived_cname_authorizations[:32],

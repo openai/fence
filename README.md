@@ -101,7 +101,9 @@ it neither selects a default `platform_profile` nor activates public
 protection, and terminal success must be repeated before any promotion
 decision. A following workflow step emits a capped sanitized DNS summary so
 GitHub-related names refused after the initial report snapshot and derived
-CNAME authorizations can be reviewed without changing policy. Its reported
+CNAME authorizations can be reviewed without changing policy. It also retains
+a short bounded heartbeat window and emits capped network findings so late
+connection failures can be reviewed without widening the candidate. Its reported
 limitations also state that the approved HTTPS channels remain usable for
 egress and that resolved address grants may represent colocated services.
 

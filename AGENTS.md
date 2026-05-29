@@ -164,7 +164,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/report-dns-block-candidate`
   - Linux x64-only, GitHub-Actions-only late-report helper for the destructive DNS-mediated candidate; do not run it on developer machines or reusable runners.
-  - Reads the existing runner-readable test-only report after the blocking step returns and emits a capped sanitized DNS summary so refused GitHub-related names between workflow steps can be reviewed.
+  - Emits a short bounded heartbeat window after the blocking step returns, then reads the existing runner-readable test-only report and emits capped sanitized DNS, derived-CNAME, counter, finding, and critical-finding summaries so late connection failures can be reviewed.
   - Does not use sudo, mutate policy, select a profile, write readiness, or establish a protection claim.
 
 - `script/test-profile-candidate`
