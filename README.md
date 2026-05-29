@@ -15,13 +15,16 @@ Fence is still unreleased. The current Phase 4 executable strictly validates
 local JSON policy, renders a frozen policy and deterministic native
 `nftables` ruleset preview, and models the selected bounded DNS-mediated
 hosted job-status compatibility descriptor. On supported GitHub-hosted
-`ubuntu-24.04` x64 runners, the Linux binary can now enter one protected
-standard-block lifecycle only when invoked as root inside its matching
-trusted transient `systemd` service with a root-owned configuration. That
-path verifies the pinned runner shape, applies and verifies host network
-policy, disables measured passwordless sudo and container control paths,
-writes production readiness, and remains resident without restoring access.
-Ordinary direct execution is rejected before configuration intake.
+`ubuntu-24.04` x64 runners, the Linux binary can now enter a protected block
+lifecycle only when invoked as root inside its matching trusted transient
+`systemd` service with a root-owned configuration. Standard block verifies
+the pinned runner shape, applies and verifies host network policy, disables
+measured passwordless sudo and container control paths, writes production
+readiness, and remains resident without restoring access. Explicit
+`unsafe_preserve` keeps the same network and sudo controls while preserving
+Docker/containerd access and reporting degraded assurance without an
+ordinary containment claim. Ordinary direct execution is rejected before
+configuration intake.
 
 The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -137,7 +140,7 @@ plans `github_hosted_job_status_v1` by omission, reports the schema-`3` logical
 policy hash separately from the active TTL-derived ruleset hash, and still
 emits only test-only readiness below a non-production runtime root. This
 established the evidence gate used by the trusted-launcher activation. The
-production standard-block path now applies the same reviewed mechanism.
+production block paths now apply the same reviewed mechanism.
 Explicit `"none"` remains available for strict no-implicit-egress planning
 but is not accepted by the production activation slice.
 
@@ -145,9 +148,9 @@ Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The `integration`
 workflow additionally records a bounded, read-only hosted-runner fingerprint
 observation before its namespace and resident-service evidence tests, and
-runs a packaged production-shaped standard-block transient service on a
-disposable runner. This does not publish an alpha release or create a GitHub
-Action interface.
+runs packaged production-shaped standard and degraded block transient
+services on disposable runners. This does not publish an alpha release or
+create a GitHub Action interface.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -278,7 +281,8 @@ hash, and the selected bounded DNS-mediated hosted job-status descriptor.
 `check-support` reports a versioned hosted-runner fingerprint gate as an
 accepted reference that is checked during activation rather than by the
 read-only support probe. `run` rejects ordinary direct execution and accepts
-only the supported production-shaped standard-block transient service.
+only the supported production-shaped standard or explicit degraded block
+transient service.
 
 ```console
 script/build
@@ -332,17 +336,18 @@ preceded activation of the standard production path. Explicit `"none"`
 remains the strict planning override but is not accepted for production
 activation in this slice.
 
-The trusted-launcher standard-block path now makes that boundary reachable
-from the Linux CLI under a narrowly validated service context. Production
+The trusted-launcher block path now makes that boundary reachable from the
+Linux CLI under a narrowly validated service context. Production
 runtime intake accepts only a root-owned `/run/fence/<invocation-id>/config.json`
 file as the only initial invocation-directory entry beneath pinned root-owned
 directories, opens it with no-follow and close-on-exec protections, and
 derives the fixed state/report/readiness paths.
 The matching service validator accepts only a root process running as the
 `MainPID` of `fence-<invocation-id>.service`. The activated lifecycle accepts
-only standard block with disabled container access and the selected
-`github_hosted_job_status_v1` descriptor. Production audit, degraded
-`unsafe_preserve`, and strict `"none"` activation remain deferred.
+standard block with disabled container access or explicit degraded
+`unsafe_preserve` with preserved container access, always with the selected
+`github_hosted_job_status_v1` descriptor. Production audit and strict
+`"none"` activation remain deferred.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been

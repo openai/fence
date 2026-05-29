@@ -150,7 +150,11 @@ jobs:
         run: script/report-dns-block-candidate
 
   protected-run:
-    name: protected standard block
+    name: protected ${{ matrix.scenario }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [standard, unsafe-preserve]
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -172,8 +176,8 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: run packaged trusted-launcher standard block
-        run: script/test-protected-run
+      - name: run packaged trusted-launcher block
+        run: script/test-protected-run "${{ matrix.scenario }}"
 
   integration:
     name: integration

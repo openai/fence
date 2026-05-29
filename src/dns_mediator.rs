@@ -8,7 +8,7 @@ use crate::lifecycle::{
     require_production_root_process, validate_production_service_context,
     validate_test_service_context,
 };
-use crate::lockdown::{LockdownControl, SystemLockdownControl};
+use crate::lockdown::{LockdownControl, LockdownPosture, SystemLockdownControl};
 use crate::nflog::NflogReader;
 use crate::nft::{
     NetworkEvidenceCounters, OwnedNftState, expected_dns_mediated_owned_state,
@@ -56,6 +56,8 @@ pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
     "dns_mediated_host_block_candidate_ready_no_public_activation";
 pub const PROTECTED_BLOCK_STATUS: &str = "protected_host_block";
 pub const PROTECTED_BLOCK_READY_STATUS: &str = "ready";
+pub const PROTECTED_DEGRADED_BLOCK_STATUS: &str = "protected_host_block_degraded";
+pub const PROTECTED_DEGRADED_BLOCK_READY_STATUS: &str = "ready_degraded";
 pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
     "*.actions.githubusercontent.com",
     "codeload.github.com",
@@ -99,25 +101,33 @@ enum DnsEvidenceScope {
     Audit,
     HostBlockCandidate,
     ProtectedHostBlock,
+    ProtectedHostBlockDegraded,
 }
 
 impl DnsEvidenceScope {
     fn mode(self) -> Mode {
         match self {
             Self::Audit => Mode::Audit,
-            Self::HostBlockCandidate | Self::ProtectedHostBlock => Mode::Block,
+            Self::HostBlockCandidate
+            | Self::ProtectedHostBlock
+            | Self::ProtectedHostBlockDegraded => Mode::Block,
         }
     }
 
     fn is_block(self) -> bool {
-        matches!(self, Self::HostBlockCandidate | Self::ProtectedHostBlock)
+        matches!(
+            self,
+            Self::HostBlockCandidate | Self::ProtectedHostBlock | Self::ProtectedHostBlockDegraded
+        )
     }
 
     #[cfg(test)]
     fn forward_query(self, hostname: &str, query_type: u16) -> bool {
         match self {
             Self::Audit => true,
-            Self::HostBlockCandidate | Self::ProtectedHostBlock => {
+            Self::HostBlockCandidate
+            | Self::ProtectedHostBlock
+            | Self::ProtectedHostBlockDegraded => {
                 matches_supported_block_query_type(query_type)
                     && authorized_block_candidate_hostname(
                         hostname,
@@ -133,22 +143,23 @@ impl DnsEvidenceScope {
             Self::Audit => DNS_MEDIATION_EVIDENCE_STATUS,
             Self::HostBlockCandidate => DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
             Self::ProtectedHostBlock => PROTECTED_BLOCK_STATUS,
+            Self::ProtectedHostBlockDegraded => PROTECTED_DEGRADED_BLOCK_STATUS,
         }
     }
 
     fn candidate_profile_id(self) -> &'static str {
         match self {
             Self::Audit => DNS_MEDIATED_GITHUB_CANDIDATE_ID,
-            Self::HostBlockCandidate | Self::ProtectedHostBlock => {
-                DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID
-            }
+            Self::HostBlockCandidate
+            | Self::ProtectedHostBlock
+            | Self::ProtectedHostBlockDegraded => DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
         }
     }
 
     fn active_routing_status(self) -> &'static str {
         match self {
             Self::Audit | Self::HostBlockCandidate => "active_test_only",
-            Self::ProtectedHostBlock => "active",
+            Self::ProtectedHostBlock | Self::ProtectedHostBlockDegraded => "active",
         }
     }
 }
@@ -156,46 +167,59 @@ impl DnsEvidenceScope {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DnsBlockRuntimeScope {
     TestEvidence,
-    ProductionProtected,
+    ProductionStandardBlock,
+    ProductionUnsafePreserve,
 }
 
 impl DnsBlockRuntimeScope {
     fn evidence_status(self) -> &'static str {
         match self {
             Self::TestEvidence => DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
-            Self::ProductionProtected => PROTECTED_BLOCK_STATUS,
+            Self::ProductionStandardBlock => PROTECTED_BLOCK_STATUS,
+            Self::ProductionUnsafePreserve => PROTECTED_DEGRADED_BLOCK_STATUS,
         }
     }
 
     fn ready_status(self) -> &'static str {
         match self {
             Self::TestEvidence => DNS_MEDIATED_BLOCK_READY_STATUS,
-            Self::ProductionProtected => PROTECTED_BLOCK_READY_STATUS,
+            Self::ProductionStandardBlock => PROTECTED_BLOCK_READY_STATUS,
+            Self::ProductionUnsafePreserve => PROTECTED_DEGRADED_BLOCK_READY_STATUS,
         }
     }
 
     fn resident_status(self) -> &'static str {
         match self {
             Self::TestEvidence => "resident_dns_mediated_host_block_candidate_test_only",
-            Self::ProductionProtected => "resident_protected",
+            Self::ProductionStandardBlock => "resident_protected",
+            Self::ProductionUnsafePreserve => "resident_degraded",
         }
     }
 
     fn protection_available(self) -> bool {
-        matches!(self, Self::ProductionProtected)
+        matches!(self, Self::ProductionStandardBlock)
     }
 
     fn dns_scope(self) -> DnsEvidenceScope {
         match self {
             Self::TestEvidence => DnsEvidenceScope::HostBlockCandidate,
-            Self::ProductionProtected => DnsEvidenceScope::ProtectedHostBlock,
+            Self::ProductionStandardBlock => DnsEvidenceScope::ProtectedHostBlock,
+            Self::ProductionUnsafePreserve => DnsEvidenceScope::ProtectedHostBlockDegraded,
         }
     }
 
     fn limitations(self) -> Vec<&'static str> {
         match self {
             Self::TestEvidence => dns_block_test_limitations(),
-            Self::ProductionProtected => protected_block_limitations(),
+            Self::ProductionStandardBlock => protected_block_limitations(),
+            Self::ProductionUnsafePreserve => protected_degraded_block_limitations(),
+        }
+    }
+
+    fn lockdown_posture(self) -> LockdownPosture {
+        match self {
+            Self::TestEvidence | Self::ProductionStandardBlock => LockdownPosture::StandardBlock,
+            Self::ProductionUnsafePreserve => LockdownPosture::UnsafePreserve,
         }
     }
 }
@@ -408,7 +432,9 @@ impl ObservationRecorder {
     fn forward_query(&self, hostname: &str, query_type: u16) -> bool {
         match self.scope {
             DnsEvidenceScope::Audit => true,
-            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 if !matches_supported_block_query_type(query_type) {
                     return false;
                 }
@@ -793,6 +819,7 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     expected_state: OwnedNftState,
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
+    scope: DnsBlockRuntimeScope,
     next_dns_refresh: Duration,
     next_verification: Duration,
 }
@@ -873,14 +900,28 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 .verify_owned_state(&expected_state)
                 .map_err(backend_error)?;
             evidence.network_verification_status = "verified";
-            lockdown.disable_sudo().map_err(lockdown_error)?;
-            lockdown.disable_containers().map_err(lockdown_error)?;
-            lockdown.verify_sudo_disabled().map_err(lockdown_error)?;
-            lockdown
-                .verify_containers_disabled()
-                .map_err(lockdown_error)?;
-            evidence.sudo_status = "disabled_verified";
-            evidence.container_status = "disabled_verified";
+            match scope.lockdown_posture() {
+                LockdownPosture::StandardBlock => {
+                    lockdown.disable_sudo().map_err(lockdown_error)?;
+                    lockdown.disable_containers().map_err(lockdown_error)?;
+                    lockdown.verify_sudo_disabled().map_err(lockdown_error)?;
+                    lockdown
+                        .verify_containers_disabled()
+                        .map_err(lockdown_error)?;
+                    evidence.sudo_status = "disabled_verified";
+                    evidence.container_status = "disabled_verified";
+                }
+                LockdownPosture::UnsafePreserve => {
+                    lockdown.disable_sudo().map_err(lockdown_error)?;
+                    lockdown.verify_sudo_disabled().map_err(lockdown_error)?;
+                    lockdown
+                        .verify_containers_available()
+                        .map_err(lockdown_error)?;
+                    evidence.sudo_status = "disabled_verified";
+                    evidence.container_status = "preserved_unsafe";
+                }
+                LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
+            }
             Ok(())
         })();
         if let Err(error) = setup_result {
@@ -932,6 +973,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             expected_state,
             evidence,
             findings: FindingCollection::empty(),
+            scope,
             next_dns_refresh: DNS_CANDIDATE_REFRESH_INTERVAL,
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
         })
@@ -1021,12 +1063,26 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                     "measured passwordless sudo state drifted after readiness",
                 );
             }
-            if self.lockdown.verify_containers_disabled().is_err() {
-                self.evidence.container_status = "critical_drift";
-                self.record_critical(
-                    "dns_block_container_drift",
-                    "measured container control state drifted after readiness",
-                );
+            match self.scope.lockdown_posture() {
+                LockdownPosture::StandardBlock => {
+                    if self.lockdown.verify_containers_disabled().is_err() {
+                        self.evidence.container_status = "critical_drift";
+                        self.record_critical(
+                            "dns_block_container_drift",
+                            "measured container control state drifted after readiness",
+                        );
+                    }
+                }
+                LockdownPosture::UnsafePreserve => {
+                    if self.lockdown.verify_containers_available().is_err() {
+                        self.evidence.container_status = "critical_drift";
+                        self.record_critical(
+                            "dns_block_container_drift",
+                            "preserved container control path drifted after readiness",
+                        );
+                    }
+                }
+                LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
             }
             self.next_verification = elapsed + RESIDENT_VERIFICATION_INTERVAL;
             changed = true;
@@ -1063,7 +1119,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
     }
 }
 
-pub fn run_protected_standard_block_service(config: &Path) -> Result<(), DnsMediationError> {
+pub fn run_protected_block_service(config: &Path) -> Result<(), DnsMediationError> {
     require_production_root_process()
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     let runtime = ProductionRuntimeStore::open(config).map_err(runtime_error)?;
@@ -1078,16 +1134,29 @@ pub fn run_protected_standard_block_service(config: &Path) -> Result<(), DnsMedi
         ));
     }
     let plan = build_plan(normalized, &SystemResolver).map_err(config_error)?;
+    let scope = match (plan.assurance_status, plan.container_policy) {
+        (AssuranceStatus::PlannedBlockContainment, Some(ContainerPolicy::Disable)) => {
+            DnsBlockRuntimeScope::ProductionStandardBlock
+        }
+        (
+            AssuranceStatus::PlannedBlockDegradedContainerAccess,
+            Some(ContainerPolicy::UnsafePreserve),
+        ) => DnsBlockRuntimeScope::ProductionUnsafePreserve,
+        _ => {
+            return Err(DnsMediationError::new(
+                "protected_run_policy_not_activated",
+                "protected run accepts only standard block or explicit unsafe-preserve block with the reviewed hosted job-status profile",
+            ));
+        }
+    };
     if plan.selected_mode != Mode::Block
-        || plan.assurance_status != AssuranceStatus::PlannedBlockContainment
-        || plan.container_policy != Some(ContainerPolicy::Disable)
         || plan.platform_profile.id != GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
         || plan.platform_profile.dns_mediated_compatibility.as_ref()
             != Some(&github_hosted_job_status_dns_mediation_plan())
     {
         return Err(DnsMediationError::new(
             "protected_run_policy_not_activated",
-            "protected run currently accepts only standard block with the reviewed hosted job-status profile",
+            "protected run accepts only standard block or explicit unsafe-preserve block with the reviewed hosted job-status profile",
         ));
     }
     let mut fingerprint = SystemLockdownControl::new(runtime.directory());
@@ -1098,16 +1167,10 @@ pub fn run_protected_standard_block_service(config: &Path) -> Result<(), DnsMedi
     let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
     let mediation = DnsMediationSession::establish(
         runtime.directory(),
-        DnsBlockRuntimeScope::ProductionProtected.dns_scope(),
+        scope.dns_scope(),
         Some(queue.clone()),
     )?;
-    let mut session = DnsMediatedBlockSession::establish(
-        runtime,
-        mediation,
-        queue,
-        &plan,
-        DnsBlockRuntimeScope::ProductionProtected,
-    )?;
+    let mut session = DnsMediatedBlockSession::establish(runtime, mediation, queue, &plan, scope)?;
     let start = Instant::now();
     loop {
         session.poll_once(start.elapsed(), POLL_INTERVAL)?;
@@ -1219,6 +1282,22 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
 }
 
 fn protected_block_limitations() -> Vec<&'static str> {
+    let mut limitations = protected_block_shared_limitations();
+    limitations.push("audit_production_activation_not_implemented");
+    limitations
+}
+
+fn protected_degraded_block_limitations() -> Vec<&'static str> {
+    let mut limitations = protected_block_shared_limitations();
+    limitations.extend([
+        "container_control_preserved_invalidates_containment",
+        "container_control_remains_available_to_later_workflow_code",
+        "audit_production_activation_not_implemented",
+    ]);
+    limitations
+}
+
+fn protected_block_shared_limitations() -> Vec<&'static str> {
     vec![
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
         "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
@@ -1234,7 +1313,6 @@ fn protected_block_limitations() -> Vec<&'static str> {
         "resolved_status_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
-        "standard_block_only_until_audit_and_unsafe_preserve_are_activated",
     ]
 }
 
@@ -1503,7 +1581,9 @@ fn query_for_upstream(
     match (recorder.scope, parsed_question) {
         (DnsEvidenceScope::Audit, _) => Some(query.to_vec()),
         (
-            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock,
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded,
             Some((hostname, query_type)),
         ) => {
             let canonical = canonical_block_query(hostname, *query_type, query)?;
@@ -1511,7 +1591,12 @@ fn query_for_upstream(
                 .forward_query(hostname, *query_type)
                 .then_some(canonical)
         }
-        (DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock, None) => None,
+        (
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded,
+            None,
+        ) => None,
     }
 }
 
@@ -1977,7 +2062,9 @@ fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static
         DnsEvidenceScope::Audit if matches_candidate_pattern(hostname) => {
             "matches_candidate_pattern"
         }
-        DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock
+        DnsEvidenceScope::HostBlockCandidate
+        | DnsEvidenceScope::ProtectedHostBlock
+        | DnsEvidenceScope::ProtectedHostBlockDegraded
             if matches_exact_block_candidate_hostname(hostname) =>
         {
             "matches_candidate_pattern"
@@ -2019,19 +2106,25 @@ fn evidence_from_state_and_authorizations(
         candidate_profile_id: scope.candidate_profile_id(),
         selected_platform_profile_id: match scope {
             DnsEvidenceScope::Audit => None,
-            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID)
             }
         },
         candidate_domain_patterns: match scope {
             DnsEvidenceScope::Audit => DNS_CANDIDATE_PATTERNS.to_vec(),
-            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 DNS_BLOCK_COMPATIBILITY_PATTERNS.to_vec()
             }
         },
         candidate_hostnames: match scope {
             DnsEvidenceScope::Audit => Vec::new(),
-            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.to_vec()
             }
         },
@@ -2039,17 +2132,23 @@ fn evidence_from_state_and_authorizations(
         protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
         routing_status,
         host_dns_routing: match scope {
-            DnsEvidenceScope::ProtectedHostBlock => "local_root_resident_mediator",
+            DnsEvidenceScope::ProtectedHostBlock | DnsEvidenceScope::ProtectedHostBlockDegraded => {
+                "local_root_resident_mediator"
+            }
             _ => "local_mediator_test_only",
         },
         docker_dns_routing: match scope {
-            DnsEvidenceScope::ProtectedHostBlock => "local_root_resident_mediator",
+            DnsEvidenceScope::ProtectedHostBlock | DnsEvidenceScope::ProtectedHostBlockDegraded => {
+                "local_root_resident_mediator"
+            }
             _ => "local_mediator_test_only",
         },
         answer_attribution_status: "bounded_reportable_hostname_answers_only",
         proxy_policy_status: match scope {
             DnsEvidenceScope::Audit => "audit_forwards_without_name_authorization",
-            DnsEvidenceScope::HostBlockCandidate | DnsEvidenceScope::ProtectedHostBlock => {
+            DnsEvidenceScope::HostBlockCandidate
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
             }
         },
@@ -2122,24 +2221,33 @@ fn evidence_from_state_and_authorizations(
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
                 "planner_selection_does_not_activate_runtime_materialization",
             ],
-            DnsEvidenceScope::ProtectedHostBlock => vec![
-                "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
-                "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
-                "block_dns_queries_are_canonicalized_before_upstream_forwarding",
-                "dns_query_timing_and_count_remain_egress_limitations",
-                "post_ready_codeload_traffic_is_not_authorized",
-                "post_ready_results_storage_traffic_is_not_authorized",
-                "cname_descendants_are_bounded_ttl_derived_authorizations",
-                "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-                "bootstrap_roots_refresh_every_5_seconds",
-                "https_materialization_expiry_includes_30_second_refresh_overlap",
-                "dns_answers_materialize_only_bounded_status_or_cname_descendant_https_addresses",
-                "approved_status_https_destinations_remain_egress_channels",
-                "resolved_status_ip_addresses_may_serve_additional_destinations",
-                "root_resident_dns_upstream_channel_remains_an_egress_limitation",
-            ],
+            DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(false),
+            DnsEvidenceScope::ProtectedHostBlockDegraded => protected_dns_scope_limitations(true),
         },
     }
+}
+
+fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
+    let mut limitations = vec![
+        "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
+        "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
+        "block_dns_queries_are_canonicalized_before_upstream_forwarding",
+        "dns_query_timing_and_count_remain_egress_limitations",
+        "post_ready_codeload_traffic_is_not_authorized",
+        "post_ready_results_storage_traffic_is_not_authorized",
+        "cname_descendants_are_bounded_ttl_derived_authorizations",
+        "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+        "bootstrap_roots_refresh_every_5_seconds",
+        "https_materialization_expiry_includes_30_second_refresh_overlap",
+        "dns_answers_materialize_only_bounded_status_or_cname_descendant_https_addresses",
+        "approved_status_https_destinations_remain_egress_channels",
+        "resolved_status_ip_addresses_may_serve_additional_destinations",
+        "root_resident_dns_upstream_channel_remains_an_egress_limitation",
+    ];
+    if degraded {
+        limitations.push("container_control_preserved_invalidates_containment");
+    }
+    limitations
 }
 
 fn write_report(path: &Path, evidence: &DnsMediationEvidence) -> Result<(), DnsMediationError> {
@@ -2709,5 +2817,30 @@ mod tests {
         assert!(!evidence.observations[0].addresses_truncated);
         assert_eq!(evidence.excluded_non_github_query_count, 1);
         assert!(!evidence.protection_available);
+    }
+
+    #[test]
+    fn degraded_production_scope_preserves_container_limitation_without_protection_claim() {
+        let scope = DnsBlockRuntimeScope::ProductionUnsafePreserve;
+        let evidence =
+            evidence_from_state(&ObservationState::default(), "active", scope.dns_scope());
+
+        assert_eq!(scope.evidence_status(), PROTECTED_DEGRADED_BLOCK_STATUS);
+        assert_eq!(scope.ready_status(), PROTECTED_DEGRADED_BLOCK_READY_STATUS);
+        assert_eq!(scope.resident_status(), "resident_degraded");
+        assert_eq!(scope.lockdown_posture(), LockdownPosture::UnsafePreserve);
+        assert!(!scope.protection_available());
+        assert_eq!(evidence.status, PROTECTED_DEGRADED_BLOCK_STATUS);
+        assert!(!evidence.protection_available);
+        assert!(
+            evidence
+                .limitations
+                .contains(&"container_control_preserved_invalidates_containment")
+        );
+        assert!(
+            scope
+                .limitations()
+                .contains(&"container_control_remains_available_to_later_workflow_code")
+        );
     }
 }
