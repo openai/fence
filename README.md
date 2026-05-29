@@ -102,16 +102,17 @@ the four bootstrap roots every five seconds, and continued to materialize
 only TTL-bounded TCP `443` address rules. All three hosted jobs reached
 terminal success. Removing `codeload.github.com` because v0 does not support
 post-ready action downloads also reached terminal success in three hosted
-jobs. The current reduction removes the results-storage wildcard because v0
-does not support post-ready artifact or cache storage traffic. This remains
-*test-only*: it neither selects a default `platform_profile` nor activates
-public protection, and its remaining wildcard DNS authorization is an egress
-limitation that cannot become a default profile without another reduction
-pass. A following workflow step emits a capped sanitized DNS summary so late
-DNS and network findings can be reviewed without changing policy. Its
-reported limitations also state that the approved DNS and HTTPS channels
-remain usable for egress and that resolved address grants may represent
-colocated services.
+jobs. Removing the results-storage wildcard because v0 does not support
+post-ready artifact or cache storage traffic also reached terminal success in
+three hosted jobs. The current reduction replaces the remaining Actions DNS
+wildcard with the four measured bootstrap roots while retaining the exact
+GitHub app receiver compatibility name and bounded TTL-derived CNAME
+descendants. This remains *test-only*: it neither selects a default
+`platform_profile` nor activates public protection. A following workflow step
+emits a capped sanitized DNS summary so late DNS and network findings can be
+reviewed without changing policy. Its reported limitations also state that
+the approved DNS and HTTPS channels remain usable for egress and that
+resolved address grants may represent colocated services.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
