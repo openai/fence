@@ -16,7 +16,8 @@ defaults:
     shell: bash
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # A stranded host-block evidence job may be unable to receive cancellation.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
@@ -115,9 +116,42 @@ jobs:
       - name: test composed namespace-network and host-lockdown evidence
         run: script/test-composed
 
+  dns-mediated-host-block:
+    name: bounded DNS-mediated host-block evidence
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: run bounded DNS-mediated host-block evidence
+        env:
+          DNS_BLOCK_CANDIDATE_REPLICA: required
+        run: script/test-dns-block-candidate
+
+      - name: emit bounded late DNS-mediated evidence
+        env:
+          DNS_BLOCK_CANDIDATE_REPLICA: required
+        run: script/report-dns-block-candidate
+
   integration:
     name: integration
-    needs: [lockdown, profile-measurement, composed]
+    needs: [lockdown, profile-measurement, composed, dns-mediated-host-block]
     runs-on: ubuntu-24.04
 
     steps:
