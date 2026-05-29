@@ -108,11 +108,14 @@ function validateReport(report, failOnCritical = true) {
   if (report.selected_platform_profile_id !== PROFILE_ID) {
     fail("Fence report does not select the reviewed hosted-runner profile");
   }
-  if (report.network_verification_status !== "verified") {
-    fail("Fence report does not contain verified network state");
-  }
   if (!Array.isArray(report.critical_findings) || report.critical_findings_truncated !== false) {
     fail("Fence report does not contain bounded critical findings");
+  }
+  if (failOnCritical && report.critical_findings.length !== 0) {
+    fail("Fence report contains critical resident findings");
+  }
+  if (report.network_verification_status !== "verified") {
+    fail("Fence report does not contain verified network state");
   }
   const expected = {
     protected_host_block: {
@@ -149,9 +152,6 @@ function validateReport(report, failOnCritical = true) {
     report.container_status !== expected.containers
   ) {
     fail("Fence report mode and control status are inconsistent");
-  }
-  if (failOnCritical && report.critical_findings.length !== 0) {
-    fail("Fence report contains critical resident findings");
   }
   return report;
 }

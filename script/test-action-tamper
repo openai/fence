@@ -1,0 +1,86 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "Action tamper evidence runs only on disposable GitHub Actions runners"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "Action tamper evidence requires Linux x86_64"
+fi
+
+require_cmd node
+require_cmd python3
+require_cmd sleep
+require_cmd sudo
+if [[ ! -x /usr/bin/systemctl || ! -x /usr/sbin/nft ]]; then
+  die "Action tamper evidence requires systemctl and /usr/sbin/nft"
+fi
+
+temporary_directory="$(make_temp_dir fence-action-tamper "$RUNNER_TEMP")"
+trap 'remove_generated_path "$temporary_directory" "Action tamper scratch directory"' EXIT
+
+invocation="action-tamper"
+directory="/run/fence/$invocation"
+report="$directory/report.json"
+state="$temporary_directory/state"
+summary="$temporary_directory/summary"
+post_stdout="$temporary_directory/post-stdout"
+post_stderr="$temporary_directory/post-stderr"
+: >"$state"
+: >"$summary"
+
+if [[ -e "$directory" ]]; then
+  die "Action tamper evidence requires no preexisting runtime directory"
+fi
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action tamper evidence requires no preexisting inet fence_v0 table"
+fi
+
+INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"action-tamper","allowances":[]}' \
+  GITHUB_STATE="$state" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/main.js
+
+grep -Fxq "invocation_id=$invocation" "$state"
+grep -Fxq "report_path=$report" "$state"
+sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
+sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null
+
+sudo --non-interactive /usr/sbin/nft delete table inet fence_v0
+sleep 7
+
+python3 - "$report" <<'PY'
+import json
+import pathlib
+import sys
+
+report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert report["status"] == "protected_host_audit_observation", report
+assert report["readiness_status"] == "ready_observation_only", report
+assert report["network_verification_status"] == "critical_drift", report
+assert report["critical_findings_truncated"] is False, report
+assert any(item["code"] == "dns_audit_network_drift" for item in report["critical_findings"]), report
+PY
+
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action tamper evidence unexpectedly restored inet fence_v0"
+fi
+sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
+
+if STATE_invocation_id="$invocation" \
+  STATE_report_path="$report" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/post.js >"$post_stdout" 2>"$post_stderr"; then
+  die "Action post hook unexpectedly accepted critical resident drift"
+fi
+grep -q "Fence report contains critical resident findings" "$post_stderr"
+
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action post hook unexpectedly restored inet fence_v0"
+fi
+sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
+
+echo -e "${GREEN}Action tamper evidence verified:${OFF} post hook failed without restoring access"
