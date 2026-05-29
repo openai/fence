@@ -4,15 +4,21 @@ set -euo pipefail
 
 source script/env "$@"
 
-if [[ $# -ne 0 ]]; then
-  die "usage: script/test-protected-run"
+if [[ $# -ne 1 ]]; then
+  die "usage: script/test-protected-run <standard|unsafe-preserve>"
 fi
 
+scenario="$1"
+case "$scenario" in
+  standard|unsafe-preserve) ;;
+  *) die "unknown protected run scenario: $scenario" ;;
+esac
+
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
-  die "protected standard-block proof runs only on disposable GitHub Actions runners"
+  die "protected block proof runs only on disposable GitHub Actions runners"
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
-  die "protected standard-block proof requires Linux x86_64"
+  die "protected block proof requires Linux x86_64"
 fi
 
 ensure_rust_toolchain
@@ -23,11 +29,11 @@ require_cmd sudo
 
 for required in /usr/bin/install /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/resolvectl /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
-    die "protected standard-block proof requires executable $required"
+    die "protected block proof requires executable $required"
   fi
 done
 
-invocation="protected-run-${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
+invocation="protected-${scenario}-${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}"
 unit="fence-${invocation}.service"
 directory="/run/fence/$invocation"
 config="$directory/config.json"
@@ -35,13 +41,13 @@ ready="$directory/ready.json"
 report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 config_source="$RUNNER_TEMP/fence-protected-run-config.json"
-target_root="$RUNNER_TEMP/fence-protected-run-target"
+target_root="$RUNNER_TEMP/fence-protected-run-target-$scenario"
 
 if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
-  die "protected standard-block proof requires absent host inet fence_v0 table"
+  die "protected block proof requires absent host inet fence_v0 table"
 fi
 if [[ -e "$directory" ]]; then
-  die "protected standard-block proof requires absent production runtime directory"
+  die "protected block proof requires absent production runtime directory"
 fi
 
 mkdir -p "$target_root"
@@ -49,18 +55,19 @@ export CARGO_TARGET_DIR="$target_root"
 cargo build --frozen --release --bin fence
 binary="$target_root/release/fence"
 
-python3 - "$config_source" "$invocation" <<'PY'
+python3 - "$config_source" "$invocation" "$scenario" <<'PY'
 import json
 import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
 invocation_id = sys.argv[2]
+scenario = sys.argv[3]
 document = {
     "schema_version": 1,
     "mode": "block",
     "invocation_id": invocation_id,
-    "container_policy": "disable",
+    "container_policy": "disable" if scenario == "standard" else "unsafe_preserve",
     "allowances": [],
 }
 path.write_text(
@@ -81,14 +88,31 @@ sudo /usr/bin/systemd-run \
   --unit "$unit" \
   "$binary" run --config "$config"
 
-python3 - "$report" "$dns_report" "$ready" <<'PY'
+python3 - "$scenario" "$report" "$dns_report" "$ready" <<'PY'
 import json
 import pathlib
 import re
 import sys
 import time
 
-report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[1:])
+scenario = sys.argv[1]
+report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:])
+expected = {
+    "standard": {
+        "status": "protected_host_block",
+        "resident": "resident_protected",
+        "ready": "ready",
+        "protection_available": True,
+        "container_status": "disabled_verified",
+    },
+    "unsafe-preserve": {
+        "status": "protected_host_block_degraded",
+        "resident": "resident_degraded",
+        "ready": "ready_degraded",
+        "protection_available": False,
+        "container_status": "preserved_unsafe",
+    },
+}[scenario]
 deadline = time.monotonic() + 30
 report = None
 dns = None
@@ -98,18 +122,18 @@ while time.monotonic() < deadline:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         dns = json.loads(dns_path.read_text(encoding="utf-8"))
         ready = json.loads(ready_path.read_text(encoding="utf-8"))
-        if report.get("setup_status") == "resident_protected":
+        if report.get("setup_status") == expected["resident"]:
             break
     time.sleep(0.1)
 
 assert report is not None, "protected report was not emitted"
 assert dns is not None, "protected DNS report was not emitted"
 assert ready is not None, "protected readiness was not emitted"
-assert report["status"] == "protected_host_block", report
+assert report["status"] == expected["status"], report
 assert report["mode"] == "block", report
-assert report["setup_status"] == "resident_protected", report
-assert report["readiness_status"] == "ready", report
-assert report["protection_available"] is True, report
+assert report["setup_status"] == expected["resident"], report
+assert report["readiness_status"] == expected["ready"], report
+assert report["protection_available"] is expected["protection_available"], report
 assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
 assert report["policy_hash_schema_version"] == 3, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
@@ -118,18 +142,18 @@ assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
 assert report["network_application_status"] == "applied", report
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
-assert report["container_status"] == "disabled_verified", report
+assert report["container_status"] == expected["container_status"], report
 assert len(report["materialized_https_allowances"]) >= 1, report
 assert report["critical_findings"] == [], report
-assert ready["status"] == "ready", ready
+assert ready["status"] == expected["ready"], ready
 assert ready["mode"] == "block", ready
-assert ready["protection_available"] is True, ready
+assert ready["protection_available"] is expected["protection_available"], ready
 assert ready["selected_platform_profile_id"] == "github_hosted_job_status_v1", ready
 assert ready["policy_hash"] == report["policy_hash"], (ready, report)
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"], (ready, report)
-assert dns["status"] == "protected_host_block", dns
+assert dns["status"] == expected["status"], dns
 assert dns["mode"] == "block", dns
-assert dns["protection_available"] is True, dns
+assert dns["protection_available"] is expected["protection_available"], dns
 assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1", dns
 assert dns["routing_status"] == "active", dns
 assert dns["host_dns_routing"] == "local_root_resident_mediator", dns
@@ -137,33 +161,56 @@ assert dns["docker_dns_routing"] == "local_root_resident_mediator", dns
 assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]
 assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
-assert "standard_block_only_until_audit_and_unsafe_preserve_are_activated" in report["limitations"]
+assert "audit_production_activation_not_implemented" in report["limitations"]
+if scenario == "unsafe-preserve":
+    assert "container_control_preserved_invalidates_containment" in report["limitations"]
+    assert "container_control_remains_available_to_later_workflow_code" in report["limitations"]
 PY
 
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
-  die "protected standard-block proof did not disable runner passwordless sudo"
+  die "protected block proof did not disable runner passwordless sudo"
 fi
-if docker ps --quiet >/dev/null 2>&1; then
-  die "protected standard-block proof did not disable runner Docker access"
-fi
+case "$scenario" in
+  standard)
+    if docker ps --quiet >/dev/null 2>&1; then
+      die "protected standard-block proof did not disable runner Docker access"
+    fi
+    ;;
+  unsafe-preserve)
+    docker ps --quiet >/dev/null
+    ;;
+esac
 
 sleep 6
-python3 - "$report" "$dns_report" <<'PY'
+python3 - "$scenario" "$report" "$dns_report" <<'PY'
 import json
 import pathlib
 import sys
 
-report_path, dns_path = (pathlib.Path(item) for item in sys.argv[1:])
+scenario = sys.argv[1]
+report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
+expected = {
+    "standard": {
+        "status": "protected_host_block",
+        "resident": "resident_protected",
+        "container_status": "disabled_verified",
+    },
+    "unsafe-preserve": {
+        "status": "protected_host_block_degraded",
+        "resident": "resident_degraded",
+        "container_status": "preserved_unsafe",
+    },
+}[scenario]
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-assert report["status"] == "protected_host_block", report
-assert report["setup_status"] == "resident_protected", report
+assert report["status"] == expected["status"], report
+assert report["setup_status"] == expected["resident"], report
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
-assert report["container_status"] == "disabled_verified", report
+assert report["container_status"] == expected["container_status"], report
 assert report["critical_findings"] == [], report
-assert dns["status"] == "protected_host_block", dns
+assert dns["status"] == expected["status"], dns
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY
 
-echo -e "${GREEN}protected trusted-launcher standard block verified${OFF}"
+echo -e "${GREEN}protected trusted-launcher block verified: $scenario${OFF}"

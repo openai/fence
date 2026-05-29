@@ -400,7 +400,7 @@ fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
             limitations.push("standard_block_requires_supported_trusted_launcher_for_activation");
         }
         AssuranceStatus::PlannedBlockDegradedContainerAccess => {
-            limitations.push("unsafe_preserve_production_activation_not_implemented");
+            limitations.push("unsafe_preserve_requires_supported_trusted_launcher_for_activation");
             limitations.push("container_access_would_invalidate_ordinary_containment");
         }
         AssuranceStatus::AuditObservationOnly => {
@@ -567,7 +567,7 @@ mod tests {
             degraded.limitations,
             vec![
                 "render_plan_does_not_apply_or_verify_security_state",
-                "unsafe_preserve_production_activation_not_implemented",
+                "unsafe_preserve_requires_supported_trusted_launcher_for_activation",
                 "container_access_would_invalidate_ordinary_containment"
             ]
         );
