@@ -198,13 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn render_plan_exposes_explicit_https_only_candidate_without_activation() {
+    fn render_plan_exposes_explicit_https_udp_dns_candidate_without_activation() {
         let root = std::path::Path::new("target/tmp/cli-unit-tests");
         std::fs::create_dir_all(root).unwrap();
         let config = root.join("broad-compatibility-profile.json");
         std::fs::write(
             &config,
-            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_https_only_candidate_v1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_https_udp_dns_candidate_v1","allowances":[]}"#,
         )
         .unwrap();
 
@@ -221,12 +221,12 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_https_only_candidate_v1\"")
+                .contains("\"id\":\"github_hosted_https_udp_dns_candidate_v1\"")
         );
         assert!(
             output
                 .json
-                .contains("\"selection_status\":\"explicit_open_https_only_not_default\"")
+                .contains("\"selection_status\":\"explicit_open_https_udp_dns_not_default\"")
         );
         assert!(
             output
@@ -236,7 +236,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"candidate_removes_explicit_dns_and_host_control_channels\"")
+                .contains("\"candidate_removes_tcp_dns_and_host_control_channels\"")
         );
         assert!(
             output

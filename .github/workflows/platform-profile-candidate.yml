@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   candidate:
-    name: https-only candidate ${{ matrix.replica }}
+    name: https plus UDP DNS candidate ${{ matrix.replica }}
     timeout-minutes: 8
     runs-on: ubuntu-24.04
     strategy:
@@ -45,7 +45,7 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: run HTTPS-only profile candidate
+      - name: run HTTPS plus UDP DNS profile candidate
         env:
           PROFILE_CANDIDATE_REPLICA: ${{ matrix.replica }}
         run: script/test-profile-candidate
