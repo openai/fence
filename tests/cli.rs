@@ -91,7 +91,7 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     assert_eq!(first, second);
     assert_eq!(first["data"]["application_status"], "not_applied");
     assert_eq!(first["data"]["verification_status"], "not_verified");
-    assert_eq!(first["data"]["policy_hash_schema_version"], 2);
+    assert_eq!(first["data"]["policy_hash_schema_version"], 3);
     assert_eq!(
         first["data"]["network_enforcement_preview"]["owned_table"]["name"],
         "fence_v0"
@@ -105,6 +105,39 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
         first["data"]["derived_runtime_paths"]["directory"],
         runtime_path.to_str().unwrap()
     );
+    assert_eq!(runtime_path.exists(), existed_before);
+}
+
+#[test]
+fn renders_default_bounded_job_status_profile_without_activation() {
+    let invocation_id = format!("default-plan-{}", std::process::id());
+    let runtime_path = PathBuf::from(format!("/run/fence/{invocation_id}"));
+    let existed_before = runtime_path.exists();
+    let path = config_file(
+        "default-job-status-plan.json",
+        format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowances":[]}}"#
+        )
+        .as_bytes(),
+    );
+    let response = success_json(&["render-plan", "--config", path.to_str().unwrap()]);
+    let profile = &response["data"]["platform_profile"];
+    let dns = &profile["dns_mediated_compatibility"];
+
+    assert_eq!(response["data"]["policy_hash_schema_version"], 3);
+    assert_eq!(profile["id"], "github_hosted_job_status_v1");
+    assert_eq!(profile["selection_status"], "default_bounded_dns_mediated");
+    assert_eq!(
+        dns["realization_status"],
+        "trusted_launcher_runtime_materialization_required"
+    );
+    assert_eq!(dns["max_dynamic_actions_suffix_authorizations"], 8);
+    assert_eq!(dns["max_dynamic_actions_suffix_prefix_labels"], 2);
+    assert_eq!(
+        dns["forwarded_query_types"],
+        serde_json::json!(["a", "aaaa"])
+    );
+    assert_eq!(dns["https_materialization_port"], 443);
     assert_eq!(runtime_path.exists(), existed_before);
 }
 

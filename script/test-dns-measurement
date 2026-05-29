@@ -144,10 +144,10 @@ dns = json.loads(dns_path.read_text(encoding="utf-8"))
 report = json.loads(report_path.read_text(encoding="utf-8"))
 assert dns["routing_status"] == "active_test_only", dns
 assert dns["protection_available"] is False, dns
-assert "candidate_patterns_not_selected_as_platform_profile" in dns["limitations"], dns
+assert "audit_measurement_patterns_do_not_define_default_descriptor" in dns["limitations"], dns
 assert "dns_answers_attribute_addresses_without_authorizing_firewall_rules" in dns["limitations"], dns
 assert "dns_ttls_are_evidence_for_future_bounded_refresh_design_only" in dns["limitations"], dns
-assert "terminal_block_success_required_before_default_selection" in dns["limitations"], dns
+assert "audit_measurement_does_not_activate_runtime_materialization" in dns["limitations"], dns
 assert dns["excluded_non_github_query_count"] >= 2, dns
 assert report["verification_status"] == "verified", report
 assert report["critical_findings"] == [], report

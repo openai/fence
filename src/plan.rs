@@ -6,6 +6,10 @@ use crate::config::{
 };
 use crate::error::ErrorDetail;
 use crate::nft::{NetworkEnforcementPreview, build_preview, implicit_ipv6_control};
+use crate::platform_profile::{
+    DnsMediatedCompatibilityPlan, GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+    github_hosted_job_status_dns_mediation_plan,
+};
 use crate::resolver::{Resolution, ResolveError, Resolver};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -16,7 +20,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 2;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 3;
 pub const GITHUB_HOSTED_HTTPS_UDP_DNS_CANDIDATE_PROFILE_ID: &str =
     "github_hosted_https_udp_dns_candidate_v1";
 const HOSTED_HTTPS_UDP_DNS_CHANNELS: [(DestinationType, &str, Protocol, u16); 3] = [
@@ -84,6 +88,7 @@ pub struct PlatformProfilePlan {
     pub requested_allowances: Vec<NormalizedAllowance>,
     pub effective_allowances: Vec<EffectiveAllowance>,
     pub frozen_resolution_results: Vec<ResolutionResult>,
+    pub dns_mediated_compatibility: Option<DnsMediatedCompatibilityPlan>,
     pub limitations: Vec<&'static str>,
 }
 
@@ -117,6 +122,7 @@ struct PolicyHashInput<'a> {
     mode: Mode,
     container_policy: Option<ContainerPolicy>,
     platform_profile: &'a str,
+    platform_profile_dns_mediated_compatibility: Option<DnsMediatedCompatibilityPlan>,
     allowances: &'a [EffectiveAllowance],
     implicit_ipv6_control: crate::nft::ImplicitIpv6Control,
 }
@@ -273,6 +279,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
         PlatformProfile::None => Vec::new(),
+        PlatformProfile::GithubHostedJobStatusV1 => Vec::new(),
         PlatformProfile::GithubHostedHttpsUdpDnsCandidateV1 => HOSTED_HTTPS_UDP_DNS_CHANNELS
             .iter()
             .map(
@@ -324,12 +331,34 @@ fn platform_plan(
     match profile {
         PlatformProfile::None => PlatformProfilePlan {
             id: profile.id(),
-            selection_status: "none_current_default",
+            selection_status: "explicit_none_override",
             purpose: "no_implicit_platform_egress",
             requested_allowances,
             effective_allowances,
             frozen_resolution_results,
+            dns_mediated_compatibility: None,
             limitations: Vec::new(),
+        },
+        PlatformProfile::GithubHostedJobStatusV1 => PlatformProfilePlan {
+            id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            selection_status: "default_bounded_dns_mediated",
+            purpose: "github_hosted_job_status_reporting",
+            requested_allowances,
+            effective_allowances,
+            frozen_resolution_results,
+            dns_mediated_compatibility: Some(github_hosted_job_status_dns_mediation_plan()),
+            limitations: vec![
+                "dns_mediated_runtime_materialization_requires_trusted_launcher",
+                "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
+                "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
+                "dns_query_timing_and_count_remain_egress_limitations",
+                "cname_descendants_are_bounded_ttl_derived_authorizations",
+                "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+                "approved_status_https_destinations_remain_egress_channels",
+                "resolved_status_ip_addresses_may_serve_additional_destinations",
+                "post_ready_codeload_traffic_is_not_authorized",
+                "post_ready_results_storage_traffic_is_not_authorized",
+            ],
         },
         PlatformProfile::GithubHostedHttpsUdpDnsCandidateV1 => PlatformProfilePlan {
             id: GITHUB_HOSTED_HTTPS_UDP_DNS_CANDIDATE_PROFILE_ID,
@@ -338,6 +367,7 @@ fn platform_plan(
             requested_allowances,
             effective_allowances,
             frozen_resolution_results,
+            dns_mediated_compatibility: None,
             limitations: vec![
                 "candidate_is_intentionally_open_https_udp_dns_only",
                 "permitted_platform_destinations_are_available_to_later_workflow_code",
@@ -394,6 +424,12 @@ fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance
         mode: config.mode,
         container_policy: config.container_policy,
         platform_profile: config.platform_profile.id(),
+        platform_profile_dns_mediated_compatibility: match config.platform_profile {
+            PlatformProfile::GithubHostedJobStatusV1 => {
+                Some(github_hosted_job_status_dns_mediation_plan())
+            }
+            PlatformProfile::None | PlatformProfile::GithubHostedHttpsUdpDnsCandidateV1 => None,
+        },
         allowances: effective_policy,
         implicit_ipv6_control: implicit_ipv6_control(),
     })
@@ -577,6 +613,10 @@ mod tests {
                 })
         );
         assert_eq!(none.platform_profile.id, "none");
+        assert_eq!(
+            none.platform_profile.selection_status,
+            "explicit_none_override"
+        );
         assert!(none.platform_profile.requested_allowances.is_empty());
         assert_ne!(candidate.policy_hash, none.policy_hash);
         assert_ne!(candidate.ruleset_hash, none.ruleset_hash);
@@ -592,6 +632,51 @@ mod tests {
                 .limitations
                 .contains(&"candidate_removes_tcp_dns_and_host_control_channels")
         );
+    }
+
+    #[test]
+    fn models_default_bounded_dns_mediated_job_status_profile() {
+        let default = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"default","allowances":[]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let explicit = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_job_status_v1","allowances":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let none = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"none","platform_profile":"none","allowances":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+
+        assert_eq!(default.policy_hash_schema_version, 3);
+        assert_eq!(
+            default.platform_profile.id,
+            GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+        );
+        assert_eq!(
+            default.platform_profile.selection_status,
+            "default_bounded_dns_mediated"
+        );
+        assert!(default.platform_profile.requested_allowances.is_empty());
+        assert!(default.platform_profile.effective_allowances.is_empty());
+        let dns = default
+            .platform_profile
+            .dns_mediated_compatibility
+            .as_ref()
+            .unwrap();
+        assert_eq!(dns.max_dynamic_actions_suffix_authorizations, 8);
+        assert_eq!(dns.max_dynamic_actions_suffix_prefix_labels, 2);
+        assert_eq!(dns.forwarded_query_types, ["a", "aaaa"]);
+        assert_eq!(dns.https_materialization_port, 443);
+        assert_eq!(default.policy_hash, explicit.policy_hash);
+        assert_eq!(default.ruleset_hash, explicit.ruleset_hash);
+        assert_ne!(default.policy_hash, none.policy_hash);
     }
 
     #[test]

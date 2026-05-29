@@ -76,7 +76,7 @@ summary = {
     "protection_available": False,
     "limitations": [
         "bounded_late_step_dns_evidence_only",
-        "no_public_activation_or_profile_selection",
+        "no_public_activation_or_runtime_materialization",
     ],
 }
 encoded = json.dumps(summary, sort_keys=True, separators=(",", ":"))

@@ -14,10 +14,11 @@ GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
 Fence is not an enforcement agent yet. The current Phase 3 non-enforcing executable builds
 on the Phase 2 network-evidence backend: it strictly validates local JSON
 policy, renders a frozen policy and deterministic native `nftables` ruleset
-preview, and reports an accepted but not runtime-checked hosted-runner
-fingerprint reference needed before the privileged lifecycle can be activated.
-It never applies a network boundary, changes privilege state, writes
-readiness, or reports protection as available.
+preview, models the selected bounded DNS-mediated hosted job-status
+compatibility descriptor, and reports an accepted but not runtime-checked
+hosted-runner fingerprint reference needed before the privileged lifecycle can
+be activated. It never applies a network boundary, changes privilege state,
+writes readiness, or reports protection as available.
 
 The hosted `integration` workflow additionally exercises native apply, verification, rollback,
 forwarded-path behavior, and bounded NFLOG connection findings in disposable
@@ -59,7 +60,7 @@ allowances removed, then reached terminal success in three independent
 disposable-host jobs. It is not a candidate final allowlist: general HTTPS
 and DNS are usable by later workflow code for egress and still must be
 replaced with a constrained design before any default profile decision. It
-remains test-only and non-default; no built-in platform profile is selected.
+remains test-only and non-default.
 A separate, non-required DNS-mediated audit experiment routes host and Docker
 resolver traffic through a local test-only mediator and records only bounded
 GitHub-related queried hostnames. For those retained names only, it records
@@ -130,7 +131,10 @@ disposable-host replicas across two executions reached terminal success. One
 bounded DNS-mediated host-block scenario now runs behind the stable required
 `integration` aggregate so future compatibility regressions fail closed. This
 promotes the evidence gate, not the product interface: public `run` remains
-disabled and no default `platform_profile` is selected.
+disabled. The non-enforcing planner now selects this bounded compatibility
+model as `github_hosted_job_status_v1` when `platform_profile` is omitted,
+while explicit `"none"` remains available for strict no-implicit-egress
+planning.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the non-enforcing JSON CLI contract. The `integration`
@@ -260,9 +264,10 @@ sudo/container lockdown while retaining only test-only readiness and reports.
 ## Phase 4 Evidence Boundary
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
-`inet fence_v0` ruleset preview, policy hash schema version `2`, and a ruleset
-hash. `check-support` reports a versioned hosted-runner fingerprint gate as
-an accepted reference that is not yet checked or enforced by public execution.
+`inet fence_v0` base-ruleset preview, policy hash schema version `3`, a ruleset
+hash, and the selected bounded DNS-mediated hosted job-status descriptor.
+`check-support` reports a versioned hosted-runner fingerprint gate as an
+accepted reference that is not yet checked or enforced by public execution.
 `run` fails closed until the privileged lifecycle is implemented and proved.
 
 ```console
@@ -311,7 +316,10 @@ required `integration` aggregate now exercises one copy of this test-only
 host-block evidence. Its DNS timing/count channel, bounded query-label channel,
 approved HTTPS destinations, CNAME delegation, and address-plus-port
 realization remain disclosed limitations. This does not activate public
-`run`, establish production readiness, or select a default profile.
+`run` or establish production readiness. The non-enforcing planner now selects
+the versioned `github_hosted_job_status_v1` descriptor by omission and retains
+explicit `"none"` as the strict override. Runtime TTL-derived materialization
+still requires the future trusted launcher.
 
 A public GitHub Action wrapper is deferred until a later protected lifecycle
 can truthfully establish readiness and an attested alpha agent has been
