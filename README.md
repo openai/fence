@@ -255,7 +255,7 @@ consumers should pin Fence to a full immutable commit SHA rather than a
 floating branch:
 
 ```yaml
-- uses: GrantBirki/fence@<full-commit-sha>
+- uses: GrantBirki/fence@f087c7b2bab87701b5114ccf82261cdd80e96995
 ```
 
 The zero-input form is the strict default: standard block mode, disabled
@@ -263,7 +263,7 @@ container control paths, the selected GitHub-hosted job-status profile, and no
 user-defined egress. Advanced configuration remains explicit:
 
 ```yaml
-- uses: GrantBirki/fence@<full-commit-sha>
+- uses: GrantBirki/fence@f087c7b2bab87701b5114ccf82261cdd80e96995
   with:
     config: >-
       {"schema_version":1,"mode":"block","invocation_id":"example-run","allowlist":[]}
