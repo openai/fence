@@ -6,6 +6,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {
+  defaultInlineConfig,
   runtimePaths,
   summaryLines,
   validateBundle,
@@ -14,8 +15,20 @@ const {
   validateReport,
 } = require("./lib");
 
-const parsed = validateInlineConfig('{"schema_version":1,"mode":"block","invocation_id":"action-test","allowances":[]}');
+const parsed = validateInlineConfig('{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}');
 assert.equal(parsed.invocationId, "action-test");
+assert.equal(parsed.usingDefault, false);
+const defaultConfig = defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" });
+assert.equal(
+  defaultConfig,
+  '{"schema_version":1,"mode":"block","invocation_id":"fence-12345-2","allowlist":[]}',
+);
+assert.deepEqual(validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }), {
+  invocationId: "fence-12345-2",
+  raw: defaultConfig,
+  usingDefault: true,
+});
+assert.throws(() => validateInlineConfig("", {}), /GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT/);
 assert.throws(() => validateInlineConfig('{"invocation_id":"Action_Test"}'), /slug grammar/);
 assert.throws(() => validateInlineConfig("[]"), /JSON object/);
 

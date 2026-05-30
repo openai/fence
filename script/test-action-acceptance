@@ -4,8 +4,8 @@ set -euo pipefail
 
 source script/env "$@"
 
-if [[ $# -ne 1 ]]; then
-  die "usage: script/test-action-acceptance <standard|unsafe-preserve|audit>"
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  die "usage: script/test-action-acceptance <standard|unsafe-preserve|audit> [invocation-id]"
 fi
 
 scenario="$1"
@@ -25,7 +25,7 @@ require_cmd docker
 require_cmd python3
 require_cmd sudo
 
-invocation="action-$scenario"
+invocation="${2:-action-$scenario}"
 directory="/run/fence/$invocation"
 ready="$directory/ready.json"
 report="$directory/report.json"
@@ -49,7 +49,7 @@ dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 assert manifest["schema_version"] == 2, manifest
-assert manifest["release_tag"] == "v0.1.0", manifest
+assert manifest["release_tag"] == "v0.1.1", manifest
 assert manifest["release_channel"] == "stable", manifest
 assert report["mode"] == mode, report
 assert report["status"] == status, report
