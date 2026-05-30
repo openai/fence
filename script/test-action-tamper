@@ -39,7 +39,7 @@ if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1
   die "Action tamper evidence requires no preexisting inet fence_v0 table"
 fi
 
-INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"action-tamper","allowances":[]}' \
+INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"action-tamper","allowlist":[]}' \
   GITHUB_STATE="$state" \
   GITHUB_STEP_SUMMARY="$summary" \
   node action/main.js

@@ -28,11 +28,11 @@ jobs:
       matrix:
         include:
           - scenario: standard
-            config: '{"schema_version":1,"mode":"block","invocation_id":"action-standard","container_policy":"disable","allowances":[]}'
+            config: '{"schema_version":1,"mode":"block","invocation_id":"action-standard","container_policy":"disable","allowlist":[]}'
           - scenario: unsafe-preserve
-            config: '{"schema_version":1,"mode":"block","invocation_id":"action-unsafe-preserve","container_policy":"unsafe_preserve","allowances":[]}'
+            config: '{"schema_version":1,"mode":"block","invocation_id":"action-unsafe-preserve","container_policy":"unsafe_preserve","allowlist":[]}'
           - scenario: audit
-            config: '{"schema_version":1,"mode":"audit","invocation_id":"action-audit","allowances":[]}'
+            config: '{"schema_version":1,"mode":"audit","invocation_id":"action-audit","allowlist":[]}'
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -58,6 +58,32 @@ jobs:
 
       - name: verify Action lifecycle
         run: script/test-action-acceptance "${{ matrix.scenario }}"
+
+  zero-input:
+    name: action zero-input standard
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
+
+      - name: activate bundled Fence agent with strict defaults
+        uses: ./
+
+      - name: verify zero-input Action lifecycle
+        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
   setup-failure:
     name: action setup failure evidence
@@ -107,7 +133,7 @@ jobs:
 
   acceptance:
     name: action acceptance
-    needs: [action, setup-failure, tamper]
+    needs: [action, zero-input, setup-failure, tamper]
     runs-on: ubuntu-24.04
 
     steps:

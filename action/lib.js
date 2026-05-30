@@ -25,6 +25,20 @@ function fail(message) {
   throw new Error(message);
 }
 
+function defaultInlineConfig(environment) {
+  const runId = environment.GITHUB_RUN_ID;
+  const runAttempt = environment.GITHUB_RUN_ATTEMPT;
+  if (!/^[0-9]+$/.test(runId || "") || !/^[0-9]+$/.test(runAttempt || "")) {
+    fail("GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are required for the default config");
+  }
+  return JSON.stringify({
+    schema_version: 1,
+    mode: "block",
+    invocation_id: `fence-${runId}-${runAttempt}`,
+    allowlist: [],
+  });
+}
+
 function readJsonBounded(file, maximumBytes, description) {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -36,14 +50,13 @@ function readJsonBounded(file, maximumBytes, description) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function validateInlineConfig(raw) {
-  if (typeof raw !== "string" || raw.length === 0) {
-    fail("config input is required");
-  }
-  if (Buffer.byteLength(raw, "utf8") > MAX_CONFIG_BYTES) {
+function validateInlineConfig(raw, environment = process.env) {
+  const usingDefault = typeof raw !== "string" || raw.length === 0;
+  const normalizedRaw = usingDefault ? defaultInlineConfig(environment) : raw;
+  if (Buffer.byteLength(normalizedRaw, "utf8") > MAX_CONFIG_BYTES) {
     fail("config input exceeds 256 KiB");
   }
-  const parsed = JSON.parse(raw);
+  const parsed = JSON.parse(normalizedRaw);
   if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
     fail("config input must be a JSON object");
   }
@@ -56,7 +69,7 @@ function validateInlineConfig(raw) {
   ) {
     fail("config invocation_id must use the Fence lowercase slug grammar");
   }
-  return { invocationId, raw };
+  return { invocationId, raw: normalizedRaw, usingDefault };
 }
 
 function runtimePaths(invocationId) {
@@ -243,6 +256,7 @@ function summaryLines(report) {
 
 module.exports = {
   MAX_REPORT_BYTES,
+  defaultInlineConfig,
   readJsonBounded,
   runtimePaths,
   summaryLines,

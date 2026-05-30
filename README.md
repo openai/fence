@@ -66,8 +66,7 @@ compatibility boundary.
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The current
 `0.1.1` publication remains limited to the Linux x64 agent artifact. The root
-Action continues carrying the attested stable `0.1.0` binary without runtime
-downloads until the release-bound bundle refresh lands.
+Action carries the attested stable `0.1.1` binary without runtime downloads.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -244,8 +243,11 @@ Production `state.json`, `ready.json`, and `report.json` documents carry
 The root `action.yml` wrapper carries an exact, checksum-validated copy of an
 attested Linux release binary. Its schema-`2` manifest distinguishes immutable
 prerelease and stable release channels. The wrapper requires runtime evidence
-schema `1`. It accepts one inline strict-JSON configuration,
-writes the untouched bytes into the pinned root-owned runtime path, launches
+schema `1`. With no inputs, it creates a strict standard-block configuration
+with an empty `allowlist` and a bounded invocation identifier derived from
+GitHub run metadata. An optional inline strict-JSON configuration overrides
+that default for reviewed advanced use. The wrapper writes the selected bytes
+into the pinned root-owned runtime path, launches
 the trusted transient service, waits for agent readiness, and renders bounded
 local evidence from its post hook. It does not download an agent, fetch policy,
 stop the resident service, or restore access at workflow runtime. External
@@ -253,15 +255,24 @@ consumers should pin Fence to a full immutable commit SHA rather than a
 floating branch:
 
 ```yaml
-- uses: GrantBirki/fence@9100d0f458b358f810f559c34efd7fec08ffdb27
-  with:
-    config: >-
-      {"schema_version":1,"mode":"block","invocation_id":"example-run","allowances":[]}
+- uses: GrantBirki/fence@<full-commit-sha>
 ```
 
-That immutable `0.1.0` Action pin retains the original explicit configuration
-shape. The release-bound Action bundle refresh following `0.1.1` publication
-switches the default path to a zero-input standard block invocation.
+The zero-input form is the strict default: standard block mode, disabled
+container control paths, the selected GitHub-hosted job-status profile, and no
+user-defined egress. Advanced configuration remains explicit:
+
+```yaml
+- uses: GrantBirki/fence@<full-commit-sha>
+  with:
+    config: >-
+      {"schema_version":1,"mode":"block","invocation_id":"example-run","allowlist":[]}
+```
+
+Pull requests prove the zero-input path on the supported fixed
+`ubuntu-24.04` runner label. A separate non-required `ubuntu-latest` canary
+exercises the same path as an observational compatibility signal; it does not
+expand the supported protected target.
 
 ## Release Baseline
 
@@ -271,9 +282,9 @@ to `main` established a baseline without publishing a release. The current
 The `0.1.0-alpha.3` prerelease completed the final soak before stable `0.1.0`.
 The `0.1.1` patch publication renames the direct agent configuration collection
 to `allowlist` while intentionally keeping configuration schema `1`. The root
-Action continues carrying the attested stable `0.1.0` binary until the
-release-bound bundle refresh lands. Future deliberate version bumps merged to
-`main` remain release triggers.
+Action carries that attested stable binary and provides a zero-input strict
+standard-block default. Future deliberate version bumps merged to `main`
+remain release triggers.
 
 The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
 and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its

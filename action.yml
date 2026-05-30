@@ -2,8 +2,8 @@ name: Fence
 description: Launch the bundled Fence Linux x64 agent on a supported GitHub-hosted runner
 inputs:
   config:
-    description: Inline strict JSON Fence configuration
-    required: true
+    description: Optional inline strict JSON Fence configuration; omission selects strict standard block with an empty allowlist
+    required: false
 runs:
   using: node24
   main: action/main.js

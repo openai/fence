@@ -34,7 +34,7 @@ if [[ -e /run/fence/Action_Invalid || -e /run/fence/action-invalid ]]; then
   die "Action setup-failure evidence requires no preexisting invalid runtime directory"
 fi
 
-if INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"Action_Invalid","allowances":[]}' \
+if INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"Action_Invalid","allowlist":[]}' \
   GITHUB_STATE="$state" \
   GITHUB_STEP_SUMMARY="$summary" \
   node action/main.js >"$stdout" 2>"$stderr"; then
