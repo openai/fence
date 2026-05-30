@@ -60,7 +60,7 @@ tmp_vendor=""
 install_locked_update_tool cargo-audit cargo-audit "$CARGO_AUDIT_VERSION_FILE" "${CARGO_AUDIT_VERSION:-}"
 install_locked_update_tool cargo-deny cargo-deny "$CARGO_DENY_VERSION_FILE" "${CARGO_DENY_VERSION:-}"
 
-cargo audit
+cargo audit --deny warnings
 cargo deny check
 
 # Restore config before verifying offline build.

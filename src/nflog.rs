@@ -1,13 +1,6 @@
 use crate::config::Mode;
 use crate::findings::{ConnectionFinding, bounded_timestamp_now, finding_from_prefix};
 use crate::nft::{NFLOG_GROUP, NFLOG_PACKET_PREFIX_BYTES, NFLOG_PREFIX_AUDIT, NFLOG_PREFIX_BLOCK};
-use netlink_packet_netfilter::{
-    constants::{AF_INET, AF_INET6, AF_UNSPEC, NFULA_PAYLOAD, NFULA_PREFIX, NFULNL_MSG_PACKET},
-    nflog::{
-        NfLogMessage, config_request,
-        nlas::config::{ConfigCmd, ConfigMode},
-    },
-};
 use netlink_sys::{Socket, SocketAddr, constants::NETLINK_NETFILTER};
 use std::io::ErrorKind;
 use std::thread;
@@ -16,7 +9,18 @@ use std::time::{Duration, Instant};
 const RECEIVE_BUFFER_BYTES: usize = 4096;
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(2);
 const NLMSG_ERROR: u16 = 2;
-const NFLOG_PACKET_MESSAGE: u16 = ((NfLogMessage::SUBSYS as u16) << 8) | NFULNL_MSG_PACKET as u16;
+const NETLINK_HEADER_BYTES: usize = 16;
+const NFGENMSG_BYTES: usize = 4;
+const NLA_HEADER_BYTES: usize = 4;
+const NLM_F_REQUEST: u16 = 1;
+const NLM_F_ACK: u16 = 4;
+const NFNL_SUBSYS_ULOG: u16 = 4;
+const NFULNL_MSG_PACKET: u16 = 0;
+const NFULNL_MSG_CONFIG: u16 = 1;
+const NFLOG_PACKET_MESSAGE: u16 = (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_PACKET;
+const NFLOG_CONFIG_MESSAGE: u16 = (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG;
+const NFULA_PAYLOAD: u16 = libc::NFULA_PAYLOAD as u16;
+const NFULA_PREFIX: u16 = libc::NFULA_PREFIX as u16;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -53,25 +57,33 @@ impl NflogReader {
             .set_non_blocking(true)
             .map_err(|error| io_error("nflog_nonblocking_failed", error))?;
 
-        macro_rules! send_request {
-            ($request:expr) => {{
-                let request = $request;
-                let mut bytes = vec![0_u8; request.buffer_len()];
-                request.serialize(&mut bytes);
-                send_config_and_wait_for_ack(&socket, &bytes)?;
-            }};
-        }
-
-        send_request!(config_request(AF_INET, 0, vec![ConfigCmd::PfBind.into()]));
-        send_request!(config_request(AF_INET6, 0, vec![ConfigCmd::PfBind.into()]));
-        send_request!(config_request(
-            AF_UNSPEC,
-            NFLOG_GROUP,
-            vec![
-                ConfigCmd::Bind.into(),
-                ConfigMode::new_packet(NFLOG_PACKET_PREFIX_BYTES).into()
-            ]
-        ));
+        send_config_and_wait_for_ack(
+            &socket,
+            &config_request(
+                libc::AF_INET as u8,
+                0,
+                libc::NFULNL_CFG_CMD_PF_BIND as u8,
+                None,
+            ),
+        )?;
+        send_config_and_wait_for_ack(
+            &socket,
+            &config_request(
+                libc::AF_INET6 as u8,
+                0,
+                libc::NFULNL_CFG_CMD_PF_BIND as u8,
+                None,
+            ),
+        )?;
+        send_config_and_wait_for_ack(
+            &socket,
+            &config_request(
+                libc::AF_UNSPEC as u8,
+                NFLOG_GROUP,
+                libc::NFULNL_CFG_CMD_BIND as u8,
+                Some(NFLOG_PACKET_PREFIX_BYTES),
+            ),
+        )?;
 
         Ok(Self { socket, mode })
     }
@@ -98,6 +110,56 @@ impl NflogReader {
             }
         }
     }
+}
+
+fn config_request(
+    family: u8,
+    group: u16,
+    command: u8,
+    packet_prefix_bytes: Option<u32>,
+) -> Vec<u8> {
+    let mut attributes = Vec::new();
+    push_attribute(&mut attributes, libc::NFULA_CFG_CMD as u16, &[command]);
+
+    if let Some(copy_range) = packet_prefix_bytes {
+        let mut mode = [0_u8; 6];
+        mode[..4].copy_from_slice(&copy_range.to_be_bytes());
+        mode[4] = libc::NFULNL_COPY_PACKET as u8;
+        push_attribute(&mut attributes, libc::NFULA_CFG_MODE as u16, &mode);
+    }
+
+    let length = NETLINK_HEADER_BYTES + NFGENMSG_BYTES + attributes.len();
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(
+        &u32::try_from(length)
+            .expect("fixed NFLOG configuration message length must fit in u32")
+            .to_ne_bytes(),
+    );
+    bytes.extend_from_slice(&NFLOG_CONFIG_MESSAGE.to_ne_bytes());
+    bytes.extend_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+    bytes.extend_from_slice(&0_u32.to_ne_bytes());
+    bytes.extend_from_slice(&0_u32.to_ne_bytes());
+    bytes.push(family);
+    bytes.push(0);
+    bytes.extend_from_slice(&group.to_be_bytes());
+    bytes.extend_from_slice(&attributes);
+    bytes
+}
+
+fn push_attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    let length = NLA_HEADER_BYTES + value.len();
+    bytes.extend_from_slice(
+        &u16::try_from(length)
+            .expect("fixed NFLOG configuration attribute length must fit in u16")
+            .to_ne_bytes(),
+    );
+    bytes.extend_from_slice(&kind.to_ne_bytes());
+    bytes.extend_from_slice(value);
+    bytes.resize(bytes.len() + align_to_4(length) - length, 0);
+}
+
+fn align_to_4(length: usize) -> usize {
+    (length + 3) & !3
 }
 
 fn send_config_and_wait_for_ack(socket: &Socket, bytes: &[u8]) -> Result<(), NflogError> {
@@ -298,5 +360,62 @@ mod tests {
                 .code,
             "nflog_payload_prefix_too_large"
         );
+    }
+
+    #[test]
+    fn renders_fixed_kernel_nflog_configuration_requests() {
+        assert_eq!(
+            config_request(
+                libc::AF_INET as u8,
+                0,
+                libc::NFULNL_CFG_CMD_PF_BIND as u8,
+                None,
+            ),
+            [
+                0x1c, 0x00, 0x00, 0x00, 0x01, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            config_request(
+                libc::AF_INET6 as u8,
+                0,
+                libc::NFULNL_CFG_CMD_PF_BIND as u8,
+                None,
+            ),
+            [
+                0x1c, 0x00, 0x00, 0x00, 0x01, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            config_request(
+                libc::AF_UNSPEC as u8,
+                NFLOG_GROUP,
+                libc::NFULNL_CFG_CMD_BIND as u8,
+                Some(NFLOG_PACKET_PREFIX_BYTES),
+            ),
+            [
+                0x28, 0x00, 0x00, 0x00, 0x01, 0x04, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x10, 0x92, 0x05, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+                0x0a, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x40, 0x02, 0x00, 0x00, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn aligns_kernel_nflog_configuration_attributes() {
+        let mut bytes = Vec::new();
+        push_attribute(&mut bytes, libc::NFULA_CFG_CMD as u16, &[1]);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[5..], &[0, 0, 0]);
+
+        push_attribute(
+            &mut bytes,
+            libc::NFULA_CFG_MODE as u16,
+            &[0, 0, 0, 64, libc::NFULNL_COPY_PACKET as u8, 0],
+        );
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[18..], &[0, 0]);
     }
 }
