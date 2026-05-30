@@ -645,9 +645,13 @@ fn sha256_bounded_file(path: &Path) -> Result<String, LockdownError> {
 fn read_bounded_policy_file(path: &Path) -> Result<Vec<u8>, LockdownError> {
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| unsupported_fingerprint())?;
+    let metadata = file.metadata().map_err(|_| unsupported_fingerprint())?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_POLICY_SOURCE_BYTES {
+        return Err(unsupported_fingerprint());
+    }
     let mut bytes = Vec::new();
     file.take(MAX_POLICY_SOURCE_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -978,6 +982,13 @@ mod tests {
         fs::write(&oversized, vec![b'x'; MAX_POLICY_SOURCE_BYTES as usize + 1]).unwrap();
         assert_eq!(
             sha256_bounded_file(&oversized).unwrap_err().code,
+            "unsupported_host_fingerprint"
+        );
+
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            sha256_bounded_file(&directory).unwrap_err().code,
             "unsupported_host_fingerprint"
         );
         fs::remove_dir_all(root).unwrap();

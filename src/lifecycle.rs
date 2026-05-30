@@ -9,13 +9,15 @@ use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const RESIDENT_VERIFICATION_INTERVAL: Duration = Duration::from_secs(5);
 pub const PRODUCTION_SERVICE_PREFIX: &str = "fence-";
 const FINDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CRITICAL_FINDINGS: usize = 64;
+const SYSTEMD_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LifecycleError {
@@ -414,11 +416,38 @@ fn production_effective_uid() -> Result<u32, LifecycleError> {
 }
 
 fn query_service_main_pid(unit_name: &str) -> Result<Option<u32>, LifecycleError> {
-    let output = Command::new("/usr/bin/systemctl")
+    let mut child = Command::new("/usr/bin/systemctl")
         .args(["show", "--property=MainPID", "--value", unit_name])
         .env_clear()
         .env("LC_ALL", "C")
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| LifecycleError::new("systemd_query_failed", error.to_string()))?;
+    let deadline = Instant::now() + SYSTEMD_QUERY_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(LifecycleError::new(
+                    "systemd_query_timeout",
+                    "resident service identity query exceeded its deadline",
+                ));
+            }
+            Err(error) => {
+                return Err(LifecycleError::new(
+                    "systemd_query_failed",
+                    error.to_string(),
+                ));
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|error| LifecycleError::new("systemd_query_failed", error.to_string()))?;
     if !output.status.success() || output.stdout.len() > 64 {
         return Err(LifecycleError::new(
@@ -446,6 +475,7 @@ fn valid_test_service_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && !slug.starts_with('-')
         && !slug.ends_with('-')
+        && !slug.as_bytes().windows(2).any(|pair| pair == b"--")
 }
 
 fn production_service_name(invocation_id: &str) -> Result<String, LifecycleError> {
@@ -468,6 +498,7 @@ fn valid_service_slug(value: &str, maximum_length: usize) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && !value.starts_with('-')
         && !value.ends_with('-')
+        && !value.as_bytes().windows(2).any(|pair| pair == b"--")
 }
 
 fn validate_production_service_identity(
@@ -707,6 +738,7 @@ mod tests {
     fn bounds_critical_findings_and_checks_transient_service_identity() {
         assert!(valid_test_service_name("fence-evidence-proof-1.service"));
         assert!(!valid_test_service_name("fence.service"));
+        assert!(!valid_test_service_name("fence-evidence-proof--1.service"));
         assert!(
             validate_service_main_pid(
                 Some(12),
@@ -730,6 +762,10 @@ mod tests {
         assert_eq!(
             production_service_name("protected-run").unwrap(),
             "fence-protected-run.service"
+        );
+        assert_eq!(
+            production_service_name("protected--run").unwrap_err().code,
+            "invalid_runtime_identifier"
         );
         assert!(validate_production_service_identity("protected-run", 0, Some(12), 12).is_ok());
         assert_eq!(

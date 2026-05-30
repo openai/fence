@@ -314,6 +314,7 @@ fn valid_invocation_id(value: &str) -> bool {
         && value.len() <= 64
         && !value.starts_with('-')
         && !value.ends_with('-')
+        && !value.as_bytes().windows(2).any(|pair| pair == b"--")
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -553,7 +554,7 @@ mod tests {
         for valid in ["a", "build-012345", &"a".repeat(64)] {
             assert!(valid_invocation_id(valid));
         }
-        for invalid in ["", "-a", "a-", "A", "a_b", &"a".repeat(65)] {
+        for invalid in ["", "-a", "a-", "a--b", "A", "a_b", &"a".repeat(65)] {
             assert!(!valid_invocation_id(invalid));
         }
     }

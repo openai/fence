@@ -188,7 +188,8 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Must never become an Action runtime step.
 
 - `script/test-action-wrapper`
-  - Offline-only dependency-free Node syntax and unit checks for the Action launcher, report validation, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, report validation, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+  - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
   - Proves that an omitted Action input derives a bounded invocation identifier from GitHub run metadata and emits strict schema-`1` standard block with an empty `allowlist`.
   - The wrapper and hosted acceptance assertions require runtime-evidence schema `1` and stable profile-realization fields.
 
@@ -382,7 +383,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Preserve public API stability unless the task explicitly calls for a breaking Fence change.
 - If changing CLI output or release archive layout, update README examples.
 - Keep unsupported `run` modes fail-closed. Production readiness may be emitted only by reviewed trusted-launcher lifecycles after their mode-specific controls or observation state verify.
-- Keep the root `action.yml` wrapper thin: it must use the committed attested Linux binary, delegate policy semantics to the agent, use immutable external references in documentation, and avoid runtime agent downloads, policy fetches, service stop operations, or access restoration.
+- Keep the root `action.yml` wrapper thin: it must use dependency-free TypeScript executed by Node 24 built-in type stripping, use Node standard-library modules only, use the committed attested Linux binary, delegate policy semantics to the agent, use immutable external references in documentation, and avoid runtime agent downloads, policy fetches, service stop operations, or access restoration.
 
 ## Testing Standards
 

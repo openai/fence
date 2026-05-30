@@ -12,12 +12,13 @@ const {
   validateInlineConfig,
   validateReady,
   validateReport,
-} = require("./lib");
+} = require("./lib.cts");
 
 const ACTION_ROOT = __dirname;
 const BINARY = path.join(ACTION_ROOT, "bin", "fence");
 const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
 const READY_TIMEOUT_MS = 30 * 1000;
+const CHILD_TIMEOUT_MS = 10 * 1000;
 const POLL_INTERVAL_MS = 100;
 const CHILD_ENV = {
   LANG: "C.UTF-8",
@@ -25,18 +26,26 @@ const CHILD_ENV = {
   PATH: "/usr/bin:/usr/sbin:/bin:/sbin",
 };
 
-function emitError(error) {
+function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`::error::Fence setup failed: ${message.replace(/[\r\n%]/g, "_").slice(0, 512)}\n`);
 }
 
-function run(executable, args, input = undefined, ignoreStdout = false) {
+function run(
+  executable: string,
+  args: string[],
+  input: string | undefined = undefined,
+  ignoreStdout = false,
+  timeout = CHILD_TIMEOUT_MS,
+): void {
   const result = spawnSync(executable, args, {
     encoding: "utf8",
     env: CHILD_ENV,
     input,
+    killSignal: "SIGKILL",
     maxBuffer: 64 * 1024,
     stdio: ignoreStdout ? ["pipe", "ignore", "pipe"] : ["pipe", "pipe", "pipe"],
+    timeout,
   });
   if (result.error) {
     throw result.error;
@@ -47,18 +56,18 @@ function run(executable, args, input = undefined, ignoreStdout = false) {
   }
 }
 
-function sleep(milliseconds) {
+function sleep(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
-function assertRootDirectory(directory) {
+function assertRootDirectory(directory: string): void {
   const stat = fs.lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== 0 || (stat.mode & 0o777) !== 0o755) {
     throw new Error(`unsafe root-owned runtime directory: ${directory}`);
   }
 }
 
-function appendState(name, value) {
+function appendState(name: string, value: string): void {
   const state = process.env.GITHUB_STATE;
   if (!state) {
     throw new Error("GITHUB_STATE is required");
@@ -66,7 +75,7 @@ function appendState(name, value) {
   fs.appendFileSync(state, `${name}=${value}\n`, { encoding: "utf8" });
 }
 
-function appendSummary(report) {
+function appendSummary(report: any): void {
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report).join("\n"), {
       encoding: "utf8",
@@ -74,7 +83,7 @@ function appendSummary(report) {
   }
 }
 
-function waitForReady(paths) {
+function waitForReady(paths: { ready: string; report: string }): any {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (fs.existsSync(paths.ready) && fs.existsSync(paths.report)) {
@@ -91,7 +100,7 @@ function waitForReady(paths) {
   throw new Error("Fence readiness was not emitted before the timeout");
 }
 
-function main() {
+function main(): void {
   if (process.platform !== "linux" || process.arch !== "x64") {
     throw new Error("Fence Action supports only Linux x64");
   }
@@ -128,9 +137,13 @@ function main() {
   process.stdout.write("Fence readiness verified; resident controls remain active until runner teardown.\n");
 }
 
-try {
-  main();
-} catch (error) {
-  emitError(error);
-  process.exitCode = 1;
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    emitError(error);
+    process.exitCode = 1;
+  }
 }
+
+module.exports = { main, run };

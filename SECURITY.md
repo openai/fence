@@ -60,6 +60,8 @@ The published Fence agent target is limited to `x86_64-unknown-linux-gnu` on
 GitHub-hosted `ubuntu-24.04` x64 after its documented security assertions are
 proved. Release publication, Action-bundle refresh, artifact upload/download,
 and attestation verification are intentionally GitHub-networked operations.
+The current public review notes and residual boundaries are recorded in
+[`docs/security-review.md`](docs/security-review.md).
 
 ## Reporting Vulnerabilities
 

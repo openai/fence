@@ -42,7 +42,7 @@ fi
 INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"action-tamper","allowlist":[]}' \
   GITHUB_STATE="$state" \
   GITHUB_STEP_SUMMARY="$summary" \
-  node action/main.js
+  node action/main.cts
 
 grep -Fxq "invocation_id=$invocation" "$state"
 grep -Fxq "report_path=$report" "$state"
@@ -73,7 +73,7 @@ sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.s
 if STATE_invocation_id="$invocation" \
   STATE_report_path="$report" \
   GITHUB_STEP_SUMMARY="$summary" \
-  node action/post.js >"$post_stdout" 2>"$post_stderr"; then
+  node action/post.cts >"$post_stdout" 2>"$post_stderr"; then
   die "Action post hook unexpectedly accepted critical resident drift"
 fi
 grep -q "Fence report contains critical resident findings" "$post_stderr"

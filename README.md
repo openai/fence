@@ -246,7 +246,10 @@ prerelease and stable release channels. The wrapper requires runtime evidence
 schema `1`. With no inputs, it creates a strict standard-block configuration
 with an empty `allowlist` and a bounded invocation identifier derived from
 GitHub run metadata. An optional inline strict-JSON configuration overrides
-that default for reviewed advanced use. The wrapper writes the selected bytes
+that default for reviewed advanced use. The wrapper is dependency-free
+TypeScript executed directly by Node 24's built-in type stripping and uses
+only Node standard-library modules; it does not install Node packages. The
+wrapper writes the selected bytes
 into the pinned root-owned runtime path, launches
 the trusted transient service, waits for agent readiness, and renders bounded
 local evidence from its post hook. It does not download an agent, fetch policy,

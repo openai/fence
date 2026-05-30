@@ -6,8 +6,5 @@ source script/env "$@"
 
 require_cmd node
 
-node --check action/lib.js
-node --check action/main.js
-node --check action/post.js
-node --check action/test.js
-node action/test.js
+node -e 'require("./action/lib.cts"); require("./action/main.cts"); require("./action/post.cts")'
+node --test action/test.cts

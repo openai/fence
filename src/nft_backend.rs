@@ -212,10 +212,12 @@ fn run_process_bounded(
         .stdin
         .take()
         .ok_or_else(|| BackendError::new("nft_stdin_failed", "failed to open nft stdin"))?;
-    stdin.write_all(input).map_err(|error| {
-        BackendError::new("nft_stdin_failed", bounded_message(&error.to_string()))
-    })?;
-    drop(stdin);
+    let input = input.to_vec();
+    let stdin_writer = thread::spawn(move || {
+        stdin.write_all(&input)?;
+        drop(stdin);
+        Ok::<(), std::io::Error>(())
+    });
 
     let stdout = child
         .stdout
@@ -238,6 +240,7 @@ fn run_process_bounded(
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdin_writer.join();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(BackendError::new(
@@ -248,6 +251,12 @@ fn run_process_bounded(
         thread::sleep(Duration::from_millis(5));
     };
 
+    stdin_writer
+        .join()
+        .map_err(|_| BackendError::new("nft_stdin_failed", "nft stdin writer failed"))?
+        .map_err(|error| {
+            BackendError::new("nft_stdin_failed", bounded_message(&error.to_string()))
+        })?;
     let stdout = stdout_reader
         .join()
         .map_err(|_| BackendError::new("nft_stdout_failed", "nft stdout reader failed"))?
@@ -1352,6 +1361,16 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(timeout.code, "nft_command_timeout");
+
+        let blocked_stdin_timeout = run_process_bounded(
+            Path::new("/bin/sleep"),
+            &["1"],
+            &vec![b'x'; 1024 * 1024],
+            Duration::from_millis(1),
+            32,
+        )
+        .unwrap_err();
+        assert_eq!(blocked_stdin_timeout.code, "nft_command_timeout");
 
         let missing = run_process_bounded(
             Path::new("/missing/fence-command"),

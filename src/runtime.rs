@@ -296,7 +296,8 @@ fn validate_slug(value: &str) -> Result<(), RuntimeError> {
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && !value.starts_with('-')
-        && !value.ends_with('-');
+        && !value.ends_with('-')
+        && !value.as_bytes().windows(2).any(|pair| pair == b"--");
     if valid {
         Ok(())
     } else {
@@ -456,6 +457,12 @@ mod tests {
         );
         assert_eq!(
             TestRuntimeStore::create(Path::new("target/tmp/runtime-bad"), "../bad")
+                .unwrap_err()
+                .code,
+            "invalid_runtime_identifier"
+        );
+        assert_eq!(
+            TestRuntimeStore::create(Path::new("target/tmp/runtime-bad"), "bad--slug")
                 .unwrap_err()
                 .code,
             "invalid_runtime_identifier"
