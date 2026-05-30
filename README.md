@@ -12,7 +12,7 @@ against undeclared outbound network access and ordinary runner-privilege
 bypass paths. The v0 enforcement target is a GitHub-hosted `ubuntu-24.04` x64
 runner executing a native Linux GNU binary.
 
-Fence is stabilizing its first v0 Linux x64 release. The current v0
+Fence publishes a stable v0 Linux x64 release. The current v0
 executable strictly validates local JSON policy, renders a frozen policy and
 deterministic native `nftables` ruleset preview, and models the selected
 bounded DNS-mediated hosted job-status compatibility descriptor. On supported
@@ -65,8 +65,9 @@ compatibility boundary.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The current
-`0.1.0-alpha.3` publication remains limited to the Linux x64 agent artifact,
-and the root Action bundles that attested binary without runtime downloads.
+`0.1.0` publication remains limited to the Linux x64 agent artifact. The root
+Action remains pinned to the soaked `0.1.0-alpha.3` binary until the follow-up
+stable-bundle refresh, without runtime downloads.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -262,10 +263,11 @@ floating branch:
 
 The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
 to `main` established a baseline without publishing a release. The current
-`0.1.0-alpha.2` release was the first usable Linux x64 alpha publication. The
-current `0.1.0-alpha.3` prerelease is the final soak candidate before stable
-`0.1.0`. Future deliberate version bumps merged to `main` remain release
-triggers.
+`0.1.0-alpha.2` release was the first usable Linux x64 alpha publication.
+The `0.1.0-alpha.3` prerelease completed the final soak before the current
+stable `0.1.0` publication. Refreshing the root Action from that attested
+stable release is the next publication step. Future deliberate version bumps
+merged to `main` remain release triggers.
 
 The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
 and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its
