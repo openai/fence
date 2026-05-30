@@ -65,7 +65,7 @@ compatibility boundary.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The current
-`0.1.0-alpha.2` publication remains limited to the Linux x64 agent artifact,
+`0.1.0-alpha.3` publication remains limited to the Linux x64 agent artifact,
 and the root Action bundles that attested binary without runtime downloads.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
@@ -242,10 +242,8 @@ Production `state.json`, `ready.json`, and `report.json` documents carry
 
 The root `action.yml` wrapper carries an exact, checksum-validated copy of an
 attested Linux release binary. Its schema-`2` manifest distinguishes immutable
-prerelease and stable release channels. While the committed bundle remains
-`v0.1.0-alpha.2`, the wrapper accepts that immutable binary's legacy evidence
-field names through a release-tag-bound bridge. Later bundles require runtime
-evidence schema `1`. The wrapper accepts one inline strict-JSON configuration,
+prerelease and stable release channels. The wrapper requires runtime evidence
+schema `1`. It accepts one inline strict-JSON configuration,
 writes the untouched bytes into the pinned root-owned runtime path, launches
 the trusted transient service, waits for agent readiness, and renders bounded
 local evidence from its post hook. It does not download an agent, fetch policy,
@@ -264,10 +262,10 @@ floating branch:
 
 The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
 to `main` established a baseline without publishing a release. The current
-`0.1.0-alpha.2` release is the first usable Linux x64 alpha publication. The
-next publication sequence is a final `0.1.0-alpha.3` prerelease soak followed
-by stable `0.1.0`. Future deliberate version bumps merged to `main` remain
-release triggers.
+`0.1.0-alpha.2` release was the first usable Linux x64 alpha publication. The
+current `0.1.0-alpha.3` prerelease is the final soak candidate before stable
+`0.1.0`. Future deliberate version bumps merged to `main` remain release
+triggers.
 
 The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
 and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its
