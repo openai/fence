@@ -26,11 +26,10 @@ function main() {
   if (!invocationId || runtimePaths(invocationId).report !== reportPath) {
     throw new Error("Fence post-job report path is missing or invalid");
   }
-  const manifest = validateBundle(MANIFEST, BINARY);
+  validateBundle(MANIFEST, BINARY);
   const report = validateReport(
     readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
     true,
-    manifest,
   );
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report).join("\n"), {

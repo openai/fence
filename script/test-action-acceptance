@@ -48,7 +48,8 @@ report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-legacy_alpha2 = manifest["schema_version"] == 2 and manifest["release_tag"] == "v0.1.0-alpha.2"
+assert manifest["schema_version"] == 2, manifest
+assert manifest["release_tag"] == "v0.1.0-alpha.3", manifest
 assert report["mode"] == mode, report
 assert report["status"] == status, report
 assert report["setup_status"] == resident, report
@@ -60,20 +61,15 @@ assert report["network_verification_status"] == "verified", report
 assert report["critical_findings"] == [], report
 assert ready["status"] == readiness, ready
 assert dns["routing_status"] == "active", dns
-if legacy_alpha2:
-    assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
-    assert ready["selected_platform_profile_id"] == "github_hosted_job_status_v1", ready
-    assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1", dns
-else:
-    assert report["runtime_evidence_schema_version"] == 1, report
-    assert report["platform_profile_id"] == "github_hosted_job_status_v1", report
-    assert report["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", report
-    assert ready["runtime_evidence_schema_version"] == 1, ready
-    assert ready["platform_profile_id"] == "github_hosted_job_status_v1", ready
-    assert ready["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", ready
-    assert dns["runtime_evidence_schema_version"] == 1, dns
-    assert dns["platform_profile_id"] == "github_hosted_job_status_v1", dns
-    assert dns["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", dns
+assert report["runtime_evidence_schema_version"] == 1, report
+assert report["platform_profile_id"] == "github_hosted_job_status_v1", report
+assert report["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", report
+assert ready["runtime_evidence_schema_version"] == 1, ready
+assert ready["platform_profile_id"] == "github_hosted_job_status_v1", ready
+assert ready["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", ready
+assert dns["runtime_evidence_schema_version"] == 1, dns
+assert dns["platform_profile_id"] == "github_hosted_job_status_v1", dns
+assert dns["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", dns
 PY
 
 case "$scenario" in
