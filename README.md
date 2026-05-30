@@ -7,12 +7,12 @@
 [![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
-Fence is an early-stage, source-auditable Rust project for hardening supported
-CI runners against undeclared outbound network access and ordinary
-runner-privilege bypass paths. The intended first enforcement target is a
-GitHub-hosted `ubuntu-24.04` x64 runner executing a native Linux GNU binary.
+Fence is a source-auditable Rust project for hardening supported CI runners
+against undeclared outbound network access and ordinary runner-privilege
+bypass paths. The v0 enforcement target is a GitHub-hosted `ubuntu-24.04` x64
+runner executing a native Linux GNU binary.
 
-Fence is publishing its first Linux x64 alpha prerelease. The current Phase 4
+Fence is stabilizing its first v0 Linux x64 release. The current v0
 executable strictly validates local JSON policy, renders a frozen policy and
 deterministic native `nftables` ruleset preview, and models the selected
 bounded DNS-mediated hosted job-status compatibility descriptor. On supported
@@ -64,7 +64,7 @@ artifact storage, and repository API traffic are not included in the default
 compatibility boundary.
 
 Pull requests also build a Linux x64 package independently and execute that
-artifact through the trusted-launcher JSON CLI boundary. The
+artifact through the trusted-launcher JSON CLI boundary. The current
 `0.1.0-alpha.2` publication remains limited to the Linux x64 agent artifact,
 and the root Action bundles that attested binary without runtime downloads.
 
@@ -183,7 +183,7 @@ after six terminal-success proofs. That worker plans the selected
 DNS-mediated host blocking and measured sudo/container lockdown, and retains
 only test-only readiness and reports below a non-production runtime root.
 
-## Phase 4 Evidence Boundary
+## v0 Evidence Boundary
 
 The current binary emits versioned JSON only. `render-plan` includes the fixed
 `inet fence_v0` base-ruleset preview, policy hash schema version `3`, a ruleset
@@ -235,8 +235,17 @@ Docker DNS through the local root-resident mediator, and preserves sudo and
 container access. Every unsupported `platform_profile` value is rejected before
 mutation.
 
-The root `action.yml` wrapper carries an exact, checksum-validated copy of the
-attested Linux alpha binary. It accepts one inline strict-JSON configuration,
+Production `state.json`, `ready.json`, and `report.json` documents carry
+`runtime_evidence_schema_version: 1`, the logical
+`github_hosted_job_status_v1` profile identifier, and the stable
+`github_hosted_job_status_dns_mediation_v1` realization identifier.
+
+The root `action.yml` wrapper carries an exact, checksum-validated copy of an
+attested Linux release binary. Its schema-`2` manifest distinguishes immutable
+prerelease and stable release channels. While the committed bundle remains
+`v0.1.0-alpha.2`, the wrapper accepts that immutable binary's legacy evidence
+field names through a release-tag-bound bridge. Later bundles require runtime
+evidence schema `1`. The wrapper accepts one inline strict-JSON configuration,
 writes the untouched bytes into the pinned root-owned runtime path, launches
 the trusted transient service, waits for agent readiness, and renders bounded
 local evidence from its post hook. It does not download an agent, fetch policy,
@@ -255,18 +264,25 @@ floating branch:
 
 The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
 to `main` established a baseline without publishing a release. The current
-`0.1.0-alpha.2` version bump is the first usable Linux x64 alpha publication
-trigger.
-Future deliberate version bumps merged to `main` remain release triggers.
+`0.1.0-alpha.2` release is the first usable Linux x64 alpha publication. The
+next publication sequence is a final `0.1.0-alpha.3` prerelease soak followed
+by stable `0.1.0`. Future deliberate version bumps merged to `main` remain
+release triggers.
 
-The first publishable agent artifact is limited to
-`x86_64-unknown-linux-gnu` and must be proved on GitHub-hosted
-`ubuntu-24.04` x64 before release. Its narrow CLI package contains the binary
-and provenance/checksum assets, not generated shell completion or man-page
-artifacts. Portable validation and retained cross-build tooling may continue
-to run on other prepared hosts, but do not establish protected platform
-support. Publication, artifact attestations, and verification remain
-GitHub-networked operations by design.
+The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
+and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its
+narrow CLI package contains the binary and provenance/checksum assets, not
+generated shell completion or man-page artifacts. Portable validation and
+retained cross-build tooling may continue to run on other prepared hosts, but
+do not establish protected platform support. Publication, artifact
+attestations, and verification remain GitHub-networked operations by design.
+
+## Post-v0 Hardening
+
+Stable v0 does not end supply-chain hardening work. Follow-up releases should
+add a checksum-bound release SBOM, evaluate `cargo-vet`, evaluate auditable or
+reproducible binary comparison, and review whether the bounded Actions-suffix
+profile can be narrowed further without stranding hosted job completion.
 
 ## Security
 

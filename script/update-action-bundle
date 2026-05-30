@@ -5,7 +5,7 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -ne 1 ]]; then
-  die "usage: script/update-action-bundle <vX.Y.Z-alpha.N>"
+  die "usage: script/update-action-bundle <vX.Y.Z[-prerelease]>"
 fi
 
 tag="$1"
@@ -15,8 +15,12 @@ artifact="fence_${tag}_linux-amd64"
 manifest="$DIR/action/bundle-manifest.json"
 binary="$DIR/action/bin/fence"
 
-if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
-  die "Action bundle release must be an alpha tag such as v0.1.0-alpha.2"
+if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+  die "Action bundle release must be an immutable semver tag such as v0.1.0-alpha.3 or v0.1.0"
+fi
+release_channel="stable"
+if [[ "$tag" == *-* ]]; then
+  release_channel="prerelease"
 fi
 
 require_cmd gh
@@ -63,24 +67,27 @@ gh attestation verify \
   --deny-self-hosted-runners >/dev/null
 
 /usr/bin/install -m 0755 "$tmpdir/download/$artifact" "$binary"
-python3 - "$tmpdir/release.json" "$manifest" "$repository" "$signer_workflow" "$artifact" "$actual_sha256" <<'PY'
+python3 - "$tmpdir/release.json" "$manifest" "$repository" "$signer_workflow" "$artifact" "$actual_sha256" "$release_channel" <<'PY'
 import json
 import pathlib
 import re
 import sys
 
-release_path, manifest_path, repository, signer_workflow, artifact, sha256 = sys.argv[1:]
+release_path, manifest_path, repository, signer_workflow, artifact, sha256, release_channel = sys.argv[1:]
 release = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
 if release["tagName"] not in artifact:
     raise SystemExit("release tag does not match downloaded Action artifact")
-if release["isPrerelease"] is not True:
-    raise SystemExit("Action bundle release must be a prerelease")
+if release_channel not in {"prerelease", "stable"}:
+    raise SystemExit("Action bundle release channel is invalid")
+if release["isPrerelease"] is not (release_channel == "prerelease"):
+    raise SystemExit("Action bundle release channel does not match the GitHub Release")
 if not re.fullmatch(r"[0-9a-f]{40}", release["targetCommitish"]):
     raise SystemExit("Action bundle release target must be a full source commit SHA")
 manifest = {
-    "schema_version": 1,
+    "schema_version": 2,
     "repository": repository,
     "release_tag": release["tagName"],
+    "release_channel": release_channel,
     "release_url": release["url"],
     "source_commit": release["targetCommitish"],
     "artifact_name": artifact,

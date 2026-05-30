@@ -46,8 +46,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID: &str =
-    "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6";
+pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str = "github_hosted_job_status_dns_mediation_v1";
+pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
     "selected_profile_runtime_ready_no_public_activation";
@@ -142,9 +142,9 @@ impl DnsEvidenceScope {
         }
     }
 
-    fn candidate_profile_id(self) -> &'static str {
+    fn profile_realization_id(self) -> &'static str {
         let _ = self;
-        DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID
+        DNS_MEDIATED_PROFILE_REALIZATION_ID
     }
 
     fn active_routing_status(self) -> &'static str {
@@ -236,7 +236,7 @@ impl DnsMediationError {
 pub struct DnsObservation {
     pub hostname: String,
     pub query_type: String,
-    pub candidate_classification: &'static str,
+    pub profile_classification: &'static str,
     pub occurrences: u64,
     pub resolved_addresses: Vec<String>,
     pub minimum_observed_ttl_seconds: Option<u32>,
@@ -245,11 +245,12 @@ pub struct DnsObservation {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct DnsMediationEvidence {
+    pub runtime_evidence_schema_version: u32,
     pub status: &'static str,
-    pub candidate_profile_id: &'static str,
-    pub selected_platform_profile_id: Option<&'static str>,
-    pub candidate_domain_patterns: Vec<&'static str>,
-    pub candidate_hostnames: Vec<&'static str>,
+    pub profile_realization_id: &'static str,
+    pub platform_profile_id: &'static str,
+    pub authorized_domain_patterns: Vec<&'static str>,
+    pub bootstrap_hostnames: Vec<&'static str>,
     pub mode: Mode,
     pub protection_available: bool,
     pub routing_status: &'static str,
@@ -264,7 +265,7 @@ pub struct DnsMediationEvidence {
     pub derived_cname_authorizations: Vec<DnsDerivedCnameAuthorization>,
     pub derived_cname_authorizations_truncated: bool,
     pub excluded_non_github_query_count: u64,
-    pub blocked_non_candidate_query_count: u64,
+    pub blocked_non_profile_query_count: u64,
     pub limitations: Vec<&'static str>,
 }
 
@@ -287,14 +288,15 @@ pub struct DnsMaterializedHttpsAllowance {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct DnsMediatedBlockEvidence {
+    pub runtime_evidence_schema_version: u32,
     pub status: &'static str,
     pub mode: Mode,
-    pub candidate_profile_id: &'static str,
-    pub selected_platform_profile_id: &'static str,
+    pub profile_realization_id: &'static str,
+    pub platform_profile_id: &'static str,
     pub policy_hash_schema_version: u32,
     pub policy_hash: String,
     pub base_ruleset_hash: String,
-    pub candidate_hostnames: Vec<&'static str>,
+    pub bootstrap_hostnames: Vec<&'static str>,
     pub setup_status: &'static str,
     pub network_application_status: &'static str,
     pub network_verification_status: &'static str,
@@ -319,10 +321,11 @@ pub struct DnsMediatedBlockEvidence {
 
 #[derive(Debug, Serialize)]
 struct DnsMediatedBlockState<'a> {
+    runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
-    candidate_profile_id: &'static str,
-    selected_platform_profile_id: &'static str,
+    profile_realization_id: &'static str,
+    platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
     policy_hash: &'a str,
     base_ruleset_hash: &'a str,
@@ -333,10 +336,11 @@ struct DnsMediatedBlockState<'a> {
 
 #[derive(Debug, Serialize)]
 struct DnsMediatedBlockReady<'a> {
+    runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
-    candidate_profile_id: &'static str,
-    selected_platform_profile_id: &'static str,
+    profile_realization_id: &'static str,
+    platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
     policy_hash: &'a str,
     base_ruleset_hash: &'a str,
@@ -347,9 +351,11 @@ struct DnsMediatedBlockReady<'a> {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct DnsMediatedAuditEvidence {
+    pub runtime_evidence_schema_version: u32,
     pub status: &'static str,
     pub mode: Mode,
-    pub selected_platform_profile_id: &'static str,
+    pub profile_realization_id: &'static str,
+    pub platform_profile_id: &'static str,
     pub policy_hash_schema_version: u32,
     pub policy_hash: String,
     pub base_ruleset_hash: String,
@@ -372,9 +378,11 @@ pub struct DnsMediatedAuditEvidence {
 
 #[derive(Debug, Serialize)]
 struct DnsMediatedAuditState<'a> {
+    runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
-    selected_platform_profile_id: &'static str,
+    profile_realization_id: &'static str,
+    platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
     policy_hash: &'a str,
     base_ruleset_hash: &'a str,
@@ -385,9 +393,11 @@ struct DnsMediatedAuditState<'a> {
 
 #[derive(Debug, Serialize)]
 struct DnsMediatedAuditReady<'a> {
+    runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
-    selected_platform_profile_id: &'static str,
+    profile_realization_id: &'static str,
+    platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
     policy_hash: &'a str,
     base_ruleset_hash: &'a str,
@@ -401,7 +411,7 @@ struct ObservationState {
     retained: BTreeMap<(String, u16, &'static str), RetainedObservation>,
     truncated: bool,
     excluded_non_github_query_count: u64,
-    blocked_non_candidate_query_count: u64,
+    blocked_non_profile_query_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -491,9 +501,9 @@ impl ObservationRecorder {
         }
     }
 
-    fn candidate_classification(&self, hostname: &str) -> &'static str {
-        let classification = candidate_classification(self.scope, hostname);
-        if classification != "github_related_outside_candidate" {
+    fn profile_classification(&self, hostname: &str) -> &'static str {
+        let classification = profile_classification(self.scope, hostname);
+        if classification != "github_related_outside_profile" {
             classification
         } else {
             let mut authorizations = self
@@ -553,7 +563,7 @@ impl ObservationRecorder {
             .filter(|name| reportable_github_hostname(name))
             .cloned()
         {
-            let classification = self.candidate_classification(&hostname);
+            let classification = self.profile_classification(&hostname);
             let key = (hostname, query_type, classification);
             if let Some(observation) = state.retained.get_mut(&key) {
                 observation.occurrences = observation.occurrences.saturating_add(1);
@@ -573,8 +583,8 @@ impl ObservationRecorder {
                 state.excluded_non_github_query_count.saturating_add(1);
         }
         if self.scope.is_block() && !forwarded {
-            state.blocked_non_candidate_query_count =
-                state.blocked_non_candidate_query_count.saturating_add(1);
+            state.blocked_non_profile_query_count =
+                state.blocked_non_profile_query_count.saturating_add(1);
         }
         let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
@@ -602,7 +612,7 @@ impl ObservationRecorder {
         let answers = parse_dns_address_answers(packet);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         if reportable_github_hostname(&hostname) {
-            let classification = self.candidate_classification(&hostname);
+            let classification = self.profile_classification(&hostname);
             let key = (hostname, query_type, classification);
             if let Some(observation) = state.retained.get_mut(&key) {
                 retain_address_answers(observation, answers.clone());
@@ -841,9 +851,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let expected_state = expected_dns_mediated_owned_state(Mode::Audit, &plan.effective_policy);
         let mut evidence = initial_dns_audit_evidence(plan, ruleset_hash.clone());
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedAuditState {
+            runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_STATUS,
             mode: Mode::Audit,
-            selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
+            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -906,9 +918,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             return Err(runtime_error(error));
         }
         if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedAuditReady {
+            runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_READY_STATUS,
             mode: Mode::Audit,
-            selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
+            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -1075,10 +1089,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             scope,
         );
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedBlockState {
+            runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.evidence_status(),
             mode: Mode::Block,
-            candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
-            selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
+            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -1157,10 +1172,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             return Err(runtime_error(error));
         }
         if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedBlockReady {
+            runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.ready_status(),
             mode: Mode::Block,
-            candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
-            selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
+            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -1459,14 +1475,15 @@ fn initial_dns_block_evidence(
     scope: DnsBlockRuntimeScope,
 ) -> DnsMediatedBlockEvidence {
     DnsMediatedBlockEvidence {
+        runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: scope.evidence_status(),
         mode: Mode::Block,
-        candidate_profile_id: DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
-        selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
+        platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
         policy_hash_schema_version: plan.policy_hash_schema_version,
         policy_hash: plan.policy_hash.clone(),
         base_ruleset_hash: plan.ruleset_hash.clone(),
-        candidate_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
+        bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
         setup_status: "setting_up",
         network_application_status: "not_applied",
         network_verification_status: "not_verified",
@@ -1495,9 +1512,11 @@ fn initial_dns_block_evidence(
 
 fn initial_dns_audit_evidence(plan: &PlanData, ruleset_hash: String) -> DnsMediatedAuditEvidence {
     DnsMediatedAuditEvidence {
+        runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: PROTECTED_AUDIT_STATUS,
         mode: Mode::Audit,
-        selected_platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
+        platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
         policy_hash_schema_version: plan.policy_hash_schema_version,
         policy_hash: plan.policy_hash.clone(),
         base_ruleset_hash: plan.ruleset_hash.clone(),
@@ -1540,7 +1559,6 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "resolved_status_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
-        "planner_selection_does_not_activate_runtime_materialization",
     ]
 }
 
@@ -1554,14 +1572,11 @@ fn protected_audit_limitations() -> Vec<&'static str> {
         "later_workflow_code_retains_arbitrary_egress_in_audit_mode",
         "packet_prefixes_transiently_inspected_in_memory_not_serialized",
         "remote_reporting_not_implemented",
-        "strict_none_production_activation_not_implemented",
     ]
 }
 
 fn protected_block_limitations() -> Vec<&'static str> {
-    let mut limitations = protected_block_shared_limitations();
-    limitations.push("strict_none_production_activation_not_implemented");
-    limitations
+    protected_block_shared_limitations()
 }
 
 fn protected_degraded_block_limitations() -> Vec<&'static str> {
@@ -1569,7 +1584,6 @@ fn protected_degraded_block_limitations() -> Vec<&'static str> {
     limitations.extend([
         "container_control_preserved_invalidates_containment",
         "container_control_remains_available_to_later_workflow_code",
-        "strict_none_production_activation_not_implemented",
     ]);
     limitations
 }
@@ -2346,7 +2360,7 @@ fn matches_supported_block_query_type(query_type: u16) -> bool {
     matches!(query_type, 1 | 28)
 }
 
-fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
+fn profile_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
     match scope {
         DnsEvidenceScope::ProtectedHostAudit if matches_selected_profile_pattern(hostname) => {
             "matches_selected_profile_pattern"
@@ -2358,7 +2372,7 @@ fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static
         {
             "matches_selected_profile_pattern"
         }
-        _ => "github_related_outside_candidate",
+        _ => "github_related_outside_profile",
     }
 }
 
@@ -2391,11 +2405,12 @@ fn evidence_from_state_and_authorizations(
     cname_authorizations: &CnameAuthorizationState,
 ) -> DnsMediationEvidence {
     DnsMediationEvidence {
+        runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: scope.status(),
-        candidate_profile_id: scope.candidate_profile_id(),
-        selected_platform_profile_id: Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID),
-        candidate_domain_patterns: DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec(),
-        candidate_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
+        profile_realization_id: scope.profile_realization_id(),
+        platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        authorized_domain_patterns: DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec(),
+        bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
         mode: scope.mode(),
         protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
         routing_status,
@@ -2427,7 +2442,7 @@ fn evidence_from_state_and_authorizations(
                 |((hostname, query_type, classification), observation)| DnsObservation {
                     hostname: hostname.clone(),
                     query_type: query_type_name(*query_type),
-                    candidate_classification: classification,
+                    profile_classification: classification,
                     occurrences: observation.occurrences,
                     resolved_addresses: observation
                         .resolved_addresses
@@ -2459,7 +2474,7 @@ fn evidence_from_state_and_authorizations(
             .collect(),
         derived_cname_authorizations_truncated: cname_authorizations.truncated,
         excluded_non_github_query_count: state.excluded_non_github_query_count,
-        blocked_non_candidate_query_count: state.blocked_non_candidate_query_count,
+        blocked_non_profile_query_count: state.blocked_non_profile_query_count,
         limitations: match scope {
             DnsEvidenceScope::ProtectedHostAudit => protected_dns_audit_limitations(),
             DnsEvidenceScope::SelectedProfileRuntimeTest => vec![
@@ -2475,11 +2490,10 @@ fn evidence_from_state_and_authorizations(
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
                 "bootstrap_roots_refresh_every_5_seconds",
                 "https_materialization_expiry_includes_30_second_refresh_overlap",
-                "dns_answers_materialize_only_bounded_candidate_or_cname_descendant_https_addresses",
+                "dns_answers_materialize_only_bounded_profile_or_cname_descendant_https_addresses",
                 "approved_status_https_destinations_remain_egress_channels",
                 "resolved_status_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
-                "planner_selection_does_not_activate_runtime_materialization",
             ],
             DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(false),
             DnsEvidenceScope::ProtectedHostBlockDegraded => protected_dns_scope_limitations(true),
@@ -2779,7 +2793,7 @@ mod tests {
     }
 
     #[test]
-    fn blocking_scope_forwards_only_candidate_names_and_refuses_others() {
+    fn blocking_scope_forwards_only_selected_profile_names_and_refuses_others() {
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("vstoken.actions.githubusercontent.com", 1)
@@ -2803,7 +2817,7 @@ mod tests {
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.pipelines.actions.githubusercontent.com", 1,),
-            "the candidate permits only bounded dynamic names in the documented suffix class"
+            "the selected profile permits only bounded dynamic names in the documented suffix class"
         );
         assert!(
             !DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query(
@@ -2835,7 +2849,7 @@ mod tests {
     }
 
     #[test]
-    fn bounds_dynamic_actions_suffix_names_for_the_candidate_lifetime() {
+    fn bounds_dynamic_actions_suffix_names_for_the_profile_lifetime() {
         let now = Instant::now();
         let mut authorizations = CnameAuthorizationState::default();
         for index in 0..MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
@@ -3130,8 +3144,8 @@ mod tests {
         assert_eq!(evidence.status, PROTECTED_AUDIT_STATUS);
         assert_eq!(evidence.mode, Mode::Audit);
         assert_eq!(
-            evidence.selected_platform_profile_id,
-            Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID)
+            evidence.platform_profile_id,
+            GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
         );
         assert_eq!(evidence.routing_status, "active");
         assert_eq!(evidence.host_dns_routing, "local_root_resident_mediator");

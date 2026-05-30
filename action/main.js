@@ -74,13 +74,17 @@ function appendSummary(report) {
   }
 }
 
-function waitForReady(paths) {
+function waitForReady(paths, manifest) {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (fs.existsSync(paths.ready) && fs.existsSync(paths.report)) {
-      const report = validateReport(readJsonBounded(paths.report, MAX_REPORT_BYTES, "Fence report"));
+      const report = validateReport(
+        readJsonBounded(paths.report, MAX_REPORT_BYTES, "Fence report"),
+        true,
+        manifest,
+      );
       const ready = readJsonBounded(paths.ready, 64 * 1024, "Fence readiness");
-      validateReady(ready, report);
+      validateReady(ready, report, manifest);
       return report;
     }
     sleep(POLL_INTERVAL_MS);
@@ -92,7 +96,7 @@ function main() {
   if (process.platform !== "linux" || process.arch !== "x64") {
     throw new Error("Fence Action supports only Linux x64");
   }
-  validateBundle(MANIFEST, BINARY);
+  const manifest = validateBundle(MANIFEST, BINARY);
   const config = validateInlineConfig(process.env.INPUT_CONFIG);
   const paths = runtimePaths(config.invocationId);
 
@@ -120,7 +124,7 @@ function main() {
     "--config",
     paths.config,
   ]);
-  const report = waitForReady(paths);
+  const report = waitForReady(paths, manifest);
   appendSummary(report);
   process.stdout.write("Fence readiness verified; resident controls remain active until runner teardown.\n");
 }

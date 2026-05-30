@@ -2,7 +2,12 @@
 
 ## Supported Versions
 
-Fence is under initial development. Security fixes are applied to the latest `main` branch; no released security boundary should be assumed until the `ubuntu-24.04` x64 enforcement behavior in `docs/v0.md` is implemented and tested.
+Fence is stabilizing its first v0 release. Security fixes are applied to the
+latest `main` branch and the latest published prerelease. The implemented
+protection boundary is intentionally limited to GitHub-hosted `ubuntu-24.04`
+x64 host jobs as documented in `docs/v0.md`. Audit mode is observation-only,
+and `unsafe_preserve` is explicitly degraded because it retains container
+control paths. Stable `0.1.0` has not yet been published.
 
 ## Dependency Policy
 
@@ -51,11 +56,10 @@ Prepared cross-build tooling is vendored in `vendor/release-tools`:
 - `script/vendor-release-tools` is the only online refresh path for those tools.
 - Retaining these tools does not establish macOS, ARM, or other protected-agent support.
 
-The first publishable Fence agent target is limited to
-`x86_64-unknown-linux-gnu` on GitHub-hosted `ubuntu-24.04` x64 after its
-documented security assertions are proved. Release publication, artifact
-upload/download, and attestation verification are intentionally
-GitHub-networked operations.
+The published Fence agent target is limited to `x86_64-unknown-linux-gnu` on
+GitHub-hosted `ubuntu-24.04` x64 after its documented security assertions are
+proved. Release publication, Action-bundle refresh, artifact upload/download,
+and attestation verification are intentionally GitHub-networked operations.
 
 ## Reporting Vulnerabilities
 
