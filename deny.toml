@@ -1,7 +1,7 @@
 [advisories]
 yanked = "deny"
-unmaintained = "workspace"
-unsound = "workspace"
+unmaintained = "all"
+unsound = "all"
 ignore = []
 unused-ignored-advisory = "deny"
 
