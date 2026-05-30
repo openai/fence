@@ -207,6 +207,7 @@ require_pattern "$DIR/.github/workflows/build.yml" 'script/prepare-rust' "build 
 require_pattern "$DIR/.github/workflows/build.yml" 'script/build --release --targets "x86_64-unknown-linux-gnu"' "build workflow must run Linux x64 release-mode packaging"
 require_pattern "$DIR/.github/workflows/build.yml" 'script/install-zig' "build workflow must separately exercise committed retained cross-build-tool installation"
 require_pattern "$DIR/.github/workflows/build.yml" 'script/verify-release-toolchain' "build workflow must separately verify retained cross-build tools"
+require_pattern "$DIR/script/build" 'build_version="v[$][{]package_version[}]"' "build script must default local release artifact labels from the checked-out Cargo package version"
 
 require_pattern "$DIR/.github/workflows/release.yml" 'runs-on:[[:space:]]+ubuntu-24[.]04' "release workflow must run the supported Ubuntu 24.04 environment"
 require_pattern "$DIR/.github/workflows/release.yml" 'script/build --release --targets "x86_64-unknown-linux-gnu"' "release workflow must package the Linux x64 release artifact"

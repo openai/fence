@@ -121,6 +121,12 @@ if [[ -z "$package_name" ]]; then
   package_name="$REPO_NAME"
 fi
 
+package_version_line="$(first_match '^[[:space:]]*version[[:space:]]*=' "$DIR/Cargo.toml" || true)"
+package_version=""
+if [[ "$package_version_line" =~ =[[:space:]]*\"([^\"]+)\" ]]; then
+  package_version="${BASH_REMATCH[1]}"
+fi
+
 metadata=$(cargo metadata --frozen --no-deps --format-version 1 2>/dev/null || true)
 target_dir=""
 if [[ -n "$metadata" ]]; then
@@ -178,6 +184,9 @@ fi
 build_version="${BUILD_VERSION:-}"
 if [[ -z "$build_version" && -n "${GITHUB_REF_NAME:-}" ]]; then
   build_version="$GITHUB_REF_NAME"
+fi
+if [[ -z "$build_version" && -n "$package_version" ]]; then
+  build_version="v${package_version}"
 fi
 if [[ -z "$build_version" ]]; then
   build_version=$(git describe --tags --abbrev=0 2>/dev/null || true)

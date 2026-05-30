@@ -1,13 +1,13 @@
 {
-  "artifact_name": "fence_v0.1.0-alpha.3_linux-amd64",
-  "artifact_sha256": "c1ab5238aa919d71aa6901bfb0a5308bb98f494f7d893f4de3ffc0976af4f55e",
+  "artifact_name": "fence_v0.1.0_linux-amd64",
+  "artifact_sha256": "421b7220b5eb8f77105c4d7acd2012139bed5eab2deebf4e9313399b95fdbf4b",
   "attestation_verified": true,
   "bundle_path": "action/bin/fence",
-  "release_channel": "prerelease",
-  "release_tag": "v0.1.0-alpha.3",
-  "release_url": "https://github.com/GrantBirki/fence/releases/tag/v0.1.0-alpha.3",
+  "release_channel": "stable",
+  "release_tag": "v0.1.0",
+  "release_url": "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
   "repository": "GrantBirki/fence",
   "schema_version": 2,
   "signer_workflow": "GrantBirki/fence/.github/workflows/release.yml",
-  "source_commit": "b537a70635221667f3d78b49042cdc58019586b3"
+  "source_commit": "b77ce0e0641de597f957cdaa13ac16aa26369da8"
 }
