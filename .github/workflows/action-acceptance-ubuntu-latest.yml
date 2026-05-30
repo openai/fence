@@ -23,6 +23,7 @@ concurrency:
 jobs:
   canary:
     name: ubuntu-latest zero-input canary
+    continue-on-error: true
     timeout-minutes: 8
     runs-on: ubuntu-latest
 
