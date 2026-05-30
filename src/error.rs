@@ -40,11 +40,11 @@ mod tests {
     fn adds_bounded_field_context() {
         let field = ErrorDetail::new("invalid", "invalid").field("mode");
         let indexed =
-            ErrorDetail::new("invalid", "invalid").indexed_field("allowances.destination", 2);
+            ErrorDetail::new("invalid", "invalid").indexed_field("allowlist.destination", 2);
 
         assert_eq!(field.field.as_deref(), Some("mode"));
         assert_eq!(field.index, None);
-        assert_eq!(indexed.field.as_deref(), Some("allowances.destination"));
+        assert_eq!(indexed.field.as_deref(), Some("allowlist.destination"));
         assert_eq!(indexed.index, Some(2));
     }
 }

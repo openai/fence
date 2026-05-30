@@ -255,7 +255,7 @@ fn resident_service_worker() {
     let runtime_root = PathBuf::from(std::env::var_os("FENCE_RESIDENT_ROOT").unwrap());
     let unit = std::env::var("FENCE_RESIDENT_UNIT").unwrap();
     let config = format!(
-        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowances":[]}}"#
+        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowlist":[]}}"#
     );
     let plan = build_plan(parse_and_normalize(config.as_bytes()).unwrap(), &NoResolver).unwrap();
     let expected = if std::env::var_os("FENCE_RESIDENT_INJECT_PRE_READY_FAILURE").is_some() {
@@ -349,7 +349,7 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
             .contains(marker)
     );
     let planned = build_plan(
-        parse_and_normalize(br#"{"schema_version":1,"mode":"block","invocation_id":"block-output","allowances":[{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":18443},{"destination_type":"ip","destination":"192.0.2.2","protocol":"udp","port":18444},{"destination_type":"ip","destination":"2001:db8:1::2","protocol":"tcp","port":18443},{"destination_type":"ip","destination":"2001:db8:1::2","protocol":"udp","port":18444}]}"#).unwrap(),
+        parse_and_normalize(br#"{"schema_version":1,"mode":"block","invocation_id":"block-output","allowlist":[{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":18443},{"destination_type":"ip","destination":"192.0.2.2","protocol":"udp","port":18444},{"destination_type":"ip","destination":"2001:db8:1::2","protocol":"tcp","port":18443},{"destination_type":"ip","destination":"2001:db8:1::2","protocol":"udp","port":18444}]}"#).unwrap(),
         &NoResolver,
     )
     .unwrap();

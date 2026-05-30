@@ -80,7 +80,7 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     let path = config_file(
         "plan.json",
         format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowances":[{{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443}},{{"destination_type":"cidr","destination":"2001:db8::/64","protocol":"udp","port":53}}]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowlist":[{{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443}},{{"destination_type":"cidr","destination":"2001:db8::/64","protocol":"udp","port":53}}]}}"#
         )
         .as_bytes(),
     );
@@ -116,7 +116,7 @@ fn renders_default_bounded_job_status_profile_without_activation() {
     let path = config_file(
         "default-job-status-plan.json",
         format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowances":[]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowlist":[]}}"#
         )
         .as_bytes(),
     );
@@ -160,7 +160,7 @@ fn run_fails_closed_without_reading_config() {
 fn invalid_and_oversized_configs_are_structured_errors() {
     let invalid = config_file(
         "invalid.json",
-        br#"{"schema_version":1,"mode":"block","invocation_id":"bad","allowances":[],"extra":true}"#,
+        br#"{"schema_version":1,"mode":"block","invocation_id":"bad","allowlist":[],"extra":true}"#,
     );
     let oversized = config_file(
         "oversized.json",
@@ -189,7 +189,7 @@ fn retired_platform_profiles_are_structured_errors() {
         let config = config_file(
             name,
             format!(
-                r#"{{"schema_version":1,"mode":"block","invocation_id":"bad-profile","platform_profile":"{profile}","allowances":[]}}"#
+                r#"{{"schema_version":1,"mode":"block","invocation_id":"bad-profile","platform_profile":"{profile}","allowlist":[]}}"#
             )
             .as_bytes(),
         );

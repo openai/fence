@@ -65,8 +65,9 @@ compatibility boundary.
 
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The current
-`0.1.0` publication remains limited to the Linux x64 agent artifact. The root
-Action carries the attested stable `0.1.0` binary without runtime downloads.
+`0.1.1` publication remains limited to the Linux x64 agent artifact. The root
+Action continues carrying the attested stable `0.1.0` binary without runtime
+downloads until the release-bound bundle refresh lands.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -258,15 +259,21 @@ floating branch:
       {"schema_version":1,"mode":"block","invocation_id":"example-run","allowances":[]}
 ```
 
+That immutable `0.1.0` Action pin retains the original explicit configuration
+shape. The release-bound Action bundle refresh following `0.1.1` publication
+switches the default path to a zero-input standard block invocation.
+
 ## Release Baseline
 
 The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
 to `main` established a baseline without publishing a release. The current
 `0.1.0-alpha.2` release was the first usable Linux x64 alpha publication.
-The `0.1.0-alpha.3` prerelease completed the final soak before the current
-stable `0.1.0` publication. The root Action now carries that attested stable
-release. Future deliberate version bumps merged to `main` remain release
-triggers.
+The `0.1.0-alpha.3` prerelease completed the final soak before stable `0.1.0`.
+The `0.1.1` patch publication renames the direct agent configuration collection
+to `allowlist` while intentionally keeping configuration schema `1`. The root
+Action continues carrying the attested stable `0.1.0` binary until the
+release-bound bundle refresh lands. Future deliberate version bumps merged to
+`main` remain release triggers.
 
 The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
 and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its

@@ -67,7 +67,7 @@ document = {
     "schema_version": 1,
     "mode": "audit" if scenario == "audit" else "block",
     "invocation_id": invocation_id,
-    "allowances": [],
+    "allowlist": [],
 }
 if scenario == "standard":
     document["container_policy"] = "disable"

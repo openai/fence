@@ -1443,7 +1443,7 @@ pub fn run_selected_profile_runtime_test_service(
     {
         return Err(DnsMediationError::new(
             "invalid_selected_profile_runtime_policy",
-            "DNS-mediated block evidence accepts only standard block with the reviewed hosted job-status profile and no user allowances",
+            "DNS-mediated block evidence accepts only standard block with the reviewed hosted job-status profile and no user allowlist entries",
         ));
     }
     let runtime =
