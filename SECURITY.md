@@ -2,12 +2,12 @@
 
 ## Supported Versions
 
-Fence is stabilizing its first v0 release. Security fixes are applied to the
-latest `main` branch and the latest published prerelease. The implemented
+Fence publishes a stable v0 release. Security fixes are applied to the
+latest `main` branch and the latest published stable release. The implemented
 protection boundary is intentionally limited to GitHub-hosted `ubuntu-24.04`
 x64 host jobs as documented in `docs/v0.md`. Audit mode is observation-only,
 and `unsafe_preserve` is explicitly degraded because it retains container
-control paths. Stable `0.1.0` has not yet been published.
+control paths. Stable `0.1.0` is the current supported agent publication.
 
 ## Dependency Policy
 
