@@ -31,6 +31,7 @@ expected_keys = {
     "schema_version",
     "repository",
     "release_tag",
+    "release_channel",
     "release_url",
     "source_commit",
     "artifact_name",
@@ -41,12 +42,15 @@ expected_keys = {
 }
 if set(manifest) != expected_keys:
     raise SystemExit("Action bundle manifest fields do not match the reviewed schema")
-if manifest["schema_version"] != 1:
-    raise SystemExit("Action bundle manifest schema_version must be 1")
+if manifest["schema_version"] != 2:
+    raise SystemExit("Action bundle manifest schema_version must be 2")
 if manifest["repository"] != "GrantBirki/fence":
     raise SystemExit("Action bundle manifest repository mismatch")
-if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+", manifest["release_tag"]):
-    raise SystemExit("Action bundle manifest release_tag must identify an alpha release")
+if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", manifest["release_tag"]):
+    raise SystemExit("Action bundle manifest release_tag must identify an immutable semver release")
+expected_release_channel = "prerelease" if "-" in manifest["release_tag"] else "stable"
+if manifest["release_channel"] != expected_release_channel:
+    raise SystemExit("Action bundle manifest release channel mismatch")
 if manifest["release_url"] != f"https://github.com/GrantBirki/fence/releases/tag/{manifest['release_tag']}":
     raise SystemExit("Action bundle manifest release URL mismatch")
 if not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):

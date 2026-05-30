@@ -43,7 +43,7 @@ fn version_is_json_and_does_not_claim_protection() {
 
     assert_eq!(response["command"], "version");
     assert_eq!(response["status"], "success");
-    assert_eq!(response["data"]["implementation_phase"], "phase4");
+    assert_eq!(response["data"]["implementation_phase"], "v0");
     assert_eq!(response["data"]["protection_available"], false);
 }
 
@@ -52,7 +52,7 @@ fn support_is_read_only_and_not_protective() {
     let response = success_json(&["check-support"]);
 
     assert_eq!(response["command"], "check-support");
-    assert_eq!(response["data"]["implementation_phase"], "phase4");
+    assert_eq!(response["data"]["implementation_phase"], "v0");
     assert_eq!(response["data"]["protection_available"], false);
     assert_eq!(
         response["data"]["hosted_runner_fingerprint"]["status"],

@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "fence",
-    about = "Fence phase4 hosted-runner lifecycle agent",
+    about = "Fence v0 hosted-runner lifecycle agent",
     disable_help_flag = true,
     disable_version_flag = true
 )]
@@ -218,7 +218,7 @@ mod tests {
         let support = execute_test(&["fence", "check-support"]);
 
         assert_eq!(version.exit_code, 0);
-        assert!(version.json.contains("\"implementation_phase\":\"phase4\""));
+        assert!(version.json.contains("\"implementation_phase\":\"v0\""));
         assert_eq!(support.exit_code, 0);
         assert!(support.json.contains("\"protection_available\":false"));
     }

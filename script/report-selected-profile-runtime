@@ -38,13 +38,15 @@ report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.arg
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 assert report["status"] == "selected_profile_runtime_test_only", report
+assert report["runtime_evidence_schema_version"] == 1, report
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 assert dns["status"] == "selected_profile_runtime_test_only", dns
-assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
-assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1", dns
+assert dns["runtime_evidence_schema_version"] == 1, dns
+assert report["platform_profile_id"] == "github_hosted_job_status_v1", report
+assert dns["platform_profile_id"] == "github_hosted_job_status_v1", dns
 assert report["policy_hash_schema_version"] == 3, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
@@ -55,16 +57,17 @@ observations = dns["observations"]
 derived_cname_authorizations = dns["derived_cname_authorizations"]
 summary = {
     "schema_version": 1,
+    "runtime_evidence_schema_version": report["runtime_evidence_schema_version"],
     "status": "selected_profile_runtime_late_report_test_only",
-    "candidate_profile_id": dns["candidate_profile_id"],
-    "selected_platform_profile_id": dns["selected_platform_profile_id"],
+    "profile_realization_id": dns["profile_realization_id"],
+    "platform_profile_id": dns["platform_profile_id"],
     "policy_hash_schema_version": report["policy_hash_schema_version"],
     "policy_hash": report["policy_hash"],
     "base_ruleset_hash": report["base_ruleset_hash"],
     "active_ruleset_hash": report["ruleset_hash"],
-    "candidate_hostnames": dns["candidate_hostnames"],
+    "bootstrap_hostnames": dns["bootstrap_hostnames"],
     "excluded_non_github_query_count": dns["excluded_non_github_query_count"],
-    "blocked_non_candidate_query_count": dns["blocked_non_candidate_query_count"],
+    "blocked_non_profile_query_count": dns["blocked_non_profile_query_count"],
     "network_counters": report["counters"],
     "network_findings": report["findings"][:64],
     "network_findings_truncated": report["findings_truncated"] or len(report["findings"]) > 64,

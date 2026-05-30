@@ -98,14 +98,15 @@ assert report is not None, "DNS-mediated block report was not emitted"
 assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "selected_profile_runtime_test_only"
+assert report["runtime_evidence_schema_version"] == 1
 assert report["mode"] == "block"
-assert report["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
-assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1"
+assert report["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1"
+assert report["platform_profile_id"] == "github_hosted_job_status_v1"
 assert report["policy_hash_schema_version"] == 3
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"])
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"])
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"])
-assert report["candidate_hostnames"] == [
+assert report["bootstrap_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
@@ -120,19 +121,22 @@ assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_con
 assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
 assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"
+assert ready["runtime_evidence_schema_version"] == 1
 assert ready["protection_available"] is False
-assert ready["selected_platform_profile_id"] == "github_hosted_job_status_v1"
+assert ready["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1"
+assert ready["platform_profile_id"] == "github_hosted_job_status_v1"
 assert ready["policy_hash_schema_version"] == 3
 assert ready["policy_hash"] == report["policy_hash"]
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
 assert dns["status"] == "selected_profile_runtime_test_only"
-assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
-assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1"
-assert dns["candidate_domain_patterns"] == [
+assert dns["runtime_evidence_schema_version"] == 1
+assert dns["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1"
+assert dns["platform_profile_id"] == "github_hosted_job_status_v1"
+assert dns["authorized_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
 ]
-assert dns["candidate_hostnames"] == [
+assert dns["bootstrap_hostnames"] == [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
@@ -221,7 +225,7 @@ assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
-assert dns["blocked_non_candidate_query_count"] >= 4, dns
+assert dns["blocked_non_profile_query_count"] >= 4, dns
 assert not production_path.exists()
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY

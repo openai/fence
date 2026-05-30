@@ -29,25 +29,33 @@ assert.deepEqual(runtimePaths("action-test"), {
 assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
 
 const report = {
+  runtime_evidence_schema_version: 1,
   status: "protected_host_block",
   mode: "block",
   readiness_status: "ready",
-  selected_platform_profile_id: "github_hosted_job_status_v1",
+  platform_profile_id: "github_hosted_job_status_v1",
+  profile_realization_id: "github_hosted_job_status_dns_mediation_v1",
   network_verification_status: "verified",
   setup_status: "resident_protected",
   protection_available: true,
   sudo_status: "disabled_verified",
   container_status: "disabled_verified",
+  policy_hash_schema_version: 3,
   policy_hash: "a".repeat(64),
-  ruleset_hash: "b".repeat(64),
+  base_ruleset_hash: "b".repeat(64),
+  ruleset_hash: "c".repeat(64),
   critical_findings: [],
   critical_findings_truncated: false,
 };
 validateReport(report);
 validateReady({
+  runtime_evidence_schema_version: 1,
   status: "ready",
-  selected_platform_profile_id: "github_hosted_job_status_v1",
+  platform_profile_id: "github_hosted_job_status_v1",
+  profile_realization_id: "github_hosted_job_status_dns_mediation_v1",
+  policy_hash_schema_version: report.policy_hash_schema_version,
   policy_hash: report.policy_hash,
+  base_ruleset_hash: report.base_ruleset_hash,
   ruleset_hash: report.ruleset_hash,
   protection_available: true,
 }, report);
@@ -60,6 +68,7 @@ assert.throws(
 assert.throws(() => validateReport({ ...report, network_verification_status: "critical_drift" }), /verified network state/);
 assert.throws(() => validateReport({ ...report, critical_findings_truncated: true }), /bounded critical findings/);
 assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
+assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 0 }), /profile/);
 assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-test-"));
@@ -75,14 +84,60 @@ try {
   fs.chmodSync(wrongBinary, 0o755);
   const digest = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
   fs.writeFileSync(manifest, JSON.stringify({
-    schema_version: 1,
+    schema_version: 2,
     repository: "GrantBirki/fence",
+    release_tag: "v0.1.0-alpha.2",
+    release_channel: "prerelease",
+    release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0-alpha.2",
+    source_commit: "a".repeat(40),
+    artifact_name: "fence_v0.1.0-alpha.2_linux-amd64",
     signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
     bundle_path: "action/bin/fence",
     artifact_sha256: digest,
     attestation_verified: true,
   }), "utf8");
   validateBundle(manifest, binary);
+  fs.writeFileSync(manifest, JSON.stringify({
+    schema_version: 2,
+    repository: "GrantBirki/fence",
+    release_tag: "v0.1.0",
+    release_channel: "stable",
+    release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
+    source_commit: "b".repeat(40),
+    artifact_name: "fence_v0.1.0_linux-amd64",
+    signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
+    bundle_path: "action/bin/fence",
+    artifact_sha256: digest,
+    attestation_verified: true,
+  }), "utf8");
+  validateBundle(manifest, binary);
+  fs.writeFileSync(manifest, JSON.stringify({
+    schema_version: 2,
+    repository: "GrantBirki/fence",
+    release_tag: "v0.1.0",
+    release_channel: "prerelease",
+    release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
+    source_commit: "b".repeat(40),
+    artifact_name: "fence_v0.1.0_linux-amd64",
+    signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
+    bundle_path: "action/bin/fence",
+    artifact_sha256: digest,
+    attestation_verified: true,
+  }), "utf8");
+  assert.throws(() => validateBundle(manifest, binary), /contract/);
+  fs.writeFileSync(manifest, JSON.stringify({
+    schema_version: 2,
+    repository: "GrantBirki/fence",
+    release_tag: "v0.1.0",
+    release_channel: "stable",
+    release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
+    source_commit: "b".repeat(40),
+    artifact_name: "fence_v0.1.0_linux-amd64",
+    signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
+    bundle_path: "action/bin/fence",
+    artifact_sha256: digest,
+    attestation_verified: true,
+  }), "utf8");
   fs.symlinkSync(binary, binaryLink);
   fs.symlinkSync(manifest, manifestLink);
   assert.throws(() => validateBundle(manifest, wrongBinary), /checksum/);

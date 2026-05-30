@@ -31,7 +31,7 @@ pub mod support;
 
 use serde::Serialize;
 
-pub const IMPLEMENTATION_PHASE: &str = "phase4";
+pub const IMPLEMENTATION_PHASE: &str = "v0";
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct VersionInfo {
@@ -66,7 +66,7 @@ mod tests {
 
         assert_eq!(info.name, env!("CARGO_PKG_NAME"));
         assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(info.implementation_phase, "phase4");
+        assert_eq!(info.implementation_phase, "v0");
         assert!(!info.protection_available);
     }
 }
