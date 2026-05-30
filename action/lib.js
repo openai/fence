@@ -13,6 +13,8 @@ const POLICY_HASH_SCHEMA_VERSION = 3;
 const RUNTIME_EVIDENCE_SCHEMA_VERSION = 1;
 const RELEASE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+// Remove this bounded bridge when the committed Action bundle moves past alpha.2.
+const LEGACY_EVIDENCE_RELEASE_TAG = "v0.1.0-alpha.2";
 const RUNTIME_ROOT = "/run/fence";
 const REPORT_STATUSES = new Set([
   "protected_host_block",
@@ -123,7 +125,11 @@ function validateBundle(manifestPath, binaryPath) {
   return manifest;
 }
 
-function validateReport(report, failOnCritical = true) {
+function usesLegacyEvidenceSchema(manifest) {
+  return manifest && manifest.release_tag === LEGACY_EVIDENCE_RELEASE_TAG;
+}
+
+function validateReport(report, failOnCritical = true, manifest = undefined) {
   if (report === null || Array.isArray(report) || typeof report !== "object") {
     fail("Fence report must be a JSON object");
   }
@@ -133,15 +139,20 @@ function validateReport(report, failOnCritical = true) {
   if (!READY_STATUSES.has(report.readiness_status)) {
     fail("Fence report does not contain a recognized readiness status");
   }
-  if (
-    report.runtime_evidence_schema_version !== RUNTIME_EVIDENCE_SCHEMA_VERSION ||
-    report.platform_profile_id !== PROFILE_ID ||
-    report.profile_realization_id !== PROFILE_REALIZATION_ID ||
-    report.policy_hash_schema_version !== POLICY_HASH_SCHEMA_VERSION ||
-    !SHA256.test(report.policy_hash) ||
-    !SHA256.test(report.base_ruleset_hash) ||
-    !SHA256.test(report.ruleset_hash)
-  ) {
+  const validIdentity = usesLegacyEvidenceSchema(manifest)
+    ? report.selected_platform_profile_id === PROFILE_ID &&
+      report.policy_hash_schema_version === POLICY_HASH_SCHEMA_VERSION &&
+      SHA256.test(report.policy_hash) &&
+      SHA256.test(report.base_ruleset_hash) &&
+      SHA256.test(report.ruleset_hash)
+    : report.runtime_evidence_schema_version === RUNTIME_EVIDENCE_SCHEMA_VERSION &&
+      report.platform_profile_id === PROFILE_ID &&
+      report.profile_realization_id === PROFILE_REALIZATION_ID &&
+      report.policy_hash_schema_version === POLICY_HASH_SCHEMA_VERSION &&
+      SHA256.test(report.policy_hash) &&
+      SHA256.test(report.base_ruleset_hash) &&
+      SHA256.test(report.ruleset_hash);
+  if (!validIdentity) {
     fail("Fence report does not select the reviewed hosted-runner profile");
   }
   if (!Array.isArray(report.critical_findings) || report.critical_findings_truncated !== false) {
@@ -192,23 +203,29 @@ function validateReport(report, failOnCritical = true) {
   return report;
 }
 
-function validateReady(ready, report) {
+function validateReady(ready, report, manifest = undefined) {
   if (ready === null || Array.isArray(ready) || typeof ready !== "object") {
     fail("Fence readiness must be a JSON object");
   }
   if (!READY_STATUSES.has(ready.status) || ready.status !== report.readiness_status) {
     fail("Fence readiness does not match the resident report");
   }
-  if (
-    ready.runtime_evidence_schema_version !== RUNTIME_EVIDENCE_SCHEMA_VERSION ||
-    ready.platform_profile_id !== PROFILE_ID ||
-    ready.profile_realization_id !== PROFILE_REALIZATION_ID ||
-    ready.policy_hash_schema_version !== report.policy_hash_schema_version ||
-    ready.policy_hash !== report.policy_hash ||
-    ready.base_ruleset_hash !== report.base_ruleset_hash ||
-    ready.ruleset_hash !== report.ruleset_hash ||
-    ready.protection_available !== report.protection_available
-  ) {
+  const validIdentity = usesLegacyEvidenceSchema(manifest)
+    ? ready.selected_platform_profile_id === PROFILE_ID &&
+      ready.policy_hash_schema_version === report.policy_hash_schema_version &&
+      ready.policy_hash === report.policy_hash &&
+      ready.base_ruleset_hash === report.base_ruleset_hash &&
+      ready.ruleset_hash === report.ruleset_hash &&
+      ready.protection_available === report.protection_available
+    : ready.runtime_evidence_schema_version === RUNTIME_EVIDENCE_SCHEMA_VERSION &&
+      ready.platform_profile_id === PROFILE_ID &&
+      ready.profile_realization_id === PROFILE_REALIZATION_ID &&
+      ready.policy_hash_schema_version === report.policy_hash_schema_version &&
+      ready.policy_hash === report.policy_hash &&
+      ready.base_ruleset_hash === report.base_ruleset_hash &&
+      ready.ruleset_hash === report.ruleset_hash &&
+      ready.protection_available === report.protection_available;
+  if (!validIdentity) {
     fail("Fence readiness identity does not match the resident report");
   }
   return ready;
@@ -233,7 +250,7 @@ function summaryLines(report) {
     `| network verification | \`${boundedScalar(report.network_verification_status)}\` |`,
     `| sudo | \`${boundedScalar(report.sudo_status)}\` |`,
     `| containers | \`${boundedScalar(report.container_status)}\` |`,
-    `| platform profile | \`${boundedScalar(report.platform_profile_id)}\` |`,
+    `| platform profile | \`${boundedScalar(report.platform_profile_id || report.selected_platform_profile_id)}\` |`,
     `| critical findings | \`${report.critical_findings.length}\` |`,
     "",
     "Fence remains resident until ephemeral runner teardown. This summary does not restore access.",

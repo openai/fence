@@ -242,13 +242,16 @@ Production `state.json`, `ready.json`, and `report.json` documents carry
 
 The root `action.yml` wrapper carries an exact, checksum-validated copy of an
 attested Linux release binary. Its schema-`2` manifest distinguishes immutable
-prerelease and stable release channels. The wrapper accepts one inline
-strict-JSON configuration, writes the untouched bytes into the pinned
-root-owned runtime path, launches the trusted transient service, waits for
-agent readiness, and renders bounded local evidence from its post hook. It
-does not download an agent, fetch policy, stop the resident service, or restore
-access at workflow runtime. External consumers should pin Fence to a full
-immutable commit SHA rather than a floating branch:
+prerelease and stable release channels. While the committed bundle remains
+`v0.1.0-alpha.2`, the wrapper accepts that immutable binary's legacy evidence
+field names through a release-tag-bound bridge. Later bundles require runtime
+evidence schema `1`. The wrapper accepts one inline strict-JSON configuration,
+writes the untouched bytes into the pinned root-owned runtime path, launches
+the trusted transient service, waits for agent readiness, and renders bounded
+local evidence from its post hook. It does not download an agent, fetch policy,
+stop the resident service, or restore access at workflow runtime. External
+consumers should pin Fence to a full immutable commit SHA rather than a
+floating branch:
 
 ```yaml
 - uses: GrantBirki/fence@<full-commit-sha>

@@ -1,13 +1,19 @@
 "use strict";
 
 const fs = require("node:fs");
+const path = require("node:path");
 const {
   MAX_REPORT_BYTES,
   readJsonBounded,
   runtimePaths,
   summaryLines,
+  validateBundle,
   validateReport,
 } = require("./lib");
+
+const ACTION_ROOT = __dirname;
+const BINARY = path.join(ACTION_ROOT, "bin", "fence");
+const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
 
 function emitError(error) {
   const message = error instanceof Error ? error.message : String(error);
@@ -20,7 +26,12 @@ function main() {
   if (!invocationId || runtimePaths(invocationId).report !== reportPath) {
     throw new Error("Fence post-job report path is missing or invalid");
   }
-  const report = validateReport(readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"));
+  const manifest = validateBundle(MANIFEST, BINARY);
+  const report = validateReport(
+    readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
+    true,
+    manifest,
+  );
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report).join("\n"), {
       encoding: "utf8",
