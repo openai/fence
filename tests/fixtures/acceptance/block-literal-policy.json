@@ -2,7 +2,6 @@
   "schema_version": 1,
   "mode": "block",
   "invocation_id": "package-acceptance",
-  "platform_profile": "none",
   "container_policy": "disable",
   "allowances": [
     {

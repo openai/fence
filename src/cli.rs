@@ -271,51 +271,41 @@ mod tests {
     }
 
     #[test]
-    fn render_plan_exposes_explicit_https_udp_dns_candidate_without_activation() {
+    fn render_plan_rejects_retired_platform_profiles() {
         let root = std::path::Path::new("target/tmp/cli-unit-tests");
         std::fs::create_dir_all(root).unwrap();
-        let config = root.join("broad-compatibility-profile.json");
-        std::fs::write(
-            &config,
-            br#"{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"github_hosted_https_udp_dns_candidate_v1","allowances":[]}"#,
-        )
-        .unwrap();
+        for (name, profile) in [
+            ("none-profile.json", "none"),
+            (
+                "broad-compatibility-profile.json",
+                "github_hosted_https_udp_dns_candidate_v1",
+            ),
+        ] {
+            let config = root.join(name);
+            std::fs::write(
+                &config,
+                format!(
+                    r#"{{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"{profile}","allowances":[]}}"#
+                ),
+            )
+            .unwrap();
 
-        let output = execute(
-            ["fence", "render-plan", "--config", config.to_str().unwrap()]
-                .into_iter()
-                .map(OsString::from)
-                .collect(),
-            &FailResolver,
-            &LinuxProvider,
-        );
+            let output = execute(
+                ["fence", "render-plan", "--config", config.to_str().unwrap()]
+                    .into_iter()
+                    .map(OsString::from)
+                    .collect(),
+                &FailResolver,
+                &LinuxProvider,
+            );
 
-        assert_eq!(output.exit_code, 0);
-        assert!(
-            output
-                .json
-                .contains("\"id\":\"github_hosted_https_udp_dns_candidate_v1\"")
-        );
-        assert!(
-            output
-                .json
-                .contains("\"selection_status\":\"explicit_open_https_udp_dns_not_default\"")
-        );
-        assert!(
-            output
-                .json
-                .contains("\"candidate_permits_arbitrary_https_egress_for_baseline_only\"")
-        );
-        assert!(
-            output
-                .json
-                .contains("\"candidate_removes_tcp_dns_and_host_control_channels\"")
-        );
-        assert!(
-            output
-                .json
-                .contains("\"application_status\":\"not_applied\"")
-        );
+            assert_eq!(output.exit_code, 1);
+            assert!(
+                output
+                    .json
+                    .contains("\"code\":\"invalid_platform_profile\"")
+            );
+        }
     }
 
     #[test]

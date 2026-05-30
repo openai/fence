@@ -1,18 +1,18 @@
 #![cfg(target_os = "linux")]
 
 use fence::config::parse_and_normalize;
-use fence::dns_mediator::run_dns_mediated_host_block_candidate_test_service;
+use fence::dns_mediator::run_selected_profile_runtime_test_service;
 use fence::plan::build_plan;
 use fence::resolver::SystemResolver;
 use std::path::PathBuf;
 
 #[test]
 #[ignore = "executed as a transient service with DNS-mediated host block policy on a disposable hosted runner"]
-fn dns_mediated_host_block_candidate_worker() {
-    if std::env::var_os("FENCE_DNS_BLOCK_CANDIDATE_WORKER").is_none() {
+fn selected_profile_runtime_worker() {
+    if std::env::var_os("FENCE_SELECTED_PROFILE_RUNTIME_WORKER").is_none() {
         return;
     }
-    let invocation_id = std::env::var("FENCE_DNS_BLOCK_CANDIDATE_INVOCATION").unwrap();
+    let invocation_id = std::env::var("FENCE_SELECTED_PROFILE_RUNTIME_INVOCATION").unwrap();
     let config = format!(
         r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","container_policy":"disable","allowances":[]}}"#
     );
@@ -21,9 +21,9 @@ fn dns_mediated_host_block_candidate_worker() {
         &SystemResolver,
     )
     .unwrap();
-    run_dns_mediated_host_block_candidate_test_service(
-        &std::env::var("FENCE_DNS_BLOCK_CANDIDATE_UNIT").unwrap(),
-        &PathBuf::from(std::env::var_os("FENCE_DNS_BLOCK_CANDIDATE_ROOT").unwrap()),
+    run_selected_profile_runtime_test_service(
+        &std::env::var("FENCE_SELECTED_PROFILE_RUNTIME_UNIT").unwrap(),
+        &PathBuf::from(std::env::var_os("FENCE_SELECTED_PROFILE_RUNTIME_ROOT").unwrap()),
         &plan,
     )
     .unwrap();

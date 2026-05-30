@@ -52,17 +52,13 @@ pub enum ContainerPolicy {
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformProfile {
-    None,
     GithubHostedJobStatusV1,
-    GithubHostedHttpsUdpDnsCandidateV1,
 }
 
 impl PlatformProfile {
     pub fn id(self) -> &'static str {
         match self {
-            Self::None => "none",
             Self::GithubHostedJobStatusV1 => "github_hosted_job_status_v1",
-            Self::GithubHostedHttpsUdpDnsCandidateV1 => "github_hosted_https_udp_dns_candidate_v1",
         }
     }
 }
@@ -162,15 +158,11 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
         .as_deref()
         .unwrap_or("github_hosted_job_status_v1")
     {
-        "none" => PlatformProfile::None,
         "github_hosted_job_status_v1" => PlatformProfile::GithubHostedJobStatusV1,
-        "github_hosted_https_udp_dns_candidate_v1" => {
-            PlatformProfile::GithubHostedHttpsUdpDnsCandidateV1
-        }
         _ => {
             return Err(ErrorDetail::new(
                 "invalid_platform_profile",
-                "platform_profile must be github_hosted_job_status_v1, none, or github_hosted_https_udp_dns_candidate_v1",
+                "platform_profile must be github_hosted_job_status_v1",
             )
             .field("platform_profile"));
         }
@@ -443,25 +435,20 @@ mod tests {
     }
 
     #[test]
-    fn accepts_explicit_none_audit_without_lockdown_degraded_block_and_candidate_profile() {
-        let none = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"none-1","platform_profile":"none","allowances":[]}"#,
-        )
-        .unwrap();
+    fn accepts_explicit_selected_profile_audit_without_lockdown_and_degraded_block() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_https_udp_dns_candidate_v1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_job_status_v1","allowances":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_https_udp_dns_candidate_v1","container_policy":"unsafe_preserve","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_job_status_v1","container_policy":"unsafe_preserve","allowances":[]}"#,
         )
         .unwrap();
 
-        assert_eq!(none.platform_profile, PlatformProfile::None);
         assert_eq!(audit.container_policy, None);
         assert_eq!(
             audit.platform_profile,
-            PlatformProfile::GithubHostedHttpsUdpDnsCandidateV1
+            PlatformProfile::GithubHostedJobStatusV1
         );
         assert_eq!(
             degraded.container_policy,
@@ -469,7 +456,7 @@ mod tests {
         );
         assert_eq!(
             degraded.platform_profile,
-            PlatformProfile::GithubHostedHttpsUdpDnsCandidateV1
+            PlatformProfile::GithubHostedJobStatusV1
         );
     }
 
@@ -493,6 +480,16 @@ mod tests {
             ),
             (
                 br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"default","allowances":[]}"#
+                    .as_slice(),
+                "invalid_platform_profile",
+            ),
+            (
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"none","allowances":[]}"#
+                    .as_slice(),
+                "invalid_platform_profile",
+            ),
+            (
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"github_hosted_https_udp_dns_candidate_v1","allowances":[]}"#
                     .as_slice(),
                 "invalid_platform_profile",
             ),
