@@ -21,47 +21,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  profile-measurement:
-    name: platform profile measurement
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: validate locks
-        run: script/validate-locks --ci
-
-      - name: observe hosted runner fingerprint candidate
-        run: script/observe-hosted-runner
-
-      - name: prepare rust
-        run: script/prepare-rust
-
-      - name: bootstrap
-        run: script/bootstrap
-
-      - name: start non-blocking host audit measurement
-        run: script/measure-platform-egress start
-
-      - name: exercise GitHub metadata path under audit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api "repos/${GITHUB_REPOSITORY}" --silent
-
-      - name: exercise GitHub artifact path under audit
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
-        with:
-          name: fence-profile-measurement-${{ github.run_id }}-${{ github.run_attempt }}
-          path: tests/fixtures/acceptance/block-literal-policy.json
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: emit bounded platform-profile evidence
-        run: script/measure-platform-egress report
-
   lockdown:
     name: lockdown ${{ matrix.scenario }} evidence
     strategy:
@@ -91,32 +50,7 @@ jobs:
       - name: test lockdown evidence
         run: script/test-lockdown "${{ matrix.scenario }}"
 
-  composed:
-    name: composed lifecycle evidence
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: validate locks
-        run: script/validate-locks --ci
-
-      - name: observe hosted runner fingerprint candidate
-        run: script/observe-hosted-runner
-
-      - name: prepare rust
-        run: script/prepare-rust
-
-      - name: bootstrap
-        run: script/bootstrap
-
-      - name: test composed namespace-network and host-lockdown evidence
-        run: script/test-composed
-
-  dns-mediated-host-block:
+  selected-profile-runtime:
     name: selected profile runtime evidence
     timeout-minutes: 8
     runs-on: ubuntu-24.04
@@ -141,13 +75,13 @@ jobs:
 
       - name: run selected profile runtime evidence
         env:
-          DNS_BLOCK_CANDIDATE_REPLICA: required
-        run: script/test-dns-block-candidate
+          SELECTED_PROFILE_RUNTIME_REPLICA: required
+        run: script/test-selected-profile-runtime
 
       - name: emit bounded late selected profile evidence
         env:
-          DNS_BLOCK_CANDIDATE_REPLICA: required
-        run: script/report-dns-block-candidate
+          SELECTED_PROFILE_RUNTIME_REPLICA: required
+        run: script/report-selected-profile-runtime
 
   protected-run:
     name: protected ${{ matrix.scenario }}
@@ -181,7 +115,7 @@ jobs:
 
   integration:
     name: integration
-    needs: [lockdown, profile-measurement, composed, dns-mediated-host-block, protected-run]
+    needs: [lockdown, selected-profile-runtime, protected-run]
     runs-on: ubuntu-24.04
 
     steps:

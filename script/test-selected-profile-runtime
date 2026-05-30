@@ -5,7 +5,7 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -ne 0 ]]; then
-  die "usage: script/test-dns-block-candidate"
+  die "usage: script/test-selected-profile-runtime"
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
@@ -27,24 +27,24 @@ for required in /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/resolvectl /usr
   fi
 done
 
-suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
-invocation="dns-block-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${SELECTED_PROFILE_RUNTIME_REPLICA:-trial}"
+invocation="selected-profile-${GITHUB_RUN_ATTEMPT:-attempt}-${SELECTED_PROFILE_RUNTIME_REPLICA:-trial}"
 unit="fence-evidence-${invocation}.service"
-runtime_root="/run/fence-dns-block-candidate-${suffix}"
+runtime_root="/run/fence-selected-profile-runtime-${suffix}"
 directory="$runtime_root/$invocation"
 report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 ready="$directory/ready.json"
 production_ready="/run/fence/$invocation/ready.json"
-target_root="$RUNNER_TEMP/fence-dns-block-candidate-target"
+target_root="$RUNNER_TEMP/fence-selected-profile-runtime-target"
 
 mkdir -p "$target_root"
 export CARGO_TARGET_DIR="$target_root"
-cargo test --frozen --test dns_block_candidate --no-run
+cargo test --frozen --test selected_profile_runtime --no-run
 
 shopt -s nullglob
 test_binaries=()
-for candidate in "$target_root"/debug/deps/dns_block_candidate-*; do
+for candidate in "$target_root"/debug/deps/selected_profile_runtime-*; do
   if [[ -f "$candidate" && -x "$candidate" ]]; then
     test_binaries+=("$candidate")
   fi
@@ -68,11 +68,11 @@ sudo /usr/bin/systemd-run \
   --collect \
   --property=Type=exec \
   --unit "$unit" \
-  --setenv=FENCE_DNS_BLOCK_CANDIDATE_WORKER=1 \
-  "--setenv=FENCE_DNS_BLOCK_CANDIDATE_UNIT=$unit" \
-  "--setenv=FENCE_DNS_BLOCK_CANDIDATE_ROOT=$runtime_root" \
-  "--setenv=FENCE_DNS_BLOCK_CANDIDATE_INVOCATION=$invocation" \
-  "${test_binaries[0]}" --ignored --exact dns_mediated_host_block_candidate_worker --nocapture
+  --setenv=FENCE_SELECTED_PROFILE_RUNTIME_WORKER=1 \
+  "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_UNIT=$unit" \
+  "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_ROOT=$runtime_root" \
+  "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INVOCATION=$invocation" \
+  "${test_binaries[0]}" --ignored --exact selected_profile_runtime_worker --nocapture
 
 python3 - "$report" "$dns_report" "$ready" "$production_ready" <<'PY'
 import json
@@ -91,13 +91,13 @@ while time.monotonic() < deadline:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         dns = json.loads(dns_path.read_text(encoding="utf-8"))
         ready = json.loads(ready_path.read_text(encoding="utf-8"))
-        if report.get("setup_status") == "resident_dns_mediated_host_block_candidate_test_only":
+        if report.get("setup_status") == "resident_selected_profile_runtime_test_only":
             break
     time.sleep(0.1)
 assert report is not None, "DNS-mediated block report was not emitted"
 assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
-assert report["status"] == "dns_mediated_host_block_candidate_test_only"
+assert report["status"] == "selected_profile_runtime_test_only"
 assert report["mode"] == "block"
 assert report["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
 assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1"
@@ -119,13 +119,13 @@ assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
 assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_constrained_actions_or_cname_descendant_https_only"
 assert len(report["materialized_https_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
-assert ready["status"] == "dns_mediated_host_block_candidate_ready_no_public_activation"
+assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"
 assert ready["protection_available"] is False
 assert ready["selected_platform_profile_id"] == "github_hosted_job_status_v1"
 assert ready["policy_hash_schema_version"] == 3
 assert ready["policy_hash"] == report["policy_hash"]
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
-assert dns["status"] == "dns_mediated_host_block_candidate_test_only"
+assert dns["status"] == "selected_profile_runtime_test_only"
 assert dns["candidate_profile_id"] == "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6"
 assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1"
 assert dns["candidate_domain_patterns"] == [
@@ -156,7 +156,7 @@ assert "post_ready_codeload_traffic_is_not_authorized" in dns["limitations"]
 assert "post_ready_results_storage_traffic_is_not_authorized" in dns["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
-assert "candidate_bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
+assert "bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
 assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
@@ -168,7 +168,7 @@ assert "dns_query_timing_and_count_remain_egress_limitations" in report["limitat
 assert "post_ready_codeload_traffic_is_not_authorized" in report["limitations"]
 assert "post_ready_results_storage_traffic_is_not_authorized" in report["limitations"]
 assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
-assert "candidate_bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
+assert "bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
 assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]

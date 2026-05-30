@@ -36,132 +36,37 @@ acceptance gate proves standard, degraded, and audit activation through
 critical resident findings fail the post hook without stopping the service or
 restoring access.
 
-The hosted `integration` workflow additionally exercises native apply, verification, rollback,
-forwarded-path behavior, and bounded NFLOG connection findings in disposable
-privileged test namespaces on `ubuntu-24.04`. The event path immediately
-reduces a bounded packet prefix to approved endpoint metadata and never writes
-raw packet bytes to evidence. This is test-only proof, not a usable protection
-mode. Phase 3B extends that proof with a transient `systemd` service,
-root-owned test runtime state, test-only readiness, five-second resident
-verification, critical drift reporting, and pre-ready rollback. Phase 3C adds
-separate disposable-runner evidence for measured sudo and Docker/containerd
-lockdown, rollback, degraded container preservation, and audit preservation.
-Phase 4A begins controlled compatibility measurement by applying only
-non-blocking host audit rules on an ephemeral runner, exercising GitHub
-metadata and artifact paths, and emitting bounded endpoint evidence before
-runner teardown. A follow-up composed evidence service applies block rules
-only inside a disposable network namespace while disabling the measured host
-sudo/container paths in one transient service. Neither path emits protection
-readiness, applies blocking policy to the host network, or selects an implicit
-platform profile from observed addresses. Separate disposable-host
-finalization experiments applied the same controls with zero allowances and
-with only GitHub's documented log/summary receiver permitted; each completed
-local assertions but failed to yield a terminal successful hosted job while
-the controls remained resident. A Phase 4B experiment then permitted exactly
-the GitHub-owned pipelines and results-receiver HTTPS endpoints in three
-independent hosted jobs. All three completed their visible local steps but
-remained non-terminal past the configured five-minute observation limit, so
-that candidate was rejected as insufficient. A subsequent experiment allowing
-fixed GitHub service/results-storage hosts and measured hosted-runner
-platform DNS/host-control traffic also finished local completion steps without
-yielding a terminal job result. An intentionally open diagnostic baseline,
-`github_hosted_https_baseline_candidate_v1`, then permitted arbitrary outbound
-TCP `443` plus those measured platform channels and reached terminal success
-in three independent disposable-host jobs. A follow-up HTTPS-only reduction
-stranded one of three jobs after visible completion. A reduced non-required
-experiment using explicit
-`github_hosted_https_udp_dns_candidate_v1`: arbitrary outbound TCP `443` plus
-UDP DNS to the measured platform resolver, with TCP DNS and host-control
-allowances removed, then reached terminal success in three independent
-disposable-host jobs. It is not a candidate final allowlist: general HTTPS
-and DNS are usable by later workflow code for egress and still must be
-replaced with a constrained design before any default profile decision. It
-remains test-only and non-default.
-A separate, non-required DNS-mediated audit experiment routes host and Docker
-resolver traffic through a local test-only mediator and records only bounded
-GitHub-related queried hostnames. For those retained names only, it records
-bounded canonical answer addresses and the minimum observed DNS TTL to support
-later correlation and refresh design; it does not use those answers to add
-firewall authorization. It classifies observations against a fixed GitHub
-compatibility hypothesis consisting of
-`*.actions.githubusercontent.com`, `codeload.github.com`,
-`actions-results-receiver-production.githubapp.com`, and
-`productionresultssa*.blob.core.windows.net`. That hypothesis is not an
-accepted `platform_profile`, does not change the default policy, and must be
-proved by a later blocking terminal-completion experiment before it can
-support any protection claim. The experiment sends only a fixed non-GitHub
-DNS probe to prove host and Docker-address forwarding; that name is counted
-but not retained as platform evidence.
+The hosted `integration` workflow exercises native apply, verification,
+rollback, forwarded-path behavior, bounded NFLOG metadata, read-only hosted
+runner fingerprint observation, disposable lockdown scenarios, one
+selected-profile runtime finalization scenario, and packaged
+production-shaped standard block, degraded block, and audit services on
+`ubuntu-24.04`. The event path immediately reduces a bounded packet prefix to
+approved endpoint metadata and never writes raw packet bytes to evidence.
 
-A non-required DNS-mediated host-block experiment then pre-resolved approved
-job-status names through the local mediator, permitted upstream UDP DNS only
-from that root-resident mediator, materialized bounded TCP `443` address
-grants with DNS TTL expiry, and retained verified sudo and container lockdown
-until teardown. Its broad suffix-matched authorization reached terminal
-success on three disposable hosted runners, but remained unsuitable as a
-default because later code could encode data in permitted DNS query labels.
-A first exact-name reduction that forwarded and materialized only
-`pipelines.actions.githubusercontent.com` and
-`results-receiver.actions.githubusercontent.com` completed its visible
-steps but did not publish terminal job conclusions. GitHub's public runner
-checks also identify `vstoken.actions.githubusercontent.com` as a required
-Actions service endpoint. Adding that third name still left hosted jobs
-non-terminal. A bounded late report consistently observed the stable
-`payload.pipelines.actions.githubusercontent.com` service name and a generated
-`glb-...github.com` DNS alias. Public DNS inspection also shows that the
-pipeline roots delegate through bounded Microsoft edge aliases. Authorizing
-four exact root names plus bounded TTL-derived CNAME descendants and retaining
-their HTTPS rules for DNS TTL plus a fixed thirty-second refresh overlap still
-left three hosted jobs non-terminal after their visible completion steps.
-The compatibility-first diagnostic therefore forwarded the four
-GitHub-related DNS classes already modeled by the audit experiment, refreshed
-the four bootstrap roots every five seconds, and continued to materialize
-only TTL-bounded TCP `443` address rules. All three hosted jobs reached
-terminal success. Removing `codeload.github.com` because v0 does not support
-post-ready action downloads also reached terminal success in three hosted
-jobs. Removing the results-storage wildcard because v0 does not support
-post-ready artifact or cache storage traffic also reached terminal success in
-three hosted jobs. A further reduction replaced the remaining Actions DNS
-wildcard with the four measured bootstrap roots while retaining the exact
-GitHub app receiver compatibility name and bounded TTL-derived CNAME
-descendants, but all three hosted jobs again completed visible steps without
-publishing terminal conclusions. The retained no-storage candidate therefore
-still includes the Actions wildcard. This remains *test-only*: it neither
-selects a default `platform_profile` nor activates public protection, and the
-wildcard query-label channel is a disclosed egress limitation. The current
-follow-up replaces that unrestricted wildcard with a constrained suffix
-experiment: exact bootstrap roots remain explicit, previously unseen
-`*.actions.githubusercontent.com` names are limited to eight unique names for
-the candidate lifetime and at most two labels before the suffix, only `A` and
-`AAAA` questions are forwarded in block mode, outbound questions are rebuilt
-into a canonical lowercase form before upstream forwarding, and bounded
-TTL-derived CNAME descendants remain available. This test-only design still
-has disclosed DNS query timing and count channels, but bounds caller-controlled
-query content while testing whether GitHub-hosted job finalization remains
-compatible. A following
-workflow step emits a capped sanitized DNS summary so late DNS and network
-findings can be reviewed without changing policy. Its reported limitations
-also state that the approved DNS and HTTPS channels remain usable for egress
-and that resolved address grants may represent colocated services. Six
-disposable-host replicas across two executions reached terminal success. One
-selected-profile runtime scenario now runs behind the stable required
-`integration` aggregate so future compatibility regressions fail closed. It
-plans `github_hosted_job_status_v1` by omission, reports the schema-`3` logical
-policy hash separately from the active TTL-derived ruleset hash, and still
-emits only test-only readiness below a non-production runtime root. This
-established the evidence gate used by the trusted-launcher activation. The
-production block paths now apply the same reviewed mechanism.
-Explicit `"none"` remains available for strict no-implicit-egress planning
-but is not accepted by the production activation slice.
+Compatibility research converged on the versioned
+`github_hosted_job_status_v1` descriptor. It routes host and Docker DNS through
+a root-resident mediator, forwards canonical `A` and `AAAA` questions to the
+platform resolver, refreshes four exact bootstrap roots, accepts one exact
+GitHub app receiver compatibility name, permits at most eight previously unseen
+`*.actions.githubusercontent.com` names with at most two prefix labels, derives
+at most bounded TTL-limited CNAME authorizations, and materializes only TCP
+`443` address rules. Six disposable-host replicas across two executions
+reached terminal success, and required integration now checks the selected
+runtime path on every change. The permitted DNS timing/count, bounded query
+label, CNAME delegation, HTTPS destination, and address-plus-port channels are
+explicitly disclosed egress limitations.
+
+Omitting `platform_profile` selects `github_hosted_job_status_v1`; explicitly
+supplying that same identifier is equivalent. Fence v0 rejects every other
+profile value before mutation. Post-ready action downloads, cache traffic,
+artifact storage, and repository API traffic are not included in the default
+compatibility boundary.
 
 Pull requests also build a Linux x64 package independently and execute that
-artifact through the trusted-launcher JSON CLI boundary. The `integration`
-workflow additionally records a bounded, read-only hosted-runner fingerprint
-observation before its namespace and resident-service evidence tests, and
-runs packaged production-shaped standard block, degraded block, and audit
-observation transient services on disposable runners. The `0.1.0-alpha.2`
-publication remains limited to the Linux x64 agent artifact; it does not
-create a GitHub Action interface.
+artifact through the trusted-launcher JSON CLI boundary. The
+`0.1.0-alpha.2` publication remains limited to the Linux x64 agent artifact,
+and the root Action bundles that attested binary without runtime downloads.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -217,9 +122,10 @@ the caller provides `TMPDIR` or `RUNNER_TEMP`.
 The bootstrap imports these explicit supply-chain inputs:
 
 - `Cargo.lock` plus vendored application crates in `vendor/cache`;
-- Linux-only, exact-pinned MIT netlink crates used solely by privileged NFLOG
-  evidence tests, plus exact-pinned `libc` constants used for no-follow
-  lifecycle-evidence file opens without first-party unsafe code;
+- a Linux-only, exact-pinned MIT `netlink-sys` socket boundary, a narrow
+  first-party safe NFLOG request serializer, and exact-pinned `libc` constants
+  used for no-follow lifecycle-evidence file opens without first-party unsafe
+  code;
 - a checksum lock for the Rust distribution in
   `.cargo/tooling/rust-toolchain.lock.toml`;
 - committed Zig and `cargo-zigbuild` artifacts in `vendor/release-tools`,
@@ -270,16 +176,9 @@ artifact operations, and release publication still require network access.
 On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
 artifact's public trusted-launcher boundary separately from
 `script/observe-hosted-runner` and the privileged namespace evidence workflow.
-The `integration` workflow may intentionally exercise GitHub-hosted metadata
-and artifact services while `script/measure-platform-egress` keeps a
-non-blocking test-only audit service resident; that measurement is online
-evidence, not part of the offline developer script contract.
-It separately runs `script/test-composed`, whose block-mode network rules are
-confined to a disposable namespace while the associated host lockdown remains
-test-only evidence on an ephemeral runner.
-It also runs one disposable-host `script/test-dns-block-candidate` scenario
-through the required aggregate after six non-required terminal-success proofs.
-Despite the historical script name, that worker plans the selected
+The `integration` workflow also runs one disposable-host
+`script/test-selected-profile-runtime` scenario through the required aggregate
+after six terminal-success proofs. That worker plans the selected
 `github_hosted_job_status_v1` descriptor by omission, applies bounded
 DNS-mediated host blocking and measured sudo/container lockdown, and retains
 only test-only readiness and reports below a non-production runtime root.
@@ -308,33 +207,8 @@ the pinned root-owned configuration and invoked the binary as the root
 `MainPID` of `fence-<invocation-id>.service`. Ordinary direct invocation
 returns `trusted_launcher_required` without reading configuration. Privileged
 hosted tests may still emit explicitly test-only resident, lockdown, or
-composed evidence. Resident network measurement and composed
-namespace-network evidence may emit non-protecting test readiness. The composed
-evidence does not protect the workflow host network and cannot be used as a
-runner security control. Phase 4A host-block finalization experiments are
-recorded as negative evidence: strict zero-egress and a candidate permitting
-only the documented log/summary receiver both stranded hosted job completion.
-Phase 4B also rejected a static candidate permitting only
-`pipelines.actions.githubusercontent.com:443` and
-`results-receiver.actions.githubusercontent.com:443`: three independent jobs
-completed visible local assertions and remained non-terminal past the
-five-minute observation limit while controls were resident. These negative
-results do not activate the public agent or justify a default platform
-profile. A follow-up fixed-host candidate with measured hosted-runner
-platform DNS/host-control channels also failed to become terminal. The
-explicit `github_hosted_https_baseline_candidate_v1` diagnostic baseline
-subsequently reached terminal success in three disposable-host jobs by
-permitting arbitrary outbound TCP `443` and the measured platform channels.
-An HTTPS-only reduction then left one of three replicas non-terminal past the
-observation limit. The narrower passing non-required candidate may be
-selected explicitly as `github_hosted_https_udp_dns_candidate_v1`; it adds
-back only UDP DNS to the measured platform resolver while retaining arbitrary
-outbound TCP `443` and excluding TCP DNS and host-control paths. Its three
-replicas reached terminal success, but general HTTPS and DNS remain broad
-disclosed egress channels. It is neither a public enforcement interface nor a
-default profile.
-
-The later DNS-mediated reduction now constrains dynamic
+selected-profile runtime evidence. The selected DNS-mediated reduction
+constrains dynamic
 `*.actions.githubusercontent.com` authorization to eight unique lifetime
 names with no more than two prefix labels, canonicalizes block-mode upstream
 `A`/`AAAA` questions, and retains bounded TTL-derived CNAME descendants. Six
@@ -343,9 +217,7 @@ required `integration` aggregate now exercises one copy of this test-only
 selected-profile runtime evidence. Its DNS timing/count channel, bounded
 query-label channel, approved HTTPS destinations, CNAME delegation, and
 address-plus-port realization remain disclosed limitations. This evidence
-preceded activation of the standard production path. Explicit `"none"`
-remains the strict planning override but is not accepted for production
-activation in this slice.
+preceded activation of the standard production path.
 
 The trusted-launcher paths now make that boundary reachable from the
 Linux CLI under a narrowly validated service context. Production
@@ -360,7 +232,8 @@ standard block with disabled container access or explicit degraded
 `github_hosted_job_status_v1` descriptor. Audit accepts the same selected
 descriptor, applies only non-blocking observation rules, routes host and
 Docker DNS through the local root-resident mediator, and preserves sudo and
-container access. Strict `"none"` activation remains deferred.
+container access. Every unsupported `platform_profile` value is rejected before
+mutation.
 
 The root `action.yml` wrapper carries an exact, checksum-validated copy of the
 attested Linux alpha binary. It accepts one inline strict-JSON configuration,

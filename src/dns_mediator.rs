@@ -4,9 +4,8 @@ use crate::config::{
 use crate::error::ErrorDetail;
 use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
 use crate::lifecycle::{
-    CriticalFinding, NativeResidentNetwork, RESIDENT_VERIFICATION_INTERVAL, ResidentSession,
-    require_production_root_process, validate_production_service_context,
-    validate_test_service_context,
+    CriticalFinding, RESIDENT_VERIFICATION_INTERVAL, require_production_root_process,
+    validate_production_service_context, validate_test_service_context,
 };
 use crate::lockdown::{LockdownControl, LockdownPosture, SystemLockdownControl};
 use crate::nflog::NflogReader;
@@ -47,30 +46,22 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const DNS_MEDIATION_EVIDENCE_STATUS: &str = "dns_mediation_audit_test_only";
-pub const DNS_MEDIATED_GITHUB_CANDIDATE_ID: &str = "github_hosted_dns_mediated_candidate_v1";
 pub const DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID: &str =
     "github_hosted_dns_mediated_bounded_actions_suffix_candidate_v6";
-pub const DNS_MEDIATED_BLOCK_EVIDENCE_STATUS: &str = "dns_mediated_host_block_candidate_test_only";
-pub const DNS_MEDIATED_BLOCK_READY_STATUS: &str =
-    "dns_mediated_host_block_candidate_ready_no_public_activation";
+pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
+pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
+    "selected_profile_runtime_ready_no_public_activation";
 pub const PROTECTED_BLOCK_STATUS: &str = "protected_host_block";
 pub const PROTECTED_BLOCK_READY_STATUS: &str = "ready";
 pub const PROTECTED_DEGRADED_BLOCK_STATUS: &str = "protected_host_block_degraded";
 pub const PROTECTED_DEGRADED_BLOCK_READY_STATUS: &str = "ready_degraded";
 pub const PROTECTED_AUDIT_STATUS: &str = "protected_host_audit_observation";
 pub const PROTECTED_AUDIT_READY_STATUS: &str = "ready_observation_only";
-pub const DNS_CANDIDATE_PATTERNS: [&str; 4] = [
-    "*.actions.githubusercontent.com",
-    "codeload.github.com",
-    "actions-results-receiver-production.githubapp.com",
-    "productionresultssa*.blob.core.windows.net",
-];
-pub const DNS_BLOCK_COMPATIBILITY_PATTERNS: [&str; 2] = [
+pub const DNS_MEDIATED_COMPATIBILITY_PATTERNS: [&str; 2] = [
     GITHUB_HOSTED_JOB_STATUS_ACTIONS_SUFFIX_PATTERN,
     GITHUB_HOSTED_JOB_STATUS_EXACT_COMPATIBILITY_HOSTNAMES[0],
 ];
-pub const DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES: [&str; 4] =
+pub const SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES: [&str; 4] =
     GITHUB_HOSTED_JOB_STATUS_BOOTSTRAP_HOSTNAMES;
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
@@ -83,7 +74,7 @@ const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_AUTHORIZATIONS;
 const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_DEPTH;
 const MAX_DYNAMIC_TTL_SECONDS: u32 = GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS;
-const DNS_CANDIDATE_REFRESH_INTERVAL: Duration =
+const DNS_PROFILE_REFRESH_INTERVAL: Duration =
     Duration::from_secs(GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS);
 const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
     Duration::from_secs(GITHUB_HOSTED_JOB_STATUS_HTTPS_REFRESH_OVERLAP_SECONDS);
@@ -100,9 +91,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DnsEvidenceScope {
-    Audit,
     ProtectedHostAudit,
-    HostBlockCandidate,
+    SelectedProfileRuntimeTest,
     ProtectedHostBlock,
     ProtectedHostBlockDegraded,
 }
@@ -110,8 +100,8 @@ enum DnsEvidenceScope {
 impl DnsEvidenceScope {
     fn mode(self) -> Mode {
         match self {
-            Self::Audit | Self::ProtectedHostAudit => Mode::Audit,
-            Self::HostBlockCandidate
+            Self::ProtectedHostAudit => Mode::Audit,
+            Self::SelectedProfileRuntimeTest
             | Self::ProtectedHostBlock
             | Self::ProtectedHostBlockDegraded => Mode::Block,
         }
@@ -120,19 +110,21 @@ impl DnsEvidenceScope {
     fn is_block(self) -> bool {
         matches!(
             self,
-            Self::HostBlockCandidate | Self::ProtectedHostBlock | Self::ProtectedHostBlockDegraded
+            Self::SelectedProfileRuntimeTest
+                | Self::ProtectedHostBlock
+                | Self::ProtectedHostBlockDegraded
         )
     }
 
     #[cfg(test)]
     fn forward_query(self, hostname: &str, query_type: u16) -> bool {
         match self {
-            Self::Audit | Self::ProtectedHostAudit => true,
-            Self::HostBlockCandidate
+            Self::ProtectedHostAudit => true,
+            Self::SelectedProfileRuntimeTest
             | Self::ProtectedHostBlock
             | Self::ProtectedHostBlockDegraded => {
                 matches_supported_block_query_type(query_type)
-                    && authorized_block_candidate_hostname(
+                    && authorized_selected_profile_hostname(
                         hostname,
                         &mut CnameAuthorizationState::default(),
                         Instant::now(),
@@ -143,26 +135,21 @@ impl DnsEvidenceScope {
 
     fn status(self) -> &'static str {
         match self {
-            Self::Audit => DNS_MEDIATION_EVIDENCE_STATUS,
             Self::ProtectedHostAudit => PROTECTED_AUDIT_STATUS,
-            Self::HostBlockCandidate => DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
+            Self::SelectedProfileRuntimeTest => SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS,
             Self::ProtectedHostBlock => PROTECTED_BLOCK_STATUS,
             Self::ProtectedHostBlockDegraded => PROTECTED_DEGRADED_BLOCK_STATUS,
         }
     }
 
     fn candidate_profile_id(self) -> &'static str {
-        match self {
-            Self::Audit | Self::ProtectedHostAudit => DNS_MEDIATED_GITHUB_CANDIDATE_ID,
-            Self::HostBlockCandidate
-            | Self::ProtectedHostBlock
-            | Self::ProtectedHostBlockDegraded => DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID,
-        }
+        let _ = self;
+        DNS_MEDIATED_COMPATIBILITY_CANDIDATE_ID
     }
 
     fn active_routing_status(self) -> &'static str {
         match self {
-            Self::Audit | Self::HostBlockCandidate => "active_test_only",
+            Self::SelectedProfileRuntimeTest => "active_test_only",
             Self::ProtectedHostAudit
             | Self::ProtectedHostBlock
             | Self::ProtectedHostBlockDegraded => "active",
@@ -180,7 +167,7 @@ enum DnsBlockRuntimeScope {
 impl DnsBlockRuntimeScope {
     fn evidence_status(self) -> &'static str {
         match self {
-            Self::TestEvidence => DNS_MEDIATED_BLOCK_EVIDENCE_STATUS,
+            Self::TestEvidence => SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS,
             Self::ProductionStandardBlock => PROTECTED_BLOCK_STATUS,
             Self::ProductionUnsafePreserve => PROTECTED_DEGRADED_BLOCK_STATUS,
         }
@@ -188,7 +175,7 @@ impl DnsBlockRuntimeScope {
 
     fn ready_status(self) -> &'static str {
         match self {
-            Self::TestEvidence => DNS_MEDIATED_BLOCK_READY_STATUS,
+            Self::TestEvidence => SELECTED_PROFILE_RUNTIME_READY_STATUS,
             Self::ProductionStandardBlock => PROTECTED_BLOCK_READY_STATUS,
             Self::ProductionUnsafePreserve => PROTECTED_DEGRADED_BLOCK_READY_STATUS,
         }
@@ -196,7 +183,7 @@ impl DnsBlockRuntimeScope {
 
     fn resident_status(self) -> &'static str {
         match self {
-            Self::TestEvidence => "resident_dns_mediated_host_block_candidate_test_only",
+            Self::TestEvidence => "resident_selected_profile_runtime_test_only",
             Self::ProductionStandardBlock => "resident_protected",
             Self::ProductionUnsafePreserve => "resident_degraded",
         }
@@ -208,7 +195,7 @@ impl DnsBlockRuntimeScope {
 
     fn dns_scope(self) -> DnsEvidenceScope {
         match self {
-            Self::TestEvidence => DnsEvidenceScope::HostBlockCandidate,
+            Self::TestEvidence => DnsEvidenceScope::SelectedProfileRuntimeTest,
             Self::ProductionStandardBlock => DnsEvidenceScope::ProtectedHostBlock,
             Self::ProductionUnsafePreserve => DnsEvidenceScope::ProtectedHostBlockDegraded,
         }
@@ -488,8 +475,8 @@ struct ObservationRecorder {
 impl ObservationRecorder {
     fn forward_query(&self, hostname: &str, query_type: u16) -> bool {
         match self.scope {
-            DnsEvidenceScope::Audit | DnsEvidenceScope::ProtectedHostAudit => true,
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::ProtectedHostAudit => true,
+            DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 if !matches_supported_block_query_type(query_type) {
@@ -499,7 +486,7 @@ impl ObservationRecorder {
                     .cname_authorizations
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned");
-                authorized_block_candidate_hostname(hostname, &mut authorizations, Instant::now())
+                authorized_selected_profile_hostname(hostname, &mut authorizations, Instant::now())
             }
         }
     }
@@ -525,7 +512,7 @@ impl ObservationRecorder {
     }
 
     fn materialization_ttl_seconds(&self, hostname: &str, ttl_seconds: u32) -> Option<u32> {
-        if matches_exact_block_candidate_hostname(hostname) {
+        if matches_exact_selected_profile_hostname(hostname) {
             return bound_materialization_ttl(ttl_seconds, None);
         }
         let now = Instant::now();
@@ -831,39 +818,6 @@ impl DnsMediationSession {
     }
 }
 
-pub fn run_dns_mediation_audit_test_service(
-    unit_name: &str,
-    runtime_root: &Path,
-    plan: &PlanData,
-) -> Result<(), DnsMediationError> {
-    validate_test_service_context(unit_name)
-        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
-    if plan.selected_mode != Mode::Audit || plan.platform_profile.id != "none" {
-        return Err(DnsMediationError::new(
-            "invalid_dns_measurement_policy",
-            "DNS mediation measurement accepts only audit mode without a selected profile",
-        ));
-    }
-    let runtime = TestRuntimeStore::create(runtime_root, &plan.invocation_id)
-        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
-    let directory = runtime.directory.clone();
-    let mut mediation = DnsMediationSession::establish(&directory, DnsEvidenceScope::Audit, None)?;
-    let network = NativeResidentNetwork::in_current_namespace();
-    let mut resident = match ResidentSession::establish_test_only(runtime, plan, network) {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = mediation.routing.rollback();
-            return Err(DnsMediationError::new(error.code, error.message));
-        }
-    };
-    let start = Instant::now();
-    loop {
-        resident
-            .poll_once(start.elapsed(), POLL_INTERVAL)
-            .map_err(|error| DnsMediationError::new(error.code, error.message))?;
-    }
-}
-
 struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
     _mediation: DnsMediationSession,
     backend: NativeNftBackend<SystemNftExecutor>,
@@ -1094,7 +1048,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         plan: &PlanData,
         scope: DnsBlockRuntimeScope,
     ) -> Result<Self, DnsMediationError> {
-        if let Err(error) = prehydrate_candidate_names() {
+        if let Err(error) = prehydrate_selected_profile_names() {
             let _ = mediation.routing.rollback();
             return Err(error);
         }
@@ -1236,7 +1190,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             evidence,
             findings: FindingCollection::empty(),
             scope,
-            next_dns_refresh: DNS_CANDIDATE_REFRESH_INTERVAL,
+            next_dns_refresh: DNS_PROFILE_REFRESH_INTERVAL,
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
         })
     }
@@ -1263,13 +1217,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         if elapsed >= self.next_dns_refresh {
-            if prehydrate_candidate_names().is_err() {
+            if prehydrate_selected_profile_names().is_err() {
                 self.record_critical(
                     "dns_block_root_refresh_failed",
                     "DNS-mediated exact-root refresh failed after readiness",
                 );
             }
-            self.next_dns_refresh = elapsed + DNS_CANDIDATE_REFRESH_INTERVAL;
+            self.next_dns_refresh = elapsed + DNS_PROFILE_REFRESH_INTERVAL;
             changed = true;
         }
 
@@ -1457,7 +1411,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
     }
 }
 
-pub fn run_dns_mediated_host_block_candidate_test_service(
+pub fn run_selected_profile_runtime_test_service(
     unit_name: &str,
     runtime_root: &Path,
     plan: &PlanData,
@@ -1512,7 +1466,7 @@ fn initial_dns_block_evidence(
         policy_hash_schema_version: plan.policy_hash_schema_version,
         policy_hash: plan.policy_hash.clone(),
         base_ruleset_hash: plan.ruleset_hash.clone(),
-        candidate_hostnames: DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.to_vec(),
+        candidate_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
         setup_status: "setting_up",
         network_application_status: "not_applied",
         network_verification_status: "not_verified",
@@ -1570,7 +1524,7 @@ fn initial_dns_audit_evidence(plan: &PlanData, ruleset_hash: String) -> DnsMedia
 
 fn dns_block_test_limitations() -> Vec<&'static str> {
     vec![
-        "dns_mediated_host_block_candidate_test_only_no_public_activation",
+        "selected_profile_runtime_test_only_no_public_activation",
         "test_only_evidence_path_does_not_activate_default_planning_descriptor",
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
         "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
@@ -1580,7 +1534,7 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "post_ready_results_storage_traffic_is_not_authorized",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-        "candidate_bootstrap_roots_refresh_every_5_seconds",
+        "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
         "approved_status_https_destinations_remain_egress_channels",
         "resolved_status_ip_addresses_may_serve_additional_destinations",
@@ -1639,8 +1593,8 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
     ]
 }
 
-fn prehydrate_candidate_names() -> Result<(), DnsMediationError> {
-    for hostname in DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES {
+fn prehydrate_selected_profile_names() -> Result<(), DnsMediationError> {
+    for hostname in SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES {
         if (hostname, 443_u16)
             .to_socket_addrs()
             .map_err(|_| {
@@ -1917,9 +1871,9 @@ fn query_for_upstream(
     parsed_question: Option<&(String, u16)>,
 ) -> Option<Vec<u8>> {
     match (recorder.scope, parsed_question) {
-        (DnsEvidenceScope::Audit | DnsEvidenceScope::ProtectedHostAudit, _) => Some(query.to_vec()),
+        (DnsEvidenceScope::ProtectedHostAudit, _) => Some(query.to_vec()),
         (
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded,
             Some((hostname, query_type)),
@@ -1930,7 +1884,7 @@ fn query_for_upstream(
                 .then_some(canonical)
         }
         (
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded,
             None,
@@ -2231,13 +2185,13 @@ fn bound_materialization_ttl(
     (bounded_ttl > 0).then_some(bounded_ttl)
 }
 
-fn authorized_block_candidate_hostname(
+fn authorized_selected_profile_hostname(
     hostname: &str,
     state: &mut CnameAuthorizationState,
     now: Instant,
 ) -> bool {
     remove_expired_cname_authorizations(state, now);
-    if matches_exact_block_candidate_hostname(hostname) || state.active.contains_key(hostname) {
+    if matches_exact_selected_profile_hostname(hostname) || state.active.contains_key(hostname) {
         return true;
     }
     if !matches_constrained_dynamic_actions_suffix_hostname(hostname) {
@@ -2264,7 +2218,7 @@ fn retain_cname_authorizations(
     for _ in 0..MAX_DERIVED_CNAME_DEPTH {
         let mut progressed = false;
         pending.retain(|alias| {
-            let source_depth = if matches_exact_block_candidate_hostname(&alias.owner)
+            let source_depth = if matches_exact_selected_profile_hostname(&alias.owner)
                 || state.bounded_actions_suffix.contains(&alias.owner)
             {
                 Some(0)
@@ -2354,16 +2308,13 @@ fn reportable_github_hostname(hostname: &str) -> bool {
             && hostname.ends_with(".blob.core.windows.net"))
 }
 
-fn matches_candidate_pattern(hostname: &str) -> bool {
+fn matches_selected_profile_pattern(hostname: &str) -> bool {
     matches_actions_suffix_hostname(hostname)
-        || hostname == "codeload.github.com"
         || hostname == "actions-results-receiver-production.githubapp.com"
-        || (hostname.starts_with("productionresultssa")
-            && hostname.ends_with(".blob.core.windows.net"))
 }
 
-fn matches_exact_block_candidate_hostname(hostname: &str) -> bool {
-    DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.contains(&hostname)
+fn matches_exact_selected_profile_hostname(hostname: &str) -> bool {
+    SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.contains(&hostname)
         || hostname == "actions-results-receiver-production.githubapp.com"
 }
 
@@ -2377,7 +2328,7 @@ fn matches_constrained_dynamic_actions_suffix_hostname(hostname: &str) -> bool {
         return false;
     };
     let labels: Vec<&str> = prefix.split('.').collect();
-    !matches_exact_block_candidate_hostname(hostname)
+    !matches_exact_selected_profile_hostname(hostname)
         && !labels.is_empty()
         && labels.len() <= MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS
         && labels.iter().all(|label| {
@@ -2397,17 +2348,15 @@ fn matches_supported_block_query_type(query_type: u16) -> bool {
 
 fn candidate_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
     match scope {
-        DnsEvidenceScope::Audit | DnsEvidenceScope::ProtectedHostAudit
-            if matches_candidate_pattern(hostname) =>
-        {
-            "matches_candidate_pattern"
+        DnsEvidenceScope::ProtectedHostAudit if matches_selected_profile_pattern(hostname) => {
+            "matches_selected_profile_pattern"
         }
-        DnsEvidenceScope::HostBlockCandidate
+        DnsEvidenceScope::SelectedProfileRuntimeTest
         | DnsEvidenceScope::ProtectedHostBlock
         | DnsEvidenceScope::ProtectedHostBlockDegraded
-            if matches_exact_block_candidate_hostname(hostname) =>
+            if matches_exact_selected_profile_hostname(hostname) =>
         {
-            "matches_candidate_pattern"
+            "matches_selected_profile_pattern"
         }
         _ => "github_related_outside_candidate",
     }
@@ -2444,33 +2393,9 @@ fn evidence_from_state_and_authorizations(
     DnsMediationEvidence {
         status: scope.status(),
         candidate_profile_id: scope.candidate_profile_id(),
-        selected_platform_profile_id: match scope {
-            DnsEvidenceScope::Audit => None,
-            DnsEvidenceScope::ProtectedHostAudit => Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID),
-            DnsEvidenceScope::HostBlockCandidate
-            | DnsEvidenceScope::ProtectedHostBlock
-            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
-                Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID)
-            }
-        },
-        candidate_domain_patterns: match scope {
-            DnsEvidenceScope::Audit | DnsEvidenceScope::ProtectedHostAudit => {
-                DNS_CANDIDATE_PATTERNS.to_vec()
-            }
-            DnsEvidenceScope::HostBlockCandidate
-            | DnsEvidenceScope::ProtectedHostBlock
-            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
-                DNS_BLOCK_COMPATIBILITY_PATTERNS.to_vec()
-            }
-        },
-        candidate_hostnames: match scope {
-            DnsEvidenceScope::Audit | DnsEvidenceScope::ProtectedHostAudit => Vec::new(),
-            DnsEvidenceScope::HostBlockCandidate
-            | DnsEvidenceScope::ProtectedHostBlock
-            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
-                DNS_BLOCK_CANDIDATE_BOOTSTRAP_HOSTNAMES.to_vec()
-            }
-        },
+        selected_platform_profile_id: Some(GITHUB_HOSTED_JOB_STATUS_PROFILE_ID),
+        candidate_domain_patterns: DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec(),
+        candidate_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
         mode: scope.mode(),
         protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
         routing_status,
@@ -2488,10 +2413,8 @@ fn evidence_from_state_and_authorizations(
         },
         answer_attribution_status: "bounded_reportable_hostname_answers_only",
         proxy_policy_status: match scope {
-            DnsEvidenceScope::Audit | DnsEvidenceScope::ProtectedHostAudit => {
-                "audit_forwards_without_name_authorization"
-            }
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::ProtectedHostAudit => "audit_forwards_without_name_authorization",
+            DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded => {
                 "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
@@ -2538,18 +2461,9 @@ fn evidence_from_state_and_authorizations(
         excluded_non_github_query_count: state.excluded_non_github_query_count,
         blocked_non_candidate_query_count: state.blocked_non_candidate_query_count,
         limitations: match scope {
-            DnsEvidenceScope::Audit => vec![
-                "dns_mediation_audit_test_only_no_public_activation",
-                "audit_measurement_patterns_do_not_define_default_descriptor",
-                "audit_observes_queries_without_blocking_names",
-                "dns_answers_attribute_addresses_without_authorizing_firewall_rules",
-                "dns_ttls_are_evidence_for_future_bounded_refresh_design_only",
-                "evidence_collected_before_hosted_job_teardown",
-                "audit_measurement_does_not_activate_runtime_materialization",
-            ],
             DnsEvidenceScope::ProtectedHostAudit => protected_dns_audit_limitations(),
-            DnsEvidenceScope::HostBlockCandidate => vec![
-                "dns_mediated_host_block_candidate_test_only_no_public_activation",
+            DnsEvidenceScope::SelectedProfileRuntimeTest => vec![
+                "selected_profile_runtime_test_only_no_public_activation",
                 "test_only_evidence_path_does_not_activate_default_planning_descriptor",
                 "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
                 "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
@@ -2559,7 +2473,7 @@ fn evidence_from_state_and_authorizations(
                 "post_ready_results_storage_traffic_is_not_authorized",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-                "candidate_bootstrap_roots_refresh_every_5_seconds",
+                "bootstrap_roots_refresh_every_5_seconds",
                 "https_materialization_expiry_includes_30_second_refresh_overlap",
                 "dns_answers_materialize_only_bounded_candidate_or_cname_descendant_https_addresses",
                 "approved_status_https_destinations_remain_egress_channels",
@@ -2815,7 +2729,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_path: PathBuf::from("unused-test-report.json"),
-            scope: DnsEvidenceScope::HostBlockCandidate,
+            scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
             materializations: None,
         };
         let mut malformed = query("malformed.actions.githubusercontent.com", 1);
@@ -2845,19 +2759,19 @@ mod tests {
     }
 
     #[test]
-    fn classifies_fixed_candidate_patterns_without_authorizing_extra_hosts() {
-        assert!(matches_candidate_pattern(
+    fn classifies_selected_profile_patterns_without_authorizing_extra_hosts() {
+        assert!(matches_selected_profile_pattern(
             "pipelines.actions.githubusercontent.com"
         ));
-        assert!(matches_candidate_pattern(
+        assert!(matches_selected_profile_pattern(
             "actions-results-receiver-production.githubapp.com"
         ));
-        assert!(matches_candidate_pattern(
+        assert!(!matches_selected_profile_pattern(
             "productionresultssa17.blob.core.windows.net"
         ));
-        assert!(matches_candidate_pattern("codeload.github.com"));
-        assert!(!matches_candidate_pattern("api.github.com"));
-        assert!(!matches_candidate_pattern("unrelated.example.com"));
+        assert!(!matches_selected_profile_pattern("codeload.github.com"));
+        assert!(!matches_selected_profile_pattern("api.github.com"));
+        assert!(!matches_selected_profile_pattern("unrelated.example.com"));
         assert!(reportable_github_hostname("api.github.com"));
         assert!(!reportable_github_hostname(
             "unclassified-account.blob.core.windows.net"
@@ -2867,51 +2781,54 @@ mod tests {
     #[test]
     fn blocking_scope_forwards_only_candidate_names_and_refuses_others() {
         assert!(
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("vstoken.actions.githubusercontent.com", 1)
         );
         assert!(
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("pipelines.actions.githubusercontent.com", 1)
         );
         assert!(
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("results-receiver.actions.githubusercontent.com", 1)
         );
         assert!(
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("payload.pipelines.actions.githubusercontent.com", 1)
         );
         assert!(
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("actions-results-receiver-production.githubapp.com", 1)
         );
         assert!(
-            DnsEvidenceScope::HostBlockCandidate
+            DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.pipelines.actions.githubusercontent.com", 1,),
             "the candidate permits only bounded dynamic names in the documented suffix class"
         );
         assert!(
-            !DnsEvidenceScope::HostBlockCandidate.forward_query(
+            !DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query(
                 "lookalike.payload.pipelines.actions.githubusercontent.com",
                 1,
             ),
             "dynamic suffix names may have at most two prefix labels"
         );
-        assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("codeload.github.com", 1));
         assert!(
-            !DnsEvidenceScope::HostBlockCandidate
+            !DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("codeload.github.com", 1)
+        );
+        assert!(
+            !DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("productionresultssa17.blob.core.windows.net", 1)
         );
-        assert!(!DnsEvidenceScope::HostBlockCandidate.forward_query("api.github.com", 1));
+        assert!(!DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("api.github.com", 1));
         assert!(
-            !DnsEvidenceScope::HostBlockCandidate
+            !DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.actions.githubusercontent.com", 16,)
         );
         assert!(
-            DnsEvidenceScope::Audit.forward_query("productionresultssa17.blob.core.windows.net", 1)
+            DnsEvidenceScope::ProtectedHostAudit
+                .forward_query("productionresultssa17.blob.core.windows.net", 1)
         );
-        assert!(DnsEvidenceScope::Audit.forward_query("api.github.com", 16));
+        assert!(DnsEvidenceScope::ProtectedHostAudit.forward_query("api.github.com", 16));
         let response = refused_response(&query("api.github.com", 1)).unwrap();
         assert_eq!(u16::from_be_bytes([response[2], response[3]]) & 0x000f, 5);
         assert_ne!(u16::from_be_bytes([response[2], response[3]]) & 0x8000, 0);
@@ -2922,7 +2839,7 @@ mod tests {
         let now = Instant::now();
         let mut authorizations = CnameAuthorizationState::default();
         for index in 0..MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
-            assert!(authorized_block_candidate_hostname(
+            assert!(authorized_selected_profile_hostname(
                 &format!("dynamic-{index}.actions.githubusercontent.com"),
                 &mut authorizations,
                 now,
@@ -2932,23 +2849,23 @@ mod tests {
             authorizations.bounded_actions_suffix.len(),
             MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS
         );
-        assert!(authorized_block_candidate_hostname(
+        assert!(authorized_selected_profile_hostname(
             "dynamic-0.actions.githubusercontent.com",
             &mut authorizations,
             now + Duration::from_secs(600),
         ));
-        assert!(!authorized_block_candidate_hostname(
+        assert!(!authorized_selected_profile_hostname(
             "dynamic-overflow.actions.githubusercontent.com",
             &mut authorizations,
             now,
         ));
         assert!(authorizations.bounded_actions_suffix_truncated);
-        assert!(!authorized_block_candidate_hostname(
+        assert!(!authorized_selected_profile_hostname(
             "three.labels.deep.actions.githubusercontent.com",
             &mut CnameAuthorizationState::default(),
             now,
         ));
-        assert!(!authorized_block_candidate_hostname(
+        assert!(!authorized_selected_profile_hostname(
             "-invalid.actions.githubusercontent.com",
             &mut CnameAuthorizationState::default(),
             now,
@@ -3002,7 +2919,7 @@ mod tests {
             bound_materialization_ttl(300, Some(Duration::from_millis(999))),
             None
         );
-        assert!(!authorized_block_candidate_hostname(
+        assert!(!authorized_selected_profile_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now,
@@ -3016,12 +2933,12 @@ mod tests {
             )),
             now,
         );
-        assert!(authorized_block_candidate_hostname(
+        assert!(authorized_selected_profile_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now,
         ));
-        assert!(!authorized_block_candidate_hostname(
+        assert!(!authorized_selected_profile_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now + Duration::from_secs(61),
@@ -3035,7 +2952,7 @@ mod tests {
             }],
             now,
         );
-        assert!(authorized_block_candidate_hostname(
+        assert!(authorized_selected_profile_hostname(
             "edge.example.net",
             &mut authorizations,
             now,
@@ -3049,7 +2966,7 @@ mod tests {
             }],
             now,
         );
-        assert!(!authorized_block_candidate_hostname(
+        assert!(!authorized_selected_profile_hostname(
             "not-derived.example.net",
             &mut authorizations,
             now,
@@ -3147,7 +3064,7 @@ mod tests {
             (
                 "pipelines.actions.githubusercontent.com".to_owned(),
                 1,
-                "matches_candidate_pattern",
+                "matches_selected_profile_pattern",
             ),
             RetainedObservation {
                 occurrences: 2,
@@ -3160,7 +3077,7 @@ mod tests {
             },
         );
         state.excluded_non_github_query_count = 1;
-        let evidence = evidence_from_state(&state, "active_test_only", DnsEvidenceScope::Audit);
+        let evidence = evidence_from_state(&state, "active", DnsEvidenceScope::ProtectedHostAudit);
         assert_eq!(evidence.observations.len(), 1);
         assert_eq!(evidence.observations[0].query_type, "a");
         assert_eq!(evidence.observations[0].occurrences, 2);

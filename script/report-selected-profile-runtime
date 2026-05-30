@@ -5,7 +5,7 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -ne 0 ]]; then
-  die "usage: script/report-dns-block-candidate"
+  die "usage: script/report-selected-profile-runtime"
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
@@ -17,9 +17,9 @@ fi
 
 require_cmd python3
 
-suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
-invocation="dns-block-${GITHUB_RUN_ATTEMPT:-attempt}-${DNS_BLOCK_CANDIDATE_REPLICA:-trial}"
-directory="/run/fence-dns-block-candidate-${suffix}/$invocation"
+suffix="${GITHUB_RUN_ID:-run}-${GITHUB_RUN_ATTEMPT:-attempt}-${SELECTED_PROFILE_RUNTIME_REPLICA:-trial}"
+invocation="selected-profile-${GITHUB_RUN_ATTEMPT:-attempt}-${SELECTED_PROFILE_RUNTIME_REPLICA:-trial}"
+directory="/run/fence-selected-profile-runtime-${suffix}/$invocation"
 report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 production_ready="/run/fence/$invocation/ready.json"
@@ -37,12 +37,12 @@ import sys
 report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-assert report["status"] == "dns_mediated_host_block_candidate_test_only", report
+assert report["status"] == "selected_profile_runtime_test_only", report
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
-assert dns["status"] == "dns_mediated_host_block_candidate_test_only", dns
+assert dns["status"] == "selected_profile_runtime_test_only", dns
 assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
 assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1", dns
 assert report["policy_hash_schema_version"] == 3, report
@@ -55,7 +55,7 @@ observations = dns["observations"]
 derived_cname_authorizations = dns["derived_cname_authorizations"]
 summary = {
     "schema_version": 1,
-    "status": "dns_mediated_host_block_candidate_late_report_test_only",
+    "status": "selected_profile_runtime_late_report_test_only",
     "candidate_profile_id": dns["candidate_profile_id"],
     "selected_platform_profile_id": dns["selected_platform_profile_id"],
     "policy_hash_schema_version": report["policy_hash_schema_version"],

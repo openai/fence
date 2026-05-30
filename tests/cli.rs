@@ -80,7 +80,7 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     let path = config_file(
         "plan.json",
         format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","platform_profile":"none","allowances":[{{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443}},{{"destination_type":"cidr","destination":"2001:db8::/64","protocol":"udp","port":53}}]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowances":[{{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443}},{{"destination_type":"cidr","destination":"2001:db8::/64","protocol":"udp","port":53}}]}}"#
         )
         .as_bytes(),
     );
@@ -175,6 +175,28 @@ fn invalid_and_oversized_configs_are_structured_errors() {
         "invalid_json_configuration"
     );
     assert_eq!(oversized_response["error"]["code"], "config_too_large");
+}
+
+#[test]
+fn retired_platform_profiles_are_structured_errors() {
+    for (name, profile) in [
+        ("none-profile.json", "none"),
+        (
+            "broad-compatibility-profile.json",
+            "github_hosted_https_udp_dns_candidate_v1",
+        ),
+    ] {
+        let config = config_file(
+            name,
+            format!(
+                r#"{{"schema_version":1,"mode":"block","invocation_id":"bad-profile","platform_profile":"{profile}","allowances":[]}}"#
+            )
+            .as_bytes(),
+        );
+        let response = error_json(&["render-plan", "--config", config.to_str().unwrap()], 1);
+
+        assert_eq!(response["error"]["code"], "invalid_platform_profile");
+    }
 }
 
 #[test]
