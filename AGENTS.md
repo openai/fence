@@ -189,7 +189,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-wrapper`
   - Offline-only dependency-free Node syntax and unit checks for the Action launcher, report validation, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
-  - The wrapper may accept alpha-era evidence field names only when the verified committed manifest identifies immutable bundle `v0.1.0-alpha.2`; later prerelease and stable bundles must require runtime-evidence schema `1` and stable profile-realization fields.
+  - The wrapper and hosted acceptance assertions may accept alpha-era evidence field names only when the verified committed manifest identifies immutable bundle `v0.1.0-alpha.2`; later prerelease and stable bundles must require runtime-evidence schema `1` and stable profile-realization fields.
 
 - `script/test-action-acceptance`
   - Linux x64-only, GitHub-Actions-only hosted acceptance entrypoint invoked after `uses: ./`.

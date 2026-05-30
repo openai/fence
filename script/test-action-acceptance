@@ -31,13 +31,13 @@ ready="$directory/ready.json"
 report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 
-python3 - "$scenario" "$report" "$dns_report" "$ready" <<'PY'
+python3 - "$scenario" "$report" "$dns_report" "$ready" "action/bundle-manifest.json" <<'PY'
 import json
 import pathlib
 import sys
 
 scenario = sys.argv[1]
-report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path, ready_path, manifest_path = (pathlib.Path(item) for item in sys.argv[2:])
 expected = {
     "standard": ("block", "protected_host_block", "resident_protected", "ready", True, "disabled_verified", "disabled_verified"),
     "unsafe-preserve": ("block", "protected_host_block_degraded", "resident_degraded", "ready_degraded", False, "disabled_verified", "preserved_unsafe"),
@@ -47,26 +47,33 @@ mode, status, resident, readiness, protection, sudo_status, container_status = e
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+legacy_alpha2 = manifest["schema_version"] == 2 and manifest["release_tag"] == "v0.1.0-alpha.2"
 assert report["mode"] == mode, report
 assert report["status"] == status, report
-assert report["runtime_evidence_schema_version"] == 1, report
 assert report["setup_status"] == resident, report
 assert report["readiness_status"] == readiness, report
 assert report["protection_available"] is protection, report
 assert report["sudo_status"] == sudo_status, report
 assert report["container_status"] == container_status, report
 assert report["network_verification_status"] == "verified", report
-assert report["platform_profile_id"] == "github_hosted_job_status_v1", report
-assert report["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", report
 assert report["critical_findings"] == [], report
 assert ready["status"] == readiness, ready
-assert ready["runtime_evidence_schema_version"] == 1, ready
-assert ready["platform_profile_id"] == "github_hosted_job_status_v1", ready
-assert ready["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", ready
 assert dns["routing_status"] == "active", dns
-assert dns["runtime_evidence_schema_version"] == 1, dns
-assert dns["platform_profile_id"] == "github_hosted_job_status_v1", dns
-assert dns["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", dns
+if legacy_alpha2:
+    assert report["selected_platform_profile_id"] == "github_hosted_job_status_v1", report
+    assert ready["selected_platform_profile_id"] == "github_hosted_job_status_v1", ready
+    assert dns["selected_platform_profile_id"] == "github_hosted_job_status_v1", dns
+else:
+    assert report["runtime_evidence_schema_version"] == 1, report
+    assert report["platform_profile_id"] == "github_hosted_job_status_v1", report
+    assert report["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", report
+    assert ready["runtime_evidence_schema_version"] == 1, ready
+    assert ready["platform_profile_id"] == "github_hosted_job_status_v1", ready
+    assert ready["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", ready
+    assert dns["runtime_evidence_schema_version"] == 1, dns
+    assert dns["platform_profile_id"] == "github_hosted_job_status_v1", dns
+    assert dns["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1", dns
 PY
 
 case "$scenario" in
