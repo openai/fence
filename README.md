@@ -252,7 +252,7 @@ consumers should pin Fence to a full immutable commit SHA rather than a
 floating branch:
 
 ```yaml
-- uses: GrantBirki/fence@<full-commit-sha>
+- uses: GrantBirki/fence@9100d0f458b358f810f559c34efd7fec08ffdb27
   with:
     config: >-
       {"schema_version":1,"mode":"block","invocation_id":"example-run","allowances":[]}
