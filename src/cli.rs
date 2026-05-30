@@ -260,7 +260,7 @@ mod tests {
         let config = root.join("resolution-failure.json");
         std::fs::write(
             &config,
-            br#"{"schema_version":1,"mode":"block","invocation_id":"resolve-1","allowances":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"resolve-1","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
         )
         .unwrap();
 
@@ -285,7 +285,7 @@ mod tests {
             std::fs::write(
                 &config,
                 format!(
-                    r#"{{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"{profile}","allowances":[]}}"#
+                    r#"{{"schema_version":1,"mode":"block","invocation_id":"candidate-1","platform_profile":"{profile}","allowlist":[]}}"#
                 ),
             )
             .unwrap();
@@ -315,7 +315,7 @@ mod tests {
         let config = root.join("default-job-status-profile.json");
         std::fs::write(
             &config,
-            br#"{"schema_version":1,"mode":"block","invocation_id":"default-1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"default-1","allowlist":[]}"#,
         )
         .unwrap();
 

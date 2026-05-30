@@ -3,7 +3,7 @@
   "mode": "block",
   "invocation_id": "package-acceptance",
   "container_policy": "disable",
-  "allowances": [
+  "allowlist": [
     {
       "destination_type": "ip",
       "destination": "192.0.2.10",

@@ -609,7 +609,7 @@ mod tests {
 
     fn plan(invocation: &str) -> PlanData {
         let json = format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation}","allowances":[]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation}","allowlist":[]}}"#
         );
         build_plan(
             parse_and_normalize(json.as_bytes()).unwrap(),

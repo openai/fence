@@ -164,7 +164,7 @@ pub fn build_plan(
                 "too_many_resolved_addresses",
                 "hostname resolution exceeds the fixed address limit",
             )
-            .field("allowances.destination"));
+            .field("allowlist.destination"));
         }
         resolved.insert(host, addresses);
     }
@@ -181,7 +181,7 @@ pub fn build_plan(
             "too_many_expanded_rules",
             "effective policy exceeds the fixed expanded-rule limit",
         )
-        .field("allowances"));
+        .field("allowlist"));
     }
     effective_policy.sort();
     effective_policy.dedup();
@@ -257,7 +257,7 @@ fn dns_error(code: &'static str) -> ErrorDetail {
         code,
         "hostname resolution did not complete within fixed bounds",
     )
-    .field("allowances.destination")
+    .field("allowlist.destination")
 }
 
 fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> EffectiveAllowance {
@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn renders_sorted_frozen_policy_and_hash_independent_of_invocation() {
-        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"one","allowances":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":443}]}"#;
+        let json = r#"{"schema_version":1,"mode":"block","invocation_id":"one","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":443}]}"#;
         let plan = build_plan(
             parse(json),
             &resolver(vec![resolved(
@@ -449,7 +449,7 @@ mod tests {
         )
         .unwrap();
         let another = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"two","allowances":[{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"two","allowlist":[{"destination_type":"ip","destination":"192.0.2.2","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#),
             &resolver(vec![resolved(
                 &["2001:db8::1", "192.0.2.2"],
                 Duration::from_secs(1),
@@ -477,17 +477,17 @@ mod tests {
     #[test]
     fn classifies_block_degraded_and_audit_assurance() {
         let standard = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
         let degraded = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"x","container_policy":"unsafe_preserve","allowances":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"x","container_policy":"unsafe_preserve","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
         let audit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"audit","invocation_id":"x","allowances":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"audit","invocation_id":"x","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
@@ -535,13 +535,13 @@ mod tests {
     fn models_default_bounded_dns_mediated_job_status_profile() {
         let default = build_plan(
             parse(
-                r#"{"schema_version":1,"mode":"block","invocation_id":"default","allowances":[]}"#,
+                r#"{"schema_version":1,"mode":"block","invocation_id":"default","allowlist":[]}"#,
             ),
             &resolver(vec![]),
         )
         .unwrap();
         let explicit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_job_status_v1","allowances":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_job_status_v1","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn rejects_resolution_failures_timeouts_empty_and_address_excess() {
         let config = parse(
-            r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
+            r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
         );
         assert_eq!(
             build_plan(config.clone(), &resolver(vec![Err(ResolveError::Failed)]))
@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn rejects_consumed_dns_deadlines() {
         let config = parse(
-            r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"hostname","destination":"a.example","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"b.example","protocol":"tcp","port":443}]}"#,
+            r#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"hostname","destination":"a.example","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"b.example","protocol":"tcp","port":443}]}"#,
         );
         assert_eq!(
             build_plan(
@@ -649,7 +649,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let config = parse(&format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{allowances}]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{allowances}]}}"#
         ));
         let addresses = (0..MAX_RESOLVED_ADDRESSES)
             .map(|index| format!("192.0.2.{index}"))
@@ -672,7 +672,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let budget_config = parse(&format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{budget_allowances}]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{budget_allowances}]}}"#
         ));
         let budget_results = (0..6)
             .map(|_| resolved(&["192.0.2.1"], PER_HOST_DNS_TIMEOUT))

@@ -23,7 +23,7 @@ struct ConfigInput {
     platform_profile: Option<String>,
     #[serde(default)]
     container_policy: Option<String>,
-    allowances: Vec<AllowanceInput>,
+    allowlist: Vec<AllowanceInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,17 +168,17 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
         }
     };
     let container_policy = normalize_container_policy(mode, input.container_policy.as_deref())?;
-    if input.allowances.len() > MAX_ALLOWANCES {
+    if input.allowlist.len() > MAX_ALLOWANCES {
         return Err(ErrorDetail::new(
-            "too_many_allowances",
-            "allowances exceeds the fixed v0 limit",
+            "too_many_allowlist_entries",
+            "allowlist exceeds the fixed v0 limit",
         )
-        .field("allowances"));
+        .field("allowlist"));
     }
 
-    let declared_allowance_count = input.allowances.len();
+    let declared_allowance_count = input.allowlist.len();
     let mut requested_allowances = input
-        .allowances
+        .allowlist
         .iter()
         .enumerate()
         .map(|(index, allowance)| normalize_allowance(allowance, index))
@@ -242,9 +242,9 @@ fn normalize_allowance(
         _ => {
             return Err(ErrorDetail::new(
                 "invalid_protocol",
-                "allowance protocol must be tcp or udp",
+                "allowlist protocol must be tcp or udp",
             )
-            .indexed_field("allowances.protocol", index));
+            .indexed_field("allowlist.protocol", index));
         }
     };
     let port = u16::try_from(input.port)
@@ -253,9 +253,9 @@ fn normalize_allowance(
         .ok_or_else(|| {
             ErrorDetail::new(
                 "invalid_port",
-                "allowance port must be from 1 through 65535",
+                "allowlist port must be from 1 through 65535",
             )
-            .indexed_field("allowances.port", index)
+            .indexed_field("allowlist.port", index)
         })?;
     let (destination_type, destination) = match input.destination_type.as_str() {
         "hostname" => (
@@ -265,7 +265,7 @@ fn normalize_allowance(
                     "invalid_destination",
                     "hostname destination is not a valid explicit DNS name",
                 )
-                .indexed_field("allowances.destination", index)
+                .indexed_field("allowlist.destination", index)
             })?,
         ),
         "ip" => (
@@ -279,7 +279,7 @@ fn normalize_allowance(
                         "invalid_destination",
                         "IP destination is not a valid literal address",
                     )
-                    .indexed_field("allowances.destination", index)
+                    .indexed_field("allowlist.destination", index)
                 })?,
         ),
         "cidr" => (
@@ -289,7 +289,7 @@ fn normalize_allowance(
                     "invalid_destination",
                     "CIDR destination must identify an explicit canonical network",
                 )
-                .indexed_field("allowances.destination", index)
+                .indexed_field("allowlist.destination", index)
             })?,
         ),
         _ => {
@@ -297,7 +297,7 @@ fn normalize_allowance(
                 "invalid_destination_type",
                 "destination_type must be hostname, ip, or cidr",
             )
-            .indexed_field("allowances.destination_type", index));
+            .indexed_field("allowlist.destination_type", index));
         }
     };
 
@@ -403,7 +403,7 @@ mod tests {
 
     fn config(extra: &str) -> Vec<u8> {
         format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"build-1","allowances":[]{} }}"#,
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"build-1","allowlist":[]{} }}"#,
             extra
         )
         .into_bytes()
@@ -416,7 +416,7 @@ mod tests {
         port: u64,
     ) -> Vec<u8> {
         format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"build-1","allowances":[{{"destination_type":"{destination_type}","destination":"{destination}","protocol":"{protocol}","port":{port}}}]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"build-1","allowlist":[{{"destination_type":"{destination_type}","destination":"{destination}","protocol":"{protocol}","port":{port}}}]}}"#
         )
         .into_bytes()
     }
@@ -437,11 +437,11 @@ mod tests {
     #[test]
     fn accepts_explicit_selected_profile_audit_without_lockdown_and_degraded_block() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_job_status_v1","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_job_status_v1","allowlist":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_job_status_v1","container_policy":"unsafe_preserve","allowances":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_job_status_v1","container_policy":"unsafe_preserve","allowlist":[]}"#,
         )
         .unwrap();
 
@@ -464,42 +464,42 @@ mod tests {
     fn rejects_top_level_contract_violations() {
         let invalid_cases = [
             (
-                br#"{"schema_version":2,"mode":"block","invocation_id":"x","allowances":[]}"#
+                br#"{"schema_version":2,"mode":"block","invocation_id":"x","allowlist":[]}"#
                     .as_slice(),
                 "invalid_schema_version",
             ),
             (
-                br#"{"schema_version":1,"mode":"observe","invocation_id":"x","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"observe","invocation_id":"x","allowlist":[]}"#
                     .as_slice(),
                 "invalid_mode",
             ),
             (
-                br#"{"schema_version":1,"mode":"block","invocation_id":"Bad-ID","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"block","invocation_id":"Bad-ID","allowlist":[]}"#
                     .as_slice(),
                 "invalid_invocation_id",
             ),
             (
-                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"default","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"default","allowlist":[]}"#
                     .as_slice(),
                 "invalid_platform_profile",
             ),
             (
-                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"none","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"none","allowlist":[]}"#
                     .as_slice(),
                 "invalid_platform_profile",
             ),
             (
-                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"github_hosted_https_udp_dns_candidate_v1","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"github_hosted_https_udp_dns_candidate_v1","allowlist":[]}"#
                     .as_slice(),
                 "invalid_platform_profile",
             ),
             (
-                br#"{"schema_version":1,"mode":"audit","invocation_id":"x","container_policy":"disable","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"audit","invocation_id":"x","container_policy":"disable","allowlist":[]}"#
                     .as_slice(),
                 "invalid_container_policy",
             ),
             (
-                br#"{"schema_version":1,"mode":"block","invocation_id":"x","container_policy":"other","allowances":[]}"#
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","container_policy":"other","allowlist":[]}"#
                     .as_slice(),
                 "invalid_container_policy",
             ),
@@ -519,14 +519,22 @@ mod tests {
             "invalid_json_configuration"
         );
         assert_eq!(
-            parse_and_normalize(br#"{"schema_version":1,"invocation_id":"x","allowances":[]}"#)
+            parse_and_normalize(br#"{"schema_version":1,"invocation_id":"x","allowlist":[]}"#)
                 .unwrap_err()
                 .code,
             "invalid_json_configuration"
         );
         assert_eq!(
             parse_and_normalize(
-                br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443,"unknown":true}]}"#
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"ip","destination":"192.0.2.1","protocol":"tcp","port":443,"unknown":true}]}"#
+            )
+            .unwrap_err()
+            .code,
+            "invalid_json_configuration"
+        );
+        assert_eq!(
+            parse_and_normalize(
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[]}"#
             )
             .unwrap_err()
             .code,
@@ -553,11 +561,11 @@ mod tests {
     #[test]
     fn normalizes_typed_destinations_and_deduplicates() {
         let parsed = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"hostname","destination":"Example.COM","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"ip","destination":"2001:0db8::1","protocol":"udp","port":53},{"destination_type":"cidr","destination":"192.0.2.0/24","protocol":"tcp","port":443}]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"hostname","destination":"Example.COM","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"ip","destination":"2001:0db8::1","protocol":"udp","port":53},{"destination_type":"cidr","destination":"192.0.2.0/24","protocol":"tcp","port":443}]}"#,
         )
         .unwrap();
         let zero_prefix_networks = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{"destination_type":"cidr","destination":"0.0.0.0/0","protocol":"tcp","port":443},{"destination_type":"cidr","destination":"::/0","protocol":"udp","port":53}]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"cidr","destination":"0.0.0.0/0","protocol":"tcp","port":443},{"destination_type":"cidr","destination":"::/0","protocol":"udp","port":53}]}"#,
         )
         .unwrap();
 
@@ -674,12 +682,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let bytes = format!(
-            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowances":[{allowances}]}}"#
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{allowances}]}}"#
         );
 
         assert_eq!(
             parse_and_normalize(bytes.as_bytes()).unwrap_err().code,
-            "too_many_allowances"
+            "too_many_allowlist_entries"
         );
     }
 

@@ -14,7 +14,7 @@ fn selected_profile_runtime_worker() {
     }
     let invocation_id = std::env::var("FENCE_SELECTED_PROFILE_RUNTIME_INVOCATION").unwrap();
     let config = format!(
-        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","container_policy":"disable","allowances":[]}}"#
+        r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","container_policy":"disable","allowlist":[]}}"#
     );
     let plan = build_plan(
         parse_and_normalize(config.as_bytes()).unwrap(),
