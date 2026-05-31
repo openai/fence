@@ -66,8 +66,7 @@ compatibility boundary.
 Pull requests also build a Linux x64 package independently and execute that
 artifact through the trusted-launcher JSON CLI boundary. The current
 `0.1.2` publication remains limited to the Linux x64 agent artifact. The root
-Action remains pinned to the attested stable `0.1.1` binary until the
-follow-up bundle refresh, without runtime downloads.
+Action carries the attested stable `0.1.2` binary without runtime downloads.
 
 Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
 interfaces, proof requirements, and implementation roadmap.
@@ -288,10 +287,9 @@ The `0.1.1` patch publication renames the direct agent configuration collection
 to `allowlist` while intentionally keeping configuration schema `1`. The root
 Action carries that attested stable binary and provides a zero-input strict
 standard-block default. The `0.1.2` patch publication hardens DNS mediation,
-NFLOG parsing, privileged file handling, and bounded subprocess execution.
-Refreshing the root Action from that attested stable release is the next
-publication step. Future deliberate version bumps merged to `main` remain
-release triggers.
+NFLOG parsing, privileged file handling, and bounded subprocess execution. The
+root Action carries that attested stable release. Future deliberate version
+bumps merged to `main` remain release triggers.
 
 The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
 and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its
