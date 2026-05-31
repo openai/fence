@@ -7,7 +7,7 @@ latest `main` branch and the latest published stable release. The implemented
 protection boundary is intentionally limited to GitHub-hosted `ubuntu-24.04`
 x64 host jobs as documented in `docs/v0.md`. Audit mode is observation-only,
 and `unsafe_preserve` is explicitly degraded because it retains container
-control paths. Stable `0.1.1` is the current supported agent publication.
+control paths. Stable `0.1.2` is the current supported agent publication.
 
 ## Dependency Policy
 
