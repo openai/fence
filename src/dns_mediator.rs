@@ -42,7 +42,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, ToSocketAddrs
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -87,6 +90,8 @@ const RESOLVED_DROP_IN_DIR: &str = "/etc/systemd/resolved.conf.d";
 const RESOLVED_DROP_IN_PATH: &str = "/etc/systemd/resolved.conf.d/90-fence-evidence.conf";
 const DOCKER_DAEMON_PATH: &str = "/etc/docker/daemon.json";
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -477,6 +482,7 @@ struct ActiveCnameAuthorization {
 struct ObservationRecorder {
     state: Arc<Mutex<ObservationState>>,
     cname_authorizations: Arc<Mutex<CnameAuthorizationState>>,
+    report_write_failed: Arc<AtomicBool>,
     report_path: PathBuf,
     scope: DnsEvidenceScope,
     materializations: Option<Arc<Mutex<MaterializationQueue>>>,
@@ -589,7 +595,9 @@ impl ObservationRecorder {
         let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
-        let _ = write_result;
+        if write_result.is_err() {
+            self.report_write_failed.store(true, Ordering::Relaxed);
+        }
     }
 
     fn record_response(&self, hostname: &str, query_type: u16, packet: &[u8]) {
@@ -640,7 +648,9 @@ impl ObservationRecorder {
         let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
-        let _ = write_result;
+        if write_result.is_err() {
+            self.report_write_failed.store(true, Ordering::Relaxed);
+        }
     }
 
     fn reset_after_activation(&self) -> Result<(), DnsMediationError> {
@@ -668,6 +678,10 @@ impl ObservationRecorder {
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         write_result
+    }
+
+    fn take_report_write_failure(&self) -> bool {
+        self.report_write_failed.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -714,16 +728,7 @@ impl DnsRouting {
         let _ = fixed_command("/usr/bin/resolvectl", &["flush-caches"]);
 
         let docker_path = Path::new(DOCKER_DAEMON_PATH);
-        self.docker_original = match fs::read(docker_path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(_) => {
-                return Err(DnsMediationError::new(
-                    "dns_routing_setup_failed",
-                    "failed to read bounded Docker DNS configuration input",
-                ));
-            }
-        };
+        self.docker_original = read_optional_external_file(docker_path)?;
         let mut docker_config = match self.docker_original.as_deref() {
             Some(bytes) => serde_json::from_slice::<Value>(bytes).map_err(|_| {
                 DnsMediationError::new(
@@ -782,6 +787,7 @@ impl DnsRouting {
 
 pub struct DnsMediationSession {
     routing: DnsRouting,
+    recorder: ObservationRecorder,
     _threads: Vec<JoinHandle<()>>,
 }
 
@@ -795,6 +801,7 @@ impl DnsMediationSession {
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
+            report_write_failed: Arc::new(AtomicBool::new(false)),
             report_path,
             scope,
             materializations,
@@ -823,6 +830,7 @@ impl DnsMediationSession {
         }
         Ok(Self {
             routing,
+            recorder,
             _threads: threads,
         })
     }
@@ -957,6 +965,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         finding_timeout: Duration,
     ) -> Result<(), DnsMediationError> {
         let mut changed = false;
+        if self._mediation.recorder.take_report_write_failure() {
+            self.record_critical(
+                "dns_audit_evidence_write_failed",
+                "DNS-mediated audit evidence could not be persisted after readiness",
+            );
+            changed = true;
+        }
         let mut finding_received = false;
         match self.reader.next_finding(finding_timeout) {
             Ok(Some(finding)) => {
@@ -1217,6 +1232,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         finding_timeout: Duration,
     ) -> Result<(), DnsMediationError> {
         let mut changed = false;
+        if self._mediation.recorder.take_report_write_failure() {
+            self.record_critical(
+                "dns_block_evidence_write_failed",
+                "DNS-mediated block evidence could not be persisted after readiness",
+            );
+            changed = true;
+        }
         match self.reader.next_finding(finding_timeout) {
             Ok(Some(finding)) => {
                 self.findings.record_finding(finding);
@@ -1803,12 +1825,16 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
             continue;
         };
         let _ = upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT));
-        if upstream.send_to(&upstream_query, UPSTREAM_DNS).is_err() {
+        let _ = upstream.set_write_timeout(Some(DNS_FORWARD_TIMEOUT));
+        if upstream.connect(UPSTREAM_DNS).is_err() || upstream.send(&upstream_query).is_err() {
             continue;
         }
         let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
-        if let Ok((response_length, _)) = upstream.recv_from(&mut response) {
+        if let Ok(response_length) = upstream.recv(&mut response) {
             let response = &mut response[..response_length];
+            if !response_matches_upstream_query(response, &upstream_query) {
+                continue;
+            }
             restore_client_query_id(response, bytes);
             if let Some((hostname, query_type)) = &parsed_question {
                 recorder.record_response(hostname, *query_type, response);
@@ -1820,6 +1846,9 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
 
 fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
     for mut client in listener.incoming().flatten() {
+        if set_dns_tcp_deadlines(&client).is_err() {
+            continue;
+        }
         let mut length = [0_u8; 2];
         if client.read_exact(&mut length).is_err() {
             continue;
@@ -1847,10 +1876,9 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         if let Some((hostname, query_type)) = &parsed_question {
             recorder.record_query(hostname, *query_type, true);
         }
-        let Ok(mut upstream) = TcpStream::connect(UPSTREAM_DNS) else {
+        let Ok(mut upstream) = connect_upstream_tcp() else {
             continue;
         };
-        let _ = upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT));
         if upstream
             .write_all(&(upstream_query.len() as u16).to_be_bytes())
             .is_err()
@@ -1870,6 +1898,9 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         if upstream.read_exact(&mut response).is_err() {
             continue;
         }
+        if !response_matches_upstream_query(&response, &upstream_query) {
+            continue;
+        }
         restore_client_query_id(&mut response, &query);
         if let Some((hostname, query_type)) = &parsed_question {
             recorder.record_response(hostname, *query_type, &response);
@@ -1877,6 +1908,27 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         let _ = client.write_all(&response_length);
         let _ = client.write_all(&response);
     }
+}
+
+fn connect_upstream_tcp() -> std::io::Result<TcpStream> {
+    let address = UPSTREAM_DNS.parse().map_err(|error| {
+        std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid fixed upstream DNS address: {error}"),
+        )
+    })?;
+    let stream = TcpStream::connect_timeout(&address, DNS_FORWARD_TIMEOUT)?;
+    set_dns_tcp_deadlines(&stream)?;
+    Ok(stream)
+}
+
+fn set_dns_tcp_deadlines(stream: &TcpStream) -> std::io::Result<()> {
+    stream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT))?;
+    stream.set_write_timeout(Some(DNS_FORWARD_TIMEOUT))
+}
+
+fn response_matches_upstream_query(response: &[u8], upstream_query: &[u8]) -> bool {
+    response.len() >= 2 && upstream_query.len() >= 2 && response[..2] == upstream_query[..2]
 }
 
 fn query_for_upstream(
@@ -2300,17 +2352,26 @@ fn retain_address_answers(
 }
 
 fn normalize_hostname(hostname: &str) -> Option<String> {
-    let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-    if hostname.is_empty()
-        || hostname.len() > 253
-        || !hostname
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
-    {
-        None
-    } else {
-        Some(hostname)
+    let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
+    if hostname.ends_with('.') {
+        return None;
     }
+    let hostname = hostname.to_ascii_lowercase();
+    if hostname.is_empty() || hostname.len() > 253 {
+        return None;
+    }
+    hostname
+        .split('.')
+        .all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+        .then_some(hostname)
 }
 
 fn reportable_github_hostname(hostname: &str) -> bool {
@@ -2582,12 +2643,28 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediati
 }
 
 fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            return Err(DnsMediationError::new(
+                "dns_routing_setup_failed",
+                "fixed DNS routing configuration is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(DnsMediationError::new(
+                "dns_routing_setup_failed",
+                "failed to inspect fixed DNS routing configuration",
+            ));
+        }
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o644)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| {
             DnsMediationError::new(
@@ -2595,6 +2672,18 @@ fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationEr
                 "failed to write fixed DNS routing configuration",
             )
         })?;
+    let metadata = file.metadata().map_err(|_| {
+        DnsMediationError::new(
+            "dns_routing_setup_failed",
+            "failed to inspect fixed DNS routing configuration output",
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(DnsMediationError::new(
+            "dns_routing_setup_failed",
+            "fixed DNS routing configuration output is not a regular file",
+        ));
+    }
     file.write_all(bytes).map_err(|_| {
         DnsMediationError::new(
             "dns_routing_setup_failed",
@@ -2603,21 +2692,86 @@ fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationEr
     })
 }
 
+fn read_optional_external_file(path: &Path) -> Result<Option<Vec<u8>>, DnsMediationError> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(DnsMediationError::new(
+                "dns_routing_setup_failed",
+                "failed to read bounded Docker DNS configuration input",
+            ));
+        }
+    };
+    let metadata = file.metadata().map_err(|_| {
+        DnsMediationError::new(
+            "dns_routing_setup_failed",
+            "failed to inspect Docker DNS configuration input",
+        )
+    })?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_DOCKER_DAEMON_CONFIG_BYTES {
+        return Err(DnsMediationError::new(
+            "dns_routing_setup_failed",
+            "Docker DNS configuration input is not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_DOCKER_DAEMON_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            DnsMediationError::new(
+                "dns_routing_setup_failed",
+                "failed to read bounded Docker DNS configuration input",
+            )
+        })?;
+    if bytes.len() as u64 > MAX_DOCKER_DAEMON_CONFIG_BYTES {
+        return Err(DnsMediationError::new(
+            "dns_routing_setup_failed",
+            "Docker DNS configuration input exceeds its fixed size limit",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
 fn fixed_command(path: &str, arguments: &[&str]) -> Result<(), DnsMediationError> {
-    let status = Command::new(path)
+    let mut child = Command::new(path)
         .args(arguments)
         .env_clear()
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .map_err(|_| {
             DnsMediationError::new(
                 "dns_routing_command_failed",
                 "failed to execute a fixed DNS routing command",
             )
         })?;
+    let deadline = Instant::now() + DNS_ROUTING_COMMAND_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|_| {
+            DnsMediationError::new(
+                "dns_routing_command_failed",
+                "failed to wait for a fixed DNS routing command",
+            )
+        })? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(DnsMediationError::new(
+                "dns_routing_command_timeout",
+                "a fixed DNS routing command exceeded its deadline",
+            ));
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
     if status.success() {
         Ok(())
     } else {
@@ -2688,6 +2842,15 @@ mod tests {
             parse_dns_question(&query("Pipelines.Actions.GitHubusercontent.Com", 1)),
             Some(("pipelines.actions.githubusercontent.com".to_owned(), 1))
         );
+        assert_eq!(
+            normalize_hostname("Pipelines.Actions.GitHubusercontent.Com."),
+            Some("pipelines.actions.githubusercontent.com".to_owned())
+        );
+        assert!(normalize_hostname("pipelines..actions.githubusercontent.com").is_none());
+        assert!(normalize_hostname("-pipelines.actions.githubusercontent.com").is_none());
+        assert!(normalize_hostname("pipelines-.actions.githubusercontent.com").is_none());
+        assert!(normalize_hostname("pipelines.actions.githubusercontent.com..").is_none());
+        assert!(normalize_hostname(&format!("{}.example.com", "a".repeat(64))).is_none());
         assert!(parse_dns_question(&[]).is_none());
         let mut compressed = query("example.com", 1);
         compressed[12] = 0xc0;
@@ -2716,6 +2879,13 @@ mod tests {
         let mut response = canonical.clone();
         restore_client_query_id(&mut response, &mixed_case);
         assert_eq!(&response[..2], &0x1234_u16.to_be_bytes());
+        assert!(response_matches_upstream_query(&canonical, &canonical));
+        let mut mismatched_response = canonical.clone();
+        mismatched_response[..2].copy_from_slice(&1_u16.to_be_bytes());
+        assert!(!response_matches_upstream_query(
+            &mismatched_response,
+            &canonical
+        ));
 
         let mut multiple_questions = query("mixed.actions.githubusercontent.com", 1);
         multiple_questions[4..6].copy_from_slice(&2_u16.to_be_bytes());
@@ -2742,6 +2912,7 @@ mod tests {
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
+            report_write_failed: Arc::new(AtomicBool::new(false)),
             report_path: PathBuf::from("unused-test-report.json"),
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
             materializations: None,
@@ -3160,5 +3331,77 @@ mod tests {
             protected_audit_limitations()
                 .contains(&"audit_preserves_passwordless_sudo_and_container_control")
         );
+    }
+
+    #[test]
+    fn bounds_tcp_dns_socket_io_and_external_docker_configuration_inputs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        set_dns_tcp_deadlines(&server).unwrap();
+        assert_eq!(server.read_timeout().unwrap(), Some(DNS_FORWARD_TIMEOUT));
+        assert_eq!(server.write_timeout().unwrap(), Some(DNS_FORWARD_TIMEOUT));
+        drop(client);
+
+        let root = Path::new("target/tmp/dns-mediator-safe-file-tests");
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).unwrap();
+        let config = root.join("daemon.json");
+        fs::write(&config, b"{}").unwrap();
+        assert_eq!(
+            read_optional_external_file(&config).unwrap(),
+            Some(b"{}".to_vec())
+        );
+
+        let oversized = root.join("oversized.json");
+        fs::write(
+            &oversized,
+            vec![b'x'; MAX_DOCKER_DAEMON_CONFIG_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert_eq!(
+            read_optional_external_file(&oversized).unwrap_err().code,
+            "dns_routing_setup_failed"
+        );
+
+        let linked = root.join("linked.json");
+        std::os::unix::fs::symlink(&config, &linked).unwrap();
+        assert_eq!(
+            read_optional_external_file(&linked).unwrap_err().code,
+            "dns_routing_setup_failed"
+        );
+        assert_eq!(
+            replace_external_file(&linked, b"{}").unwrap_err().code,
+            "dns_routing_setup_failed"
+        );
+
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            read_optional_external_file(&directory).unwrap_err().code,
+            "dns_routing_setup_failed"
+        );
+        assert_eq!(
+            replace_external_file(&directory, b"{}").unwrap_err().code,
+            "dns_routing_setup_failed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retains_dns_observation_report_write_failures_for_resident_checks() {
+        let root = Path::new("target/tmp/dns-mediator-report-write-failure");
+        let _ = fs::remove_dir_all(root);
+        let recorder = ObservationRecorder {
+            state: Arc::new(Mutex::new(ObservationState::default())),
+            cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
+            report_write_failed: Arc::new(AtomicBool::new(false)),
+            report_path: root.join("missing/report.json"),
+            scope: DnsEvidenceScope::ProtectedHostAudit,
+            materializations: None,
+        };
+        recorder.record_query("pipelines.actions.githubusercontent.com", 1, true);
+        assert!(recorder.take_report_write_failure());
+        assert!(!recorder.take_report_write_failure());
     }
 }

@@ -4,6 +4,20 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
+type Environment = Record<string, string | undefined>;
+type RuntimePaths = {
+  directory: string;
+  config: string;
+  ready: string;
+  report: string;
+  unit: string;
+};
+type InlineConfig = {
+  invocationId: string;
+  raw: string;
+  usingDefault: boolean;
+};
+
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -21,11 +35,11 @@ const REPORT_STATUSES = new Set([
 ]);
 const READY_STATUSES = new Set(["ready", "ready_degraded", "ready_observation_only"]);
 
-function fail(message) {
+function fail(message: string): never {
   throw new Error(message);
 }
 
-function defaultInlineConfig(environment) {
+function defaultInlineConfig(environment: Environment): string {
   const runId = environment.GITHUB_RUN_ID;
   const runAttempt = environment.GITHUB_RUN_ATTEMPT;
   if (!/^[0-9]+$/.test(runId || "") || !/^[0-9]+$/.test(runAttempt || "")) {
@@ -39,7 +53,7 @@ function defaultInlineConfig(environment) {
   });
 }
 
-function readJsonBounded(file, maximumBytes, description) {
+function readJsonBounded(file: string, maximumBytes: number, description: string): any {
   const stat = fs.lstatSync(file);
   if (!stat.isFile() || stat.isSymbolicLink()) {
     fail(`${description} is not a regular file`);
@@ -50,7 +64,7 @@ function readJsonBounded(file, maximumBytes, description) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function validateInlineConfig(raw, environment = process.env) {
+function validateInlineConfig(raw: unknown, environment: Environment = process.env): InlineConfig {
   const usingDefault = typeof raw !== "string" || raw.length === 0;
   const normalizedRaw = usingDefault ? defaultInlineConfig(environment) : raw;
   if (Buffer.byteLength(normalizedRaw, "utf8") > MAX_CONFIG_BYTES) {
@@ -72,7 +86,7 @@ function validateInlineConfig(raw, environment = process.env) {
   return { invocationId, raw: normalizedRaw, usingDefault };
 }
 
-function runtimePaths(invocationId) {
+function runtimePaths(invocationId: unknown): RuntimePaths {
   if (
     typeof invocationId !== "string" ||
     invocationId.length < 1 ||
@@ -91,11 +105,14 @@ function runtimePaths(invocationId) {
   };
 }
 
-function validateBundle(manifestPath, binaryPath) {
+function validateBundle(manifestPath: string, binaryPath: string): any {
   const manifest = readJsonBounded(manifestPath, 16 * 1024, "bundle manifest");
   const binaryStat = fs.lstatSync(binaryPath);
   if (!binaryStat.isFile() || binaryStat.isSymbolicLink() || (binaryStat.mode & 0o111) === 0) {
     fail("bundled Fence binary is not a regular file");
+  }
+  if (manifest === null || Array.isArray(manifest) || typeof manifest !== "object") {
+    fail("bundle manifest does not match the reviewed Fence release contract");
   }
   const expectedReleaseChannel = manifest.release_tag && manifest.release_tag.includes("-")
     ? "prerelease"
@@ -136,7 +153,7 @@ function validateBundle(manifestPath, binaryPath) {
   return manifest;
 }
 
-function validateReport(report, failOnCritical = true) {
+function validateReport(report: any, failOnCritical = true): any {
   if (report === null || Array.isArray(report) || typeof report !== "object") {
     fail("Fence report must be a JSON object");
   }
@@ -205,7 +222,7 @@ function validateReport(report, failOnCritical = true) {
   return report;
 }
 
-function validateReady(ready, report) {
+function validateReady(ready: any, report: any): any {
   if (ready === null || Array.isArray(ready) || typeof ready !== "object") {
     fail("Fence readiness must be a JSON object");
   }
@@ -227,14 +244,14 @@ function validateReady(ready, report) {
   return ready;
 }
 
-function boundedScalar(value) {
+function boundedScalar(value: unknown): string {
   if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
     return "unavailable";
   }
   return String(value).replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 96);
 }
 
-function summaryLines(report) {
+function summaryLines(report: any): string[] {
   return [
     "### Fence local evidence",
     "",

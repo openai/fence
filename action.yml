@@ -6,6 +6,6 @@ inputs:
     required: false
 runs:
   using: node24
-  main: action/main.js
-  post: action/post.js
+  main: action/main.cts
+  post: action/post.cts
   post-if: always()

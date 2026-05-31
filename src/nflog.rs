@@ -248,11 +248,31 @@ fn extract_logged_prefix(bytes: &[u8], mode: Mode) -> Result<&[u8], NflogError> 
             u16::from_ne_bytes([bytes[offset + 2], bytes[offset + 3]]) & NLA_TYPE_MASK;
         let value = &bytes[offset + 4..offset + attribute_length];
         match attribute_type {
-            NFULA_PAYLOAD => payload = Some(value),
-            NFULA_PREFIX => prefix = Some(value.strip_suffix(&[0]).unwrap_or(value)),
+            NFULA_PAYLOAD if payload.replace(value).is_some() => {
+                return Err(NflogError::new(
+                    "nflog_invalid_attribute",
+                    "received a duplicate NFLOG payload attribute",
+                ));
+            }
+            NFULA_PREFIX
+                if prefix
+                    .replace(value.strip_suffix(&[0]).unwrap_or(value))
+                    .is_some() =>
+            {
+                return Err(NflogError::new(
+                    "nflog_invalid_attribute",
+                    "received a duplicate NFLOG prefix attribute",
+                ));
+            }
             _ => {}
         }
         offset += (attribute_length + 3) & !3;
+    }
+    if offset != length {
+        return Err(NflogError::new(
+            "nflog_invalid_attribute",
+            "received trailing bytes outside aligned NFLOG attributes",
+        ));
     }
     let expected_prefix = match mode {
         Mode::Block => NFLOG_PREFIX_BLOCK.as_bytes(),
@@ -359,6 +379,39 @@ mod tests {
                 .unwrap_err()
                 .code,
             "nflog_payload_prefix_too_large"
+        );
+
+        let mut duplicate_payload = event(Mode::Block, &[0x45; 64]);
+        duplicate_payload.extend(attribute(NFULA_PAYLOAD, &[0x45]));
+        let length = duplicate_payload.len() as u32;
+        duplicate_payload[..4].copy_from_slice(&length.to_ne_bytes());
+        assert_eq!(
+            extract_logged_prefix(&duplicate_payload, Mode::Block)
+                .unwrap_err()
+                .code,
+            "nflog_invalid_attribute"
+        );
+
+        let mut duplicate_prefix = event(Mode::Block, &[0x45; 64]);
+        duplicate_prefix.extend(attribute(NFULA_PREFIX, b"fence-v0-block\0"));
+        let length = duplicate_prefix.len() as u32;
+        duplicate_prefix[..4].copy_from_slice(&length.to_ne_bytes());
+        assert_eq!(
+            extract_logged_prefix(&duplicate_prefix, Mode::Block)
+                .unwrap_err()
+                .code,
+            "nflog_invalid_attribute"
+        );
+
+        let mut trailing_byte = event(Mode::Block, &[0x45; 64]);
+        trailing_byte.push(0);
+        let length = trailing_byte.len() as u32;
+        trailing_byte[..4].copy_from_slice(&length.to_ne_bytes());
+        assert_eq!(
+            extract_logged_prefix(&trailing_byte, Mode::Block)
+                .unwrap_err()
+                .code,
+            "nflog_invalid_attribute"
         );
     }
 

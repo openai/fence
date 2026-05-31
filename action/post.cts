@@ -9,18 +9,18 @@ const {
   summaryLines,
   validateBundle,
   validateReport,
-} = require("./lib");
+} = require("./lib.cts");
 
 const ACTION_ROOT = __dirname;
 const BINARY = path.join(ACTION_ROOT, "bin", "fence");
 const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
 
-function emitError(error) {
+function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`::error::Fence post-job evidence failed: ${message.replace(/[\r\n%]/g, "_").slice(0, 512)}\n`);
 }
 
-function main() {
+function main(): void {
   const invocationId = process.env.STATE_invocation_id;
   const reportPath = process.env.STATE_report_path;
   if (!invocationId || runtimePaths(invocationId).report !== reportPath) {
@@ -39,9 +39,13 @@ function main() {
   process.stdout.write("Fence post-job local evidence verified; resident controls remain active until runner teardown.\n");
 }
 
-try {
-  main();
-} catch (error) {
-  emitError(error);
-  process.exitCode = 1;
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    emitError(error);
+    process.exitCode = 1;
+  }
 }
+
+module.exports = { main };
