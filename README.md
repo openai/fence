@@ -1,4 +1,4 @@
-# Fence
+# Fence 🛡️
 
 [![lint](https://github.com/GrantBirki/fence/actions/workflows/lint.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/lint.yml)
 [![test](https://github.com/GrantBirki/fence/actions/workflows/test.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/test.yml)
@@ -7,263 +7,20 @@
 [![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
-Fence is a source-auditable Rust project for hardening supported CI runners
-against undeclared outbound network access and ordinary runner-privilege
-bypass paths. The v0 enforcement target is a GitHub-hosted `ubuntu-24.04` x64
-runner executing a native Linux GNU binary.
+A GitHub Action that locks down undeclared outbound network access and ordinary runner-privilege bypass paths on supported GitHub-hosted Linux runners.
 
-Fence publishes a stable v0 Linux x64 release. The current v0
-executable strictly validates local JSON policy, renders a frozen policy and
-deterministic native `nftables` ruleset preview, and models the selected
-bounded DNS-mediated hosted job-status compatibility descriptor. On supported
-GitHub-hosted `ubuntu-24.04` x64 runners, the Linux binary can now enter a
-protected block lifecycle only when invoked as root inside its matching trusted transient
-`systemd` service with a root-owned configuration. Standard block verifies
-the pinned runner shape, applies and verifies host network policy, disables
-measured passwordless sudo and container control paths, writes production
-readiness, and remains resident without restoring access. Explicit
-`unsafe_preserve` keeps the same network and sudo controls while preserving
-Docker/containerd access and reporting degraded assurance without an
-ordinary containment claim. Audit installs owned non-blocking observation
-rules and local DNS mediation while preserving passwordless sudo,
-Docker/containerd access, and arbitrary outbound traffic. It reports
-observation-only readiness and never claims containment. Ordinary direct
-execution is rejected before configuration intake.
+## Quick Start ⚡
 
-The bundled root Action is also exercised on disposable hosted runners. Its
-acceptance gate proves standard, degraded, and audit activation through
-`uses: ./`, setup rejection before mutation, and post-ready drift propagation:
-critical resident findings fail the post hook without stopping the service or
-restoring access.
-
-The hosted `integration` workflow exercises native apply, verification,
-rollback, forwarded-path behavior, bounded NFLOG metadata, read-only hosted
-runner fingerprint observation, disposable lockdown scenarios, one
-selected-profile runtime finalization scenario, and packaged
-production-shaped standard block, degraded block, and audit services on
-`ubuntu-24.04`. The event path immediately reduces a bounded packet prefix to
-approved endpoint metadata and never writes raw packet bytes to evidence.
-
-Compatibility research converged on the versioned
-`github_hosted_job_status_v1` descriptor. It routes host and Docker DNS through
-a root-resident mediator, forwards canonical `A` and `AAAA` questions to the
-platform resolver, refreshes four exact bootstrap roots, accepts one exact
-GitHub app receiver compatibility name, permits at most eight previously unseen
-`*.actions.githubusercontent.com` names with at most two prefix labels, derives
-at most bounded TTL-limited CNAME authorizations, and materializes only TCP
-`443` address rules. Six disposable-host replicas across two executions
-reached terminal success, and required integration now checks the selected
-runtime path on every change. The permitted DNS timing/count, bounded query
-label, CNAME delegation, HTTPS destination, and address-plus-port channels are
-explicitly disclosed egress limitations.
-
-Omitting `platform_profile` selects `github_hosted_job_status_v1`; explicitly
-supplying that same identifier is equivalent. Fence v0 rejects every other
-profile value before mutation. Post-ready action downloads, cache traffic,
-artifact storage, and repository API traffic are not included in the default
-compatibility boundary.
-
-Pull requests also build a Linux x64 package independently and execute that
-artifact through the trusted-launcher JSON CLI boundary. The current
-`0.1.2` publication remains limited to the Linux x64 agent artifact. The root
-Action carries the attested stable `0.1.2` binary without runtime downloads.
-
-Read [docs/v0.md](docs/v0.md) for the normative v0 security boundary,
-interfaces, proof requirements, and implementation roadmap.
-
-## Design Direction
-
-Fence is intended to:
-
-- run before untrusted later workflow steps on a supported hosted Linux runner;
-- enforce a verified native `nftables` outbound network policy in protected
-  `block` mode;
-- provide a local-only `audit` observation mode that makes no containment
-  claim;
-- remove default passwordless-sudo and container escape paths in the standard
-  protected `block` configuration;
-- produce bounded local evidence rather than uploading telemetry; and
-- remain source-owned, reproducible, and inspectable without a remote control
-  plane or runtime agent downloads.
-
-Fence must not be described as a complete sandbox. Allowed endpoints and any
-explicit lower-assurance container-preserving configuration remain possible
-exfiltration or bypass paths, and kernel, platform, or pre-start compromise is
-outside the initial boundary.
-
-## Hermetic Build Model
-
-This repository follows the "airplane test" model described in
-[Hermetic Builds](https://software.birki.io/posts/hermetic-builds/):
-dependencies and required tooling are prepared deliberately, while routine
-Cargo validation operates from committed inputs without network access.
-
-The normal local flow is:
-
-```console
-script/prepare-rust
-script/bootstrap
-script/test
-script/lint
-script/build
-script/server
-```
-
-`script/prepare-rust` is intentionally online and checksum-gated. Once the
-pinned Rust toolchain exists locally, `script/bootstrap`, `script/test`,
-`script/lint`, `script/build`, and `script/server` run with offline Cargo
-defaults and vendored crates from `vendor/cache`.
-
-Outside CI, scratch output defaults to ignored paths below `target/tmp` unless
-the caller provides `TMPDIR` or `RUNNER_TEMP`.
-
-## Prepared Inputs
-
-The bootstrap imports these explicit supply-chain inputs:
-
-- `Cargo.lock` plus vendored application crates in `vendor/cache`;
-- a Linux-only, exact-pinned MIT `netlink-sys` socket boundary, a narrow
-  first-party safe NFLOG request serializer, and exact-pinned `libc` constants
-  used for no-follow lifecycle-evidence file opens without first-party unsafe
-  code;
-- a checksum lock for the Rust distribution in
-  `.cargo/tooling/rust-toolchain.lock.toml`;
-- committed Zig and `cargo-zigbuild` artifacts in `vendor/release-tools`,
-  retained as prepared tooling for future cross-platform investigation rather
-  than evidence of a supported protected target;
-- committed `cargo-llvm-cov` artifacts in `vendor/test-tools`; and
-- SHA-pinned GitHub Actions in `.github/workflows`.
-
-Online refresh operations are intentionally separate from routine work:
-
-```console
-script/update
-script/vendor-rust
-script/vendor-update-tools
-script/vendor-release-tools
-script/vendor-test-tools
-```
-
-Each refresh operation changes a reviewed lock or vendored artifact surface.
-Do not manually curate generated third-party vendored contents.
-
-## Validation
-
-The local project checks are:
-
-```console
-script/bootstrap
-script/test
-script/lint
-script/build
-```
-
-Coverage additionally uses the committed test-tool artifact:
-
-```console
-script/install-test-tools
-script/test --coverage
-```
-
-`script/test --coverage` enforces 100 percent line, function, and region
-coverage for current first-party Rust code. It intentionally does not enable
-unstable branch coverage.
-
-CI additionally runs `script/validate-locks --ci` and
-`script/prepare-rust` before entering the offline script surface. Hosted
-runners are not fully air-gapped: checkout, action loading, Rust preparation,
-artifact operations, and release publication still require network access.
-On `ubuntu-24.04`, `script/test-package-smoke` verifies the built Linux
-artifact's public trusted-launcher boundary separately from
-`script/observe-hosted-runner` and the privileged namespace evidence workflow.
-The `integration` workflow also runs one disposable-host
-`script/test-selected-profile-runtime` scenario through the required aggregate
-after six terminal-success proofs. That worker plans the selected
-`github_hosted_job_status_v1` descriptor by omission, applies bounded
-DNS-mediated host blocking and measured sudo/container lockdown, and retains
-only test-only readiness and reports below a non-production runtime root.
-
-## v0 Evidence Boundary
-
-The current binary emits versioned JSON only. `render-plan` includes the fixed
-`inet fence_v0` base-ruleset preview, policy hash schema version `3`, a ruleset
-hash, and the selected bounded DNS-mediated hosted job-status descriptor.
-`check-support` reports a versioned hosted-runner fingerprint gate as an
-accepted reference that is checked during activation rather than by the
-read-only support probe. `run` rejects ordinary direct execution and accepts
-only the supported production-shaped standard block, explicit degraded block,
-or audit observation transient service.
-
-```console
-script/build
-./target/release/fence --version
-./target/release/fence check-support
-./target/release/fence render-plan --config policy.json
-./target/release/fence run --config /run/fence/example/config.json
-```
-
-The last command succeeds only when a trusted launcher has already created
-the pinned root-owned configuration and invoked the binary as the root
-`MainPID` of `fence-<invocation-id>.service`. Ordinary direct invocation
-returns `trusted_launcher_required` without reading configuration. Privileged
-hosted tests may still emit explicitly test-only resident, lockdown, or
-selected-profile runtime evidence. The selected DNS-mediated reduction
-constrains dynamic
-`*.actions.githubusercontent.com` authorization to eight unique lifetime
-names with no more than two prefix labels, canonicalizes block-mode upstream
-`A`/`AAAA` questions, and retains bounded TTL-derived CNAME descendants. Six
-disposable-host replicas across two executions reached terminal success. The
-required `integration` aggregate now exercises one copy of this test-only
-selected-profile runtime evidence. Its DNS timing/count channel, bounded
-query-label channel, approved HTTPS destinations, CNAME delegation, and
-address-plus-port realization remain disclosed limitations. This evidence
-preceded activation of the standard production path.
-
-The trusted-launcher paths now make that boundary reachable from the
-Linux CLI under a narrowly validated service context. Production
-runtime intake accepts only a root-owned `/run/fence/<invocation-id>/config.json`
-file as the only initial invocation-directory entry beneath pinned root-owned
-directories, opens it with no-follow and close-on-exec protections, and
-derives the fixed state/report/readiness paths.
-The matching service validator accepts only a root process running as the
-`MainPID` of `fence-<invocation-id>.service`. The activated lifecycle accepts
-standard block with disabled container access or explicit degraded
-`unsafe_preserve` with preserved container access, always with the selected
-`github_hosted_job_status_v1` descriptor. Audit accepts the same selected
-descriptor, applies only non-blocking observation rules, routes host and
-Docker DNS through the local root-resident mediator, and preserves sudo and
-container access. Every unsupported `platform_profile` value is rejected before
-mutation.
-
-Production `state.json`, `ready.json`, and `report.json` documents carry
-`runtime_evidence_schema_version: 1`, the logical
-`github_hosted_job_status_v1` profile identifier, and the stable
-`github_hosted_job_status_dns_mediation_v1` realization identifier.
-
-The root `action.yml` wrapper carries an exact, checksum-validated copy of an
-attested Linux release binary. Its schema-`2` manifest distinguishes immutable
-prerelease and stable release channels. The wrapper requires runtime evidence
-schema `1`. With no inputs, it creates a strict standard-block configuration
-with an empty `allowlist` and a bounded invocation identifier derived from
-GitHub run metadata. An optional inline strict-JSON configuration overrides
-that default for reviewed advanced use. The wrapper is dependency-free
-TypeScript executed directly by Node 24's built-in type stripping and uses
-only Node standard-library modules; it does not install Node packages. The
-wrapper writes the selected bytes
-into the pinned root-owned runtime path, launches
-the trusted transient service, waits for agent readiness, and renders bounded
-local evidence from its post hook. It does not download an agent, fetch policy,
-stop the resident service, or restore access at workflow runtime. External
-consumers should pin Fence to a full immutable commit SHA rather than a
-floating branch:
+Add Fence before any untrusted workflow steps:
 
 ```yaml
 - uses: GrantBirki/fence@eb175bb3c7d4b28007e01d2c26b93ea8df820e6f
 ```
 
-The zero-input form is the strict default: standard block mode, disabled
-container control paths, the selected GitHub-hosted job-status profile, and no
-user-defined egress. Advanced configuration remains explicit:
+The zero-input form selects strict `block` mode with an empty user `allowlist`.
+Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs only.
+
+Advanced callers may provide an explicit strict JSON configuration:
 
 ```yaml
 - uses: GrantBirki/fence@eb175bb3c7d4b28007e01d2c26b93ea8df820e6f
@@ -272,42 +29,97 @@ user-defined egress. Advanced configuration remains explicit:
       {"schema_version":1,"mode":"block","invocation_id":"example-run","allowlist":[]}
 ```
 
-Pull requests prove the zero-input path on the supported fixed
-`ubuntu-24.04` runner label. A separate non-required `ubuntu-latest` canary
-exercises the same path as an observational compatibility signal; it does not
-expand the supported protected target.
+## Features 🌟
 
-## Release Baseline
+- 🔒 Applies and verifies a native Linux `nftables` outbound policy.
+- 🧱 Disables ordinary passwordless sudo and Docker/containerd control paths in
+  the default protected mode.
+- 📡 Preserves narrowly bounded GitHub-hosted job-status reporting so protected
+  jobs can still finalize.
+- 🔎 Keeps a resident root-owned agent running after readiness and reports
+  critical policy drift.
+- 📦 Bundles a checksum-validated, attested Linux x64 release binary without
+  runtime agent downloads or remote policy fetches.
+- 🧪 Provides explicit degraded and observation-only modes for workflows that
+  need a narrower assurance claim.
 
-The initial package version was `0.0.0`. Importing that initial `Cargo.toml`
-to `main` established a baseline without publishing a release. The current
-`0.1.0-alpha.2` release was the first usable Linux x64 alpha publication.
-The `0.1.0-alpha.3` prerelease completed the final soak before stable `0.1.0`.
-The `0.1.1` patch publication renames the direct agent configuration collection
-to `allowlist` while intentionally keeping configuration schema `1`. The root
-Action carries that attested stable binary and provides a zero-input strict
-standard-block default. The `0.1.2` patch publication hardens DNS mediation,
-NFLOG parsing, privileged file handling, and bounded subprocess execution. The
-root Action carries that attested stable release. Future deliberate version
-bumps merged to `main` remain release triggers.
+## How It Works 🔧
 
-The supported agent artifact remains limited to `x86_64-unknown-linux-gnu`
-and must be proved on GitHub-hosted `ubuntu-24.04` x64 before release. Its
-narrow CLI package contains the binary and provenance/checksum assets, not
-generated shell completion or man-page artifacts. Portable validation and
-retained cross-build tooling may continue to run on other prepared hosts, but
-do not establish protected platform support. Publication, artifact
-attestations, and verification remain GitHub-networked operations by design.
+1. The Action writes a bounded root-owned configuration and launches the
+   bundled Fence agent as a transient `systemd` service.
+2. The agent verifies the supported hosted-runner shape, installs the native
+   network policy, and enables bounded DNS mediation for required GitHub
+   job-status traffic.
+3. Standard `block` mode disables ordinary passwordless sudo and
+   Docker/containerd control paths before emitting readiness.
+4. The agent remains resident, records bounded local evidence, and checks for
+   policy drift. Fence never restores access after readiness.
+5. The Action post hook renders a bounded summary and fails the job when
+   critical resident findings are present.
 
-## Post-v0 Hardening
+## Modes 🎛️
 
-Stable v0 does not end supply-chain hardening work. Follow-up releases should
-add a checksum-bound release SBOM, evaluate `cargo-vet`, evaluate auditable or
-reproducible binary comparison, and review whether the bounded Actions-suffix
-profile can be narrowed further without stranding hosted job completion.
+| Mode | Behavior | Assurance |
+| --- | --- | --- |
+| `block` | Enforces the network policy, disables ordinary passwordless sudo, and disables Docker/containerd control paths. | Default protected posture. |
+| `block` with `container_policy: "unsafe_preserve"` | Enforces the network policy and disables ordinary passwordless sudo while preserving container access. | Degraded: retained container control invalidates the ordinary containment claim. |
+| `audit` | Applies non-blocking observation rules while preserving sudo, containers, and outbound traffic. | Observation only: no containment claim. |
 
-## Security
+## Security 🔒
 
-See [SECURITY.md](SECURITY.md) for reporting and verification policy and
-[docs/repository-settings.md](docs/repository-settings.md) for repository
-controls that must be configured in GitHub.
+Fence reduces arbitrary outbound egress and ordinary runner-privilege bypass
+paths. It is not a complete sandbox and does not make GitHub-hosted runners
+fully hermetic. The default `github_hosted_job_status_v1` profile intentionally
+permits a bounded GitHub-owned status channel so jobs can report progress and
+finalize; later workflow code can also use permitted channels for egress.
+Kernel compromise, platform compromise, and pre-start compromise remain
+outside the v0 boundary.
+
+Fence is intentionally narrow: the supported protected target is a
+GitHub-hosted `ubuntu-24.04` x64 host job. A separate `ubuntu-latest` canary is
+observational only and does not expand the support claim. Pin Fence to a full
+immutable commit SHA, as shown above.
+
+## Hermetic Development ✈️
+
+Fence follows the airplane-test model described in
+[Hermetic Builds](https://software.birki.io/posts/hermetic-builds/). Rust
+toolchains and dependencies are prepared deliberately; routine project work
+then operates from pinned, vendored inputs without network access.
+
+```console
+script/prepare-rust
+script/bootstrap
+script/test
+script/lint
+script/build
+```
+
+`script/prepare-rust` is intentionally online and checksum-gated. The remaining
+commands use the repository's offline Cargo defaults after preparation.
+
+## CLI 🧰
+
+The bundled Rust agent exposes a narrow JSON-only interface:
+
+```console
+fence --version
+fence check-support
+fence render-plan --config policy.json
+fence run --config /run/fence/example/config.json
+```
+
+The root Action is the supported public launcher. Direct `run` execution is
+rejected unless the trusted transient-service contract is satisfied.
+
+## Further Reading 📚
+
+- [Fence v0 security contract](docs/v0.md)
+- [Security policy](SECURITY.md)
+- [Security review](docs/security-review.md)
+- [Repository settings](docs/repository-settings.md)
+- [Hermetic Builds](https://software.birki.io/posts/hermetic-builds/)
+
+## License ⚖️
+
+Fence is released under the [MIT License](LICENSE).
