@@ -275,6 +275,10 @@ mod tests {
         let root = std::path::Path::new("target/tmp/cli-unit-tests");
         std::fs::create_dir_all(root).unwrap();
         for (name, profile) in [
+            (
+                "retired-job-status-profile.json",
+                "github_hosted_job_status_v1",
+            ),
             ("none-profile.json", "none"),
             (
                 "broad-compatibility-profile.json",
@@ -312,7 +316,7 @@ mod tests {
     fn render_plan_exposes_default_bounded_dns_mediated_profile_without_activation() {
         let root = std::path::Path::new("target/tmp/cli-unit-tests");
         std::fs::create_dir_all(root).unwrap();
-        let config = root.join("default-job-status-profile.json");
+        let config = root.join("default-workflow-bootstrap-profile.json");
         std::fs::write(
             &config,
             br#"{"schema_version":1,"mode":"block","invocation_id":"default-1","allowlist":[]}"#,
@@ -332,7 +336,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_job_status_v1\"")
+                .contains("\"id\":\"github_hosted_workflow_bootstrap_v1\"")
         );
         assert!(
             output

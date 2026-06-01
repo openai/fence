@@ -52,13 +52,13 @@ pub enum ContainerPolicy {
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformProfile {
-    GithubHostedJobStatusV1,
+    GithubHostedWorkflowBootstrapV1,
 }
 
 impl PlatformProfile {
     pub fn id(self) -> &'static str {
         match self {
-            Self::GithubHostedJobStatusV1 => "github_hosted_job_status_v1",
+            Self::GithubHostedWorkflowBootstrapV1 => "github_hosted_workflow_bootstrap_v1",
         }
     }
 }
@@ -156,13 +156,13 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
     let platform_profile = match input
         .platform_profile
         .as_deref()
-        .unwrap_or("github_hosted_job_status_v1")
+        .unwrap_or("github_hosted_workflow_bootstrap_v1")
     {
-        "github_hosted_job_status_v1" => PlatformProfile::GithubHostedJobStatusV1,
+        "github_hosted_workflow_bootstrap_v1" => PlatformProfile::GithubHostedWorkflowBootstrapV1,
         _ => {
             return Err(ErrorDetail::new(
                 "invalid_platform_profile",
-                "platform_profile must be github_hosted_job_status_v1",
+                "platform_profile must be github_hosted_workflow_bootstrap_v1",
             )
             .field("platform_profile"));
         }
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(parsed.container_policy, Some(ContainerPolicy::Disable));
         assert_eq!(
             parsed.platform_profile,
-            PlatformProfile::GithubHostedJobStatusV1
+            PlatformProfile::GithubHostedWorkflowBootstrapV1
         );
         assert!(parsed.requested_allowances.is_empty());
     }
@@ -438,18 +438,18 @@ mod tests {
     #[test]
     fn accepts_explicit_selected_profile_audit_without_lockdown_and_degraded_block() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_job_status_v1","allowlist":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_workflow_bootstrap_v1","allowlist":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_job_status_v1","container_policy":"unsafe_preserve","allowlist":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_workflow_bootstrap_v1","container_policy":"unsafe_preserve","allowlist":[]}"#,
         )
         .unwrap();
 
         assert_eq!(audit.container_policy, None);
         assert_eq!(
             audit.platform_profile,
-            PlatformProfile::GithubHostedJobStatusV1
+            PlatformProfile::GithubHostedWorkflowBootstrapV1
         );
         assert_eq!(
             degraded.container_policy,
@@ -457,7 +457,7 @@ mod tests {
         );
         assert_eq!(
             degraded.platform_profile,
-            PlatformProfile::GithubHostedJobStatusV1
+            PlatformProfile::GithubHostedWorkflowBootstrapV1
         );
     }
 
@@ -478,6 +478,11 @@ mod tests {
                 br#"{"schema_version":1,"mode":"block","invocation_id":"Bad-ID","allowlist":[]}"#
                     .as_slice(),
                 "invalid_invocation_id",
+            ),
+            (
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"github_hosted_job_status_v1","allowlist":[]}"#
+                    .as_slice(),
+                "invalid_platform_profile",
             ),
             (
                 br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"default","allowlist":[]}"#

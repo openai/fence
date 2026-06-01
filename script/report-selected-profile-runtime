@@ -45,8 +45,8 @@ assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 assert dns["status"] == "selected_profile_runtime_test_only", dns
 assert dns["runtime_evidence_schema_version"] == 1, dns
-assert report["platform_profile_id"] == "github_hosted_job_status_v1", report
-assert dns["platform_profile_id"] == "github_hosted_job_status_v1", dns
+assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", report
+assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", dns
 assert report["policy_hash_schema_version"] == 3, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report

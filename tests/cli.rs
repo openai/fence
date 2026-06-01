@@ -109,12 +109,12 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
 }
 
 #[test]
-fn renders_default_bounded_job_status_profile_without_activation() {
+fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
     let invocation_id = format!("default-plan-{}", std::process::id());
     let runtime_path = PathBuf::from(format!("/run/fence/{invocation_id}"));
     let existed_before = runtime_path.exists();
     let path = config_file(
-        "default-job-status-plan.json",
+        "default-workflow-bootstrap-plan.json",
         format!(
             r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowlist":[]}}"#
         )
@@ -125,7 +125,7 @@ fn renders_default_bounded_job_status_profile_without_activation() {
     let dns = &profile["dns_mediated_compatibility"];
 
     assert_eq!(response["data"]["policy_hash_schema_version"], 3);
-    assert_eq!(profile["id"], "github_hosted_job_status_v1");
+    assert_eq!(profile["id"], "github_hosted_workflow_bootstrap_v1");
     assert_eq!(profile["selection_status"], "default_bounded_dns_mediated");
     assert_eq!(
         dns["realization_status"],
@@ -180,6 +180,10 @@ fn invalid_and_oversized_configs_are_structured_errors() {
 #[test]
 fn retired_platform_profiles_are_structured_errors() {
     for (name, profile) in [
+        (
+            "retired-job-status-profile.json",
+            "github_hosted_job_status_v1",
+        ),
         ("none-profile.json", "none"),
         (
             "broad-compatibility-profile.json",

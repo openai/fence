@@ -7,8 +7,8 @@ use crate::config::{
 use crate::error::ErrorDetail;
 use crate::nft::{NetworkEnforcementPreview, build_preview, implicit_ipv6_control};
 use crate::platform_profile::{
-    DnsMediatedCompatibilityPlan, GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
-    github_hosted_job_status_dns_mediation_plan,
+    DnsMediatedCompatibilityPlan, GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
+    github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
 use crate::resolver::{Resolution, ResolveError, Resolver};
 use serde::Serialize;
@@ -271,7 +271,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
-        PlatformProfile::GithubHostedJobStatusV1 => Vec::new(),
+        PlatformProfile::GithubHostedWorkflowBootstrapV1 => Vec::new(),
     }
 }
 
@@ -310,14 +310,14 @@ fn platform_plan(
     frozen_resolution_results: Vec<ResolutionResult>,
 ) -> PlatformProfilePlan {
     match profile {
-        PlatformProfile::GithubHostedJobStatusV1 => PlatformProfilePlan {
-            id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        PlatformProfile::GithubHostedWorkflowBootstrapV1 => PlatformProfilePlan {
+            id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             selection_status: "default_bounded_dns_mediated",
-            purpose: "github_hosted_job_status_reporting",
+            purpose: "github_hosted_workflow_bootstrap",
             requested_allowances,
             effective_allowances,
             frozen_resolution_results,
-            dns_mediated_compatibility: Some(github_hosted_job_status_dns_mediation_plan()),
+            dns_mediated_compatibility: Some(github_hosted_workflow_bootstrap_dns_mediation_plan()),
             limitations: vec![
                 "dns_mediated_runtime_materialization_requires_trusted_launcher",
                 "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
@@ -325,8 +325,8 @@ fn platform_plan(
                 "dns_query_timing_and_count_remain_egress_limitations",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-                "approved_status_https_destinations_remain_egress_channels",
-                "resolved_status_ip_addresses_may_serve_additional_destinations",
+                "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
+                "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "post_ready_codeload_traffic_is_not_authorized",
                 "post_ready_results_storage_traffic_is_not_authorized",
             ],
@@ -382,7 +382,7 @@ fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance
         container_policy: config.container_policy,
         platform_profile: config.platform_profile.id(),
         platform_profile_dns_mediated_compatibility: Some(
-            github_hosted_job_status_dns_mediation_plan(),
+            github_hosted_workflow_bootstrap_dns_mediation_plan(),
         ),
         allowances: effective_policy,
         implicit_ipv6_control: implicit_ipv6_control(),
@@ -532,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn models_default_bounded_dns_mediated_job_status_profile() {
+    fn models_default_bounded_dns_mediated_workflow_bootstrap_profile() {
         let default = build_plan(
             parse(
                 r#"{"schema_version":1,"mode":"block","invocation_id":"default","allowlist":[]}"#,
@@ -541,14 +541,14 @@ mod tests {
         )
         .unwrap();
         let explicit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_job_status_v1","allowlist":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v1","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
         assert_eq!(default.policy_hash_schema_version, 3);
         assert_eq!(
             default.platform_profile.id,
-            GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
         );
         assert_eq!(
             default.platform_profile.selection_status,

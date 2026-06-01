@@ -119,6 +119,33 @@ test("validates stable runtime evidence and sanitizes summaries", () => {
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
 });
 
+test("validates the attested workflow-bootstrap profile transition", () => {
+  const workflowBootstrapReport = {
+    ...report,
+    platform_profile_id: "github_hosted_workflow_bootstrap_v1",
+    profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
+  };
+  validateReport(workflowBootstrapReport);
+  validateReady({
+    runtime_evidence_schema_version: 1,
+    status: "ready",
+    platform_profile_id: workflowBootstrapReport.platform_profile_id,
+    profile_realization_id: workflowBootstrapReport.profile_realization_id,
+    policy_hash_schema_version: workflowBootstrapReport.policy_hash_schema_version,
+    policy_hash: workflowBootstrapReport.policy_hash,
+    base_ruleset_hash: workflowBootstrapReport.base_ruleset_hash,
+    ruleset_hash: workflowBootstrapReport.ruleset_hash,
+    protection_available: true,
+  }, workflowBootstrapReport);
+  assert.throws(
+    () => validateReport({
+      ...workflowBootstrapReport,
+      profile_realization_id: "github_hosted_job_status_dns_mediation_v1",
+    }),
+    /profile/,
+  );
+});
+
 test("validates immutable attested bundle metadata and binary identity", () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-test-"));
   try {
