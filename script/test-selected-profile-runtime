@@ -100,13 +100,16 @@ assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "selected_profile_runtime_test_only"
 assert report["runtime_evidence_schema_version"] == 1
 assert report["mode"] == "block"
-assert report["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1"
-assert report["platform_profile_id"] == "github_hosted_job_status_v1"
+assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
+assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
 assert report["policy_hash_schema_version"] == 3
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"])
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"])
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"])
 assert report["bootstrap_hostnames"] == [
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
@@ -123,20 +126,23 @@ assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report[
 assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"
 assert ready["runtime_evidence_schema_version"] == 1
 assert ready["protection_available"] is False
-assert ready["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1"
-assert ready["platform_profile_id"] == "github_hosted_job_status_v1"
+assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
+assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
 assert ready["policy_hash_schema_version"] == 3
 assert ready["policy_hash"] == report["policy_hash"]
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
 assert dns["status"] == "selected_profile_runtime_test_only"
 assert dns["runtime_evidence_schema_version"] == 1
-assert dns["profile_realization_id"] == "github_hosted_job_status_dns_mediation_v1"
-assert dns["platform_profile_id"] == "github_hosted_job_status_v1"
+assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
+assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
 assert dns["authorized_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
 ]
 assert dns["bootstrap_hostnames"] == [
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
@@ -162,8 +168,8 @@ assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limita
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
 assert "bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"]
-assert "approved_status_https_destinations_remain_egress_channels" in dns["limitations"]
-assert "resolved_status_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
+assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in dns["limitations"]
+assert "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
 assert "test_only_evidence_path_does_not_activate_default_planning_descriptor" in report["limitations"]
 assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
 assert "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in report["limitations"]
@@ -175,8 +181,8 @@ assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["lim
 assert "bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
 assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]
 assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
-assert "approved_status_https_destinations_remain_egress_channels" in report["limitations"]
-assert "resolved_status_ip_addresses_may_serve_additional_destinations" in report["limitations"]
+assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in report["limitations"]
+assert "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in report["limitations"]
 assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
 assert not production_path.exists()
 PY
@@ -191,7 +197,7 @@ import struct
 for hostname in (
     b"codeload.github.com",
     b"productionresultssa17.blob.core.windows.net",
-    b"api.github.com",
+    b"uploads.github.com",
     b"lookalike.payload.pipelines.actions.githubusercontent.com",
 ):
     identifier = random.randrange(0, 65536)

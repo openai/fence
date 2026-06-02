@@ -16,16 +16,19 @@ use crate::nft::{
 use crate::nft_backend::{NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_plan};
 use crate::platform_profile::{
-    GITHUB_HOSTED_JOB_STATUS_ACTIONS_SUFFIX_PATTERN, GITHUB_HOSTED_JOB_STATUS_BOOTSTRAP_HOSTNAMES,
-    GITHUB_HOSTED_JOB_STATUS_EXACT_COMPATIBILITY_HOSTNAMES,
-    GITHUB_HOSTED_JOB_STATUS_HTTPS_REFRESH_OVERLAP_SECONDS,
-    GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_AUTHORIZATIONS,
-    GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_DEPTH,
-    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
-    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
-    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS, GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
-    GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS, GITHUB_HOSTED_JOB_STATUS_UPSTREAM_DNS,
-    github_hosted_job_status_dns_mediation_plan,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_TTL_SECONDS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
+    github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
 use crate::resolver::SystemResolver;
 use crate::runtime::{
@@ -49,7 +52,8 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str = "github_hosted_job_status_dns_mediation_v1";
+pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
+    "github_hosted_workflow_bootstrap_dns_mediation_v1";
 pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
@@ -61,29 +65,29 @@ pub const PROTECTED_DEGRADED_BLOCK_READY_STATUS: &str = "ready_degraded";
 pub const PROTECTED_AUDIT_STATUS: &str = "protected_host_audit_observation";
 pub const PROTECTED_AUDIT_READY_STATUS: &str = "ready_observation_only";
 pub const DNS_MEDIATED_COMPATIBILITY_PATTERNS: [&str; 2] = [
-    GITHUB_HOSTED_JOB_STATUS_ACTIONS_SUFFIX_PATTERN,
-    GITHUB_HOSTED_JOB_STATUS_EXACT_COMPATIBILITY_HOSTNAMES[0],
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES[0],
 ];
-pub const SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES: [&str; 4] =
-    GITHUB_HOSTED_JOB_STATUS_BOOTSTRAP_HOSTNAMES;
+pub const SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES: [&str; 7] =
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES;
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_DYNAMIC_MATERIALIZATIONS: usize = 128;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize =
-    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize =
-    GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS;
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS;
 const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize =
-    GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_AUTHORIZATIONS;
-const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_JOB_STATUS_MAX_DERIVED_CNAME_DEPTH;
-const MAX_DYNAMIC_TTL_SECONDS: u32 = GITHUB_HOSTED_JOB_STATUS_MAX_DYNAMIC_TTL_SECONDS;
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS;
+const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH;
+const MAX_DYNAMIC_TTL_SECONDS: u32 = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_TTL_SECONDS;
 const DNS_PROFILE_REFRESH_INTERVAL: Duration =
-    Duration::from_secs(GITHUB_HOSTED_JOB_STATUS_REFRESH_INTERVAL_SECONDS);
+    Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS);
 const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
-    Duration::from_secs(GITHUB_HOSTED_JOB_STATUS_HTTPS_REFRESH_OVERLAP_SECONDS);
+    Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
-const UPSTREAM_DNS: &str = GITHUB_HOSTED_JOB_STATUS_UPSTREAM_DNS;
+const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
 const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
 const RESOLVED_DROP_IN_DIR: &str = "/etc/systemd/resolved.conf.d";
@@ -863,7 +867,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             status: PROTECTED_AUDIT_STATUS,
             mode: Mode::Audit,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
-            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -930,7 +934,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             status: PROTECTED_AUDIT_READY_STATUS,
             mode: Mode::Audit,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
-            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -1108,7 +1112,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             status: scope.evidence_status(),
             mode: Mode::Block,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
-            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -1191,7 +1195,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             status: scope.ready_status(),
             mode: Mode::Block,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
-            platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+            platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
@@ -1388,13 +1392,13 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
         ));
     }
     let plan = build_plan(normalized, &SystemResolver).map_err(config_error)?;
-    if plan.platform_profile.id != GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+    if plan.platform_profile.id != GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
         || plan.platform_profile.dns_mediated_compatibility.as_ref()
-            != Some(&github_hosted_job_status_dns_mediation_plan())
+            != Some(&github_hosted_workflow_bootstrap_dns_mediation_plan())
     {
         return Err(DnsMediationError::new(
             "protected_run_policy_not_activated",
-            "protected run accepts only reviewed block or audit modes with the hosted job-status profile",
+            "protected run accepts only reviewed block or audit modes with the hosted workflow-bootstrap profile",
         ));
     }
     let mut fingerprint = SystemLockdownControl::new(runtime.directory());
@@ -1444,7 +1448,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
         }
         _ => Err(DnsMediationError::new(
             "protected_run_policy_not_activated",
-            "protected run accepts only reviewed block or audit modes with the hosted job-status profile",
+            "protected run accepts only reviewed block or audit modes with the hosted workflow-bootstrap profile",
         )),
     }
 }
@@ -1458,14 +1462,14 @@ pub fn run_selected_profile_runtime_test_service(
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     if plan.selected_mode != Mode::Block
         || plan.assurance_status != AssuranceStatus::PlannedBlockContainment
-        || plan.platform_profile.id != GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+        || plan.platform_profile.id != GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
         || plan.platform_profile.dns_mediated_compatibility.as_ref()
-            != Some(&github_hosted_job_status_dns_mediation_plan())
+            != Some(&github_hosted_workflow_bootstrap_dns_mediation_plan())
         || !plan.requested_policy.is_empty()
     {
         return Err(DnsMediationError::new(
             "invalid_selected_profile_runtime_policy",
-            "DNS-mediated block evidence accepts only standard block with the reviewed hosted job-status profile and no user allowlist entries",
+            "DNS-mediated block evidence accepts only standard block with the reviewed hosted workflow-bootstrap profile and no user allowlist entries",
         ));
     }
     let runtime =
@@ -1501,7 +1505,7 @@ fn initial_dns_block_evidence(
         status: scope.evidence_status(),
         mode: Mode::Block,
         profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
-        platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
         policy_hash_schema_version: plan.policy_hash_schema_version,
         policy_hash: plan.policy_hash.clone(),
         base_ruleset_hash: plan.ruleset_hash.clone(),
@@ -1538,7 +1542,7 @@ fn initial_dns_audit_evidence(plan: &PlanData, ruleset_hash: String) -> DnsMedia
         status: PROTECTED_AUDIT_STATUS,
         mode: Mode::Audit,
         profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
-        platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
         policy_hash_schema_version: plan.policy_hash_schema_version,
         policy_hash: plan.policy_hash.clone(),
         base_ruleset_hash: plan.ruleset_hash.clone(),
@@ -1577,8 +1581,8 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
-        "approved_status_https_destinations_remain_egress_channels",
-        "resolved_status_ip_addresses_may_serve_additional_destinations",
+        "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
+        "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
     ]
@@ -1622,8 +1626,8 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
-        "approved_status_https_destinations_remain_egress_channels",
-        "resolved_status_ip_addresses_may_serve_additional_destinations",
+        "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
+        "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
     ]
@@ -2423,7 +2427,10 @@ fn matches_supported_block_query_type(query_type: u16) -> bool {
 
 fn profile_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
     match scope {
-        DnsEvidenceScope::ProtectedHostAudit if matches_selected_profile_pattern(hostname) => {
+        DnsEvidenceScope::ProtectedHostAudit
+            if matches_selected_profile_pattern(hostname)
+                || matches_exact_selected_profile_hostname(hostname) =>
+        {
             "matches_selected_profile_pattern"
         }
         DnsEvidenceScope::SelectedProfileRuntimeTest
@@ -2469,7 +2476,7 @@ fn evidence_from_state_and_authorizations(
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: scope.status(),
         profile_realization_id: scope.profile_realization_id(),
-        platform_profile_id: GITHUB_HOSTED_JOB_STATUS_PROFILE_ID,
+        platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
         authorized_domain_patterns: DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec(),
         bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
         mode: scope.mode(),
@@ -2552,8 +2559,8 @@ fn evidence_from_state_and_authorizations(
                 "bootstrap_roots_refresh_every_5_seconds",
                 "https_materialization_expiry_includes_30_second_refresh_overlap",
                 "dns_answers_materialize_only_bounded_profile_or_cname_descendant_https_addresses",
-                "approved_status_https_destinations_remain_egress_channels",
-                "resolved_status_ip_addresses_may_serve_additional_destinations",
+                "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
+                "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
             ],
             DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(false),
@@ -2574,9 +2581,9 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
-        "dns_answers_materialize_only_bounded_status_or_cname_descendant_https_addresses",
-        "approved_status_https_destinations_remain_egress_channels",
-        "resolved_status_ip_addresses_may_serve_additional_destinations",
+        "dns_answers_materialize_only_bounded_workflow_bootstrap_or_cname_descendant_https_addresses",
+        "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
+        "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
     ];
     if degraded {
@@ -2956,11 +2963,27 @@ mod tests {
         ));
         assert!(!matches_selected_profile_pattern("codeload.github.com"));
         assert!(!matches_selected_profile_pattern("api.github.com"));
+        assert!(matches_exact_selected_profile_hostname("github.com"));
+        assert!(matches_exact_selected_profile_hostname("api.github.com"));
+        assert!(matches_exact_selected_profile_hostname(
+            "release-assets.githubusercontent.com"
+        ));
+        assert!(!matches_exact_selected_profile_hostname(
+            "uploads.github.com"
+        ));
         assert!(!matches_selected_profile_pattern("unrelated.example.com"));
         assert!(reportable_github_hostname("api.github.com"));
         assert!(!reportable_github_hostname(
             "unclassified-account.blob.core.windows.net"
         ));
+        assert_eq!(
+            profile_classification(DnsEvidenceScope::ProtectedHostAudit, "api.github.com"),
+            "matches_selected_profile_pattern"
+        );
+        assert_eq!(
+            profile_classification(DnsEvidenceScope::ProtectedHostAudit, "uploads.github.com"),
+            "github_related_outside_profile"
+        );
     }
 
     #[test]
@@ -2985,6 +3008,12 @@ mod tests {
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("actions-results-receiver-production.githubapp.com", 1)
         );
+        assert!(DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("github.com", 1));
+        assert!(DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("api.github.com", 1));
+        assert!(
+            DnsEvidenceScope::SelectedProfileRuntimeTest
+                .forward_query("release-assets.githubusercontent.com", 1)
+        );
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.pipelines.actions.githubusercontent.com", 1,),
@@ -3004,7 +3033,9 @@ mod tests {
             !DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("productionresultssa17.blob.core.windows.net", 1)
         );
-        assert!(!DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("api.github.com", 1));
+        assert!(
+            !DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query("uploads.github.com", 1)
+        );
         assert!(
             !DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.actions.githubusercontent.com", 16,)
@@ -3316,7 +3347,7 @@ mod tests {
         assert_eq!(evidence.mode, Mode::Audit);
         assert_eq!(
             evidence.platform_profile_id,
-            GITHUB_HOSTED_JOB_STATUS_PROFILE_ID
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
         );
         assert_eq!(evidence.routing_status, "active");
         assert_eq!(evidence.host_dns_routing, "local_root_resident_mediator");

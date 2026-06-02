@@ -21,8 +21,10 @@ type InlineConfig = {
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
-const PROFILE_ID = "github_hosted_job_status_v1";
-const PROFILE_REALIZATION_ID = "github_hosted_job_status_dns_mediation_v1";
+const PROFILE_REALIZATIONS = new Map([
+  ["github_hosted_job_status_v1", "github_hosted_job_status_dns_mediation_v1"],
+  ["github_hosted_workflow_bootstrap_v1", "github_hosted_workflow_bootstrap_dns_mediation_v1"],
+]);
 const POLICY_HASH_SCHEMA_VERSION = 3;
 const RUNTIME_EVIDENCE_SCHEMA_VERSION = 1;
 const RELEASE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
@@ -37,6 +39,12 @@ const READY_STATUSES = new Set(["ready", "ready_degraded", "ready_observation_on
 
 function fail(message: string): never {
   throw new Error(message);
+}
+
+function selectsReviewedProfile(profileId: unknown, realizationId: unknown): boolean {
+  return typeof profileId === "string" &&
+    typeof realizationId === "string" &&
+    PROFILE_REALIZATIONS.get(profileId) === realizationId;
 }
 
 function defaultInlineConfig(environment: Environment): string {
@@ -165,8 +173,7 @@ function validateReport(report: any, failOnCritical = true): any {
   }
   const validIdentity =
     report.runtime_evidence_schema_version === RUNTIME_EVIDENCE_SCHEMA_VERSION &&
-    report.platform_profile_id === PROFILE_ID &&
-    report.profile_realization_id === PROFILE_REALIZATION_ID &&
+    selectsReviewedProfile(report.platform_profile_id, report.profile_realization_id) &&
     report.policy_hash_schema_version === POLICY_HASH_SCHEMA_VERSION &&
     SHA256.test(report.policy_hash) &&
     SHA256.test(report.base_ruleset_hash) &&
@@ -231,8 +238,9 @@ function validateReady(ready: any, report: any): any {
   }
   const validIdentity =
     ready.runtime_evidence_schema_version === RUNTIME_EVIDENCE_SCHEMA_VERSION &&
-    ready.platform_profile_id === PROFILE_ID &&
-    ready.profile_realization_id === PROFILE_REALIZATION_ID &&
+    selectsReviewedProfile(ready.platform_profile_id, ready.profile_realization_id) &&
+    ready.platform_profile_id === report.platform_profile_id &&
+    ready.profile_realization_id === report.profile_realization_id &&
     ready.policy_hash_schema_version === report.policy_hash_schema_version &&
     ready.policy_hash === report.policy_hash &&
     ready.base_ruleset_hash === report.base_ruleset_hash &&

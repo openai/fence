@@ -5,15 +5,17 @@
 This review covers the v0 Linux agent, DNS-mediated selected platform profile,
 native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted
 lockdown controls, bundled Action wrapper, release provenance workflow, and
-offline validation scripts as of May 2026.
+offline validation scripts as of June 2026.
 
 Fence intentionally supports only GitHub-hosted `ubuntu-24.04` x64 host jobs.
 Standard block mode reduces arbitrary outbound egress, disables measured
 passwordless sudo and container-control paths, and keeps resident controls
 active until ephemeral runner teardown. It does not claim sandboxing, kernel
 isolation, or elimination of every exfiltration channel. The selected GitHub
-job-status profile and its bounded DNS mediation remain disclosed channels
-that later workflow code may use.
+workflow-bootstrap profile and its bounded DNS mediation remain disclosed
+channels that later workflow code may use. The exact `github.com`,
+`api.github.com`, and `release-assets.githubusercontent.com` HTTPS bootstrap
+channels are intentional compatibility exceptions.
 
 ## Release Provenance
 
@@ -105,7 +107,7 @@ compile TypeScript at workflow runtime. See Node's
 
 ## Residual Risks And Boundaries
 
-- Approved GitHub job-status DNS and HTTPS channels remain available to later
+- Approved GitHub workflow-bootstrap DNS and HTTPS channels remain available to later
   workflow code and therefore remain possible exfiltration channels.
 - The fixed upstream DNS resolver remains a trusted platform dependency. Fence
   bounds, canonicalizes, and filters requests and validates response source and
