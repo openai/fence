@@ -4,6 +4,9 @@ inputs:
   config:
     description: Optional inline strict JSON Fence configuration; omission selects strict standard block with an empty allowlist
     required: false
+  mode:
+    description: Optional zero-config mode, either block or audit; may not be combined with config
+    required: false
 runs:
   using: node24
   main: action/main.cts

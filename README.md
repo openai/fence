@@ -14,20 +14,27 @@ A GitHub Action that locks down undeclared outbound network access and ordinary 
 Add Fence before any untrusted workflow steps:
 
 ```yaml
-- uses: GrantBirki/fence@eb175bb3c7d4b28007e01d2c26b93ea8df820e6f
+- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
 ```
 
 The zero-input form selects strict `block` mode with an empty user `allowlist`.
 Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs only.
-The pinned Action currently carries the attested stable `0.1.2` agent. The
-source `0.1.3` release candidate expands the default compatibility profile for
-first-step workflow bootstrap and will reach the Action after its attested
-release and bundle refresh.
+The pinned Action carries the attested stable `0.1.3` agent and its bounded
+workflow-bootstrap compatibility profile.
+
+To observe would-block traffic without enforcing containment, use the
+zero-config audit shortcut:
+
+```yaml
+- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
+  with:
+    mode: audit
+```
 
 Advanced callers may provide an explicit strict JSON configuration:
 
 ```yaml
-- uses: GrantBirki/fence@eb175bb3c7d4b28007e01d2c26b93ea8df820e6f
+- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
   with:
     config: >-
       {"schema_version":1,"mode":"block","invocation_id":"example-run","allowlist":[]}
@@ -73,12 +80,10 @@ Advanced callers may provide an explicit strict JSON configuration:
 
 Fence reduces arbitrary outbound egress and ordinary runner-privilege bypass
 paths. It is not a complete sandbox and does not make GitHub-hosted runners
-fully hermetic. The source `0.1.3` release candidate selects the
+fully hermetic. Stable `0.1.3` selects the
 `github_hosted_workflow_bootstrap_v1` profile, which intentionally permits
 bounded GitHub-owned bootstrap and finalization channels; later workflow code
-can also use permitted channels for egress. The pinned Quick Start Action still
-carries stable `0.1.2` and its narrower `github_hosted_job_status_v1` profile
-until the attested bundle refresh lands. Kernel compromise, platform
+can also use permitted channels for egress. Kernel compromise, platform
 compromise, and pre-start compromise remain outside the v0 boundary.
 
 Fence is intentionally narrow: the supported protected target is a

@@ -17,12 +17,12 @@ type InlineConfig = {
   raw: string;
   usingDefault: boolean;
 };
+type DefaultMode = "block" | "audit";
 
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const PROFILE_REALIZATIONS = new Map([
-  ["github_hosted_job_status_v1", "github_hosted_job_status_dns_mediation_v1"],
   ["github_hosted_workflow_bootstrap_v1", "github_hosted_workflow_bootstrap_dns_mediation_v1"],
 ]);
 const POLICY_HASH_SCHEMA_VERSION = 3;
@@ -47,7 +47,17 @@ function selectsReviewedProfile(profileId: unknown, realizationId: unknown): boo
     PROFILE_REALIZATIONS.get(profileId) === realizationId;
 }
 
-function defaultInlineConfig(environment: Environment): string {
+function normalizeDefaultMode(mode: unknown): DefaultMode {
+  if (typeof mode !== "string" || mode.length === 0) {
+    return "block";
+  }
+  if (mode === "block" || mode === "audit") {
+    return mode;
+  }
+  fail("mode input must be either block or audit");
+}
+
+function defaultInlineConfig(environment: Environment, mode: unknown = undefined): string {
   const runId = environment.GITHUB_RUN_ID;
   const runAttempt = environment.GITHUB_RUN_ATTEMPT;
   if (!/^[0-9]+$/.test(runId || "") || !/^[0-9]+$/.test(runAttempt || "")) {
@@ -55,7 +65,7 @@ function defaultInlineConfig(environment: Environment): string {
   }
   return JSON.stringify({
     schema_version: 1,
-    mode: "block",
+    mode: normalizeDefaultMode(mode),
     invocation_id: `fence-${runId}-${runAttempt}`,
     allowlist: [],
   });
@@ -72,9 +82,12 @@ function readJsonBounded(file: string, maximumBytes: number, description: string
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function validateInlineConfig(raw: unknown, environment: Environment = process.env): InlineConfig {
+function validateInlineConfig(raw: unknown, environment: Environment = process.env, mode: unknown = undefined): InlineConfig {
   const usingDefault = typeof raw !== "string" || raw.length === 0;
-  const normalizedRaw = usingDefault ? defaultInlineConfig(environment) : raw;
+  if (!usingDefault && typeof mode === "string" && mode.length > 0) {
+    fail("mode input cannot be combined with config input");
+  }
+  const normalizedRaw = usingDefault ? defaultInlineConfig(environment, mode) : raw;
   if (Buffer.byteLength(normalizedRaw, "utf8") > MAX_CONFIG_BYTES) {
     fail("config input exceeds 256 KiB");
   }
