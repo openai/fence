@@ -22,7 +22,6 @@ const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const PROFILE_REALIZATIONS = new Map([
-  ["github_hosted_job_status_v1", "github_hosted_job_status_dns_mediation_v1"],
   ["github_hosted_workflow_bootstrap_v1", "github_hosted_workflow_bootstrap_dns_mediation_v1"],
 ]);
 const POLICY_HASH_SCHEMA_VERSION = 3;
