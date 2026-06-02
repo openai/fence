@@ -70,6 +70,31 @@ test("validates explicit and zero-input inline configurations", () => {
     raw: defaultConfig,
     usingDefault: true,
   });
+  assert.deepEqual(validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "audit"), {
+    invocationId: "fence-12345-2",
+    raw: '{"schema_version":1,"mode":"audit","invocation_id":"fence-12345-2","allowlist":[]}',
+    usingDefault: true,
+  });
+  assert.equal(
+    defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "block"),
+    defaultConfig,
+  );
+  assert.equal(
+    defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "audit"),
+    '{"schema_version":1,"mode":"audit","invocation_id":"fence-12345-2","allowlist":[]}',
+  );
+  assert.throws(
+    () => validateInlineConfig(
+      '{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}',
+      {},
+      "audit",
+    ),
+    /cannot be combined/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "observe"),
+    /mode input/,
+  );
   assert.throws(() => validateInlineConfig("", {}), /GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT/);
   assert.throws(() => validateInlineConfig('{"invocation_id":"Action_Test"}'), /slug grammar/);
   assert.throws(() => validateInlineConfig('{"invocation_id":"action--test"}'), /slug grammar/);

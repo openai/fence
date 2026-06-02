@@ -105,7 +105,7 @@ function main(): void {
     throw new Error("Fence Action supports only Linux x64");
   }
   validateBundle(MANIFEST, BINARY);
-  const config = validateInlineConfig(process.env.INPUT_CONFIG);
+  const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, process.env.INPUT_MODE);
   const paths = runtimePaths(config.invocationId);
 
   if (fs.existsSync(paths.directory)) {

@@ -22,6 +22,15 @@ Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs only.
 The pinned Action carries the attested stable `0.1.3` agent and its bounded
 workflow-bootstrap compatibility profile.
 
+To observe would-block traffic without enforcing containment, use the
+zero-config audit shortcut:
+
+```yaml
+- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
+  with:
+    mode: audit
+```
+
 Advanced callers may provide an explicit strict JSON configuration:
 
 ```yaml

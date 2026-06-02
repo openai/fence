@@ -29,10 +29,13 @@ jobs:
         include:
           - scenario: standard
             config: '{"schema_version":1,"mode":"block","invocation_id":"action-standard","container_policy":"disable","allowlist":[]}'
+            mode: ''
           - scenario: unsafe-preserve
             config: '{"schema_version":1,"mode":"block","invocation_id":"action-unsafe-preserve","container_policy":"unsafe_preserve","allowlist":[]}'
+            mode: ''
           - scenario: audit
-            config: '{"schema_version":1,"mode":"audit","invocation_id":"action-audit","allowlist":[]}'
+            config: ''
+            mode: audit
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -55,9 +58,15 @@ jobs:
         uses: ./
         with:
           config: ${{ matrix.config }}
+          mode: ${{ matrix.mode }}
 
       - name: verify Action lifecycle
-        run: script/test-action-acceptance "${{ matrix.scenario }}"
+        run: |
+          if [[ "${{ matrix.mode }}" == "audit" ]]; then
+            script/test-action-acceptance "${{ matrix.scenario }}" "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          else
+            script/test-action-acceptance "${{ matrix.scenario }}"
+          fi
 
   zero-input:
     name: action zero-input standard
