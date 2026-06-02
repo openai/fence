@@ -2427,7 +2427,10 @@ fn matches_supported_block_query_type(query_type: u16) -> bool {
 
 fn profile_classification(scope: DnsEvidenceScope, hostname: &str) -> &'static str {
     match scope {
-        DnsEvidenceScope::ProtectedHostAudit if matches_selected_profile_pattern(hostname) => {
+        DnsEvidenceScope::ProtectedHostAudit
+            if matches_selected_profile_pattern(hostname)
+                || matches_exact_selected_profile_hostname(hostname) =>
+        {
             "matches_selected_profile_pattern"
         }
         DnsEvidenceScope::SelectedProfileRuntimeTest
@@ -2973,6 +2976,14 @@ mod tests {
         assert!(!reportable_github_hostname(
             "unclassified-account.blob.core.windows.net"
         ));
+        assert_eq!(
+            profile_classification(DnsEvidenceScope::ProtectedHostAudit, "api.github.com"),
+            "matches_selected_profile_pattern"
+        );
+        assert_eq!(
+            profile_classification(DnsEvidenceScope::ProtectedHostAudit, "uploads.github.com"),
+            "github_related_outside_profile"
+        );
     }
 
     #[test]
