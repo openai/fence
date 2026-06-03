@@ -447,6 +447,7 @@ struct DnsCnameAnswer {
 
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct PendingMaterialization {
+    source_hostname: String,
     hostname: String,
     address: IpAddr,
     ttl_seconds: u32,
@@ -460,6 +461,7 @@ struct MaterializationQueue {
 
 #[derive(Clone)]
 struct ActiveMaterialization {
+    source_hostname: String,
     hostname: String,
     address: IpAddr,
     observed_ttl_seconds: u32,
@@ -625,7 +627,7 @@ impl ObservationRecorder {
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         if reportable_github_hostname(&hostname) {
             let classification = self.profile_classification(&hostname);
-            let key = (hostname, query_type, classification);
+            let key = (hostname.clone(), query_type, classification);
             if let Some(observation) = state.retained.get_mut(&key) {
                 retain_address_answers(observation, answers.clone());
             }
@@ -643,6 +645,7 @@ impl ObservationRecorder {
                     break;
                 }
                 queue.pending.insert(PendingMaterialization {
+                    source_hostname: hostname.clone(),
                     hostname: answer.hostname,
                     address: answer.address,
                     ttl_seconds,
@@ -1064,7 +1067,7 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     reader: NflogReader,
     runtime: R,
     base_allowances: Vec<EffectiveAllowance>,
-    active: BTreeMap<(String, IpAddr), ActiveMaterialization>,
+    active: BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
     expected_state: OwnedNftState,
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
@@ -1092,11 +1095,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let mut active = BTreeMap::new();
         let (changed, materializations_truncated, _) =
             merge_pending_materializations(&mut active, &queue, Instant::now());
-        if !changed || active.is_empty() {
+        if !changed || !active_covers_selected_profile_bootstrap_roots(&active) {
             let _ = mediation.routing.rollback();
             return Err(DnsMediationError::new(
                 "dns_block_prehydration_failed",
-                "DNS-mediated block lifecycle did not materialize fixed bootstrap names",
+                "DNS-mediated block lifecycle did not materialize every fixed bootstrap name",
             ));
         }
         let allowances =
@@ -1262,17 +1265,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             }
         }
 
+        let mut root_refresh_failed = false;
         if elapsed >= self.next_dns_refresh {
             match prehydrate_selected_profile_names() {
                 Ok(materializations) => {
                     enqueue_pending_materializations(&self.queue, materializations)
                 }
-                Err(_) => {
-                    self.record_critical(
-                        "dns_block_root_refresh_failed",
-                        "DNS-mediated exact-root refresh failed after readiness",
-                    );
-                }
+                Err(_) => root_refresh_failed = true,
             };
             self.next_dns_refresh = elapsed + DNS_PROFILE_REFRESH_INTERVAL;
             changed = true;
@@ -1308,6 +1307,14 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                     "approved DNS-derived owned nftables replacement failed after readiness",
                 );
             }
+            changed = true;
+        }
+        if root_refresh_failed && !active_covers_selected_profile_bootstrap_roots(&self.active) {
+            self.evidence.network_verification_status = "critical_dynamic_update_failed";
+            self.record_critical(
+                "dns_block_root_refresh_failed",
+                "DNS-mediated exact-root refresh lost required bootstrap coverage after readiness",
+            );
             changed = true;
         }
 
@@ -1504,7 +1511,7 @@ pub fn run_selected_profile_runtime_test_service(
 
 fn initial_dns_block_evidence(
     plan: &PlanData,
-    active: &BTreeMap<(String, IpAddr), ActiveMaterialization>,
+    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
     materializations_truncated: bool,
     ruleset_hash: String,
     scope: DnsBlockRuntimeScope,
@@ -1643,23 +1650,26 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
     ]
 }
 
+#[derive(Debug)]
+enum PrehydrationQueryError {
+    Transient,
+    Fatal(DnsMediationError),
+}
+
 fn prehydrate_selected_profile_names() -> Result<Vec<PendingMaterialization>, DnsMediationError> {
     let mut materializations = Vec::new();
     let now = Instant::now();
     for hostname in SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES {
-        let mut hostname_materializations = Vec::new();
-        for query_type in [1_u16, 28_u16] {
-            let response = query_fixed_upstream_for_prehydration(hostname, query_type)?;
-            hostname_materializations.extend(pending_materializations_from_bootstrap_response(
-                hostname, query_type, &response, now,
-            )?);
-        }
-        if hostname_materializations.is_empty() {
-            return Err(DnsMediationError::new(
-                "dns_block_prehydration_failed",
-                "a fixed DNS-mediated bootstrap hostname returned no upstream addresses",
-            ));
-        }
+        let hostname_materializations = materializations_from_bootstrap_query_results(
+            hostname,
+            now,
+            [1_u16, 28_u16].map(|query_type| {
+                (
+                    query_type,
+                    query_fixed_upstream_for_prehydration(hostname, query_type),
+                )
+            }),
+        )?;
         materializations.extend(hostname_materializations);
         if materializations.len() > MAX_DYNAMIC_MATERIALIZATIONS {
             return Err(DnsMediationError::new(
@@ -1671,65 +1681,77 @@ fn prehydrate_selected_profile_names() -> Result<Vec<PendingMaterialization>, Dn
     Ok(materializations)
 }
 
+fn materializations_from_bootstrap_query_results(
+    hostname: &str,
+    now: Instant,
+    results: impl IntoIterator<Item = (u16, Result<Vec<u8>, PrehydrationQueryError>)>,
+) -> Result<Vec<PendingMaterialization>, DnsMediationError> {
+    let mut materializations = Vec::new();
+    let mut transient_failures = 0_u8;
+    for (query_type, result) in results {
+        match result {
+            Ok(response) => {
+                materializations.extend(pending_materializations_from_bootstrap_response(
+                    hostname, query_type, &response, now,
+                )?)
+            }
+            Err(PrehydrationQueryError::Transient) => {
+                transient_failures = transient_failures.saturating_add(1);
+            }
+            Err(PrehydrationQueryError::Fatal(error)) => return Err(error),
+        }
+    }
+    materializations.sort();
+    materializations.dedup();
+    if materializations.is_empty() {
+        let message = if transient_failures > 0 {
+            "a fixed DNS-mediated bootstrap hostname could not be materialized before its query attempts completed"
+        } else {
+            "a fixed DNS-mediated bootstrap hostname returned no upstream addresses"
+        };
+        return Err(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            message,
+        ));
+    }
+    Ok(materializations)
+}
+
 fn query_fixed_upstream_for_prehydration(
     hostname: &str,
     query_type: u16,
-) -> Result<Vec<u8>, DnsMediationError> {
+) -> Result<Vec<u8>, PrehydrationQueryError> {
     let query = canonical_dns_query(hostname, query_type, 0x0100).ok_or_else(|| {
-        DnsMediationError::new(
+        PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
             "failed to build a fixed DNS-mediated bootstrap query",
-        )
+        ))
     })?;
-    let upstream = UdpSocket::bind("0.0.0.0:0").map_err(|_| {
-        DnsMediationError::new(
-            "dns_block_prehydration_failed",
-            "failed to create a fixed upstream DNS socket for prehydration",
-        )
-    })?;
+    let upstream = UdpSocket::bind("0.0.0.0:0").map_err(|_| PrehydrationQueryError::Transient)?;
     upstream
         .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
-        .map_err(|_| {
-            DnsMediationError::new(
-                "dns_block_prehydration_failed",
-                "failed to configure fixed upstream DNS read timeout for prehydration",
-            )
-        })?;
+        .map_err(|_| PrehydrationQueryError::Transient)?;
     upstream
         .set_write_timeout(Some(DNS_FORWARD_TIMEOUT))
-        .map_err(|_| {
-            DnsMediationError::new(
-                "dns_block_prehydration_failed",
-                "failed to configure fixed upstream DNS write timeout for prehydration",
-            )
-        })?;
-    upstream.connect(UPSTREAM_DNS).map_err(|_| {
-        DnsMediationError::new(
-            "dns_block_prehydration_failed",
-            "failed to connect to the fixed upstream DNS endpoint for prehydration",
-        )
-    })?;
-    upstream.send(&query).map_err(|_| {
-        DnsMediationError::new(
-            "dns_block_prehydration_failed",
-            "failed to send a fixed upstream DNS query for prehydration",
-        )
-    })?;
+        .map_err(|_| PrehydrationQueryError::Transient)?;
+    upstream
+        .connect(UPSTREAM_DNS)
+        .map_err(|_| PrehydrationQueryError::Transient)?;
+    upstream
+        .send(&query)
+        .map_err(|_| PrehydrationQueryError::Transient)?;
     let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
-    let response_length = upstream.recv(&mut response).map_err(|_| {
-        DnsMediationError::new(
-            "dns_block_prehydration_failed",
-            "failed to receive a fixed upstream DNS response for prehydration",
-        )
-    })?;
+    let response_length = upstream
+        .recv(&mut response)
+        .map_err(|_| PrehydrationQueryError::Transient)?;
     let response = response[..response_length].to_vec();
     if !response_matches_upstream_query(&response, &query)
         || parse_dns_question(&response) != Some((hostname.to_owned(), query_type))
     {
-        return Err(DnsMediationError::new(
+        return Err(PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
             "fixed upstream DNS response did not match the bootstrap query",
-        ));
+        )));
     }
     Ok(response)
 }
@@ -1760,6 +1782,7 @@ fn pending_materializations_from_bootstrap_response(
             continue;
         };
         materializations.push(PendingMaterialization {
+            source_hostname: queried_hostname.to_owned(),
             hostname: answer.hostname,
             address: answer.address,
             ttl_seconds,
@@ -1810,7 +1833,7 @@ fn enqueue_pending_materializations(
 }
 
 fn merge_pending_materializations(
-    active: &mut BTreeMap<(String, IpAddr), ActiveMaterialization>,
+    active: &mut BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
     queue: &Arc<Mutex<MaterializationQueue>>,
     now: Instant,
 ) -> (bool, bool, u64) {
@@ -1824,10 +1847,15 @@ fn merge_pending_materializations(
         (std::mem::take(&mut queue.pending), queue.truncated)
     };
     for materialization in pending {
-        let key = (materialization.hostname.clone(), materialization.address);
+        let key = (
+            materialization.source_hostname.clone(),
+            materialization.hostname.clone(),
+            materialization.address,
+        );
         active.insert(
             key,
             ActiveMaterialization {
+                source_hostname: materialization.source_hostname,
                 hostname: materialization.hostname,
                 address: materialization.address,
                 observed_ttl_seconds: materialization.ttl_seconds,
@@ -1843,7 +1871,7 @@ fn merge_pending_materializations(
 
 fn effective_allowances_with_materializations(
     base_allowances: &[EffectiveAllowance],
-    active: &BTreeMap<(String, IpAddr), ActiveMaterialization>,
+    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
 ) -> Vec<EffectiveAllowance> {
     base_allowances
         .iter()
@@ -1860,7 +1888,7 @@ fn effective_allowances_with_materializations(
 }
 
 fn report_materializations(
-    active: &BTreeMap<(String, IpAddr), ActiveMaterialization>,
+    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
 ) -> Vec<DnsMaterializedHttpsAllowance> {
     active
         .values()
@@ -1872,6 +1900,21 @@ fn report_materializations(
             observed_ttl_seconds: materialization.observed_ttl_seconds,
         })
         .collect()
+}
+
+fn active_covers_selected_profile_bootstrap_roots(
+    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
+) -> bool {
+    let covered = active
+        .values()
+        .filter(|materialization| {
+            matches_exact_selected_profile_hostname(&materialization.source_hostname)
+        })
+        .map(|materialization| materialization.source_hostname.as_str())
+        .collect::<BTreeSet<_>>();
+    SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+        .iter()
+        .all(|hostname| covered.contains(hostname))
 }
 
 fn rollback_dns_block_setup(
@@ -3445,6 +3488,7 @@ mod tests {
             .unwrap()
             .pending
             .insert(PendingMaterialization {
+                source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                 hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                 address: "192.0.2.10".parse().unwrap(),
                 ttl_seconds: 30,
@@ -3546,6 +3590,28 @@ mod tests {
         assert!(!truncated);
         assert_eq!(expired, 0);
         assert_eq!(active.len(), 2);
+        assert!(active_covers_selected_profile_bootstrap_roots(
+            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+                .iter()
+                .map(|hostname| {
+                    (
+                        (
+                            (*hostname).to_owned(),
+                            (*hostname).to_owned(),
+                            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                        ),
+                        ActiveMaterialization {
+                            source_hostname: (*hostname).to_owned(),
+                            hostname: (*hostname).to_owned(),
+                            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                            observed_ttl_seconds: 60,
+                            expires_at: now + Duration::from_secs(60),
+                        },
+                    )
+                })
+                .collect()
+        ));
+        assert!(!active_covers_selected_profile_bootstrap_roots(&active));
 
         assert_eq!(
             pending_materializations_from_bootstrap_response(
@@ -3574,6 +3640,50 @@ mod tests {
             pending_materializations_from_bootstrap_response("github.com", 1, &oversized, now)
                 .unwrap_err()
                 .code,
+            "dns_block_prehydration_failed"
+        );
+    }
+
+    #[test]
+    fn bootstrap_prehydration_tolerates_one_transient_query_family_failure() {
+        let now = Instant::now();
+        let materializations = materializations_from_bootstrap_query_results(
+            "github.com",
+            now,
+            [
+                (1, Err(PrehydrationQueryError::Transient)),
+                (
+                    28,
+                    Ok(response_with_address(
+                        "github.com",
+                        28,
+                        60,
+                        &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    )),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(materializations[0].source_hostname, "github.com");
+        assert_eq!(materializations[0].hostname, "github.com");
+        assert_eq!(
+            materializations[0].address,
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1))
+        );
+
+        assert_eq!(
+            materializations_from_bootstrap_query_results(
+                "github.com",
+                now,
+                [
+                    (1, Err(PrehydrationQueryError::Transient)),
+                    (28, Err(PrehydrationQueryError::Transient)),
+                ],
+            )
+            .unwrap_err()
+            .code,
             "dns_block_prehydration_failed"
         );
     }
