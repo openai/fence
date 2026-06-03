@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  allowlistYamlSnippet,
+  correlateFindingsToDns,
   defaultInlineConfig,
   runtimePaths,
   summaryLines,
@@ -111,13 +113,14 @@ test("derives only bounded fixed runtime paths", () => {
     config: "/run/fence/action-test/config.json",
     ready: "/run/fence/action-test/ready.json",
     report: "/run/fence/action-test/report.json",
+    dnsReport: "/run/fence/action-test/dns-report.json",
     unit: "fence-action-test.service",
   });
   assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
 });
 
-test("validates stable runtime evidence and sanitizes summaries", () => {
+test("validates stable runtime evidence", () => {
   validateReport(report);
   validateReady({
     runtime_evidence_schema_version: 1,
@@ -130,8 +133,6 @@ test("validates stable runtime evidence and sanitizes summaries", () => {
     ruleset_hash: report.ruleset_hash,
     protection_available: true,
   }, report);
-  assert.match(summaryLines(report).join("\n"), /critical findings \| `0`/);
-  assert.doesNotMatch(summaryLines({ ...report, mode: "block\n| injected" }).join("\n"), /\n\| injected/);
   assert.throws(() => validateReport({ ...report, critical_findings: [{}] }), /critical resident findings/);
   assert.throws(
     () => validateReport({ ...report, network_verification_status: "critical_drift", critical_findings: [{}] }),
@@ -142,6 +143,249 @@ test("validates stable runtime evidence and sanitizes summaries", () => {
   assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
   assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 0 }), /profile/);
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
+});
+
+test("renders a concise healthy block summary without raw evidence fields", () => {
+  const summary = summaryLines(report).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\*\*Network restrictions active\*\*/);
+  assert.match(summary, /GitHub workflow support channel/);
+  assert.equal(summary.match(/Fence Summary/g)?.length, 1);
+  assert.doesNotMatch(summary, /Fence local evidence/);
+  assert.doesNotMatch(summary, /critical findings/i);
+  assert.doesNotMatch(summary, /platform profile/i);
+  assert.doesNotMatch(summary, /readiness/i);
+  assert.doesNotMatch(summary, /protected_host_block/);
+  assert.doesNotMatch(summaryLines({ ...report, mode: "block\n| injected" }).join("\n"), /\n\| injected/);
+});
+
+test("renders degraded and critical summaries without a healthy signal", () => {
+  const degraded = {
+    ...report,
+    status: "protected_host_block_degraded",
+    readiness_status: "ready_degraded",
+    setup_status: "resident_degraded",
+    protection_available: false,
+    container_status: "preserved_unsafe",
+  };
+  validateReport(degraded);
+  const degradedSummary = summaryLines(degraded).join("\n");
+  assert.match(degradedSummary, /^### Fence Summary/);
+  assert.doesNotMatch(degradedSummary, /🟢/);
+  assert.match(degradedSummary, /\*\*Limited assurance\*\*/);
+  assert.match(degradedSummary, /Docker\/container access was preserved/);
+
+  const critical = {
+    ...report,
+    network_verification_status: "critical_drift",
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "owned_nftables_state_missing",
+      message: "Fence-owned network state changed after readiness.",
+    }],
+  };
+  validateReport(critical, false);
+  assert.throws(() => validateReport(critical, true), /critical resident findings/);
+  const criticalSummary = summaryLines(critical).join("\n");
+  assert.match(criticalSummary, /^### Fence Summary/);
+  assert.doesNotMatch(criticalSummary, /🟢/);
+  assert.match(criticalSummary, /\*\*Fence needs attention\*\*/);
+  assert.match(criticalSummary, /`owned_nftables_state_missing`/);
+  assert.match(criticalSummary, /Fence-owned network state changed after readiness/);
+});
+
+test("renders audit would-block findings with DNS-backed allowlist guidance", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+        ignored_payload: "secret-payload-marker",
+      },
+      {
+        timestamp: "unix-ms:2",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+      {
+        timestamp: "unix-ms:3",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "udp",
+        remote_address: "192.0.2.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [{
+      hostname: "www.google.com",
+      query_type: "a",
+      profile_classification: "audit_observed_without_authorization",
+      occurrences: 1,
+      resolved_addresses: ["203.0.113.10"],
+      minimum_observed_ttl_seconds: 60,
+      addresses_truncated: false,
+    }],
+    observations_truncated: false,
+  };
+
+  validateReport(audit);
+  const correlation = correlateFindingsToDns(audit, dnsEvidence);
+  assert.deepEqual(correlation.hostnameRows, [{
+    destination: "www.google.com",
+    destinationKind: "hostname",
+    protocol: "tcp",
+    port: 443,
+    count: 2,
+  }]);
+  assert.deepEqual(correlation.ipRows, [{
+    destination: "192.0.2.10",
+    destinationKind: "ip",
+    protocol: "udp",
+    port: 443,
+    count: 1,
+  }]);
+
+  const summary = summaryLines(audit, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\*\*Observing only\*\*/);
+  assert.match(summary, /#### Would Be Blocked In Block Mode/);
+  assert.match(summary, /\| `www.google.com` \| `tcp` \| `443` \| `2` \|/);
+  assert.match(summary, /\| `192.0.2.10` \| `udp` \| `443` \| `1` \|/);
+  assert.match(summary, /<summary>View allowlist example<\/summary>/);
+  assert.match(summary, /```yaml/);
+  assert.match(summary, /GrantBirki\/fence@<commit-sha>/);
+  assert.match(summary, /"schema_version": 1/);
+  assert.match(summary, /"mode": "block"/);
+  assert.match(summary, /"allowlist": \[/);
+  assert.match(summary, /"destination": "www.google.com"/);
+  assert.doesNotMatch(summary, /@main/);
+  assert.doesNotMatch(summary, /secret-payload-marker/);
+});
+
+test("renders audit IP-only and missing-DNS fallbacks safely", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "udp",
+        remote_address: "192.0.2.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+      {
+        timestamp: "unix-ms:2",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv6",
+        protocol: "unknown_or_unparsed",
+        remote_address: null,
+        remote_port: null,
+        rule_class: "endpoint_unavailable_from_prefix",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const summary = summaryLines(audit).join("\n");
+  assert.match(summary, /^### Fence Summary/);
+  assert.doesNotMatch(summary, /🟢/);
+  assert.match(summary, /DNS audit evidence was unavailable/);
+  assert.match(summary, /Manual review required for IP-only findings/);
+  assert.match(summary, /could not be mapped to an endpoint/);
+  assert.doesNotMatch(summary, /View allowlist example/);
+});
+
+test("renders audit IP-only findings when DNS evidence excludes non-GitHub names", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    excluded_non_github_query_count: 2,
+  };
+
+  const summary = summaryLines(audit, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\| `203.0.113.10` \| `tcp` \| `443` \| `1` \|/);
+  assert.match(summary, /Manual review required for IP-only findings/);
+  assert.doesNotMatch(summary, /DNS audit evidence was unavailable/);
+  assert.doesNotMatch(summary, /View allowlist example/);
+});
+
+test("renders bounded allowlist YAML snippets", () => {
+  const snippet = allowlistYamlSnippet([
+    {
+      destination: "api.example.com",
+      destinationKind: "hostname",
+      protocol: "tcp",
+      port: 443,
+      count: 5,
+    },
+  ]).join("\n");
+  assert.match(snippet.trimStart(), /^<details>/);
+  assert.match(snippet, /<summary>View allowlist example<\/summary>/);
+  assert.match(snippet, /```yaml/);
+  assert.match(snippet, /GrantBirki\/fence@<commit-sha>/);
+  assert.match(snippet, /"schema_version": 1/);
+  assert.match(snippet, /"invocation_id": "example-run"/);
+  assert.match(snippet, /"allowlist": \[/);
+  assert.match(snippet, /"destination": "api.example.com"/);
+  assert.doesNotMatch(snippet, /@main/);
 });
 
 test("rejects the retired status-only profile identity", () => {

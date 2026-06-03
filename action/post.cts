@@ -23,19 +23,30 @@ function emitError(error: unknown): void {
 function main(): void {
   const invocationId = process.env.STATE_invocation_id;
   const reportPath = process.env.STATE_report_path;
-  if (!invocationId || runtimePaths(invocationId).report !== reportPath) {
+  const dnsReportPath = process.env.STATE_dns_report_path;
+  const paths = invocationId ? runtimePaths(invocationId) : undefined;
+  if (!invocationId || !paths || paths.report !== reportPath) {
     throw new Error("Fence post-job report path is missing or invalid");
+  }
+  if (dnsReportPath && paths.dnsReport !== dnsReportPath) {
+    throw new Error("Fence post-job DNS report path is invalid");
   }
   validateBundle(MANIFEST, BINARY);
   const report = validateReport(
     readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
-    true,
+    false,
   );
+  let dnsEvidence;
+  const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
+  if (fs.existsSync(effectiveDnsReportPath)) {
+    dnsEvidence = readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report");
+  }
   if (process.env.GITHUB_STEP_SUMMARY) {
-    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report).join("\n"), {
+    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {
       encoding: "utf8",
     });
   }
+  validateReport(report, true);
   process.stdout.write("Fence post-job local evidence verified; resident controls remain active until runner teardown.\n");
 }
 
