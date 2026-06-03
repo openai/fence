@@ -122,18 +122,11 @@ if scenario == "audit":
     assert report["counters"]["total_violations"] >= 1, report
     assert report["counters"]["sampled_violations"] >= 1, report
     assert any(item["classification"] == "would_block" for item in report["findings"]), report
-    google_addresses = {
-        address
-        for item in dns["observations"]
-        if item["hostname"] == "www.google.com" and item["query_type"] in ("a", "aaaa")
-        for address in item["resolved_addresses"]
-    }
-    assert google_addresses, dns
+    assert dns["excluded_non_github_query_count"] >= 1, dns
     assert any(
         item["classification"] == "would_block"
         and item["protocol"] == "tcp"
         and item["remote_port"] == 443
-        and item["remote_address"] in google_addresses
         for item in report["findings"]
     ), report
 PY

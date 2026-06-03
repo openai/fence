@@ -329,6 +329,44 @@ test("renders audit IP-only and missing-DNS fallbacks safely", () => {
   assert.doesNotMatch(summary, /View allowlist example/);
 });
 
+test("renders audit IP-only findings when DNS evidence excludes non-GitHub names", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    excluded_non_github_query_count: 2,
+  };
+
+  const summary = summaryLines(audit, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\| `203.0.113.10` \| `tcp` \| `443` \| `1` \|/);
+  assert.match(summary, /Manual review required for IP-only findings/);
+  assert.doesNotMatch(summary, /DNS audit evidence was unavailable/);
+  assert.doesNotMatch(summary, /View allowlist example/);
+});
+
 test("renders bounded allowlist YAML snippets", () => {
   const snippet = allowlistYamlSnippet([
     {
