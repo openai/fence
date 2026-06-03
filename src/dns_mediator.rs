@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1081,10 +1081,14 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         plan: &PlanData,
         scope: DnsBlockRuntimeScope,
     ) -> Result<Self, DnsMediationError> {
-        if let Err(error) = prehydrate_selected_profile_names() {
-            let _ = mediation.routing.rollback();
-            return Err(error);
-        }
+        let prehydrated = match prehydrate_selected_profile_names() {
+            Ok(materializations) => materializations,
+            Err(error) => {
+                let _ = mediation.routing.rollback();
+                return Err(error);
+            }
+        };
+        enqueue_pending_materializations(&queue, prehydrated);
         let mut active = BTreeMap::new();
         let (changed, materializations_truncated, _) =
             merge_pending_materializations(&mut active, &queue, Instant::now());
@@ -1259,12 +1263,17 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         if elapsed >= self.next_dns_refresh {
-            if prehydrate_selected_profile_names().is_err() {
-                self.record_critical(
-                    "dns_block_root_refresh_failed",
-                    "DNS-mediated exact-root refresh failed after readiness",
-                );
-            }
+            match prehydrate_selected_profile_names() {
+                Ok(materializations) => {
+                    enqueue_pending_materializations(&self.queue, materializations)
+                }
+                Err(_) => {
+                    self.record_critical(
+                        "dns_block_root_refresh_failed",
+                        "DNS-mediated exact-root refresh failed after readiness",
+                    );
+                }
+            };
             self.next_dns_refresh = elapsed + DNS_PROFILE_REFRESH_INTERVAL;
             changed = true;
         }
@@ -1579,6 +1588,7 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "post_ready_results_storage_traffic_is_not_authorized",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+        "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
         "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
@@ -1633,26 +1643,170 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
     ]
 }
 
-fn prehydrate_selected_profile_names() -> Result<(), DnsMediationError> {
+fn prehydrate_selected_profile_names() -> Result<Vec<PendingMaterialization>, DnsMediationError> {
+    let mut materializations = Vec::new();
+    let now = Instant::now();
     for hostname in SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES {
-        if (hostname, 443_u16)
-            .to_socket_addrs()
-            .map_err(|_| {
-                DnsMediationError::new(
-                    "dns_block_prehydration_failed",
-                    "failed to resolve a fixed DNS-mediated bootstrap hostname",
-                )
-            })?
-            .next()
-            .is_none()
-        {
+        let mut hostname_materializations = Vec::new();
+        for query_type in [1_u16, 28_u16] {
+            let response = query_fixed_upstream_for_prehydration(hostname, query_type)?;
+            hostname_materializations.extend(pending_materializations_from_bootstrap_response(
+                hostname, query_type, &response, now,
+            )?);
+        }
+        if hostname_materializations.is_empty() {
             return Err(DnsMediationError::new(
                 "dns_block_prehydration_failed",
-                "a fixed DNS-mediated bootstrap hostname returned no addresses",
+                "a fixed DNS-mediated bootstrap hostname returned no upstream addresses",
+            ));
+        }
+        materializations.extend(hostname_materializations);
+        if materializations.len() > MAX_DYNAMIC_MATERIALIZATIONS {
+            return Err(DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "fixed DNS-mediated bootstrap hostnames exceeded the materialization bound",
             ));
         }
     }
-    Ok(())
+    Ok(materializations)
+}
+
+fn query_fixed_upstream_for_prehydration(
+    hostname: &str,
+    query_type: u16,
+) -> Result<Vec<u8>, DnsMediationError> {
+    let query = canonical_dns_query(hostname, query_type, 0x0100).ok_or_else(|| {
+        DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "failed to build a fixed DNS-mediated bootstrap query",
+        )
+    })?;
+    let upstream = UdpSocket::bind("0.0.0.0:0").map_err(|_| {
+        DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "failed to create a fixed upstream DNS socket for prehydration",
+        )
+    })?;
+    upstream
+        .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
+        .map_err(|_| {
+            DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "failed to configure fixed upstream DNS read timeout for prehydration",
+            )
+        })?;
+    upstream
+        .set_write_timeout(Some(DNS_FORWARD_TIMEOUT))
+        .map_err(|_| {
+            DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "failed to configure fixed upstream DNS write timeout for prehydration",
+            )
+        })?;
+    upstream.connect(UPSTREAM_DNS).map_err(|_| {
+        DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "failed to connect to the fixed upstream DNS endpoint for prehydration",
+        )
+    })?;
+    upstream.send(&query).map_err(|_| {
+        DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "failed to send a fixed upstream DNS query for prehydration",
+        )
+    })?;
+    let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
+    let response_length = upstream.recv(&mut response).map_err(|_| {
+        DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "failed to receive a fixed upstream DNS response for prehydration",
+        )
+    })?;
+    let response = response[..response_length].to_vec();
+    if !response_matches_upstream_query(&response, &query)
+        || parse_dns_question(&response) != Some((hostname.to_owned(), query_type))
+    {
+        return Err(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "fixed upstream DNS response did not match the bootstrap query",
+        ));
+    }
+    Ok(response)
+}
+
+fn pending_materializations_from_bootstrap_response(
+    queried_hostname: &str,
+    query_type: u16,
+    packet: &[u8],
+    now: Instant,
+) -> Result<Vec<PendingMaterialization>, DnsMediationError> {
+    if parse_dns_question(packet) != Some((queried_hostname.to_owned(), query_type)) {
+        return Err(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "fixed upstream DNS response did not match the bootstrap query",
+        ));
+    }
+    let mut authorizations = CnameAuthorizationState::default();
+    retain_cname_authorizations(&mut authorizations, parse_dns_cname_answers(packet), now);
+
+    let mut materializations = Vec::new();
+    for answer in parse_dns_address_answers(packet) {
+        let Some(ttl_seconds) = prehydration_materialization_ttl_seconds(
+            &authorizations,
+            &answer.hostname,
+            answer.ttl_seconds,
+            now,
+        ) else {
+            continue;
+        };
+        materializations.push(PendingMaterialization {
+            hostname: answer.hostname,
+            address: answer.address,
+            ttl_seconds,
+        });
+    }
+    materializations.sort();
+    materializations.dedup();
+    if materializations.len() > MAX_RETAINED_ADDRESSES_PER_OBSERVATION {
+        return Err(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "a fixed DNS-mediated bootstrap hostname exceeded the address bound",
+        ));
+    }
+    Ok(materializations)
+}
+
+fn prehydration_materialization_ttl_seconds(
+    authorizations: &CnameAuthorizationState,
+    hostname: &str,
+    ttl_seconds: u32,
+    now: Instant,
+) -> Option<u32> {
+    if matches_exact_selected_profile_hostname(hostname) {
+        return bound_materialization_ttl(ttl_seconds, None);
+    }
+    let remaining_seconds = authorizations
+        .active
+        .get(hostname)?
+        .expires_at
+        .saturating_duration_since(now);
+    bound_materialization_ttl(ttl_seconds, Some(remaining_seconds))
+}
+
+fn enqueue_pending_materializations(
+    queue: &Arc<Mutex<MaterializationQueue>>,
+    materializations: impl IntoIterator<Item = PendingMaterialization>,
+) {
+    let mut queue = queue.lock().expect("DNS materialization lock poisoned");
+    for materialization in materializations {
+        if queue.pending.len() >= MAX_DYNAMIC_MATERIALIZATIONS
+            && !queue.pending.contains(&materialization)
+        {
+            queue.truncated = true;
+            break;
+        }
+        queue.pending.insert(materialization);
+    }
 }
 
 fn merge_pending_materializations(
@@ -1991,6 +2145,14 @@ fn canonical_block_query(hostname: &str, query_type: u16, query: &[u8]) -> Optio
     {
         return None;
     }
+    canonical_dns_query(hostname, query_type, flags & 0x0110)
+}
+
+fn canonical_dns_query(hostname: &str, query_type: u16, flags: u16) -> Option<Vec<u8>> {
+    if !matches_supported_block_query_type(query_type) {
+        return None;
+    }
+    let hostname = normalize_hostname(hostname)?;
     let mut canonical = Vec::with_capacity(hostname.len() + 18);
     canonical.extend_from_slice(&0_u16.to_be_bytes());
     canonical.extend_from_slice(&(flags & 0x0110).to_be_bytes());
@@ -2556,6 +2718,7 @@ fn evidence_from_state_and_authorizations(
                 "post_ready_results_storage_traffic_is_not_authorized",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+                "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
                 "bootstrap_roots_refresh_every_5_seconds",
                 "https_materialization_expiry_includes_30_second_refresh_overlap",
                 "dns_answers_materialize_only_bounded_profile_or_cname_descendant_https_addresses",
@@ -2579,6 +2742,7 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
         "post_ready_results_storage_traffic_is_not_authorized",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
+        "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
         "dns_answers_materialize_only_bounded_workflow_bootstrap_or_cname_descendant_https_addresses",
@@ -2796,14 +2960,18 @@ mod tests {
     fn query(name: &str, query_type: u16) -> Vec<u8> {
         let mut bytes = vec![0_u8; 12];
         bytes[4..6].copy_from_slice(&1_u16.to_be_bytes());
+        append_dns_name(&mut bytes, name);
+        bytes.extend_from_slice(&query_type.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes
+    }
+
+    fn append_dns_name(bytes: &mut Vec<u8>, name: &str) {
         for label in name.split('.') {
             bytes.push(label.len() as u8);
             bytes.extend_from_slice(label.as_bytes());
         }
         bytes.push(0);
-        bytes.extend_from_slice(&query_type.to_be_bytes());
-        bytes.extend_from_slice(&1_u16.to_be_bytes());
-        bytes
     }
 
     fn response_with_address(
@@ -2833,13 +3001,49 @@ mod tests {
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
         let mut target_bytes = Vec::new();
-        for label in target.split('.') {
-            target_bytes.push(label.len() as u8);
-            target_bytes.extend_from_slice(label.as_bytes());
-        }
-        target_bytes.push(0);
+        append_dns_name(&mut target_bytes, target);
         bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
         bytes.extend_from_slice(&target_bytes);
+        bytes
+    }
+
+    fn response_with_cname_and_address(
+        name: &str,
+        target: &str,
+        cname_ttl_seconds: u32,
+        address_ttl_seconds: u32,
+        address: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = query(name, 1);
+        bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        bytes.extend_from_slice(&[0xc0, 0x0c]);
+        bytes.extend_from_slice(&5_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&cname_ttl_seconds.to_be_bytes());
+        let mut target_bytes = Vec::new();
+        append_dns_name(&mut target_bytes, target);
+        bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&target_bytes);
+        append_dns_name(&mut bytes, target);
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&address_ttl_seconds.to_be_bytes());
+        bytes.extend_from_slice(&(address.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(address);
+        bytes
+    }
+
+    fn response_with_unrelated_address(question: &str, answer: &str, address: &[u8]) -> Vec<u8> {
+        let mut bytes = query(question, 1);
+        bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        append_dns_name(&mut bytes, answer);
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&60_u32.to_be_bytes());
+        bytes.extend_from_slice(&(address.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(address);
         bytes
     }
 
@@ -3271,6 +3475,107 @@ mod tests {
         assert!(changed);
         assert_eq!(expired, 1);
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn prehydrated_bootstrap_materializations_are_deterministic_and_bounded() {
+        let now = Instant::now();
+        let root_materializations = pending_materializations_from_bootstrap_response(
+            "github.com",
+            1,
+            &response_with_address("github.com", 1, 600, &[192, 0, 2, 10]),
+            now,
+        )
+        .unwrap();
+        let cname_materializations = pending_materializations_from_bootstrap_response(
+            "github.com",
+            1,
+            &response_with_cname_and_address(
+                "github.com",
+                "edge.example.net",
+                40,
+                120,
+                &[192, 0, 2, 20],
+            ),
+            now,
+        )
+        .unwrap();
+        let unrelated_materializations = pending_materializations_from_bootstrap_response(
+            "github.com",
+            1,
+            &response_with_unrelated_address(
+                "github.com",
+                "unrelated.example.net",
+                &[192, 0, 2, 30],
+            ),
+            now,
+        )
+        .unwrap();
+        let mut materializations = root_materializations;
+        materializations.extend(cname_materializations);
+        materializations.extend(unrelated_materializations);
+        materializations.sort();
+        materializations.dedup();
+
+        assert_eq!(
+            materializations
+                .iter()
+                .map(|materialization| (
+                    materialization.hostname.as_str(),
+                    materialization.address.to_string(),
+                    materialization.ttl_seconds
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("edge.example.net", "192.0.2.20".to_owned(), 40),
+                (
+                    "github.com",
+                    "192.0.2.10".to_owned(),
+                    MAX_DYNAMIC_TTL_SECONDS
+                ),
+            ]
+        );
+
+        let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
+        enqueue_pending_materializations(&queue, materializations.clone());
+        enqueue_pending_materializations(&queue, materializations);
+        let mut active = BTreeMap::new();
+        let (changed, truncated, expired) =
+            merge_pending_materializations(&mut active, &queue, Instant::now());
+        assert!(changed);
+        assert!(!truncated);
+        assert_eq!(expired, 0);
+        assert_eq!(active.len(), 2);
+
+        assert_eq!(
+            pending_materializations_from_bootstrap_response(
+                "api.github.com",
+                1,
+                &response_with_address("github.com", 1, 60, &[192, 0, 2, 10]),
+                now,
+            )
+            .unwrap_err()
+            .code,
+            "dns_block_prehydration_failed"
+        );
+        let mut oversized = query("github.com", 1);
+        oversized[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        oversized[6..8]
+            .copy_from_slice(&((MAX_RETAINED_ADDRESSES_PER_OBSERVATION + 1) as u16).to_be_bytes());
+        for value in 0..=MAX_RETAINED_ADDRESSES_PER_OBSERVATION {
+            oversized.extend_from_slice(&[0xc0, 0x0c]);
+            oversized.extend_from_slice(&1_u16.to_be_bytes());
+            oversized.extend_from_slice(&1_u16.to_be_bytes());
+            oversized.extend_from_slice(&60_u32.to_be_bytes());
+            oversized.extend_from_slice(&4_u16.to_be_bytes());
+            oversized.extend_from_slice(&[198, 51, 100, value as u8]);
+        }
+        assert_eq!(
+            pending_materializations_from_bootstrap_response("github.com", 1, &oversized, now)
+                .unwrap_err()
+                .code,
+            "dns_block_prehydration_failed"
+        );
     }
 
     #[test]
