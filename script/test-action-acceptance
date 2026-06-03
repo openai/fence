@@ -22,6 +22,7 @@ if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
 fi
 
 require_cmd docker
+require_cmd curl
 require_cmd python3
 require_cmd sudo
 
@@ -100,6 +101,7 @@ import socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.sendto(b"fence-action-audit-probe", ("192.0.2.10", 443))
 PY
+  curl --head --silent --show-error --max-time 10 --retry 0 https://www.google.com >/dev/null
 fi
 
 sleep 6
@@ -120,6 +122,20 @@ if scenario == "audit":
     assert report["counters"]["total_violations"] >= 1, report
     assert report["counters"]["sampled_violations"] >= 1, report
     assert any(item["classification"] == "would_block" for item in report["findings"]), report
+    google_addresses = {
+        address
+        for item in dns["observations"]
+        if item["hostname"] == "www.google.com" and item["query_type"] in ("a", "aaaa")
+        for address in item["resolved_addresses"]
+    }
+    assert google_addresses, dns
+    assert any(
+        item["classification"] == "would_block"
+        and item["protocol"] == "tcp"
+        and item["remote_port"] == 443
+        and item["remote_address"] in google_addresses
+        for item in report["findings"]
+    ), report
 PY
 
 echo -e "${GREEN}Action acceptance verified:${OFF} $scenario"

@@ -188,14 +188,14 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Must never become an Action runtime step.
 
 - `script/test-action-wrapper`
-  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, report validation, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, report validation, concise job-summary rendering, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
   - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
   - Proves that an omitted Action input derives a bounded invocation identifier from GitHub run metadata and emits strict schema-`1` standard block with an empty `allowlist`; also proves `mode: audit` emits strict schema-`1` observation mode without requiring a raw JSON config.
   - The wrapper and hosted acceptance assertions require runtime-evidence schema `1` and stable profile-realization fields.
 
 - `script/test-action-acceptance`
   - Linux x64-only, GitHub-Actions-only hosted acceptance entrypoint invoked after `uses: ./`.
-  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown.
+  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown. Audit acceptance also exercises a non-profile public hostname so the Action summary has DNS-backed would-block evidence to turn into `allowlist` guidance.
   - Must not stop the service, restore controls, download an agent, or fetch policy.
 
 - `script/test-action-setup-failure`

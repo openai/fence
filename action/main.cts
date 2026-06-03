@@ -7,7 +7,6 @@ const {
   MAX_REPORT_BYTES,
   readJsonBounded,
   runtimePaths,
-  summaryLines,
   validateBundle,
   validateInlineConfig,
   validateReady,
@@ -75,14 +74,6 @@ function appendState(name: string, value: string): void {
   fs.appendFileSync(state, `${name}=${value}\n`, { encoding: "utf8" });
 }
 
-function appendSummary(report: any): void {
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report).join("\n"), {
-      encoding: "utf8",
-    });
-  }
-}
-
 function waitForReady(paths: { ready: string; report: string }): any {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -119,6 +110,7 @@ function main(): void {
 
   appendState("invocation_id", config.invocationId);
   appendState("report_path", paths.report);
+  appendState("dns_report_path", paths.dnsReport);
   appendState("ready_path", paths.ready);
   run("/usr/bin/sudo", [
     "/usr/bin/systemd-run",
@@ -132,8 +124,7 @@ function main(): void {
     "--config",
     paths.config,
   ]);
-  const report = waitForReady(paths);
-  appendSummary(report);
+  waitForReady(paths);
   process.stdout.write("Fence readiness verified; resident controls remain active until runner teardown.\n");
 }
 

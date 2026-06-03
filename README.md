@@ -65,8 +65,9 @@ Advanced callers may provide an explicit strict JSON configuration:
    Docker/containerd control paths before emitting readiness.
 4. The agent remains resident, records bounded local evidence, and checks for
    policy drift. Fence never restores access after readiness.
-5. The Action post hook renders a bounded summary and fails the job when
-   critical resident findings are present.
+5. The Action post hook renders a concise Fence Summary, including audit-mode
+   would-block guidance when available, and fails the job when critical
+   resident findings are present.
 
 ## Modes 🎛️
 
