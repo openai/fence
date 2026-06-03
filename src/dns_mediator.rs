@@ -3139,12 +3139,17 @@ mod tests {
         bytes
     }
 
-    fn response_with_unrelated_address(question: &str, answer: &str, address: &[u8]) -> Vec<u8> {
-        let mut bytes = query(question, 1);
+    fn response_with_unrelated_address(
+        question: &str,
+        query_type: u16,
+        answer: &str,
+        address: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = query(question, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
         append_dns_name(&mut bytes, answer);
-        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&query_type.to_be_bytes());
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&60_u32.to_be_bytes());
         bytes.extend_from_slice(&(address.len() as u16).to_be_bytes());
@@ -3611,6 +3616,7 @@ mod tests {
             1,
             &response_with_unrelated_address(
                 "github.com",
+                1,
                 "unrelated.example.net",
                 &[192, 0, 2, 30],
             ),
@@ -3758,6 +3764,7 @@ mod tests {
                     1,
                     Ok(response_with_unrelated_address(
                         "github.com",
+                        1,
                         "unrelated.example.net",
                         &[192, 0, 2, 30],
                     )),
@@ -3766,8 +3773,9 @@ mod tests {
                     28,
                     Ok(response_with_unrelated_address(
                         "github.com",
+                        28,
                         "unrelated.example.net",
-                        &[192, 0, 2, 31],
+                        &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
                     )),
                 ),
             ],
