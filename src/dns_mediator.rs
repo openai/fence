@@ -1726,11 +1726,7 @@ fn materializations_from_bootstrap_query_results(
             "a fixed DNS-mediated bootstrap hostname returned no upstream addresses"
         };
         let error = DnsMediationError::new("dns_block_prehydration_failed", message);
-        return if transient_failures > 0 {
-            Err(PrehydrationError::Transient(error))
-        } else {
-            Err(PrehydrationError::Fatal(error))
-        };
+        return Err(PrehydrationError::Transient(error));
     }
     Ok(materializations)
 }
@@ -3749,6 +3745,55 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, PrehydrationError::Transient(_)));
+        assert_eq!(
+            prehydration_error_code(&error),
+            "dns_block_prehydration_failed"
+        );
+
+        let error = materializations_from_bootstrap_query_results(
+            "github.com",
+            now,
+            [
+                (
+                    1,
+                    Ok(response_with_unrelated_address(
+                        "github.com",
+                        "unrelated.example.net",
+                        &[192, 0, 2, 30],
+                    )),
+                ),
+                (
+                    28,
+                    Ok(response_with_unrelated_address(
+                        "github.com",
+                        "unrelated.example.net",
+                        &[192, 0, 2, 31],
+                    )),
+                ),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(error, PrehydrationError::Transient(_)));
+        assert_eq!(
+            prehydration_error_code(&error),
+            "dns_block_prehydration_failed"
+        );
+
+        let error = materializations_from_bootstrap_query_results(
+            "github.com",
+            now,
+            [(
+                1,
+                Ok(response_with_address(
+                    "api.github.com",
+                    1,
+                    60,
+                    &[192, 0, 2, 10],
+                )),
+            )],
+        )
+        .unwrap_err();
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
         assert_eq!(
             prehydration_error_code(&error),
             "dns_block_prehydration_failed"
