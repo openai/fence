@@ -71,6 +71,32 @@ Advanced callers may provide an explicit strict JSON configuration:
    would-block guidance when available, and fails the job when critical
    resident findings are present.
 
+```mermaid
+flowchart TD
+    start["GitHub-hosted Linux job starts"] --> action["Fence Action runs first"]
+    action --> input["Normalize input<br/>default: block mode with empty allowlist"]
+    input --> config["Create root-owned config<br/>/run/fence/&lt;invocation-id&gt;/config.json"]
+    config --> launch["Launch bundled agent<br/>sudo + transient systemd service"]
+
+    launch --> trust["Verify trusted launcher, runtime ownership,<br/>and supported hosted-runner fingerprint"]
+    trust --> plan["Freeze policy plan<br/>allowlist + workflow-bootstrap profile"]
+    plan --> network["Apply native nftables policy<br/>and local DNS mediation"]
+
+    network --> mode{"Selected mode"}
+    mode --> block["block<br/>disable passwordless sudo<br/>disable Docker/containerd"]
+    mode --> degraded["block + unsafe_preserve<br/>disable passwordless sudo<br/>preserve containers"]
+    mode --> audit["audit<br/>observe would-block traffic<br/>preserve sudo and containers"]
+
+    block --> ready["Write ready.json and report.json"]
+    degraded --> ready
+    audit --> ready
+
+    ready --> resident["Resident agent stays active<br/>verify controls every 5 seconds<br/>record bounded findings"]
+    resident --> post["Action post hook reads local evidence"]
+    post --> summary["Render Fence Summary<br/>fail job on critical findings"]
+    summary --> teardown["Runner teardown removes the VM<br/>Fence does not restore access"]
+```
+
 ## Modes 🎛️
 
 | Mode | Behavior | Assurance |

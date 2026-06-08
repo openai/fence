@@ -416,6 +416,9 @@ Update docs in the same PR when changing:
 - Release artifact layout or release verification.
 - GitHub Actions permissions or release environment assumptions.
 - Public Fence expectations for users and contributors.
+- The Action, agent, trusted-launcher, policy, lockdown, resident-verification,
+  report, or post-hook flow. Keep the Mermaid diagram in the `README.md`
+  `How It Works` section aligned with the current user-facing lifecycle.
 
 `README.md` is for users of Fence. `docs/v0.md` is the normative security and implementation specification. `AGENTS.md` is for maintainers and coding agents. `SECURITY.md` is for security policy and vulnerability reporting. `docs/repository-settings.md` is for settings that cannot be fully represented in tracked files.
 
