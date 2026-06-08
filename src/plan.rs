@@ -200,6 +200,7 @@ pub fn build_plan(
     let platform_resolution_results = Vec::new();
     let platform_profile = platform_plan(
         config.platform_profile,
+        config.disable_broad_github_domains,
         platform_requested_policy,
         platform_effective_policy,
         platform_resolution_results,
@@ -305,20 +306,14 @@ fn expand_allowances(
 
 fn platform_plan(
     profile: PlatformProfile,
+    disable_broad_github_domains: bool,
     requested_allowances: Vec<NormalizedAllowance>,
     effective_allowances: Vec<EffectiveAllowance>,
     frozen_resolution_results: Vec<ResolutionResult>,
 ) -> PlatformProfilePlan {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV1 => PlatformProfilePlan {
-            id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
-            selection_status: "default_bounded_dns_mediated",
-            purpose: "github_hosted_workflow_bootstrap",
-            requested_allowances,
-            effective_allowances,
-            frozen_resolution_results,
-            dns_mediated_compatibility: Some(github_hosted_workflow_bootstrap_dns_mediation_plan()),
-            limitations: vec![
+        PlatformProfile::GithubHostedWorkflowBootstrapV1 => {
+            let mut limitations = vec![
                 "dns_mediated_runtime_materialization_requires_trusted_launcher",
                 "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
                 "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
@@ -329,8 +324,29 @@ fn platform_plan(
                 "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "post_ready_codeload_traffic_is_not_authorized",
                 "post_ready_results_storage_traffic_is_not_authorized",
-            ],
-        },
+            ];
+            if disable_broad_github_domains {
+                limitations.push("broad_github_web_api_and_release_asset_destinations_disabled");
+            } else {
+                limitations.push(
+                    "broad_github_web_api_and_release_asset_destinations_remain_egress_channels",
+                );
+            }
+            PlatformProfilePlan {
+                id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
+                selection_status: "default_bounded_dns_mediated",
+                purpose: "github_hosted_workflow_bootstrap",
+                requested_allowances,
+                effective_allowances,
+                frozen_resolution_results,
+                dns_mediated_compatibility: Some(
+                    github_hosted_workflow_bootstrap_dns_mediation_plan(
+                        disable_broad_github_domains,
+                    ),
+                ),
+                limitations,
+            }
+        }
     }
 }
 
@@ -382,7 +398,9 @@ fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance
         container_policy: config.container_policy,
         platform_profile: config.platform_profile.id(),
         platform_profile_dns_mediated_compatibility: Some(
-            github_hosted_workflow_bootstrap_dns_mediation_plan(),
+            github_hosted_workflow_bootstrap_dns_mediation_plan(
+                config.disable_broad_github_domains,
+            ),
         ),
         allowances: effective_policy,
         implicit_ipv6_control: implicit_ipv6_control(),
@@ -545,6 +563,16 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
+        let explicit_false = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit-false","disable_broad_github_domains":false,"allowlist":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let opt_out = build_plan(
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"opt-out","disable_broad_github_domains":true,"allowlist":[]}"#),
+            &resolver(vec![]),
+        )
+        .unwrap();
         assert_eq!(default.policy_hash_schema_version, 3);
         assert_eq!(
             default.platform_profile.id,
@@ -561,12 +589,50 @@ mod tests {
             .dns_mediated_compatibility
             .as_ref()
             .unwrap();
+        assert_eq!(
+            dns.bootstrap_hostnames,
+            [
+                "github.com",
+                "api.github.com",
+                "release-assets.githubusercontent.com",
+                "vstoken.actions.githubusercontent.com",
+                "pipelines.actions.githubusercontent.com",
+                "payload.pipelines.actions.githubusercontent.com",
+                "results-receiver.actions.githubusercontent.com",
+            ]
+        );
         assert_eq!(dns.max_dynamic_actions_suffix_authorizations, 8);
         assert_eq!(dns.max_dynamic_actions_suffix_prefix_labels, 2);
         assert_eq!(dns.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(dns.https_materialization_port, 443);
         assert_eq!(default.policy_hash, explicit.policy_hash);
+        assert_eq!(default.policy_hash, explicit_false.policy_hash);
         assert_eq!(default.ruleset_hash, explicit.ruleset_hash);
+        let opt_out_dns = opt_out
+            .platform_profile
+            .dns_mediated_compatibility
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            opt_out_dns.bootstrap_hostnames,
+            [
+                "vstoken.actions.githubusercontent.com",
+                "pipelines.actions.githubusercontent.com",
+                "payload.pipelines.actions.githubusercontent.com",
+                "results-receiver.actions.githubusercontent.com",
+            ]
+        );
+        assert_ne!(default.policy_hash, opt_out.policy_hash);
+        assert_eq!(default.ruleset_hash, opt_out.ruleset_hash);
+        assert!(default.platform_profile.limitations.contains(
+            &"broad_github_web_api_and_release_asset_destinations_remain_egress_channels"
+        ));
+        assert!(
+            opt_out
+                .platform_profile
+                .limitations
+                .contains(&"broad_github_web_api_and_release_asset_destinations_disabled")
+        );
     }
 
     #[test]

@@ -15,7 +15,9 @@ isolation, or elimination of every exfiltration channel. The selected GitHub
 workflow-bootstrap profile and its bounded DNS mediation remain disclosed
 channels that later workflow code may use. The exact `github.com`,
 `api.github.com`, and `release-assets.githubusercontent.com` HTTPS bootstrap
-channels are intentional compatibility exceptions.
+channels are intentional compatibility exceptions by default. Workflows may set
+`disable_broad_github_domains: true` to remove those three broad GitHub roots
+while keeping core Actions status and finalization endpoints available.
 
 ## Release Provenance
 
@@ -107,8 +109,12 @@ compile TypeScript at workflow runtime. See Node's
 
 ## Residual Risks And Boundaries
 
-- Approved GitHub workflow-bootstrap DNS and HTTPS channels remain available to later
-  workflow code and therefore remain possible exfiltration channels.
+- Approved GitHub workflow-bootstrap DNS and HTTPS channels remain available to
+  later workflow code and therefore remain possible exfiltration channels. By
+  default this includes `github.com`, `api.github.com`, and
+  `release-assets.githubusercontent.com`; `disable_broad_github_domains: true`
+  removes those three broad roots but retains core Actions status/finalization
+  channels.
 - The fixed upstream DNS resolver remains a trusted platform dependency. Fence
   bounds, canonicalizes, and filters requests and validates response source and
   transaction identity, but does not add DNSSEC validation.
