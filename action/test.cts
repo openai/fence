@@ -85,19 +85,117 @@ test("validates explicit and zero-input inline configurations", () => {
     defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "audit"),
     '{"schema_version":1,"mode":"audit","invocation_id":"fence-12345-2","allowlist":[]}',
   );
+  assert.equal(
+    defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, {
+      invocationId: "custom-run",
+      mode: "block",
+      containerPolicy: "unsafe_preserve",
+      platformProfile: "github_hosted_workflow_bootstrap_v1",
+      disableBroadGithubDomains: "true",
+      allowlist: [
+        "# comments are ignored",
+        "www.example.com",
+        "api.example.com:8443",
+        "tcp://upload.example.com:9443",
+        "udp://dns.example.com:53",
+        "hostname mirror.example.com tcp 443",
+        "ip 192.0.2.10 tcp 443",
+        "cidr 192.0.2.0/24 udp 123",
+        "cidr 2001:db8::/64 tcp 443",
+      ].join("\n"),
+    }),
+    JSON.stringify({
+      schema_version: 1,
+      mode: "block",
+      invocation_id: "custom-run",
+      allowlist: [
+        { destination_type: "hostname", destination: "www.example.com", protocol: "tcp", port: 443 },
+        { destination_type: "hostname", destination: "api.example.com", protocol: "tcp", port: 8443 },
+        { destination_type: "hostname", destination: "upload.example.com", protocol: "tcp", port: 9443 },
+        { destination_type: "hostname", destination: "dns.example.com", protocol: "udp", port: 53 },
+        { destination_type: "hostname", destination: "mirror.example.com", protocol: "tcp", port: 443 },
+        { destination_type: "ip", destination: "192.0.2.10", protocol: "tcp", port: 443 },
+        { destination_type: "cidr", destination: "192.0.2.0/24", protocol: "udp", port: 123 },
+        { destination_type: "cidr", destination: "2001:db8::/64", protocol: "tcp", port: 443 },
+      ],
+      container_policy: "unsafe_preserve",
+      platform_profile: "github_hosted_workflow_bootstrap_v1",
+      disable_broad_github_domains: true,
+    }),
+  );
+  assert.equal(
+    defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, {
+      disableBroadGithubDomains: "false",
+    }),
+    defaultConfig,
+  );
   assert.throws(
     () => validateInlineConfig(
       '{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}',
       {},
-      "audit",
+      { mode: "audit" },
     ),
     /cannot be combined/,
   );
+  for (const nativeInput of [
+    { invocationId: "native-run" },
+    { containerPolicy: "disable" },
+    { platformProfile: "github_hosted_workflow_bootstrap_v1" },
+    { disableBroadGithubDomains: "true" },
+    { allowlist: "example.com" },
+  ]) {
+    assert.throws(
+      () => validateInlineConfig(
+        '{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}',
+        {},
+        nativeInput,
+      ),
+      /cannot be combined/,
+    );
+  }
   assert.throws(
     () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "observe"),
     /mode input/,
   );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { mode: "audit", containerPolicy: "disable" }),
+    /container_policy input cannot be used with audit mode/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { containerPolicy: "keep" }),
+    /container_policy input/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { platformProfile: "none" }),
+    /platform_profile input/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { disableBroadGithubDomains: "TRUE" }),
+    /disable_broad_github_domains input/,
+  );
+  for (const allowlist of [
+    "https://example.com:443",
+    "example.com:notaport",
+    "example.com:0",
+    "192.0.2.10",
+    "192.0.2.0/24",
+    "hostname 192.0.2.10 tcp 443",
+    "ip example.com tcp 443",
+    "cidr 192.0.2.0/33 tcp 443",
+    "hostname example.com icmp 443",
+    "hostname example.com tcp 65536",
+    "hostname example.com tcp 443 extra",
+  ]) {
+    assert.throws(
+      () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { allowlist }),
+      /allowlist line 1/,
+    );
+  }
   assert.throws(() => validateInlineConfig("", {}), /GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT/);
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { invocationId: "Action_Test" }),
+    /invocation_id input/,
+  );
   assert.throws(() => validateInlineConfig('{"invocation_id":"Action_Test"}'), /slug grammar/);
   assert.throws(() => validateInlineConfig('{"invocation_id":"action--test"}'), /slug grammar/);
   assert.throws(() => validateInlineConfig("[]"), /JSON object/);
@@ -278,10 +376,10 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
   assert.match(summary, /```yaml/);
   assert.match(summary, /GrantBirki\/fence@<commit-sha>/);
-  assert.match(summary, /"schema_version": 1/);
-  assert.match(summary, /"mode": "block"/);
-  assert.match(summary, /"allowlist": \[/);
-  assert.match(summary, /"destination": "www.google.com"/);
+  assert.match(summary, /allowlist: \|/);
+  assert.match(summary, /      www.google.com/);
+  assert.doesNotMatch(summary, /invocation_id/);
+  assert.doesNotMatch(summary, /config: >-/);
   assert.doesNotMatch(summary, /@main/);
   assert.doesNotMatch(summary, /secret-payload-marker/);
 });
@@ -376,15 +474,31 @@ test("renders bounded allowlist YAML snippets", () => {
       port: 443,
       count: 5,
     },
+    {
+      destination: "metrics.example.com",
+      destinationKind: "hostname",
+      protocol: "tcp",
+      port: 8443,
+      count: 2,
+    },
+    {
+      destination: "dns.example.com",
+      destinationKind: "hostname",
+      protocol: "udp",
+      port: 53,
+      count: 1,
+    },
   ]).join("\n");
   assert.match(snippet.trimStart(), /^<details>/);
   assert.match(snippet, /<summary>View allowlist example<\/summary>/);
   assert.match(snippet, /```yaml/);
   assert.match(snippet, /GrantBirki\/fence@<commit-sha>/);
-  assert.match(snippet, /"schema_version": 1/);
-  assert.match(snippet, /"invocation_id": "example-run"/);
-  assert.match(snippet, /"allowlist": \[/);
-  assert.match(snippet, /"destination": "api.example.com"/);
+  assert.match(snippet, /allowlist: \|/);
+  assert.match(snippet, /      api.example.com/);
+  assert.match(snippet, /      metrics.example.com:8443/);
+  assert.match(snippet, /      hostname dns.example.com udp 53/);
+  assert.doesNotMatch(snippet, /invocation_id/);
+  assert.doesNotMatch(snippet, /config: >-/);
   assert.doesNotMatch(snippet, /@main/);
 });
 

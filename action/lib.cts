@@ -19,7 +19,21 @@ type InlineConfig = {
   raw: string;
   usingDefault: boolean;
 };
+type NativeConfigInputs = {
+  mode?: unknown;
+  invocationId?: unknown;
+  containerPolicy?: unknown;
+  platformProfile?: unknown;
+  disableBroadGithubDomains?: unknown;
+  allowlist?: unknown;
+};
 type DefaultMode = "block" | "audit";
+type AllowlistEntry = {
+  destination_type: "hostname" | "ip" | "cidr";
+  destination: string;
+  protocol: "tcp" | "udp";
+  port: number;
+};
 type AuditFindingRow = {
   destination: string;
   destinationKind: "hostname" | "ip";
@@ -43,8 +57,9 @@ const MAX_AUDIT_HOSTNAME_ROWS = 10;
 const MAX_AUDIT_IP_ROWS = 10;
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v1";
 const PROFILE_REALIZATIONS = new Map([
-  ["github_hosted_workflow_bootstrap_v1", "github_hosted_workflow_bootstrap_dns_mediation_v1"],
+  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_mediation_v1"],
 ]);
 const POLICY_HASH_SCHEMA_VERSION = 3;
 const RUNTIME_EVIDENCE_SCHEMA_VERSION = 1;
@@ -78,18 +93,285 @@ function normalizeDefaultMode(mode: unknown): DefaultMode {
   fail("mode input must be either block or audit");
 }
 
-function defaultInlineConfig(environment: Environment, mode: unknown = undefined): string {
+function normalizeOptionalInput(value: unknown, name: string, maximumBytes = 1024): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    fail(`${name} input must be a string`);
+  }
+  if (Buffer.byteLength(value, "utf8") > maximumBytes) {
+    fail(`${name} input is too large`);
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+function normalizeBooleanInput(value: unknown, name: string): boolean {
+  const normalized = normalizeOptionalInput(value, name);
+  if (normalized === undefined || normalized === "false") {
+    return false;
+  }
+  if (normalized === "true") {
+    return true;
+  }
+  fail(`${name} input must be either true or false`);
+}
+
+function normalizeContainerPolicy(value: unknown, mode: DefaultMode): string | undefined {
+  const normalized = normalizeOptionalInput(value, "container_policy");
+  if (normalized === undefined) {
+    return undefined;
+  }
+  if (mode === "audit") {
+    fail("container_policy input cannot be used with audit mode");
+  }
+  if (normalized === "disable" || normalized === "unsafe_preserve") {
+    return normalized;
+  }
+  fail("container_policy input must be either disable or unsafe_preserve");
+}
+
+function normalizePlatformProfile(value: unknown): string | undefined {
+  const normalized = normalizeOptionalInput(value, "platform_profile");
+  if (normalized === undefined) {
+    return undefined;
+  }
+  if (normalized === REVIEWED_PLATFORM_PROFILE) {
+    return normalized;
+  }
+  fail(`platform_profile input must be ${REVIEWED_PLATFORM_PROFILE}`);
+}
+
+function normalizeInvocationId(value: unknown, environment: Environment): string {
+  const explicit = normalizeOptionalInput(value, "invocation_id");
+  if (explicit !== undefined) {
+    if (explicit.length > 64 || !INVOCATION_ID.test(explicit)) {
+      fail("invocation_id input must use the Fence lowercase slug grammar");
+    }
+    return explicit;
+  }
   const runId = environment.GITHUB_RUN_ID;
   const runAttempt = environment.GITHUB_RUN_ATTEMPT;
   if (!/^[0-9]+$/.test(runId || "") || !/^[0-9]+$/.test(runAttempt || "")) {
     fail("GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are required for the default config");
   }
-  return JSON.stringify({
+  return `fence-${runId}-${runAttempt}`;
+}
+
+function normalizeProtocol(value: string): "tcp" | "udp" {
+  if (value === "tcp" || value === "udp") {
+    return value;
+  }
+  fail("allowlist protocol must be tcp or udp");
+}
+
+function normalizePort(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    fail("allowlist port must be an integer");
+  }
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    fail("allowlist port must be between 1 and 65535");
+  }
+  return port;
+}
+
+function validateHostname(value: string): string {
+  const destination = value.toLowerCase();
+  if (!isSafeHostname(destination) || net.isIP(destination) !== 0) {
+    fail("allowlist hostname entries must be valid DNS hostnames");
+  }
+  return destination;
+}
+
+function validateIp(value: string): string {
+  if (net.isIP(value) === 0) {
+    fail("allowlist ip entries must be valid literal IP addresses");
+  }
+  return value;
+}
+
+function validateCidr(value: string): string {
+  const separator = value.lastIndexOf("/");
+  if (separator <= 0 || separator === value.length - 1) {
+    fail("allowlist cidr entries must include an address and prefix length");
+  }
+  const address = value.slice(0, separator);
+  const prefix = value.slice(separator + 1);
+  const family = net.isIP(address);
+  if (family === 0 || !/^[0-9]+$/.test(prefix)) {
+    fail("allowlist cidr entries must include a literal IP network and prefix length");
+  }
+  const prefixLength = Number(prefix);
+  const maximum = family === 4 ? 32 : 128;
+  if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > maximum) {
+    fail(`allowlist cidr prefix length must be between 0 and ${maximum}`);
+  }
+  return value;
+}
+
+function classifyDestination(value: string): "hostname" | "ip" | "cidr" {
+  if (value.includes("/")) {
+    return "cidr";
+  }
+  if (net.isIP(value) !== 0) {
+    return "ip";
+  }
+  return "hostname";
+}
+
+function validateDestination(destinationType: "hostname" | "ip" | "cidr", destination: string): string {
+  switch (destinationType) {
+    case "hostname":
+      return validateHostname(destination);
+    case "ip":
+      return validateIp(destination);
+    case "cidr":
+      return validateCidr(destination);
+  }
+}
+
+function parseExplicitAllowlistLine(tokens: string[]): AllowlistEntry {
+  if (tokens.length !== 4) {
+    fail("allowlist explicit entries must use: hostname|ip|cidr destination tcp|udp port");
+  }
+  const destinationType = tokens[0];
+  if (destinationType !== "hostname" && destinationType !== "ip" && destinationType !== "cidr") {
+    fail("allowlist destination type must be hostname, ip, or cidr");
+  }
+  return {
+    destination_type: destinationType,
+    destination: validateDestination(destinationType, tokens[1]),
+    protocol: normalizeProtocol(tokens[2]),
+    port: normalizePort(tokens[3]),
+  };
+}
+
+function parseUrlAllowlistLine(line: string): AllowlistEntry {
+  let parsed: URL;
+  try {
+    parsed = new URL(line);
+  } catch {
+    fail("allowlist URL entries must use tcp://hostname:port or udp://hostname:port");
+  }
+  const protocol = parsed.protocol.replace(/:$/, "");
+  if (
+    parsed.username ||
+    parsed.password ||
+    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.port.length === 0
+  ) {
+    fail("allowlist URL entries may contain only protocol, hostname, and port");
+  }
+  return {
+    destination_type: "hostname",
+    destination: validateHostname(parsed.hostname),
+    protocol: normalizeProtocol(protocol),
+    port: normalizePort(parsed.port),
+  };
+}
+
+function parseShortcutAllowlistLine(line: string): AllowlistEntry {
+  if (line.includes("/")) {
+    fail("allowlist cidr entries must use the explicit cidr destination protocol port form");
+  }
+  if (net.isIP(line) !== 0) {
+    fail("allowlist ip entries must use the explicit ip destination protocol port form");
+  }
+  const colonIndex = line.lastIndexOf(":");
+  const hasPort = colonIndex > 0 && line.indexOf(":") === colonIndex;
+  const destination = hasPort ? line.slice(0, colonIndex) : line;
+  const port = hasPort ? normalizePort(line.slice(colonIndex + 1)) : 443;
+  return {
+    destination_type: "hostname",
+    destination: validateHostname(destination),
+    protocol: "tcp",
+    port,
+  };
+}
+
+function parseAllowlistLine(line: string): AllowlistEntry {
+  if (line.includes("://")) {
+    return parseUrlAllowlistLine(line);
+  }
+  const tokens = line.split(/\s+/).filter(Boolean);
+  if (tokens.length === 4) {
+    return parseExplicitAllowlistLine(tokens);
+  }
+  if (tokens.length !== 1) {
+    fail("allowlist entries must use a supported shorthand or explicit line form");
+  }
+  return parseShortcutAllowlistLine(tokens[0]);
+}
+
+function parseAllowlistInput(value: unknown): AllowlistEntry[] {
+  const raw = normalizeOptionalInput(value, "allowlist", 64 * 1024);
+  if (raw === undefined) {
+    return [];
+  }
+  const entries: AllowlistEntry[] = [];
+  for (const [index, originalLine] of raw.split(/\r?\n/).entries()) {
+    const line = originalLine.trim();
+    if (line.length === 0 || line.startsWith("#")) {
+      continue;
+    }
+    try {
+      entries.push(parseAllowlistLine(line));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      fail(`allowlist line ${index + 1}: ${message}`);
+    }
+  }
+  return entries;
+}
+
+function normalizeNativeInputs(input: unknown): NativeConfigInputs {
+  if (typeof input === "string" || input === undefined || input === null) {
+    return { mode: input };
+  }
+  if (typeof input !== "object" || Array.isArray(input)) {
+    fail("native Action inputs must be an object");
+  }
+  return input as NativeConfigInputs;
+}
+
+function nativeInputsFromEnvironment(environment: Environment): NativeConfigInputs {
+  return {
+    mode: environment.INPUT_MODE,
+    invocationId: environment.INPUT_INVOCATION_ID,
+    containerPolicy: environment.INPUT_CONTAINER_POLICY,
+    platformProfile: environment.INPUT_PLATFORM_PROFILE,
+    disableBroadGithubDomains: environment.INPUT_DISABLE_BROAD_GITHUB_DOMAINS,
+    allowlist: environment.INPUT_ALLOWLIST,
+  };
+}
+
+function defaultInlineConfig(environment: Environment, nativeInput: unknown = undefined): string {
+  const inputs = normalizeNativeInputs(nativeInput);
+  const mode = normalizeDefaultMode(normalizeOptionalInput(inputs.mode, "mode"));
+  const document: Record<string, unknown> = {
     schema_version: 1,
-    mode: normalizeDefaultMode(mode),
-    invocation_id: `fence-${runId}-${runAttempt}`,
-    allowlist: [],
-  });
+    mode,
+    invocation_id: normalizeInvocationId(inputs.invocationId, environment),
+    allowlist: parseAllowlistInput(inputs.allowlist),
+  };
+
+  const containerPolicy = normalizeContainerPolicy(inputs.containerPolicy, mode);
+  if (containerPolicy !== undefined) {
+    document.container_policy = containerPolicy;
+  }
+  const platformProfile = normalizePlatformProfile(inputs.platformProfile);
+  if (platformProfile !== undefined) {
+    document.platform_profile = platformProfile;
+  }
+  if (normalizeBooleanInput(inputs.disableBroadGithubDomains, "disable_broad_github_domains")) {
+    document.disable_broad_github_domains = true;
+  }
+
+  return JSON.stringify(document);
 }
 
 function readJsonBounded(file: string, maximumBytes: number, description: string): any {
@@ -103,12 +385,24 @@ function readJsonBounded(file: string, maximumBytes: number, description: string
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function validateInlineConfig(raw: unknown, environment: Environment = process.env, mode: unknown = undefined): InlineConfig {
+function validateInlineConfig(raw: unknown, environment: Environment = process.env, nativeInput: unknown = undefined): InlineConfig {
+  const inputs = normalizeNativeInputs(nativeInput);
   const usingDefault = typeof raw !== "string" || raw.length === 0;
-  if (!usingDefault && typeof mode === "string" && mode.length > 0) {
-    fail("mode input cannot be combined with config input");
+  if (!usingDefault) {
+    for (const [name, value] of [
+      ["mode", inputs.mode],
+      ["invocation_id", inputs.invocationId],
+      ["container_policy", inputs.containerPolicy],
+      ["platform_profile", inputs.platformProfile],
+      ["disable_broad_github_domains", inputs.disableBroadGithubDomains],
+      ["allowlist", inputs.allowlist],
+    ] as [string, unknown][]) {
+      if (normalizeOptionalInput(value, name) !== undefined) {
+        fail(`${name} input cannot be combined with config input`);
+      }
+    }
   }
-  const normalizedRaw = usingDefault ? defaultInlineConfig(environment, mode) : raw;
+  const normalizedRaw = usingDefault ? defaultInlineConfig(environment, inputs) : raw;
   if (Buffer.byteLength(normalizedRaw, "utf8") > MAX_CONFIG_BYTES) {
     fail("config input exceeds 256 KiB");
   }
@@ -508,18 +802,15 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
   if (rows.length === 0) {
     return [];
   }
-  const allowlist = rows.map((row) => ({
-    destination_type: "hostname",
-    destination: row.destination,
-    protocol: row.protocol,
-    port: row.port,
-  }));
-  const config = JSON.stringify({
-    schema_version: 1,
-    mode: "block",
-    invocation_id: "example-run",
-    allowlist,
-  }, null, 2);
+  const entries = rows.map((row) => {
+    if (row.protocol === "tcp" && row.port === 443) {
+      return row.destination;
+    }
+    if (row.protocol === "tcp") {
+      return `${row.destination}:${row.port}`;
+    }
+    return `hostname ${row.destination} ${row.protocol} ${row.port}`;
+  });
 
   return [
     "",
@@ -529,8 +820,8 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
     "```yaml",
     "- uses: GrantBirki/fence@<commit-sha>",
     "  with:",
-    "    config: >-",
-    ...config.split("\n").map((line) => `      ${line}`),
+    "    allowlist: |",
+    ...entries.map((line) => `      ${line}`),
     "```",
     "",
     "</details>",
@@ -595,6 +886,7 @@ module.exports = {
   correlateFindingsToDns,
   defaultInlineConfig,
   modeStatusCard,
+  nativeInputsFromEnvironment,
   readJsonBounded,
   runtimePaths,
   summaryHeading,

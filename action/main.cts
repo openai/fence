@@ -5,6 +5,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   MAX_REPORT_BYTES,
+  nativeInputsFromEnvironment,
   readJsonBounded,
   runtimePaths,
   validateBundle,
@@ -96,7 +97,7 @@ function main(): void {
     throw new Error("Fence Action supports only Linux x64");
   }
   validateBundle(MANIFEST, BINARY);
-  const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, process.env.INPUT_MODE);
+  const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, nativeInputsFromEnvironment(process.env));
   const paths = runtimePaths(config.invocationId);
 
   if (fs.existsSync(paths.directory)) {
