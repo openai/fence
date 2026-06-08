@@ -23,6 +23,8 @@ struct ConfigInput {
     platform_profile: Option<String>,
     #[serde(default)]
     container_policy: Option<String>,
+    #[serde(default)]
+    disable_broad_github_domains: bool,
     allowlist: Vec<AllowanceInput>,
 }
 
@@ -93,6 +95,7 @@ pub struct NormalizedConfig {
     pub invocation_id: String,
     pub platform_profile: PlatformProfile,
     pub container_policy: Option<ContainerPolicy>,
+    pub disable_broad_github_domains: bool,
     pub requested_allowances: Vec<NormalizedAllowance>,
     pub declared_allowance_count: usize,
     pub duplicate_requested_allowances_collapsed: usize,
@@ -192,6 +195,7 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
         invocation_id: input.invocation_id,
         platform_profile,
         container_policy,
+        disable_broad_github_domains: input.disable_broad_github_domains,
         duplicate_requested_allowances_collapsed: declared_allowance_count
             - requested_allowances.len(),
         requested_allowances,
@@ -432,17 +436,18 @@ mod tests {
             parsed.platform_profile,
             PlatformProfile::GithubHostedWorkflowBootstrapV1
         );
+        assert!(!parsed.disable_broad_github_domains);
         assert!(parsed.requested_allowances.is_empty());
     }
 
     #[test]
-    fn accepts_explicit_selected_profile_audit_without_lockdown_and_degraded_block() {
+    fn accepts_explicit_selected_profile_audit_without_lockdown_degraded_block_and_broad_opt_out() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_workflow_bootstrap_v1","allowlist":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_workflow_bootstrap_v1","disable_broad_github_domains":true,"allowlist":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_workflow_bootstrap_v1","container_policy":"unsafe_preserve","allowlist":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_workflow_bootstrap_v1","container_policy":"unsafe_preserve","disable_broad_github_domains":false,"allowlist":[]}"#,
         )
         .unwrap();
 
@@ -451,6 +456,7 @@ mod tests {
             audit.platform_profile,
             PlatformProfile::GithubHostedWorkflowBootstrapV1
         );
+        assert!(audit.disable_broad_github_domains);
         assert_eq!(
             degraded.container_policy,
             Some(ContainerPolicy::UnsafePreserve)
@@ -459,6 +465,7 @@ mod tests {
             degraded.platform_profile,
             PlatformProfile::GithubHostedWorkflowBootstrapV1
         );
+        assert!(!degraded.disable_broad_github_domains);
     }
 
     #[test]
@@ -508,6 +515,11 @@ mod tests {
                 br#"{"schema_version":1,"mode":"block","invocation_id":"x","container_policy":"other","allowlist":[]}"#
                     .as_slice(),
                 "invalid_container_policy",
+            ),
+            (
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","disable_broad_github_domains":"true","allowlist":[]}"#
+                    .as_slice(),
+                "invalid_json_configuration",
             ),
         ];
 

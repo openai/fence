@@ -5,6 +5,17 @@ pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN: &str =
     "*.actions.githubusercontent.com";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES: [&str; 1] =
     ["actions-results-receiver-production.githubapp.com"];
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 3] = [
+    "github.com",
+    "api.github.com",
+    "release-assets.githubusercontent.com",
+];
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_CORE_ACTIONS_HOSTNAMES: [&str; 4] = [
+    "vstoken.actions.githubusercontent.com",
+    "pipelines.actions.githubusercontent.com",
+    "payload.pipelines.actions.githubusercontent.com",
+    "results-receiver.actions.githubusercontent.com",
+];
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES: [&str; 7] = [
     "github.com",
     "api.github.com",
@@ -44,13 +55,27 @@ pub struct DnsMediatedCompatibilityPlan {
     pub https_materialization_port: u16,
 }
 
-pub fn github_hosted_workflow_bootstrap_dns_mediation_plan() -> DnsMediatedCompatibilityPlan {
+pub fn github_hosted_workflow_bootstrap_hostnames(
+    disable_broad_github_domains: bool,
+) -> Vec<&'static str> {
+    if disable_broad_github_domains {
+        GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_CORE_ACTIONS_HOSTNAMES.to_vec()
+    } else {
+        GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES.to_vec()
+    }
+}
+
+pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
+    disable_broad_github_domains: bool,
+) -> DnsMediatedCompatibilityPlan {
     DnsMediatedCompatibilityPlan {
         realization_status: "trusted_launcher_runtime_materialization_required",
         ruleset_preview_scope: "base_policy_before_dns_mediated_runtime_materialization",
         upstream_dns_policy: "root_resident_mediator_only_udp_53",
         upstream_dns: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
-        bootstrap_hostnames: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES.to_vec(),
+        bootstrap_hostnames: github_hosted_workflow_bootstrap_hostnames(
+            disable_broad_github_domains,
+        ),
         exact_compatibility_hostnames:
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES.to_vec(),
         bounded_actions_suffix_pattern: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
@@ -72,13 +97,21 @@ pub fn github_hosted_workflow_bootstrap_dns_mediation_plan() -> DnsMediatedCompa
     }
 }
 
+pub fn reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(
+    plan: &DnsMediatedCompatibilityPlan,
+) -> bool {
+    plan == &github_hosted_workflow_bootstrap_dns_mediation_plan(false)
+        || plan == &github_hosted_workflow_bootstrap_dns_mediation_plan(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn workflow_bootstrap_profile_descriptor_is_bounded_and_versioned() {
-        let profile = github_hosted_workflow_bootstrap_dns_mediation_plan();
+        let profile = github_hosted_workflow_bootstrap_dns_mediation_plan(false);
+        let opt_out = github_hosted_workflow_bootstrap_dns_mediation_plan(true);
 
         assert_eq!(
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
@@ -102,5 +135,16 @@ mod tests {
         assert_eq!(profile.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(profile.https_materialization_protocol, "tcp");
         assert_eq!(profile.https_materialization_port, 443);
+        assert_eq!(
+            opt_out.bootstrap_hostnames,
+            [
+                "vstoken.actions.githubusercontent.com",
+                "pipelines.actions.githubusercontent.com",
+                "payload.pipelines.actions.githubusercontent.com",
+                "results-receiver.actions.githubusercontent.com",
+            ]
+        );
+        assert!(reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&profile));
+        assert!(reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&opt_out));
     }
 }

@@ -24,6 +24,11 @@ Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs only.
 The pinned Action carries the attested stable `0.1.3` agent and its bounded
 workflow-bootstrap compatibility profile.
 
+By default, Fence permits the GitHub Actions status/finalization channel plus
+`github.com`, `api.github.com`, and `release-assets.githubusercontent.com` so
+it can run before checkout and common setup steps. Those GitHub destinations
+are still egress channels available to later workflow code.
+
 To observe would-block traffic without enforcing containment, use the
 zero-config audit shortcut:
 
@@ -111,9 +116,11 @@ Fence reduces arbitrary outbound egress and ordinary runner-privilege bypass
 paths. It is not a complete sandbox and does not make GitHub-hosted runners
 fully hermetic. Stable `0.1.3` selects the
 `github_hosted_workflow_bootstrap_v1` profile, which intentionally permits
-bounded GitHub-owned bootstrap and finalization channels; later workflow code
-can also use permitted channels for egress. Kernel compromise, platform
-compromise, and pre-start compromise remain outside the v0 boundary.
+bounded GitHub-owned bootstrap and finalization channels. The default profile
+also permits `github.com`, `api.github.com`, and
+`release-assets.githubusercontent.com` for first-step compatibility; later
+workflow code can also use permitted channels for egress. Kernel compromise,
+platform compromise, and pre-start compromise remain outside the v0 boundary.
 
 Fence is intentionally narrow: the supported protected target is a
 GitHub-hosted `ubuntu-24.04` x64 host job. A separate `ubuntu-latest` canary is

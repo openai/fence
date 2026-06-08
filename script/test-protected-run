@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -ne 1 ]]; then
-  die "usage: script/test-protected-run <standard|unsafe-preserve|audit>"
+  die "usage: script/test-protected-run <standard|standard-opt-out|unsafe-preserve|audit>"
 fi
 
 scenario="$1"
 case "$scenario" in
-  standard|unsafe-preserve|audit) ;;
+  standard|standard-opt-out|unsafe-preserve|audit) ;;
   *) die "unknown protected run scenario: $scenario" ;;
 esac
 
@@ -71,6 +71,9 @@ document = {
 }
 if scenario == "standard":
     document["container_policy"] = "disable"
+elif scenario == "standard-opt-out":
+    document["container_policy"] = "disable"
+    document["disable_broad_github_domains"] = True
 elif scenario == "unsafe-preserve":
     document["container_policy"] = "unsafe_preserve"
 path.write_text(
@@ -109,6 +112,30 @@ expected = {
         "protection_available": True,
         "sudo_status": "disabled_verified",
         "container_status": "disabled_verified",
+        "bootstrap_hostnames": [
+            "github.com",
+            "api.github.com",
+            "release-assets.githubusercontent.com",
+            "vstoken.actions.githubusercontent.com",
+            "pipelines.actions.githubusercontent.com",
+            "payload.pipelines.actions.githubusercontent.com",
+            "results-receiver.actions.githubusercontent.com",
+        ],
+    },
+    "standard-opt-out": {
+        "mode": "block",
+        "status": "protected_host_block",
+        "resident": "resident_protected",
+        "ready": "ready",
+        "protection_available": True,
+        "sudo_status": "disabled_verified",
+        "container_status": "disabled_verified",
+        "bootstrap_hostnames": [
+            "vstoken.actions.githubusercontent.com",
+            "pipelines.actions.githubusercontent.com",
+            "payload.pipelines.actions.githubusercontent.com",
+            "results-receiver.actions.githubusercontent.com",
+        ],
     },
     "unsafe-preserve": {
         "mode": "block",
@@ -118,6 +145,15 @@ expected = {
         "protection_available": False,
         "sudo_status": "disabled_verified",
         "container_status": "preserved_unsafe",
+        "bootstrap_hostnames": [
+            "github.com",
+            "api.github.com",
+            "release-assets.githubusercontent.com",
+            "vstoken.actions.githubusercontent.com",
+            "pipelines.actions.githubusercontent.com",
+            "payload.pipelines.actions.githubusercontent.com",
+            "results-receiver.actions.githubusercontent.com",
+        ],
     },
     "audit": {
         "mode": "audit",
@@ -127,6 +163,15 @@ expected = {
         "protection_available": False,
         "sudo_status": "preserved_verified",
         "container_status": "preserved_verified",
+        "bootstrap_hostnames": [
+            "github.com",
+            "api.github.com",
+            "release-assets.githubusercontent.com",
+            "vstoken.actions.githubusercontent.com",
+            "pipelines.actions.githubusercontent.com",
+            "payload.pipelines.actions.githubusercontent.com",
+            "results-receiver.actions.githubusercontent.com",
+        ],
     },
 }[scenario]
 deadline = time.monotonic() + 30
@@ -163,6 +208,7 @@ assert report["sudo_status"] == expected["sudo_status"], report
 assert report["container_status"] == expected["container_status"], report
 if scenario != "audit":
     assert len(report["materialized_https_allowances"]) >= 1, report
+    assert report["bootstrap_hostnames"] == expected["bootstrap_hostnames"], report
 assert report["critical_findings"] == [], report
 assert ready["status"] == expected["ready"], ready
 assert ready["runtime_evidence_schema_version"] == 1, ready
@@ -181,6 +227,7 @@ assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_me
 assert dns["routing_status"] == "active", dns
 assert dns["host_dns_routing"] == "local_root_resident_mediator", dns
 assert dns["docker_dns_routing"] == "local_root_resident_mediator", dns
+assert dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"], dns
 if scenario == "audit":
     assert "audit_observation_only_no_containment_claim" in report["limitations"]
     assert "audit_preserves_passwordless_sudo_and_container_control" in report["limitations"]
@@ -195,7 +242,7 @@ if scenario == "unsafe-preserve":
 PY
 
 case "$scenario" in
-  standard|unsafe-preserve)
+  standard|standard-opt-out|unsafe-preserve)
     if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
       die "protected block proof did not disable runner passwordless sudo"
     fi
@@ -205,7 +252,7 @@ case "$scenario" in
     ;;
 esac
 case "$scenario" in
-  standard)
+  standard|standard-opt-out)
     if docker ps --quiet >/dev/null 2>&1; then
       die "protected standard-block proof did not disable runner Docker access"
     fi
@@ -234,6 +281,13 @@ scenario = sys.argv[1]
 report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
 expected = {
     "standard": {
+        "mode": "block",
+        "status": "protected_host_block",
+        "resident": "resident_protected",
+        "sudo_status": "disabled_verified",
+        "container_status": "disabled_verified",
+    },
+    "standard-opt-out": {
         "mode": "block",
         "status": "protected_host_block",
         "resident": "resident_protected",
