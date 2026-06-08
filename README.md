@@ -9,6 +9,8 @@
 
 A GitHub Action that locks down undeclared outbound network access and ordinary runner-privilege bypass paths on supported GitHub-hosted Linux runners.
 
+![Fence](./docs/assets/fence.png)
+
 ## Quick Start ⚡
 
 Add Fence before any untrusted workflow steps:
