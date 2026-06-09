@@ -23,7 +23,6 @@ concurrency:
 jobs:
   canary:
     name: ubuntu-latest zero-input canary
-    continue-on-error: true
     timeout-minutes: 8
     runs-on: ubuntu-latest
 
@@ -43,7 +42,18 @@ jobs:
         run: script/test-action-wrapper
 
       - name: activate bundled Fence agent with strict defaults
+        id: activate
+        continue-on-error: true
         uses: ./
 
       - name: verify zero-input Action lifecycle
+        if: steps.activate.outcome == 'success'
         run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+      - name: report canary activation failure
+        if: steps.activate.outcome != 'success'
+        run: |
+          echo "::warning::ubuntu-latest canary did not reach readiness; fixed ubuntu-24.04 acceptance remains the supported gate"
+          unit="fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          sudo /usr/bin/systemctl status "$unit" --no-pager --lines=40 || true
+          sudo /usr/bin/journalctl --unit "$unit" --no-pager --lines=80 || true
