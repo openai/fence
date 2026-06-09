@@ -2,7 +2,7 @@
 name = "fence"
 version = "0.1.6"
 edition = "2024"
-rust-version = "1.95.0"
+rust-version = "1.96.0"
 
 authors = ["Grant Birkinbine"]
 license = "MIT"

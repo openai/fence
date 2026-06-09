@@ -30,6 +30,8 @@ pub struct AcceptedSudoPolicySourceV1 {
     pub path_class: &'static str,
     pub name: &'static str,
     pub sha256: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alternate_sha256: Vec<&'static str>,
     pub runner_nopasswd_markers: Vec<&'static str>,
 }
 
@@ -79,24 +81,30 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV1 {
                     path_class: "main_policy",
                     name: "sudoers",
                     sha256: "5bac27ce5ff1a78ace8f3ef81bfd60cbd44810ac3f3d280da9d7649fe90c18f8",
+                    alternate_sha256: vec![],
                     runner_nopasswd_markers: vec![],
                 },
                 AcceptedSudoPolicySourceV1 {
                     path_class: "drop_in",
                     name: "90-cloud-init-users",
                     sha256: "55b0a6eab1edea9a2151c9b73deff81fb365854a070045452766aa4a0397ab13",
+                    alternate_sha256: vec![
+                        "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
+                    ],
                     runner_nopasswd_markers: vec![],
                 },
                 AcceptedSudoPolicySourceV1 {
                     path_class: "drop_in",
                     name: "README",
                     sha256: "b428c9b673c3c806370f2aa28a98293a9cb578c70c3a8a2d1a39031861b3dbd8",
+                    alternate_sha256: vec![],
                     runner_nopasswd_markers: vec![],
                 },
                 AcceptedSudoPolicySourceV1 {
                     path_class: "drop_in",
                     name: "runner",
                     sha256: "661b4f06df1e149cc4d88457270d9ce39d2597963042718fb0da9573398f8714",
+                    alternate_sha256: vec![],
                     runner_nopasswd_markers: vec!["principal"],
                 },
             ],
@@ -181,6 +189,10 @@ mod tests {
         assert_eq!(
             requirement.accepted.sudo_policy_sources[3].runner_nopasswd_markers,
             vec!["principal"]
+        );
+        assert_eq!(
+            requirement.accepted.sudo_policy_sources[1].alternate_sha256,
+            vec!["9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950"]
         );
         assert_eq!(
             requirement.accepted.container_units[0].name,
