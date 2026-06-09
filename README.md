@@ -181,6 +181,15 @@ Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support
 claim. Pin Fence to a full immutable commit SHA, not `@main`.
 
+## Troubleshooting 🧯
+
+Fence prints a short progress log during setup and a concise **Fence Summary**
+at the end of the job. If setup fails and you need more detail, enable the
+standard GitHub Actions debug flag by setting the repository secret
+`ACTIONS_STEP_DEBUG` to `true`. Debug logs include bounded service status and
+Fence-specific diagnostics, but they avoid raw config bodies, environment
+values, packet payloads, and unrelated system logs.
+
 ## Local Development ✈️
 
 Fence follows the airplane-test model described in

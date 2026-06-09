@@ -17,6 +17,7 @@ const {
   validateReady,
   validateReport,
 } = require("./lib.cts");
+const actionLog = require("./log.cts");
 const { run } = require("./main.cts");
 
 const report = {
@@ -55,6 +56,36 @@ function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
     attestation_verified: true,
     ...overrides,
   };
+}
+
+function captureStdout(callback: () => void): string {
+  const originalWrite = process.stdout.write;
+  let output = "";
+  process.stdout.write = ((chunk: unknown) => {
+    output += String(chunk);
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    callback();
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+  return output;
+}
+
+function captureStderr(callback: () => void): string {
+  const originalWrite = process.stderr.write;
+  let output = "";
+  process.stderr.write = ((chunk: unknown) => {
+    output += String(chunk);
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    callback();
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+  return output;
 }
 
 test("validates explicit and zero-input inline configurations", () => {
@@ -202,6 +233,140 @@ test("validates explicit and zero-input inline configurations", () => {
   assert.throws(
     () => validateInlineConfig(JSON.stringify({ invocation_id: "x", padding: "x".repeat(256 * 1024) })),
     /256 KiB/,
+  );
+});
+
+test("formats concise setup and ready logs without raw evidence fields", () => {
+  const details = actionLog.configLogDetails(
+    JSON.stringify({
+      schema_version: 1,
+      mode: "block",
+      invocation_id: "fence-12345-1",
+      allowlist: [
+        { destination_type: "hostname", destination: "api.example.com", protocol: "tcp", port: 443 },
+      ],
+    }),
+    true,
+  );
+  assert.equal(details.mode, "block");
+  assert.equal(details.source, "native inputs");
+  assert.equal(details.containerPolicy, "disable");
+  assert.equal(details.platformProfile, "github_hosted_workflow_bootstrap_v1");
+  assert.equal(details.disableBroadGithubDomains, false);
+  assert.equal(details.allowlistCount, 1);
+  assert.deepEqual(details.allowlistDestinations, ["hostname:api.example.com:tcp:443"]);
+
+  const lines = actionLog.setupLines({ release_tag: "v0.1.6" }, details).join("\n");
+  assert.match(lines, /🛡️ Fence v0\.1\.6/);
+  assert.match(lines, /🔒 Mode: block/);
+  assert.match(lines, /🌐 Policy: GitHub workflow traffic \+ 1 allowlist entry/);
+  assert.doesNotMatch(lines, /policy_hash/);
+  assert.doesNotMatch(lines, /runtime_evidence_schema_version/);
+
+  assert.equal(
+    actionLog.readyLine(report),
+    "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down",
+  );
+});
+
+test("formats audit and degraded log wording accurately", () => {
+  const auditDetails = actionLog.configLogDetails(
+    '{"schema_version":1,"mode":"audit","invocation_id":"fence-12345-1","allowlist":[]}',
+    true,
+  );
+  assert.equal(actionLog.setupLines({ release_tag: "v0.1.6" }, auditDetails).join("\n"), [
+    "🛡️ Fence v0.1.6",
+    "👀 Mode: audit",
+    "🌐 Policy: observing GitHub workflow traffic + 0 allowlist entries",
+  ].join("\n"));
+
+  const auditReport = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+  };
+  assert.equal(
+    actionLog.readyLine(auditReport),
+    "✅ Fence ready: audit mode is observing traffic, not blocking it",
+  );
+  assert.equal(
+    actionLog.postEvidenceLine(auditReport, 2),
+    "👀 Audit observed 2 would-block destinations; see Fence Summary",
+  );
+
+  const degraded = {
+    ...report,
+    status: "protected_host_block_degraded",
+    readiness_status: "ready_degraded",
+    setup_status: "resident_degraded",
+    protection_available: false,
+    container_status: "preserved_unsafe",
+  };
+  assert.equal(
+    actionLog.readyLine(degraded),
+    "✅ Fence ready: network restrictions active; passwordless sudo locked down; Docker/container access preserved",
+  );
+  assert.equal(
+    actionLog.postEvidenceLine(degraded, 0),
+    "⚠️ Limited assurance: Docker/container access was preserved",
+  );
+});
+
+test("emits colored logs, respects NO_COLOR, and gates debug output", () => {
+  const colored = captureStdout(() => actionLog.success("✅ Fence evidence verified", {}));
+  assert.match(colored, /\u001b\[32m✅ Fence evidence verified\u001b\[0m/);
+
+  const plain = captureStdout(() => actionLog.success("✅ Fence evidence verified", { NO_COLOR: "1" }));
+  assert.equal(plain, "✅ Fence evidence verified\n");
+
+  assert.equal(captureStdout(() => actionLog.debug("hidden", {})), "");
+  assert.match(
+    captureStdout(() => actionLog.debug("visible", { RUNNER_DEBUG: "1" })),
+    /^::debug::visible\n$/,
+  );
+  assert.match(
+    captureStdout(() => actionLog.debug("visible", { ACTIONS_STEP_DEBUG: "true" })),
+    /^::debug::visible\n$/,
+  );
+});
+
+test("escapes workflow commands and bounds debug diagnostics", () => {
+  assert.equal(actionLog.workflowEscape("line one\nline two\r100%"), "line one line two 100%25");
+
+  const debug = captureStdout(() => actionLog.debugGroup(
+    "Fence debug: setup",
+    [
+      "normal line",
+      "::warning::injection",
+      "x".repeat(5000),
+    ],
+    { RUNNER_DEBUG: "1" },
+  ));
+  assert.match(debug, /^::group::Fence debug: setup\n/);
+  assert.match(debug, /normal line/);
+  assert.match(debug, /_::warning::injection/);
+  assert.match(debug, /\.\.\.\[truncated\]/);
+  assert.match(debug, /::endgroup::\n$/);
+
+  assert.equal(
+    captureStdout(() => actionLog.debugGroup("Fence debug: setup", ["hidden"], {})),
+    "",
+  );
+});
+
+test("emits bounded warning and error workflow commands", () => {
+  assert.equal(
+    captureStdout(() => actionLog.warning("Fence warning\n100%")),
+    "::warning::Fence warning 100%25\n",
+  );
+  assert.equal(
+    captureStderr(() => actionLog.error("Fence setup failed\n100%")),
+    "::error::Fence setup failed 100%25\n",
   );
 });
 
