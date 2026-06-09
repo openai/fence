@@ -84,7 +84,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV1 {
                 AcceptedSudoPolicySourceV1 {
                     path_class: "drop_in",
                     name: "90-cloud-init-users",
-                    sha256: "55b0a6eab1edea9a2151c9b73deff81fb365854a070045452766aa4a0397ab13",
+                    sha256: "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
                     runner_nopasswd_markers: vec![],
                 },
                 AcceptedSudoPolicySourceV1 {

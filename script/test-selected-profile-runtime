@@ -82,10 +82,7 @@ import sys
 import time
 
 report_path, dns_path, ready_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
-# Bootstrap prehydration resolves seven fixed roots over A and AAAA before the
-# first report can be emitted. Slow hosted DNS paths can legitimately exceed
-# the old 30-second harness window even when the service is healthy.
-deadline = time.monotonic() + 90
+deadline = time.monotonic() + 30
 report = None
 dns = None
 ready = None
@@ -97,9 +94,9 @@ while time.monotonic() < deadline:
         if report.get("setup_status") == "resident_selected_profile_runtime_test_only":
             break
     time.sleep(0.1)
-assert report is not None, "DNS-mediated block report was not emitted within 90 seconds"
-assert dns is not None, "DNS-mediated block DNS report was not emitted within 90 seconds"
-assert ready is not None, "DNS-mediated block test readiness was not emitted within 90 seconds"
+assert report is not None, "DNS-mediated block report was not emitted"
+assert dns is not None, "DNS-mediated block DNS report was not emitted"
+assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "selected_profile_runtime_test_only"
 assert report["runtime_evidence_schema_version"] == 1
 assert report["mode"] == "block"
