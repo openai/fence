@@ -549,11 +549,22 @@ fn verify_sudo_sources(
         } else {
             Path::new(SUDOERS_DROP_IN_ROOT).join(source.name)
         };
-        if sha256_bounded_file(&path)? != source.sha256 {
+        if !source_accepts_sha256(source, &sha256_bounded_file(&path)?) {
             return Err(unsupported_fingerprint());
         }
     }
     Ok(())
+}
+
+fn source_accepts_sha256(
+    source: &crate::hosted_runner::AcceptedSudoPolicySourceV1,
+    observed_sha256: &str,
+) -> bool {
+    observed_sha256 == source.sha256
+        || source
+            .alternate_sha256
+            .iter()
+            .any(|accepted| *accepted == observed_sha256)
 }
 
 fn verify_socket_fingerprint() -> Result<(), LockdownError> {
@@ -624,7 +635,7 @@ fn verify_restored_runner_sudo_source(mode: u32) -> Result<(), LockdownError> {
         })?
         .status
         .success();
-    if policy_hash != accepted.sha256 || !sudo_available {
+    if !source_accepts_sha256(&accepted, &policy_hash) || !sudo_available {
         return Err(LockdownError::new(
             "sudo_restore_verification_rollback_failed",
             "restored sudo policy does not match the accepted functional source",
