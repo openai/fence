@@ -7,6 +7,8 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  allowlistYamlSnippet,
+  correlateFindingsToDns,
   defaultInlineConfig,
   runtimePaths,
   summaryLines,
@@ -83,19 +85,117 @@ test("validates explicit and zero-input inline configurations", () => {
     defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "audit"),
     '{"schema_version":1,"mode":"audit","invocation_id":"fence-12345-2","allowlist":[]}',
   );
+  assert.equal(
+    defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, {
+      invocationId: "custom-run",
+      mode: "block",
+      containerPolicy: "unsafe_preserve",
+      platformProfile: "github_hosted_workflow_bootstrap_v1",
+      disableBroadGithubDomains: "true",
+      allowlist: [
+        "# comments are ignored",
+        "www.example.com",
+        "api.example.com:8443",
+        "tcp://upload.example.com:9443",
+        "udp://dns.example.com:53",
+        "hostname mirror.example.com tcp 443",
+        "ip 192.0.2.10 tcp 443",
+        "cidr 192.0.2.0/24 udp 123",
+        "cidr 2001:db8::/64 tcp 443",
+      ].join("\n"),
+    }),
+    JSON.stringify({
+      schema_version: 1,
+      mode: "block",
+      invocation_id: "custom-run",
+      allowlist: [
+        { destination_type: "hostname", destination: "www.example.com", protocol: "tcp", port: 443 },
+        { destination_type: "hostname", destination: "api.example.com", protocol: "tcp", port: 8443 },
+        { destination_type: "hostname", destination: "upload.example.com", protocol: "tcp", port: 9443 },
+        { destination_type: "hostname", destination: "dns.example.com", protocol: "udp", port: 53 },
+        { destination_type: "hostname", destination: "mirror.example.com", protocol: "tcp", port: 443 },
+        { destination_type: "ip", destination: "192.0.2.10", protocol: "tcp", port: 443 },
+        { destination_type: "cidr", destination: "192.0.2.0/24", protocol: "udp", port: 123 },
+        { destination_type: "cidr", destination: "2001:db8::/64", protocol: "tcp", port: 443 },
+      ],
+      container_policy: "unsafe_preserve",
+      platform_profile: "github_hosted_workflow_bootstrap_v1",
+      disable_broad_github_domains: true,
+    }),
+  );
+  assert.equal(
+    defaultInlineConfig({ GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, {
+      disableBroadGithubDomains: "false",
+    }),
+    defaultConfig,
+  );
   assert.throws(
     () => validateInlineConfig(
       '{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}',
       {},
-      "audit",
+      { mode: "audit" },
     ),
     /cannot be combined/,
   );
+  for (const nativeInput of [
+    { invocationId: "native-run" },
+    { containerPolicy: "disable" },
+    { platformProfile: "github_hosted_workflow_bootstrap_v1" },
+    { disableBroadGithubDomains: "true" },
+    { allowlist: "example.com" },
+  ]) {
+    assert.throws(
+      () => validateInlineConfig(
+        '{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}',
+        {},
+        nativeInput,
+      ),
+      /cannot be combined/,
+    );
+  }
   assert.throws(
     () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, "observe"),
     /mode input/,
   );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { mode: "audit", containerPolicy: "disable" }),
+    /container_policy input cannot be used with audit mode/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { containerPolicy: "keep" }),
+    /container_policy input/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { platformProfile: "none" }),
+    /platform_profile input/,
+  );
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { disableBroadGithubDomains: "TRUE" }),
+    /disable_broad_github_domains input/,
+  );
+  for (const allowlist of [
+    "https://example.com:443",
+    "example.com:notaport",
+    "example.com:0",
+    "192.0.2.10",
+    "192.0.2.0/24",
+    "hostname 192.0.2.10 tcp 443",
+    "ip example.com tcp 443",
+    "cidr 192.0.2.0/33 tcp 443",
+    "hostname example.com icmp 443",
+    "hostname example.com tcp 65536",
+    "hostname example.com tcp 443 extra",
+  ]) {
+    assert.throws(
+      () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { allowlist }),
+      /allowlist line 1/,
+    );
+  }
   assert.throws(() => validateInlineConfig("", {}), /GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT/);
+  assert.throws(
+    () => validateInlineConfig("", { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" }, { invocationId: "Action_Test" }),
+    /invocation_id input/,
+  );
   assert.throws(() => validateInlineConfig('{"invocation_id":"Action_Test"}'), /slug grammar/);
   assert.throws(() => validateInlineConfig('{"invocation_id":"action--test"}'), /slug grammar/);
   assert.throws(() => validateInlineConfig("[]"), /JSON object/);
@@ -111,13 +211,14 @@ test("derives only bounded fixed runtime paths", () => {
     config: "/run/fence/action-test/config.json",
     ready: "/run/fence/action-test/ready.json",
     report: "/run/fence/action-test/report.json",
+    dnsReport: "/run/fence/action-test/dns-report.json",
     unit: "fence-action-test.service",
   });
   assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
 });
 
-test("validates stable runtime evidence and sanitizes summaries", () => {
+test("validates stable runtime evidence", () => {
   validateReport(report);
   validateReady({
     runtime_evidence_schema_version: 1,
@@ -130,8 +231,6 @@ test("validates stable runtime evidence and sanitizes summaries", () => {
     ruleset_hash: report.ruleset_hash,
     protection_available: true,
   }, report);
-  assert.match(summaryLines(report).join("\n"), /critical findings \| `0`/);
-  assert.doesNotMatch(summaryLines({ ...report, mode: "block\n| injected" }).join("\n"), /\n\| injected/);
   assert.throws(() => validateReport({ ...report, critical_findings: [{}] }), /critical resident findings/);
   assert.throws(
     () => validateReport({ ...report, network_verification_status: "critical_drift", critical_findings: [{}] }),
@@ -142,6 +241,265 @@ test("validates stable runtime evidence and sanitizes summaries", () => {
   assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
   assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 0 }), /profile/);
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
+});
+
+test("renders a concise healthy block summary without raw evidence fields", () => {
+  const summary = summaryLines(report).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\*\*Network restrictions active\*\*/);
+  assert.match(summary, /GitHub workflow support channel/);
+  assert.equal(summary.match(/Fence Summary/g)?.length, 1);
+  assert.doesNotMatch(summary, /Fence local evidence/);
+  assert.doesNotMatch(summary, /critical findings/i);
+  assert.doesNotMatch(summary, /platform profile/i);
+  assert.doesNotMatch(summary, /readiness/i);
+  assert.doesNotMatch(summary, /protected_host_block/);
+  assert.doesNotMatch(summaryLines({ ...report, mode: "block\n| injected" }).join("\n"), /\n\| injected/);
+});
+
+test("renders degraded and critical summaries without a healthy signal", () => {
+  const degraded = {
+    ...report,
+    status: "protected_host_block_degraded",
+    readiness_status: "ready_degraded",
+    setup_status: "resident_degraded",
+    protection_available: false,
+    container_status: "preserved_unsafe",
+  };
+  validateReport(degraded);
+  const degradedSummary = summaryLines(degraded).join("\n");
+  assert.match(degradedSummary, /^### Fence Summary/);
+  assert.doesNotMatch(degradedSummary, /🟢/);
+  assert.match(degradedSummary, /\*\*Limited assurance\*\*/);
+  assert.match(degradedSummary, /Docker\/container access was preserved/);
+
+  const critical = {
+    ...report,
+    network_verification_status: "critical_drift",
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "owned_nftables_state_missing",
+      message: "Fence-owned network state changed after readiness.",
+    }],
+  };
+  validateReport(critical, false);
+  assert.throws(() => validateReport(critical, true), /critical resident findings/);
+  const criticalSummary = summaryLines(critical).join("\n");
+  assert.match(criticalSummary, /^### Fence Summary/);
+  assert.doesNotMatch(criticalSummary, /🟢/);
+  assert.match(criticalSummary, /\*\*Fence needs attention\*\*/);
+  assert.match(criticalSummary, /`owned_nftables_state_missing`/);
+  assert.match(criticalSummary, /Fence-owned network state changed after readiness/);
+});
+
+test("renders audit would-block findings with DNS-backed allowlist guidance", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+        ignored_payload: "secret-payload-marker",
+      },
+      {
+        timestamp: "unix-ms:2",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+      {
+        timestamp: "unix-ms:3",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "udp",
+        remote_address: "192.0.2.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [{
+      hostname: "www.google.com",
+      query_type: "a",
+      profile_classification: "audit_observed_without_authorization",
+      occurrences: 1,
+      resolved_addresses: ["203.0.113.10"],
+      minimum_observed_ttl_seconds: 60,
+      addresses_truncated: false,
+    }],
+    observations_truncated: false,
+  };
+
+  validateReport(audit);
+  const correlation = correlateFindingsToDns(audit, dnsEvidence);
+  assert.deepEqual(correlation.hostnameRows, [{
+    destination: "www.google.com",
+    destinationKind: "hostname",
+    protocol: "tcp",
+    port: 443,
+    count: 2,
+  }]);
+  assert.deepEqual(correlation.ipRows, [{
+    destination: "192.0.2.10",
+    destinationKind: "ip",
+    protocol: "udp",
+    port: 443,
+    count: 1,
+  }]);
+
+  const summary = summaryLines(audit, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\*\*Observing only\*\*/);
+  assert.match(summary, /#### Would Be Blocked In Block Mode/);
+  assert.match(summary, /\| `www.google.com` \| `tcp` \| `443` \| `2` \|/);
+  assert.match(summary, /\| `192.0.2.10` \| `udp` \| `443` \| `1` \|/);
+  assert.match(summary, /<summary>View allowlist example<\/summary>/);
+  assert.match(summary, /```yaml/);
+  assert.match(summary, /GrantBirki\/fence@<commit-sha>/);
+  assert.match(summary, /allowlist: \|/);
+  assert.match(summary, /      www.google.com/);
+  assert.doesNotMatch(summary, /invocation_id/);
+  assert.doesNotMatch(summary, /config: >-/);
+  assert.doesNotMatch(summary, /@main/);
+  assert.doesNotMatch(summary, /secret-payload-marker/);
+});
+
+test("renders audit IP-only and missing-DNS fallbacks safely", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "udp",
+        remote_address: "192.0.2.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+      {
+        timestamp: "unix-ms:2",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv6",
+        protocol: "unknown_or_unparsed",
+        remote_address: null,
+        remote_port: null,
+        rule_class: "endpoint_unavailable_from_prefix",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const summary = summaryLines(audit).join("\n");
+  assert.match(summary, /^### Fence Summary/);
+  assert.doesNotMatch(summary, /🟢/);
+  assert.match(summary, /DNS audit evidence was unavailable/);
+  assert.match(summary, /Manual review required for IP-only findings/);
+  assert.match(summary, /could not be mapped to an endpoint/);
+  assert.doesNotMatch(summary, /View allowlist example/);
+});
+
+test("renders audit IP-only findings when DNS evidence excludes non-GitHub names", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    excluded_non_github_query_count: 2,
+  };
+
+  const summary = summaryLines(audit, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟢 Fence Summary/);
+  assert.match(summary, /\| `203.0.113.10` \| `tcp` \| `443` \| `1` \|/);
+  assert.match(summary, /Manual review required for IP-only findings/);
+  assert.doesNotMatch(summary, /DNS audit evidence was unavailable/);
+  assert.doesNotMatch(summary, /View allowlist example/);
+});
+
+test("renders bounded allowlist YAML snippets", () => {
+  const snippet = allowlistYamlSnippet([
+    {
+      destination: "api.example.com",
+      destinationKind: "hostname",
+      protocol: "tcp",
+      port: 443,
+      count: 5,
+    },
+    {
+      destination: "metrics.example.com",
+      destinationKind: "hostname",
+      protocol: "tcp",
+      port: 8443,
+      count: 2,
+    },
+    {
+      destination: "dns.example.com",
+      destinationKind: "hostname",
+      protocol: "udp",
+      port: 53,
+      count: 1,
+    },
+  ]).join("\n");
+  assert.match(snippet.trimStart(), /^<details>/);
+  assert.match(snippet, /<summary>View allowlist example<\/summary>/);
+  assert.match(snippet, /```yaml/);
+  assert.match(snippet, /GrantBirki\/fence@<commit-sha>/);
+  assert.match(snippet, /allowlist: \|/);
+  assert.match(snippet, /      api.example.com/);
+  assert.match(snippet, /      metrics.example.com:8443/);
+  assert.match(snippet, /      hostname dns.example.com udp 53/);
+  assert.doesNotMatch(snippet, /invocation_id/);
+  assert.doesNotMatch(snippet, /config: >-/);
+  assert.doesNotMatch(snippet, /@main/);
 });
 
 test("rejects the retired status-only profile identity", () => {

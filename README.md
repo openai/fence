@@ -7,96 +7,186 @@
 [![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
-A GitHub Action that locks down undeclared outbound network access and ordinary runner-privilege bypass paths on supported GitHub-hosted Linux runners.
+Fence runs first in a GitHub Actions job, allows only GitHub workflow traffic plus your `allowlist`, blocks other outbound network access, and turns off passwordless sudo and Docker by default.
+
+![Fence](./docs/assets/fence.png)
 
 ## Quick Start ⚡
 
-Add Fence before any untrusted workflow steps:
+Add Fence as the first step in a supported GitHub-hosted Linux job:
 
 ```yaml
-- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
+- uses: GrantBirki/fence@<commit-sha>
 ```
 
-The zero-input form selects strict `block` mode with an empty user `allowlist`.
-Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs only.
-The pinned Action carries the attested stable `0.1.3` agent and its bounded
-workflow-bootstrap compatibility profile.
+That one line starts Fence in `block` mode with an empty user `allowlist`.
+Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs.
 
-To observe would-block traffic without enforcing containment, use the
-zero-config audit shortcut:
+By default, Fence allows the GitHub domains needed for Actions job reporting.
+It also allows `github.com`, `api.github.com`, and
+`release-assets.githubusercontent.com` so Fence can run before checkout and
+common setup steps. Those allowed GitHub domains are still places later
+workflow code can send data.
+
+## Examples 🧪
+
+Run in audit mode first to see what would be blocked:
 
 ```yaml
-- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
+- uses: GrantBirki/fence@<commit-sha>
   with:
     mode: audit
 ```
 
-Advanced callers may provide an explicit strict JSON configuration:
+Allow a normal HTTPS hostname:
 
 ```yaml
-- uses: GrantBirki/fence@ea6de9d504c70a7b3fbe025dcc9fb2718a28f3da
+- uses: GrantBirki/fence@<commit-sha>
   with:
-    config: >-
-      {"schema_version":1,"mode":"block","invocation_id":"example-run","allowlist":[]}
+    allowlist: |
+      api.example.com
 ```
 
-## Features 🌟
+Allow a hostname on a custom TCP port:
 
-- 🔒 Applies and verifies a native Linux `nftables` outbound policy.
-- 🧱 Disables ordinary passwordless sudo and Docker/containerd control paths in
-  the default protected mode.
-- 📡 Preserves narrowly bounded GitHub-hosted workflow-bootstrap and
-  finalization traffic.
-- 🔎 Keeps a resident root-owned agent running after readiness and reports
-  critical policy drift.
-- 📦 Bundles a checksum-validated, attested Linux x64 release binary without
-  runtime agent downloads or remote policy fetches.
-- 🧪 Provides explicit degraded and observation-only modes for workflows that
-  need a narrower assurance claim.
+```yaml
+- uses: GrantBirki/fence@<commit-sha>
+  with:
+    allowlist: |
+      registry.example.com:8443
+```
+
+Allow UDP or CIDR targets with the explicit line form:
+
+```yaml
+- uses: GrantBirki/fence@<commit-sha>
+  with:
+    allowlist: |
+      udp://dns.example.com:53
+      cidr 192.0.2.0/24 udp 123
+      cidr 2001:db8::/64 tcp 443
+```
+
+Keep Docker/container access available while still locking down the network and
+passwordless sudo:
+
+```yaml
+- uses: GrantBirki/fence@<commit-sha>
+  with:
+    container_policy: unsafe_preserve
+```
+
+Disable the broad GitHub web/API/release-asset allowlist entries while keeping
+the core GitHub Actions reporting path alive:
+
+```yaml
+- uses: GrantBirki/fence@<commit-sha>
+  with:
+    disable_broad_github_domains: true
+```
+
+Use raw JSON only when you need exact agent-schema control:
+
+```yaml
+- uses: GrantBirki/fence@<commit-sha>
+  with:
+    config: >-
+      {"schema_version":1,"mode":"block","invocation_id":"my-job-1","allowlist":[]}
+```
+
+Most users should not set `invocation_id`. The Action generates one as
+`fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`. If you use raw JSON, set
+`invocation_id` to a lowercase unique slug for that job run.
+
+## Allowlist Lines 📝
+
+The native `allowlist` input accepts one entry per line:
+
+```text
+example.com
+example.com:8443
+tcp://example.com:443
+udp://dns.example.com:53
+hostname example.com tcp 443
+ip 192.0.2.10 tcp 443
+cidr 192.0.2.0/24 udp 123
+cidr 2001:db8::/64 tcp 443
+```
+
+Blank lines and lines starting with `#` are ignored. Hostname shortcuts default
+to `tcp` port `443`. IPv6 or non-hostname entries should use the explicit
+`ip` or `cidr` form.
 
 ## How It Works 🔧
 
-1. The Action writes a bounded root-owned configuration and launches the
-   bundled Fence agent as a transient `systemd` service.
-2. The agent verifies the supported hosted-runner shape, installs the native
-   network policy, and enables bounded DNS mediation for required GitHub
-   workflow-bootstrap and finalization traffic.
-3. Standard `block` mode disables ordinary passwordless sudo and
-   Docker/containerd control paths before emitting readiness.
-4. The agent remains resident, records bounded local evidence, and checks for
-   policy drift. Fence never restores access after readiness.
-5. The Action post hook renders a bounded summary and fails the job when
-   critical resident findings are present.
+1. Your workflow starts with `uses: GrantBirki/fence@<commit-sha>`.
+2. The Action writes a small root-owned config under `/run/fence/`.
+3. The bundled Fence agent starts through `sudo` and `systemd`.
+4. Fence checks that the runner matches the supported GitHub-hosted Linux shape.
+5. In default `block` mode, Fence allows GitHub workflow traffic plus your
+   `allowlist`, blocks other outbound network access, turns off passwordless
+   sudo, and disables Docker/container access.
+6. Fence keeps running until the runner is destroyed and records local evidence.
+7. The post-job hook prints a concise **Fence Summary** and fails the job if
+   Fence sees critical drift after startup.
+
+```mermaid
+flowchart TD
+    start["GitHub-hosted Linux job starts"] --> action["Fence Action runs first"]
+    action --> input["Read native Action inputs<br/>default: block mode + empty allowlist"]
+    input --> config["Write root-owned config<br/>under /run/fence/"]
+    config --> launch["Launch bundled agent<br/>with sudo + systemd"]
+
+    launch --> support["Check supported runner shape"]
+    support --> plan["Build network plan<br/>GitHub workflow traffic + allowlist"]
+    plan --> network["Apply Linux nftables rules<br/>and local DNS handling"]
+
+    network --> mode{"Selected mode"}
+    mode --> block["block<br/>turn off passwordless sudo<br/>turn off Docker"]
+    mode --> degraded["unsafe_preserve<br/>turn off passwordless sudo<br/>keep Docker"]
+    mode --> audit["audit<br/>observe only<br/>keep sudo and Docker"]
+
+    block --> ready["Write ready/report files"]
+    degraded --> ready
+    audit --> ready
+
+    ready --> resident["Fence keeps running<br/>checks controls every 5 seconds"]
+    resident --> post["Post hook reads local evidence"]
+    post --> summary["Render Fence Summary<br/>fail on critical drift"]
+    summary --> teardown["Runner teardown removes the VM"]
+```
 
 ## Modes 🎛️
 
-| Mode | Behavior | Assurance |
+| Mode | What It Does | When To Use It |
 | --- | --- | --- |
-| `block` | Enforces the network policy, disables ordinary passwordless sudo, and disables Docker/containerd control paths. | Default protected posture. |
-| `block` with `container_policy: "unsafe_preserve"` | Enforces the network policy and disables ordinary passwordless sudo while preserving container access. | Degraded: retained container control invalidates the ordinary containment claim. |
-| `audit` | Applies non-blocking observation rules while preserving sudo, containers, and outbound traffic. | Observation only: no containment claim. |
+| `block` | Blocks network traffic outside GitHub workflow traffic and your `allowlist`; turns off passwordless sudo and Docker. | Default for locking down a job. |
+| `block` with `container_policy: unsafe_preserve` | Blocks network traffic and turns off passwordless sudo, but leaves Docker/container access available. | When a workflow needs Docker and you accept the weaker security claim. |
+| `audit` | Does not block traffic. Records what would need review before moving to `block`. | When tuning a workflow. |
 
-## Security 🔒
+## Security Notes 🔒
 
-Fence reduces arbitrary outbound egress and ordinary runner-privilege bypass
-paths. It is not a complete sandbox and does not make GitHub-hosted runners
-fully hermetic. Stable `0.1.3` selects the
-`github_hosted_workflow_bootstrap_v1` profile, which intentionally permits
-bounded GitHub-owned bootstrap and finalization channels; later workflow code
-can also use permitted channels for egress. Kernel compromise, platform
-compromise, and pre-start compromise remain outside the v0 boundary.
+Fence reduces where later workflow steps can send data and removes common ways
+to undo the lockdown. It is not a full sandbox, and it does not make a runner
+perfectly hermetic.
 
-Fence is intentionally narrow: the supported protected target is a
-GitHub-hosted `ubuntu-24.04` x64 host job. A separate `ubuntu-latest` canary is
-observational only and does not expand the support claim. Pin Fence to a full
-immutable commit SHA, as shown above.
+The default GitHub allowlist is a usability tradeoff. It keeps normal GitHub
+Actions reporting, checkout, API, and release-asset flows working, but later
+workflow code can also send data to those allowed GitHub destinations. Set
+`disable_broad_github_domains: true` if you want to remove `github.com`,
+`api.github.com`, and `release-assets.githubusercontent.com` from the default
+allowlist.
 
-## Hermetic Development ✈️
+Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
+`ubuntu-latest` canary is useful signal, but it does not expand the support
+claim. Pin Fence to a full immutable commit SHA, not `@main`.
+
+## Local Development ✈️
 
 Fence follows the airplane-test model described in
-[Hermetic Builds](https://software.birki.io/posts/hermetic-builds/). Rust
-toolchains and dependencies are prepared deliberately; routine project work
-then operates from pinned, vendored inputs without network access.
+[Hermetic Builds](https://software.birki.io/posts/hermetic-builds/). Prepare
+toolchains deliberately, then run normal project commands from pinned vendored
+inputs.
 
 ```console
 script/prepare-rust
@@ -106,12 +196,10 @@ script/lint
 script/build
 ```
 
-`script/prepare-rust` is intentionally online and checksum-gated. The remaining
-commands use the repository's offline Cargo defaults after preparation.
-
 ## CLI 🧰
 
-The bundled Rust agent exposes a narrow JSON-only interface:
+Most users should use the Action. The bundled Rust agent also exposes a narrow
+JSON-only CLI:
 
 ```console
 fence --version
@@ -120,8 +208,8 @@ fence render-plan --config policy.json
 fence run --config /run/fence/example/config.json
 ```
 
-The root Action is the supported public launcher. Direct `run` execution is
-rejected unless the trusted transient-service contract is satisfied.
+Direct `fence run` is rejected unless it is launched through the trusted
+Action/systemd path.
 
 ## Further Reading 📚
 

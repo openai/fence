@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const net = require("node:net");
 const path = require("node:path");
 
 type Environment = Record<string, string | undefined>;
@@ -10,6 +11,7 @@ type RuntimePaths = {
   config: string;
   ready: string;
   report: string;
+  dnsReport: string;
   unit: string;
 };
 type InlineConfig = {
@@ -17,13 +19,47 @@ type InlineConfig = {
   raw: string;
   usingDefault: boolean;
 };
+type NativeConfigInputs = {
+  mode?: unknown;
+  invocationId?: unknown;
+  containerPolicy?: unknown;
+  platformProfile?: unknown;
+  disableBroadGithubDomains?: unknown;
+  allowlist?: unknown;
+};
 type DefaultMode = "block" | "audit";
+type AllowlistEntry = {
+  destination_type: "hostname" | "ip" | "cidr";
+  destination: string;
+  protocol: "tcp" | "udp";
+  port: number;
+};
+type AuditFindingRow = {
+  destination: string;
+  destinationKind: "hostname" | "ip";
+  protocol: string;
+  port: number;
+  count: number;
+};
+type AuditSummary = {
+  dnsMissing: boolean;
+  hostnameRows: AuditFindingRow[];
+  ipRows: AuditFindingRow[];
+  omittedHostnameRows: number;
+  omittedIpRows: number;
+  unparsedCount: number;
+  sourceTruncated: boolean;
+};
 
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
+const MAX_AUDIT_HOSTNAME_ROWS = 10;
+const MAX_AUDIT_IP_ROWS = 10;
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v1";
 const PROFILE_REALIZATIONS = new Map([
-  ["github_hosted_workflow_bootstrap_v1", "github_hosted_workflow_bootstrap_dns_mediation_v1"],
+  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_mediation_v1"],
 ]);
 const POLICY_HASH_SCHEMA_VERSION = 3;
 const RUNTIME_EVIDENCE_SCHEMA_VERSION = 1;
@@ -57,18 +93,285 @@ function normalizeDefaultMode(mode: unknown): DefaultMode {
   fail("mode input must be either block or audit");
 }
 
-function defaultInlineConfig(environment: Environment, mode: unknown = undefined): string {
+function normalizeOptionalInput(value: unknown, name: string, maximumBytes = 1024): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    fail(`${name} input must be a string`);
+  }
+  if (Buffer.byteLength(value, "utf8") > maximumBytes) {
+    fail(`${name} input is too large`);
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+function normalizeBooleanInput(value: unknown, name: string): boolean {
+  const normalized = normalizeOptionalInput(value, name);
+  if (normalized === undefined || normalized === "false") {
+    return false;
+  }
+  if (normalized === "true") {
+    return true;
+  }
+  fail(`${name} input must be either true or false`);
+}
+
+function normalizeContainerPolicy(value: unknown, mode: DefaultMode): string | undefined {
+  const normalized = normalizeOptionalInput(value, "container_policy");
+  if (normalized === undefined) {
+    return undefined;
+  }
+  if (mode === "audit") {
+    fail("container_policy input cannot be used with audit mode");
+  }
+  if (normalized === "disable" || normalized === "unsafe_preserve") {
+    return normalized;
+  }
+  fail("container_policy input must be either disable or unsafe_preserve");
+}
+
+function normalizePlatformProfile(value: unknown): string | undefined {
+  const normalized = normalizeOptionalInput(value, "platform_profile");
+  if (normalized === undefined) {
+    return undefined;
+  }
+  if (normalized === REVIEWED_PLATFORM_PROFILE) {
+    return normalized;
+  }
+  fail(`platform_profile input must be ${REVIEWED_PLATFORM_PROFILE}`);
+}
+
+function normalizeInvocationId(value: unknown, environment: Environment): string {
+  const explicit = normalizeOptionalInput(value, "invocation_id");
+  if (explicit !== undefined) {
+    if (explicit.length > 64 || !INVOCATION_ID.test(explicit)) {
+      fail("invocation_id input must use the Fence lowercase slug grammar");
+    }
+    return explicit;
+  }
   const runId = environment.GITHUB_RUN_ID;
   const runAttempt = environment.GITHUB_RUN_ATTEMPT;
   if (!/^[0-9]+$/.test(runId || "") || !/^[0-9]+$/.test(runAttempt || "")) {
     fail("GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are required for the default config");
   }
-  return JSON.stringify({
+  return `fence-${runId}-${runAttempt}`;
+}
+
+function normalizeProtocol(value: string): "tcp" | "udp" {
+  if (value === "tcp" || value === "udp") {
+    return value;
+  }
+  fail("allowlist protocol must be tcp or udp");
+}
+
+function normalizePort(value: string): number {
+  if (!/^[0-9]+$/.test(value)) {
+    fail("allowlist port must be an integer");
+  }
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    fail("allowlist port must be between 1 and 65535");
+  }
+  return port;
+}
+
+function validateHostname(value: string): string {
+  const destination = value.toLowerCase();
+  if (!isSafeHostname(destination) || net.isIP(destination) !== 0) {
+    fail("allowlist hostname entries must be valid DNS hostnames");
+  }
+  return destination;
+}
+
+function validateIp(value: string): string {
+  if (net.isIP(value) === 0) {
+    fail("allowlist ip entries must be valid literal IP addresses");
+  }
+  return value;
+}
+
+function validateCidr(value: string): string {
+  const separator = value.lastIndexOf("/");
+  if (separator <= 0 || separator === value.length - 1) {
+    fail("allowlist cidr entries must include an address and prefix length");
+  }
+  const address = value.slice(0, separator);
+  const prefix = value.slice(separator + 1);
+  const family = net.isIP(address);
+  if (family === 0 || !/^[0-9]+$/.test(prefix)) {
+    fail("allowlist cidr entries must include a literal IP network and prefix length");
+  }
+  const prefixLength = Number(prefix);
+  const maximum = family === 4 ? 32 : 128;
+  if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > maximum) {
+    fail(`allowlist cidr prefix length must be between 0 and ${maximum}`);
+  }
+  return value;
+}
+
+function classifyDestination(value: string): "hostname" | "ip" | "cidr" {
+  if (value.includes("/")) {
+    return "cidr";
+  }
+  if (net.isIP(value) !== 0) {
+    return "ip";
+  }
+  return "hostname";
+}
+
+function validateDestination(destinationType: "hostname" | "ip" | "cidr", destination: string): string {
+  switch (destinationType) {
+    case "hostname":
+      return validateHostname(destination);
+    case "ip":
+      return validateIp(destination);
+    case "cidr":
+      return validateCidr(destination);
+  }
+}
+
+function parseExplicitAllowlistLine(tokens: string[]): AllowlistEntry {
+  if (tokens.length !== 4) {
+    fail("allowlist explicit entries must use: hostname|ip|cidr destination tcp|udp port");
+  }
+  const destinationType = tokens[0];
+  if (destinationType !== "hostname" && destinationType !== "ip" && destinationType !== "cidr") {
+    fail("allowlist destination type must be hostname, ip, or cidr");
+  }
+  return {
+    destination_type: destinationType,
+    destination: validateDestination(destinationType, tokens[1]),
+    protocol: normalizeProtocol(tokens[2]),
+    port: normalizePort(tokens[3]),
+  };
+}
+
+function parseUrlAllowlistLine(line: string): AllowlistEntry {
+  let parsed: URL;
+  try {
+    parsed = new URL(line);
+  } catch {
+    fail("allowlist URL entries must use tcp://hostname:port or udp://hostname:port");
+  }
+  const protocol = parsed.protocol.replace(/:$/, "");
+  if (
+    parsed.username ||
+    parsed.password ||
+    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.port.length === 0
+  ) {
+    fail("allowlist URL entries may contain only protocol, hostname, and port");
+  }
+  return {
+    destination_type: "hostname",
+    destination: validateHostname(parsed.hostname),
+    protocol: normalizeProtocol(protocol),
+    port: normalizePort(parsed.port),
+  };
+}
+
+function parseShortcutAllowlistLine(line: string): AllowlistEntry {
+  if (line.includes("/")) {
+    fail("allowlist cidr entries must use the explicit cidr destination protocol port form");
+  }
+  if (net.isIP(line) !== 0) {
+    fail("allowlist ip entries must use the explicit ip destination protocol port form");
+  }
+  const colonIndex = line.lastIndexOf(":");
+  const hasPort = colonIndex > 0 && line.indexOf(":") === colonIndex;
+  const destination = hasPort ? line.slice(0, colonIndex) : line;
+  const port = hasPort ? normalizePort(line.slice(colonIndex + 1)) : 443;
+  return {
+    destination_type: "hostname",
+    destination: validateHostname(destination),
+    protocol: "tcp",
+    port,
+  };
+}
+
+function parseAllowlistLine(line: string): AllowlistEntry {
+  if (line.includes("://")) {
+    return parseUrlAllowlistLine(line);
+  }
+  const tokens = line.split(/\s+/).filter(Boolean);
+  if (tokens.length === 4) {
+    return parseExplicitAllowlistLine(tokens);
+  }
+  if (tokens.length !== 1) {
+    fail("allowlist entries must use a supported shorthand or explicit line form");
+  }
+  return parseShortcutAllowlistLine(tokens[0]);
+}
+
+function parseAllowlistInput(value: unknown): AllowlistEntry[] {
+  const raw = normalizeOptionalInput(value, "allowlist", 64 * 1024);
+  if (raw === undefined) {
+    return [];
+  }
+  const entries: AllowlistEntry[] = [];
+  for (const [index, originalLine] of raw.split(/\r?\n/).entries()) {
+    const line = originalLine.trim();
+    if (line.length === 0 || line.startsWith("#")) {
+      continue;
+    }
+    try {
+      entries.push(parseAllowlistLine(line));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      fail(`allowlist line ${index + 1}: ${message}`);
+    }
+  }
+  return entries;
+}
+
+function normalizeNativeInputs(input: unknown): NativeConfigInputs {
+  if (typeof input === "string" || input === undefined || input === null) {
+    return { mode: input };
+  }
+  if (typeof input !== "object" || Array.isArray(input)) {
+    fail("native Action inputs must be an object");
+  }
+  return input as NativeConfigInputs;
+}
+
+function nativeInputsFromEnvironment(environment: Environment): NativeConfigInputs {
+  return {
+    mode: environment.INPUT_MODE,
+    invocationId: environment.INPUT_INVOCATION_ID,
+    containerPolicy: environment.INPUT_CONTAINER_POLICY,
+    platformProfile: environment.INPUT_PLATFORM_PROFILE,
+    disableBroadGithubDomains: environment.INPUT_DISABLE_BROAD_GITHUB_DOMAINS,
+    allowlist: environment.INPUT_ALLOWLIST,
+  };
+}
+
+function defaultInlineConfig(environment: Environment, nativeInput: unknown = undefined): string {
+  const inputs = normalizeNativeInputs(nativeInput);
+  const mode = normalizeDefaultMode(normalizeOptionalInput(inputs.mode, "mode"));
+  const document: Record<string, unknown> = {
     schema_version: 1,
-    mode: normalizeDefaultMode(mode),
-    invocation_id: `fence-${runId}-${runAttempt}`,
-    allowlist: [],
-  });
+    mode,
+    invocation_id: normalizeInvocationId(inputs.invocationId, environment),
+    allowlist: parseAllowlistInput(inputs.allowlist),
+  };
+
+  const containerPolicy = normalizeContainerPolicy(inputs.containerPolicy, mode);
+  if (containerPolicy !== undefined) {
+    document.container_policy = containerPolicy;
+  }
+  const platformProfile = normalizePlatformProfile(inputs.platformProfile);
+  if (platformProfile !== undefined) {
+    document.platform_profile = platformProfile;
+  }
+  if (normalizeBooleanInput(inputs.disableBroadGithubDomains, "disable_broad_github_domains")) {
+    document.disable_broad_github_domains = true;
+  }
+
+  return JSON.stringify(document);
 }
 
 function readJsonBounded(file: string, maximumBytes: number, description: string): any {
@@ -82,12 +385,24 @@ function readJsonBounded(file: string, maximumBytes: number, description: string
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-function validateInlineConfig(raw: unknown, environment: Environment = process.env, mode: unknown = undefined): InlineConfig {
+function validateInlineConfig(raw: unknown, environment: Environment = process.env, nativeInput: unknown = undefined): InlineConfig {
+  const inputs = normalizeNativeInputs(nativeInput);
   const usingDefault = typeof raw !== "string" || raw.length === 0;
-  if (!usingDefault && typeof mode === "string" && mode.length > 0) {
-    fail("mode input cannot be combined with config input");
+  if (!usingDefault) {
+    for (const [name, value] of [
+      ["mode", inputs.mode],
+      ["invocation_id", inputs.invocationId],
+      ["container_policy", inputs.containerPolicy],
+      ["platform_profile", inputs.platformProfile],
+      ["disable_broad_github_domains", inputs.disableBroadGithubDomains],
+      ["allowlist", inputs.allowlist],
+    ] as [string, unknown][]) {
+      if (normalizeOptionalInput(value, name) !== undefined) {
+        fail(`${name} input cannot be combined with config input`);
+      }
+    }
   }
-  const normalizedRaw = usingDefault ? defaultInlineConfig(environment, mode) : raw;
+  const normalizedRaw = usingDefault ? defaultInlineConfig(environment, inputs) : raw;
   if (Buffer.byteLength(normalizedRaw, "utf8") > MAX_CONFIG_BYTES) {
     fail("config input exceeds 256 KiB");
   }
@@ -122,6 +437,7 @@ function runtimePaths(invocationId: unknown): RuntimePaths {
     config: path.join(directory, "config.json"),
     ready: path.join(directory, "ready.json"),
     report: path.join(directory, "report.json"),
+    dnsReport: path.join(directory, "dns-report.json"),
     unit: `fence-${invocationId}.service`,
   };
 }
@@ -201,7 +517,9 @@ function validateReport(report: any, failOnCritical = true): any {
     fail("Fence report contains critical resident findings");
   }
   if (report.network_verification_status !== "verified") {
-    fail("Fence report does not contain verified network state");
+    if (failOnCritical || report.critical_findings.length === 0) {
+      fail("Fence report does not contain verified network state");
+    }
   }
   const expected = {
     protected_host_block: {
@@ -272,31 +590,306 @@ function boundedScalar(value: unknown): string {
   return String(value).replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 96);
 }
 
-function summaryLines(report: any): string[] {
-  return [
-    "### Fence local evidence",
+function boundedText(value: unknown, maximum = 192): string {
+  if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+    return "unavailable";
+  }
+  return String(value)
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\|/g, "\\|")
+    .slice(0, maximum);
+}
+
+function markdownCode(value: unknown, maximum = 128): string {
+  return `\`${boundedText(value, maximum).replace(/`/g, "_")}\``;
+}
+
+function isSafeHostname(value: unknown): value is string {
+  return typeof value === "string" &&
+    value === value.toLowerCase() &&
+    !value.includes("*") &&
+    !value.endsWith(".") &&
+    DNS_HOSTNAME.test(value);
+}
+
+function isSupportedProtocol(value: unknown): value is string {
+  return value === "tcp" || value === "udp";
+}
+
+function isValidPort(value: unknown): value is number {
+  return Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
+function addRow(rows: Map<string, AuditFindingRow>, row: Omit<AuditFindingRow, "count">): void {
+  const key = `${row.destinationKind}\0${row.destination}\0${row.protocol}\0${row.port}`;
+  const existing = rows.get(key);
+  if (existing) {
+    existing.count += 1;
+  } else {
+    rows.set(key, { ...row, count: 1 });
+  }
+}
+
+function sortedRows(rows: Iterable<AuditFindingRow>): AuditFindingRow[] {
+  return Array.from(rows).sort((left, right) =>
+    right.count - left.count ||
+    left.destination.localeCompare(right.destination) ||
+    left.protocol.localeCompare(right.protocol) ||
+    left.port - right.port
+  );
+}
+
+function dnsAddressHostnameMap(dnsEvidence: any): Map<string, Set<string>> {
+  const addressMap = new Map<string, Set<string>>();
+  if (dnsEvidence === undefined || dnsEvidence === null || !Array.isArray(dnsEvidence.observations)) {
+    return addressMap;
+  }
+  for (const observation of dnsEvidence.observations) {
+    if (observation === null || Array.isArray(observation) || typeof observation !== "object") {
+      continue;
+    }
+    if (observation.query_type !== "a" && observation.query_type !== "aaaa") {
+      continue;
+    }
+    const hostname = observation.hostname;
+    if (!isSafeHostname(hostname) || !Array.isArray(observation.resolved_addresses)) {
+      continue;
+    }
+    for (const address of observation.resolved_addresses) {
+      if (typeof address !== "string" || net.isIP(address) === 0) {
+        continue;
+      }
+      const hostnames = addressMap.get(address) || new Set<string>();
+      hostnames.add(hostname);
+      addressMap.set(address, hostnames);
+    }
+  }
+  return addressMap;
+}
+
+function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): AuditSummary {
+  const hostnameRows = new Map<string, AuditFindingRow>();
+  const ipRows = new Map<string, AuditFindingRow>();
+  const addressMap = dnsAddressHostnameMap(dnsEvidence);
+  let unparsedCount = 0;
+
+  for (const finding of Array.isArray(report.findings) ? report.findings : []) {
+    if (
+      finding === null ||
+      Array.isArray(finding) ||
+      typeof finding !== "object" ||
+      finding.classification !== "would_block"
+    ) {
+      continue;
+    }
+    if (
+      typeof finding.remote_address !== "string" ||
+      net.isIP(finding.remote_address) === 0 ||
+      !isSupportedProtocol(finding.protocol) ||
+      !isValidPort(finding.remote_port)
+    ) {
+      unparsedCount += 1;
+      continue;
+    }
+
+    const hostnames = Array.from(addressMap.get(finding.remote_address) || []).sort();
+    if (hostnames.length > 0) {
+      for (const hostname of hostnames) {
+        addRow(hostnameRows, {
+          destination: hostname,
+          destinationKind: "hostname",
+          protocol: finding.protocol,
+          port: finding.remote_port,
+        });
+      }
+    } else {
+      addRow(ipRows, {
+        destination: finding.remote_address,
+        destinationKind: "ip",
+        protocol: finding.protocol,
+        port: finding.remote_port,
+      });
+    }
+  }
+
+  const allHostnameRows = sortedRows(hostnameRows.values());
+  const allIpRows = sortedRows(ipRows.values());
+  return {
+    dnsMissing: dnsEvidence === undefined || dnsEvidence === null,
+    hostnameRows: allHostnameRows.slice(0, MAX_AUDIT_HOSTNAME_ROWS),
+    ipRows: allIpRows.slice(0, MAX_AUDIT_IP_ROWS),
+    omittedHostnameRows: Math.max(0, allHostnameRows.length - MAX_AUDIT_HOSTNAME_ROWS),
+    omittedIpRows: Math.max(0, allIpRows.length - MAX_AUDIT_IP_ROWS),
+    unparsedCount,
+    sourceTruncated: report.findings_truncated === true ||
+      Boolean(dnsEvidence && dnsEvidence.observations_truncated === true),
+  };
+}
+
+function summaryHeading(summaryState: { healthy: boolean }): string {
+  return summaryState.healthy ? "### 🟢 Fence Summary" : "### Fence Summary";
+}
+
+function summaryHasWarnings(report: any, auditSummary: AuditSummary): boolean {
+  return (
+    report.status === "protected_host_block_degraded" ||
+    report.network_verification_status !== "verified" ||
+    (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) ||
+    report.critical_findings_truncated === true ||
+    report.findings_truncated === true ||
+    auditSummary.sourceTruncated ||
+    auditSummary.omittedHostnameRows > 0 ||
+    auditSummary.omittedIpRows > 0 ||
+    (report.mode === "audit" && auditSummary.dnsMissing)
+  );
+}
+
+function criticalFindingLines(report: any): string[] {
+  if (!Array.isArray(report.critical_findings) || report.critical_findings.length === 0) {
+    return [];
+  }
+  const lines = [
     "",
-    "| Field | Value |",
+    "| Finding | Detail |",
     "| --- | --- |",
-    `| status | \`${boundedScalar(report.status)}\` |`,
-    `| mode | \`${boundedScalar(report.mode)}\` |`,
-    `| readiness | \`${boundedScalar(report.readiness_status)}\` |`,
-    `| network verification | \`${boundedScalar(report.network_verification_status)}\` |`,
-    `| sudo | \`${boundedScalar(report.sudo_status)}\` |`,
-    `| containers | \`${boundedScalar(report.container_status)}\` |`,
-    `| platform profile | \`${boundedScalar(report.platform_profile_id)}\` |`,
-    `| critical findings | \`${report.critical_findings.length}\` |`,
+  ];
+  for (const finding of report.critical_findings.slice(0, 5)) {
+    lines.push(`| ${markdownCode(finding && finding.code)} | ${boundedText(finding && finding.message)} |`);
+  }
+  if (report.critical_findings.length > 5) {
+    lines.push(`| ${markdownCode("additional_findings_omitted")} | ${report.critical_findings.length - 5} more critical findings are available in the local report. |`);
+  }
+  return lines;
+}
+
+function modeStatusCard(report: any): string[] {
+  if (
+    report.network_verification_status !== "verified" ||
+    (Array.isArray(report.critical_findings) && report.critical_findings.length > 0)
+  ) {
+    return [
+      "**Fence needs attention**",
+      "",
+      "Fence detected a critical issue after startup and marked this job as failed.",
+      ...criticalFindingLines(report),
+    ];
+  }
+
+  if (report.status === "protected_host_block_degraded") {
+    return [
+      "**Limited assurance**",
+      "",
+      "Fence limited outbound traffic and locked down passwordless sudo, but Docker/container access was preserved. Container access can bypass the ordinary containment claim.",
+    ];
+  }
+
+  if (report.mode === "audit") {
+    return [
+      "**Observing only**",
+      "",
+      "Fence did not block traffic in audit mode. The destinations below would need review before switching this workflow to block mode.",
+    ];
+  }
+
+  return [
+    "**Network restrictions active**",
     "",
-    "Fence remains resident until ephemeral runner teardown. This summary does not restore access.",
+    "Fence limited outbound traffic to the GitHub workflow support channel and your `allowlist`. Passwordless sudo and Docker/container access were locked down. Controls remain active until the runner is torn down.",
+  ];
+}
+
+function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
+  if (rows.length === 0) {
+    return [];
+  }
+  const entries = rows.map((row) => {
+    if (row.protocol === "tcp" && row.port === 443) {
+      return row.destination;
+    }
+    if (row.protocol === "tcp") {
+      return `${row.destination}:${row.port}`;
+    }
+    return `hostname ${row.destination} ${row.protocol} ${row.port}`;
+  });
+
+  return [
+    "",
+    "<details>",
+    "<summary>View allowlist example</summary>",
+    "",
+    "```yaml",
+    "- uses: GrantBirki/fence@<commit-sha>",
+    "  with:",
+    "    allowlist: |",
+    ...entries.map((line) => `      ${line}`),
+    "```",
+    "",
+    "</details>",
+  ];
+}
+
+function auditWouldBlockSummary(report: any, dnsEvidence: any = undefined, auditSummary: AuditSummary = correlateFindingsToDns(report, dnsEvidence)): string[] {
+  if (report.mode !== "audit") {
+    return [];
+  }
+
+  const rows = [...auditSummary.hostnameRows, ...auditSummary.ipRows];
+  const lines = ["", "#### Would Be Blocked In Block Mode", ""];
+  if (auditSummary.dnsMissing) {
+    lines.push("DNS audit evidence was unavailable, so Fence could only report IP-level findings.", "");
+  }
+  if (rows.length === 0 && auditSummary.unparsedCount === 0) {
+    lines.push("No would-block destinations were observed during this audit run.");
+    return lines;
+  }
+
+  if (rows.length > 0) {
+    lines.push("| Destination | Protocol | Port | Count |");
+    lines.push("| --- | --- | ---: | ---: |");
+    for (const row of rows) {
+      lines.push(`| ${markdownCode(row.destination)} | ${markdownCode(row.protocol)} | ${markdownCode(row.port)} | ${markdownCode(row.count)} |`);
+    }
+    lines.push("");
+  }
+  if (auditSummary.ipRows.length > 0 && auditSummary.hostnameRows.length === 0) {
+    lines.push("Manual review required for IP-only findings.");
+    lines.push("");
+  }
+  if (auditSummary.unparsedCount > 0) {
+    lines.push(`${auditSummary.unparsedCount} would-block finding(s) could not be mapped to an endpoint from the bounded packet prefix.`);
+    lines.push("");
+  }
+  if (auditSummary.sourceTruncated || auditSummary.omittedHostnameRows > 0 || auditSummary.omittedIpRows > 0) {
+    const omitted = auditSummary.omittedHostnameRows + auditSummary.omittedIpRows;
+    lines.push(`Some audit evidence was truncated or omitted from this summary. Review the local report for full bounded evidence${omitted > 0 ? `; ${omitted} grouped row(s) were omitted here` : ""}.`);
+  }
+  lines.push(...allowlistYamlSnippet(auditSummary.hostnameRows));
+  return lines;
+}
+
+function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
+  const auditSummary = correlateFindingsToDns(report, dnsEvidence);
+  const summaryState = { healthy: !summaryHasWarnings(report, auditSummary) };
+  return [
+    summaryHeading(summaryState),
+    "",
+    ...modeStatusCard(report),
+    ...auditWouldBlockSummary(report, dnsEvidence, auditSummary),
     "",
   ];
 }
 
 module.exports = {
   MAX_REPORT_BYTES,
+  allowlistYamlSnippet,
+  auditWouldBlockSummary,
+  correlateFindingsToDns,
   defaultInlineConfig,
+  modeStatusCard,
+  nativeInputsFromEnvironment,
   readJsonBounded,
   runtimePaths,
+  summaryHeading,
   summaryLines,
   validateBundle,
   validateInlineConfig,
