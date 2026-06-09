@@ -560,11 +560,7 @@ fn source_accepts_sha256(
     source: &crate::hosted_runner::AcceptedSudoPolicySourceV1,
     observed_sha256: &str,
 ) -> bool {
-    observed_sha256 == source.sha256
-        || source
-            .alternate_sha256
-            .iter()
-            .any(|accepted| *accepted == observed_sha256)
+    observed_sha256 == source.sha256 || source.alternate_sha256.contains(&observed_sha256)
 }
 
 fn verify_socket_fingerprint() -> Result<(), LockdownError> {
