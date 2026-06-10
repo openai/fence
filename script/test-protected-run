@@ -23,6 +23,7 @@ fi
 
 ensure_rust_toolchain
 require_cmd cargo
+require_cmd curl
 require_cmd docker
 require_cmd python3
 require_cmd sudo
@@ -228,6 +229,11 @@ assert dns["routing_status"] == "active", dns
 assert dns["host_dns_routing"] == "local_root_resident_mediator", dns
 assert dns["docker_dns_routing"] == "local_root_resident_mediator", dns
 assert dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"], dns
+assert isinstance(dns["materialization_batch_count"], int), dns
+assert dns["materialization_batch_count"] >= 0, dns
+assert dns["materialization_request_rejections"] == 0, dns
+assert isinstance(dns["materialization_update_max_milliseconds"], int), dns
+assert dns["materialization_update_max_milliseconds"] >= 0, dns
 if scenario == "audit":
     assert "audit_observation_only_no_containment_claim" in report["limitations"]
     assert "audit_preserves_passwordless_sudo_and_container_control" in report["limitations"]
@@ -240,6 +246,27 @@ if scenario == "unsafe-preserve":
     assert "container_control_preserved_invalidates_containment" in report["limitations"]
     assert "container_control_remains_available_to_later_workflow_code" in report["limitations"]
 PY
+
+case "$scenario" in
+  standard)
+    for url in \
+      https://github.com \
+      https://api.github.com \
+      https://release-assets.githubusercontent.com; do
+      curl --head --silent --show-error --max-time 10 --retry 0 --output /dev/null "$url"
+    done
+    ;;
+  standard-opt-out)
+    for url in \
+      https://github.com \
+      https://api.github.com \
+      https://release-assets.githubusercontent.com; do
+      if curl --head --silent --show-error --max-time 3 --retry 0 --output /dev/null "$url" 2>/dev/null; then
+        die "protected broad-domain opt-out unexpectedly allowed $url"
+      fi
+    done
+    ;;
+esac
 
 case "$scenario" in
   standard|standard-opt-out|unsafe-preserve)
@@ -319,6 +346,11 @@ assert report["sudo_status"] == expected["sudo_status"], report
 assert report["container_status"] == expected["container_status"], report
 assert report["critical_findings"] == [], report
 assert dns["status"] == expected["status"], dns
+assert isinstance(dns["materialization_batch_count"], int), dns
+assert dns["materialization_batch_count"] >= 0, dns
+assert dns["materialization_request_rejections"] == 0, dns
+assert isinstance(dns["materialization_update_max_milliseconds"], int), dns
+assert dns["materialization_update_max_milliseconds"] >= 0, dns
 if scenario == "audit":
     assert report["counters"]["total_violations"] >= 1, report
     assert report["counters"]["sampled_violations"] >= 1, report

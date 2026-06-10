@@ -5,6 +5,8 @@ const path = require("node:path");
 const log = require("./log.cts");
 const {
   correlateFindingsToDns,
+  materializationRequestRejections,
+  materializationEvidenceCounter,
   MAX_REPORT_BYTES,
   readJsonBounded,
   runtimePaths,
@@ -45,6 +47,7 @@ function main(): void {
     dnsEvidence = readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report");
   }
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
+  const dnsMaterializationRequestRejections = materializationRequestRejections(dnsEvidence);
   log.debugGroup("Fence debug: post-job evidence", [
     `report_path=${reportPath}`,
     `dns_report_path=${effectiveDnsReportPath}`,
@@ -60,6 +63,9 @@ function main(): void {
     `ip_would_block_rows=${auditSummary.ipRows.length}`,
     `unparsed_would_block_findings=${auditSummary.unparsedCount}`,
     `source_truncated=${auditSummary.sourceTruncated}`,
+    `materialization_batch_count=${materializationEvidenceCounter(dnsEvidence, "materialization_batch_count")}`,
+    `materialization_request_rejections=${dnsMaterializationRequestRejections}`,
+    `materialization_update_max_milliseconds=${materializationEvidenceCounter(dnsEvidence, "materialization_update_max_milliseconds")}`,
   ]);
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {
@@ -68,6 +74,11 @@ function main(): void {
   }
   if (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) {
     log.warning(`Fence detected ${report.critical_findings.length} critical resident finding(s); failing this job`);
+  }
+  if (dnsMaterializationRequestRejections > 0) {
+    log.warning(
+      `Fence withheld ${dnsMaterializationRequestRejections} DNS answer(s) because firewall update work could not be accepted`,
+    );
   }
   validateReport(report, true);
   const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;

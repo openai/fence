@@ -84,11 +84,23 @@ jobs:
         run: script/report-selected-profile-runtime
 
   protected-run:
-    name: protected ${{ matrix.scenario }}
+    name: protected ${{ matrix.scenario }} ${{ matrix.replica }}
     strategy:
       fail-fast: false
       matrix:
-        scenario: [standard, standard-opt-out, unsafe-preserve, audit]
+        include:
+          - scenario: standard
+            replica: first-connect-1
+          - scenario: standard
+            replica: first-connect-2
+          - scenario: standard
+            replica: first-connect-3
+          - scenario: standard-opt-out
+            replica: required
+          - scenario: unsafe-preserve
+            replica: required
+          - scenario: audit
+            replica: required
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 

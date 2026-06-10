@@ -140,8 +140,9 @@ flowchart TD
     launch --> support["Check supported runner shape"]
     support --> plan["Build network plan<br/>GitHub workflow traffic + allowlist"]
     plan --> network["Apply Linux nftables rules<br/>and local DNS handling"]
+    network --> gate["Release approved DNS answers<br/>after matching firewall access is verified"]
 
-    network --> mode{"Selected mode"}
+    gate --> mode{"Selected mode"}
     mode --> block["block<br/>turn off passwordless sudo<br/>turn off Docker"]
     mode --> degraded["unsafe_preserve<br/>turn off passwordless sudo<br/>keep Docker"]
     mode --> audit["audit<br/>observe only<br/>keep sudo and Docker"]

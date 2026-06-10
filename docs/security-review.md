@@ -97,6 +97,19 @@ proxy threads. The recorder now retains a failure flag that resident audit or
 block verification converts into a bounded critical finding in the primary
 report.
 
+### DNS answer and firewall activation ordering
+
+The DNS mediator previously waited for an approved HTTPS address to enter the
+owned `nftables` ruleset but returned the upstream answer before the verified
+firewall update was active. Block mode now submits bounded materialization
+requests to the single resident firewall owner and releases an approved address
+answer only after that owner applies and structurally verifies the matching
+rules. Queue rejection, service disconnection, or an explicit failed result
+returns a minimal retryable `SERVFAIL` response. The response contains the
+original DNS question but no answer, authority, additional, or raw upstream
+data. Queue rejections increment bounded warning evidence; backend apply and
+verification failures remain critical findings.
+
 ### Action child-process deadlines and dependency surface
 
 The Action launcher previously had no timeout for fixed privileged subprocess

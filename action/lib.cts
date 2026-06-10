@@ -730,7 +730,7 @@ function summaryHeading(summaryState: { healthy: boolean }): string {
   return summaryState.healthy ? "### 🟢 Fence Summary" : "### Fence Summary";
 }
 
-function summaryHasWarnings(report: any, auditSummary: AuditSummary): boolean {
+function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence: any): boolean {
   return (
     report.status === "protected_host_block_degraded" ||
     report.network_verification_status !== "verified" ||
@@ -740,8 +740,31 @@ function summaryHasWarnings(report: any, auditSummary: AuditSummary): boolean {
     auditSummary.sourceTruncated ||
     auditSummary.omittedHostnameRows > 0 ||
     auditSummary.omittedIpRows > 0 ||
-    (report.mode === "audit" && auditSummary.dnsMissing)
+    (report.mode === "audit" && auditSummary.dnsMissing) ||
+    materializationRequestRejections(dnsEvidence) > 0
   );
+}
+
+function materializationEvidenceCounter(dnsEvidence: any, field: string): number {
+  const value = dnsEvidence && dnsEvidence[field];
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function materializationRequestRejections(dnsEvidence: any): number {
+  return materializationEvidenceCounter(dnsEvidence, "materialization_request_rejections");
+}
+
+function materializationWarningLines(dnsEvidence: any): string[] {
+  const count = materializationRequestRejections(dnsEvidence);
+  if (count === 0) {
+    return [];
+  }
+  return [
+    "",
+    "**Some DNS answers were withheld**",
+    "",
+    `Fence withheld ${count} DNS answer(s) because firewall update work could not be accepted. Clients may have retried those lookups.`,
+  ];
 }
 
 function criticalFindingLines(report: any): string[] {
@@ -869,11 +892,12 @@ function auditWouldBlockSummary(report: any, dnsEvidence: any = undefined, audit
 
 function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
-  const summaryState = { healthy: !summaryHasWarnings(report, auditSummary) };
+  const summaryState = { healthy: !summaryHasWarnings(report, auditSummary, dnsEvidence) };
   return [
     summaryHeading(summaryState),
     "",
     ...modeStatusCard(report),
+    ...materializationWarningLines(dnsEvidence),
     ...auditWouldBlockSummary(report, dnsEvidence, auditSummary),
     "",
   ];
@@ -886,6 +910,9 @@ module.exports = {
   correlateFindingsToDns,
   defaultInlineConfig,
   modeStatusCard,
+  materializationRequestRejections,
+  materializationEvidenceCounter,
+  materializationWarningLines,
   nativeInputsFromEnvironment,
   readJsonBounded,
   runtimePaths,

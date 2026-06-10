@@ -10,6 +10,8 @@ const {
   allowlistYamlSnippet,
   correlateFindingsToDns,
   defaultInlineConfig,
+  materializationRequestRejections,
+  materializationWarningLines,
   runtimePaths,
   summaryLines,
   validateBundle,
@@ -628,6 +630,26 @@ test("renders audit IP-only findings when DNS evidence excludes non-GitHub names
   assert.match(summary, /Manual review required for IP-only findings/);
   assert.doesNotMatch(summary, /DNS audit evidence was unavailable/);
   assert.doesNotMatch(summary, /View allowlist example/);
+});
+
+test("renders DNS materialization request rejection evidence as a non-critical warning", () => {
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    materialization_request_rejections: 2,
+  };
+  assert.equal(materializationRequestRejections(dnsEvidence), 2);
+  assert.equal(materializationRequestRejections({ materialization_request_rejections: -1 }), 0);
+  assert.equal(materializationRequestRejections({ materialization_request_rejections: "2" }), 0);
+  assert.match(
+    materializationWarningLines(dnsEvidence).join("\n"),
+    /withheld 2 DNS answer\(s\).*firewall update work could not be accepted/,
+  );
+  const summary = summaryLines(report, dnsEvidence).join("\n");
+  assert.match(summary, /^### Fence Summary/);
+  assert.doesNotMatch(summary, /🟢/);
+  assert.match(summary, /Some DNS answers were withheld/);
+  assert.doesNotMatch(summary, /critical issue/);
 });
 
 test("renders bounded allowlist YAML snippets", () => {
