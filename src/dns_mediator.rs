@@ -46,7 +46,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -85,6 +85,7 @@ const DNS_PROFILE_REFRESH_INTERVAL: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS);
 const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS);
+const DNS_MATERIALIZATION_APPLY_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
 const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
@@ -458,6 +459,22 @@ struct PendingMaterialization {
 struct MaterializationQueue {
     pending: BTreeSet<PendingMaterialization>,
     truncated: bool,
+    next_generation: u64,
+    applied_generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct MaterializationCoordinator {
+    state: Mutex<MaterializationQueue>,
+    applied: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct MaterializationMerge {
+    changed: bool,
+    truncated: bool,
+    expired: u64,
+    generation: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -493,7 +510,7 @@ struct ObservationRecorder {
     report_path: PathBuf,
     scope: DnsEvidenceScope,
     bootstrap_hostnames: Vec<&'static str>,
-    materializations: Option<Arc<Mutex<MaterializationQueue>>>,
+    materializations: Option<Arc<MaterializationCoordinator>>,
 }
 
 impl ObservationRecorder {
@@ -647,31 +664,37 @@ impl ObservationRecorder {
                 retain_address_answers(observation, answers.clone());
             }
         }
-        if forwardable_block_response && let Some(queue) = &self.materializations {
-            let mut queue = queue.lock().expect("DNS materialization lock poisoned");
-            for answer in answers {
-                let Some(ttl_seconds) =
-                    self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)
-                else {
-                    continue;
-                };
-                if queue.pending.len() >= MAX_DYNAMIC_MATERIALIZATIONS {
-                    queue.truncated = true;
-                    break;
-                }
-                queue.pending.insert(PendingMaterialization {
-                    source_hostname: hostname.clone(),
-                    hostname: answer.hostname,
-                    address: answer.address,
-                    ttl_seconds,
+        let materialization_generation = if forwardable_block_response {
+            self.materializations.as_ref().and_then(|queue| {
+                let materializations = answers.into_iter().filter_map(|answer| {
+                    let ttl_seconds =
+                        self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)?;
+                    Some(PendingMaterialization {
+                        source_hostname: hostname.clone(),
+                        hostname: answer.hostname,
+                        address: answer.address,
+                        ttl_seconds,
+                    })
                 });
-            }
-        }
+                enqueue_pending_materializations(queue, materializations)
+            })
+        } else {
+            None
+        };
         let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         if write_result.is_err() {
             self.report_write_failed.store(true, Ordering::Relaxed);
+        }
+        if let (Some(queue), Some(generation)) =
+            (&self.materializations, materialization_generation)
+        {
+            let _ = wait_for_materialization_generation(
+                queue,
+                generation,
+                DNS_MATERIALIZATION_APPLY_TIMEOUT,
+            );
         }
     }
 
@@ -819,7 +842,7 @@ impl DnsMediationSession {
         runtime_directory: &Path,
         scope: DnsEvidenceScope,
         bootstrap_hostnames: Vec<&'static str>,
-        materializations: Option<Arc<Mutex<MaterializationQueue>>>,
+        materializations: Option<Arc<MaterializationCoordinator>>,
     ) -> Result<Self, DnsMediationError> {
         let report_path = runtime_directory.join("dns-report.json");
         let recorder = ObservationRecorder {
@@ -1080,7 +1103,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
 
 struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     _mediation: DnsMediationSession,
-    queue: Arc<Mutex<MaterializationQueue>>,
+    queue: Arc<MaterializationCoordinator>,
     backend: NativeNftBackend<SystemNftExecutor>,
     lockdown: SystemLockdownControl,
     reader: NflogReader,
@@ -1099,7 +1122,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
     fn establish(
         runtime: R,
         mut mediation: DnsMediationSession,
-        queue: Arc<Mutex<MaterializationQueue>>,
+        queue: Arc<MaterializationCoordinator>,
         plan: &PlanData,
         scope: DnsBlockRuntimeScope,
     ) -> Result<Self, DnsMediationError> {
@@ -1111,11 +1134,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 return Err(error.into_dns_error());
             }
         };
-        enqueue_pending_materializations(&queue, prehydrated);
+        let _ = enqueue_pending_materializations(&queue, prehydrated);
         let mut active = BTreeMap::new();
-        let (changed, materializations_truncated, _) =
-            merge_pending_materializations(&mut active, &queue, Instant::now());
-        if !changed
+        let merge = merge_pending_materializations(&mut active, &queue, Instant::now());
+        if !merge.changed
             || !active_covers_selected_profile_bootstrap_roots(&active, &bootstrap_hostnames)
         {
             let _ = mediation.routing.rollback();
@@ -1129,13 +1151,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
         let expected_state = expected_dns_mediated_owned_state(Mode::Block, &allowances);
-        let mut evidence = initial_dns_block_evidence(
-            plan,
-            &active,
-            materializations_truncated,
-            ruleset_hash.clone(),
-            scope,
-        );
+        let mut evidence =
+            initial_dns_block_evidence(plan, &active, merge.truncated, ruleset_hash.clone(), scope);
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedBlockState {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.evidence_status(),
@@ -1210,6 +1227,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(error);
         }
+        mark_materialization_generation_applied(&queue, merge.generation);
 
         evidence.setup_status = "verified_before_test_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
@@ -1291,7 +1309,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         if elapsed >= self.next_dns_refresh {
             match prehydrate_bootstrap_names(&self._mediation.recorder.bootstrap_hostnames) {
                 Ok(materializations) => {
-                    enqueue_pending_materializations(&self.queue, materializations)
+                    let _ = enqueue_pending_materializations(&self.queue, materializations);
                 }
                 Err(error) => root_refresh_error = Some(error),
             };
@@ -1300,10 +1318,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         let mut proposed = self.active.clone();
-        let (materialization_changed, truncated, expired) =
-            merge_pending_materializations(&mut proposed, &self.queue, Instant::now());
-        self.evidence.materializations_truncated |= truncated;
-        if materialization_changed {
+        let merge = merge_pending_materializations(&mut proposed, &self.queue, Instant::now());
+        self.evidence.materializations_truncated |= merge.truncated;
+        if merge.changed {
             let allowances =
                 effective_allowances_with_materializations(&self.base_allowances, &proposed);
             let ruleset = render_dns_mediated_replacement_ruleset(Mode::Block, &allowances);
@@ -1320,8 +1337,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 self.evidence.expired_materializations = self
                     .evidence
                     .expired_materializations
-                    .saturating_add(expired);
+                    .saturating_add(merge.expired);
                 self.evidence.network_verification_status = "verified";
+                mark_materialization_generation_applied(&self.queue, merge.generation);
             } else {
                 self.evidence.network_verification_status = "critical_dynamic_update_failed";
                 self.record_critical(
@@ -1485,7 +1503,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
                 }
                 AssuranceStatus::AuditObservationOnly => unreachable!("block match excludes audit"),
             };
-            let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
+            let queue = Arc::new(MaterializationCoordinator::default());
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
                 scope.dns_scope(),
@@ -1532,7 +1550,7 @@ pub fn run_selected_profile_runtime_test_service(
     }
     let runtime =
         TestRuntimeStore::create(runtime_root, &plan.invocation_id).map_err(runtime_error)?;
-    let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
+    let queue = Arc::new(MaterializationCoordinator::default());
     let bootstrap_hostnames = plan
         .platform_profile
         .dns_mediated_compatibility
@@ -1925,34 +1943,57 @@ fn prehydration_materialization_ttl_seconds(
 }
 
 fn enqueue_pending_materializations(
-    queue: &Arc<Mutex<MaterializationQueue>>,
+    queue: &Arc<MaterializationCoordinator>,
     materializations: impl IntoIterator<Item = PendingMaterialization>,
-) {
-    let mut queue = queue.lock().expect("DNS materialization lock poisoned");
+) -> Option<u64> {
+    let mut state = queue
+        .state
+        .lock()
+        .expect("DNS materialization lock poisoned");
+    let mut inserted = false;
+    let mut pending_generation = None;
     for materialization in materializations {
-        if queue.pending.len() >= MAX_DYNAMIC_MATERIALIZATIONS
-            && !queue.pending.contains(&materialization)
+        if state.pending.len() >= MAX_DYNAMIC_MATERIALIZATIONS
+            && !state.pending.contains(&materialization)
         {
-            queue.truncated = true;
+            state.truncated = true;
             break;
         }
-        queue.pending.insert(materialization);
+        if state.pending.insert(materialization) {
+            inserted = true;
+        } else {
+            pending_generation = Some(state.next_generation);
+        }
+    }
+    if inserted {
+        state.next_generation = state.next_generation.saturating_add(1);
+        Some(state.next_generation)
+    } else {
+        pending_generation
     }
 }
 
 fn merge_pending_materializations(
     active: &mut BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
-    queue: &Arc<Mutex<MaterializationQueue>>,
+    queue: &Arc<MaterializationCoordinator>,
     now: Instant,
-) -> (bool, bool, u64) {
+) -> MaterializationMerge {
     let mut changed = false;
     let expired = active
         .extract_if(.., |_, materialization| materialization.expires_at <= now)
         .count() as u64;
     changed |= expired > 0;
-    let (pending, truncated) = {
-        let mut queue = queue.lock().expect("DNS materialization lock poisoned");
-        (std::mem::take(&mut queue.pending), queue.truncated)
+    let (pending, truncated, generation) = {
+        let mut state = queue
+            .state
+            .lock()
+            .expect("DNS materialization lock poisoned");
+        let generation = (!state.pending.is_empty()).then_some(state.next_generation);
+        (
+            std::mem::take(&mut state.pending),
+            state.truncated,
+            generation,
+        )
     };
     for materialization in pending {
         let key = (
@@ -1974,7 +2015,55 @@ fn merge_pending_materializations(
         );
         changed = true;
     }
-    (changed, truncated, expired)
+    MaterializationMerge {
+        changed,
+        truncated,
+        expired,
+        generation,
+    }
+}
+
+fn mark_materialization_generation_applied(
+    queue: &Arc<MaterializationCoordinator>,
+    generation: Option<u64>,
+) {
+    let Some(generation) = generation else {
+        return;
+    };
+    let mut state = queue
+        .state
+        .lock()
+        .expect("DNS materialization lock poisoned");
+    if state.applied_generation < generation {
+        state.applied_generation = generation;
+        queue.applied.notify_all();
+    }
+}
+
+fn wait_for_materialization_generation(
+    queue: &Arc<MaterializationCoordinator>,
+    generation: u64,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut state = queue
+        .state
+        .lock()
+        .expect("DNS materialization lock poisoned");
+    while state.applied_generation < generation {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return false;
+        };
+        let (next_state, result) = queue
+            .applied
+            .wait_timeout(state, remaining)
+            .expect("DNS materialization condition variable poisoned");
+        state = next_state;
+        if result.timed_out() {
+            break;
+        }
+    }
+    state.applied_generation >= generation
 }
 
 fn effective_allowances_with_materializations(
@@ -3715,25 +3804,27 @@ mod tests {
 
     #[test]
     fn materializes_only_bounded_ttl_https_addresses_and_expires_them() {
-        let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
+        let queue = Arc::new(MaterializationCoordinator::default());
         let now = Instant::now();
-        queue
-            .lock()
-            .unwrap()
-            .pending
-            .insert(PendingMaterialization {
-                source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
-                hostname: "pipelines.actions.githubusercontent.com".to_owned(),
-                address: "192.0.2.10".parse().unwrap(),
-                ttl_seconds: 30,
-            });
+        assert_eq!(
+            enqueue_pending_materializations(
+                &queue,
+                [PendingMaterialization {
+                    source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
+                    hostname: "pipelines.actions.githubusercontent.com".to_owned(),
+                    address: "192.0.2.10".parse().unwrap(),
+                    ttl_seconds: 30,
+                }]
+            ),
+            Some(1)
+        );
         let mut active = BTreeMap::new();
-        let (changed, truncated, expired) =
-            merge_pending_materializations(&mut active, &queue, now);
+        let merge = merge_pending_materializations(&mut active, &queue, now);
 
-        assert!(changed);
-        assert!(!truncated);
-        assert_eq!(expired, 0);
+        assert!(merge.changed);
+        assert!(!merge.truncated);
+        assert_eq!(merge.expired, 0);
+        assert_eq!(merge.generation, Some(1));
         assert_eq!(
             effective_allowances_with_materializations(&[], &active),
             vec![EffectiveAllowance {
@@ -3743,16 +3834,44 @@ mod tests {
                 port: 443,
             }]
         );
-        let (changed, _, expired) =
+        let merge =
             merge_pending_materializations(&mut active, &queue, now + Duration::from_secs(31));
-        assert!(!changed);
-        assert_eq!(expired, 0);
+        assert!(!merge.changed);
+        assert_eq!(merge.expired, 0);
+        assert_eq!(merge.generation, None);
         assert_eq!(active.len(), 1);
-        let (changed, _, expired) =
+        let merge =
             merge_pending_materializations(&mut active, &queue, now + Duration::from_secs(61));
-        assert!(changed);
-        assert_eq!(expired, 1);
+        assert!(merge.changed);
+        assert_eq!(merge.expired, 1);
+        assert_eq!(merge.generation, None);
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn materialization_generation_waits_only_until_applied() {
+        let queue = Arc::new(MaterializationCoordinator::default());
+        let generation = enqueue_pending_materializations(
+            &queue,
+            [PendingMaterialization {
+                source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
+                hostname: "pipelines.actions.githubusercontent.com".to_owned(),
+                address: "192.0.2.10".parse().unwrap(),
+                ttl_seconds: 30,
+            }],
+        )
+        .unwrap();
+        assert!(!wait_for_materialization_generation(
+            &queue,
+            generation,
+            Duration::from_millis(1)
+        ));
+        mark_materialization_generation_applied(&queue, Some(generation));
+        assert!(wait_for_materialization_generation(
+            &queue,
+            generation,
+            Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -3818,15 +3937,21 @@ mod tests {
             ]
         );
 
-        let queue = Arc::new(Mutex::new(MaterializationQueue::default()));
-        enqueue_pending_materializations(&queue, materializations.clone());
-        enqueue_pending_materializations(&queue, materializations);
+        let queue = Arc::new(MaterializationCoordinator::default());
+        assert_eq!(
+            enqueue_pending_materializations(&queue, materializations.clone()),
+            Some(1)
+        );
+        assert_eq!(
+            enqueue_pending_materializations(&queue, materializations),
+            Some(1)
+        );
         let mut active = BTreeMap::new();
-        let (changed, truncated, expired) =
-            merge_pending_materializations(&mut active, &queue, Instant::now());
-        assert!(changed);
-        assert!(!truncated);
-        assert_eq!(expired, 0);
+        let merge = merge_pending_materializations(&mut active, &queue, Instant::now());
+        assert!(merge.changed);
+        assert!(!merge.truncated);
+        assert_eq!(merge.expired, 0);
+        assert_eq!(merge.generation, Some(1));
         assert_eq!(active.len(), 2);
         assert!(active_covers_selected_profile_bootstrap_roots(
             &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
