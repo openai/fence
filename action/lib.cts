@@ -741,25 +741,29 @@ function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence
     auditSummary.omittedHostnameRows > 0 ||
     auditSummary.omittedIpRows > 0 ||
     (report.mode === "audit" && auditSummary.dnsMissing) ||
-    materializationWaitTimeouts(dnsEvidence) > 0
+    materializationRequestRejections(dnsEvidence) > 0
   );
 }
 
-function materializationWaitTimeouts(dnsEvidence: any): number {
-  const value = dnsEvidence && dnsEvidence.materialization_wait_timeouts;
+function materializationEvidenceCounter(dnsEvidence: any, field: string): number {
+  const value = dnsEvidence && dnsEvidence[field];
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
 }
 
+function materializationRequestRejections(dnsEvidence: any): number {
+  return materializationEvidenceCounter(dnsEvidence, "materialization_request_rejections");
+}
+
 function materializationWarningLines(dnsEvidence: any): string[] {
-  const count = materializationWaitTimeouts(dnsEvidence);
+  const count = materializationRequestRejections(dnsEvidence);
   if (count === 0) {
     return [];
   }
   return [
     "",
-    "**Temporary DNS delays observed**",
+    "**Some DNS answers were withheld**",
     "",
-    `Fence withheld ${count} DNS answer(s) while the matching firewall access was still being verified. Clients may have retried those lookups.`,
+    `Fence withheld ${count} DNS answer(s) because firewall update work could not be accepted. Clients may have retried those lookups.`,
   ];
 }
 
@@ -906,7 +910,8 @@ module.exports = {
   correlateFindingsToDns,
   defaultInlineConfig,
   modeStatusCard,
-  materializationWaitTimeouts,
+  materializationRequestRejections,
+  materializationEvidenceCounter,
   materializationWarningLines,
   nativeInputsFromEnvironment,
   readJsonBounded,

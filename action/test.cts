@@ -10,7 +10,7 @@ const {
   allowlistYamlSnippet,
   correlateFindingsToDns,
   defaultInlineConfig,
-  materializationWaitTimeouts,
+  materializationRequestRejections,
   materializationWarningLines,
   runtimePaths,
   summaryLines,
@@ -632,23 +632,23 @@ test("renders audit IP-only findings when DNS evidence excludes non-GitHub names
   assert.doesNotMatch(summary, /View allowlist example/);
 });
 
-test("renders DNS materialization timeout evidence as a non-critical warning", () => {
+test("renders DNS materialization request rejection evidence as a non-critical warning", () => {
   const dnsEvidence = {
     observations: [],
     observations_truncated: false,
-    materialization_wait_timeouts: 2,
+    materialization_request_rejections: 2,
   };
-  assert.equal(materializationWaitTimeouts(dnsEvidence), 2);
-  assert.equal(materializationWaitTimeouts({ materialization_wait_timeouts: -1 }), 0);
-  assert.equal(materializationWaitTimeouts({ materialization_wait_timeouts: "2" }), 0);
+  assert.equal(materializationRequestRejections(dnsEvidence), 2);
+  assert.equal(materializationRequestRejections({ materialization_request_rejections: -1 }), 0);
+  assert.equal(materializationRequestRejections({ materialization_request_rejections: "2" }), 0);
   assert.match(
     materializationWarningLines(dnsEvidence).join("\n"),
-    /withheld 2 DNS answer\(s\).*firewall access was still being verified/,
+    /withheld 2 DNS answer\(s\).*firewall update work could not be accepted/,
   );
   const summary = summaryLines(report, dnsEvidence).join("\n");
   assert.match(summary, /^### Fence Summary/);
   assert.doesNotMatch(summary, /🟢/);
-  assert.match(summary, /Temporary DNS delays observed/);
+  assert.match(summary, /Some DNS answers were withheld/);
   assert.doesNotMatch(summary, /critical issue/);
 });
 

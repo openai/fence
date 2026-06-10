@@ -100,15 +100,15 @@ report.
 ### DNS answer and firewall activation ordering
 
 The DNS mediator previously waited for an approved HTTPS address to enter the
-owned `nftables` ruleset but returned the upstream answer even when that wait
-timed out. A client could therefore attempt its first connection before the
-verified firewall update was active. Block mode now wakes the resident update
-loop when materialization work arrives and releases an approved address answer
-only after the matching generation is applied and structurally verified. A
-100-millisecond wait miss returns a minimal retryable `SERVFAIL` response and
-increments bounded warning evidence. The response contains the original DNS
-question but no answer, authority, additional, or raw upstream data. Backend
-apply and verification failures remain critical findings.
+owned `nftables` ruleset but returned the upstream answer before the verified
+firewall update was active. Block mode now submits bounded materialization
+requests to the single resident firewall owner and releases an approved address
+answer only after that owner applies and structurally verifies the matching
+rules. Queue rejection, service disconnection, or an explicit failed result
+returns a minimal retryable `SERVFAIL` response. The response contains the
+original DNS question but no answer, authority, additional, or raw upstream
+data. Queue rejections increment bounded warning evidence; backend apply and
+verification failures remain critical findings.
 
 ### Action child-process deadlines and dependency surface
 

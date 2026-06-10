@@ -148,8 +148,11 @@ assert dns["bootstrap_hostnames"] == [
     "payload.pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ]
-assert isinstance(dns["materialization_wait_timeouts"], int)
-assert dns["materialization_wait_timeouts"] >= 0
+assert isinstance(dns["materialization_batch_count"], int)
+assert dns["materialization_batch_count"] >= 0
+assert dns["materialization_request_rejections"] == 0
+assert isinstance(dns["materialization_update_max_milliseconds"], int)
+assert dns["materialization_update_max_milliseconds"] >= 0
 assert dns["mode"] == "block"
 assert dns["proxy_policy_status"] == "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
 assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
