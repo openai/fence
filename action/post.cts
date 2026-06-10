@@ -2,7 +2,9 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const log = require("./log.cts");
 const {
+  correlateFindingsToDns,
   MAX_REPORT_BYTES,
   readJsonBounded,
   runtimePaths,
@@ -17,10 +19,11 @@ const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
 
 function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`::error::Fence post-job evidence failed: ${message.replace(/[\r\n%]/g, "_").slice(0, 512)}\n`);
+  log.error(`Fence post-job evidence failed: ${message}`);
 }
 
 function main(): void {
+  log.info("📋 Validating Fence evidence");
   const invocationId = process.env.STATE_invocation_id;
   const reportPath = process.env.STATE_report_path;
   const dnsReportPath = process.env.STATE_dns_report_path;
@@ -41,13 +44,39 @@ function main(): void {
   if (fs.existsSync(effectiveDnsReportPath)) {
     dnsEvidence = readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report");
   }
+  const auditSummary = correlateFindingsToDns(report, dnsEvidence);
+  log.debugGroup("Fence debug: post-job evidence", [
+    `report_path=${reportPath}`,
+    `dns_report_path=${effectiveDnsReportPath}`,
+    `dns_report_present=${dnsEvidence !== undefined}`,
+    `mode=${report.mode}`,
+    `status=${report.status}`,
+    `readiness=${report.readiness_status}`,
+    `network_verification=${report.network_verification_status}`,
+    `sudo=${report.sudo_status}`,
+    `containers=${report.container_status}`,
+    `critical_findings=${Array.isArray(report.critical_findings) ? report.critical_findings.length : "unknown"}`,
+    `hostname_would_block_rows=${auditSummary.hostnameRows.length}`,
+    `ip_would_block_rows=${auditSummary.ipRows.length}`,
+    `unparsed_would_block_findings=${auditSummary.unparsedCount}`,
+    `source_truncated=${auditSummary.sourceTruncated}`,
+  ]);
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {
       encoding: "utf8",
     });
   }
+  if (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) {
+    log.warning(`Fence detected ${report.critical_findings.length} critical resident finding(s); failing this job`);
+  }
   validateReport(report, true);
-  process.stdout.write("Fence post-job local evidence verified; resident controls remain active until runner teardown.\n");
+  const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;
+  const evidenceLine = log.postEvidenceLine(report, auditDestinationCount);
+  if (evidenceLine) {
+    log.info(evidenceLine);
+  }
+  log.success("✅ Fence evidence verified");
+  log.info("🧷 Fence remains active until the runner is torn down");
 }
 
 if (require.main === module) {

@@ -3,6 +3,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const log = require("./log.cts");
 const {
   MAX_REPORT_BYTES,
   nativeInputsFromEnvironment,
@@ -26,9 +27,13 @@ const CHILD_ENV = {
   PATH: "/usr/bin:/usr/sbin:/bin:/sbin",
 };
 
+let diagnosticPaths: { unit: string } | undefined;
+let serviceLaunchAttempted = false;
+
 function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`::error::Fence setup failed: ${message.replace(/[\r\n%]/g, "_").slice(0, 512)}\n`);
+  log.error(`Fence setup failed: ${message}`);
+  emitServiceDiagnostics(diagnosticPaths);
 }
 
 function run(
@@ -56,6 +61,80 @@ function run(
   }
 }
 
+function capture(
+  executable: string,
+  args: string[],
+  timeout = 2 * 1000,
+): { status: number | null; stdout: string; stderr: string; error: string | undefined } {
+  const result = spawnSync(executable, args, {
+    encoding: "utf8",
+    env: CHILD_ENV,
+    killSignal: "SIGKILL",
+    maxBuffer: 32 * 1024,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout,
+  });
+  return {
+    status: result.status,
+    stdout: String(result.stdout || ""),
+    stderr: String(result.stderr || ""),
+    error: result.error ? result.error.message : undefined,
+  };
+}
+
+function compactServiceStatus(output: string): string {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(0, 12)
+    .join("; ");
+}
+
+function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
+  if (!paths || !serviceLaunchAttempted) {
+    return;
+  }
+  const status = capture("/usr/bin/systemctl", [
+    "show",
+    paths.unit,
+    "--no-pager",
+    "--property=LoadState",
+    "--property=ActiveState",
+    "--property=SubState",
+    "--property=Result",
+    "--property=ExecMainCode",
+    "--property=ExecMainStatus",
+    "--property=MainPID",
+  ]);
+  const compactStatus = compactServiceStatus(`${status.stdout}\n${status.stderr}`);
+  if (compactStatus.length > 0) {
+    log.warning(`Fence service state for ${paths.unit}: ${compactStatus}`);
+  }
+  log.debugGroup("Fence debug: service status", [
+    `unit=${paths.unit}`,
+    `status=${status.status}`,
+    `error=${status.error || "none"}`,
+    ...`${status.stdout}\n${status.stderr}`.split(/\r?\n/).filter((line) => line.length > 0),
+  ]);
+
+  const journal = capture("/usr/bin/journalctl", [
+    "--no-pager",
+    "--unit",
+    paths.unit,
+    "--lines",
+    "80",
+    "--output",
+    "short-monotonic",
+  ]);
+  log.debugGroup("Fence debug: service journal", [
+    `unit=${paths.unit}`,
+    `status=${journal.status}`,
+    `error=${journal.error || "none"}`,
+    ...`${journal.stdout}\n${journal.stderr}`.split(/\r?\n/).filter((line) => line.length > 0),
+  ]);
+}
+
 function sleep(milliseconds: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
@@ -77,6 +156,12 @@ function appendState(name: string, value: string): void {
 
 function waitForReady(paths: { ready: string; report: string }): any {
   const deadline = Date.now() + READY_TIMEOUT_MS;
+  log.debugGroup("Fence debug: readiness", [
+    `timeout_ms=${READY_TIMEOUT_MS}`,
+    `poll_interval_ms=${POLL_INTERVAL_MS}`,
+    `ready_path=${paths.ready}`,
+    `report_path=${paths.report}`,
+  ]);
   while (Date.now() < deadline) {
     if (fs.existsSync(paths.ready) && fs.existsSync(paths.report)) {
       const report = validateReport(
@@ -85,6 +170,15 @@ function waitForReady(paths: { ready: string; report: string }): any {
       );
       const ready = readJsonBounded(paths.ready, 64 * 1024, "Fence readiness");
       validateReady(ready, report);
+      log.debugGroup("Fence debug: readiness verified", [
+        `mode=${report.mode}`,
+        `status=${report.status}`,
+        `readiness=${report.readiness_status}`,
+        `network_verification=${report.network_verification_status}`,
+        `sudo=${report.sudo_status}`,
+        `containers=${report.container_status}`,
+        `critical_findings=${Array.isArray(report.critical_findings) ? report.critical_findings.length : "unknown"}`,
+      ]);
       return report;
     }
     sleep(POLL_INTERVAL_MS);
@@ -96,9 +190,31 @@ function main(): void {
   if (process.platform !== "linux" || process.arch !== "x64") {
     throw new Error("Fence Action supports only Linux x64");
   }
-  validateBundle(MANIFEST, BINARY);
+  const manifest = validateBundle(MANIFEST, BINARY);
   const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, nativeInputsFromEnvironment(process.env));
   const paths = runtimePaths(config.invocationId);
+  diagnosticPaths = paths;
+  const details = log.configLogDetails(config.raw, config.usingDefault);
+
+  for (const line of log.setupLines(manifest, details)) {
+    log.info(line);
+  }
+  log.debugGroup("Fence debug: setup inputs", [
+    `mode=${details.mode}`,
+    `invocation_id=${config.invocationId}`,
+    `config_source=${details.source}`,
+    `container_policy=${details.containerPolicy}`,
+    `platform_profile=${details.platformProfile}`,
+    `disable_broad_github_domains=${details.disableBroadGithubDomains}`,
+    `allowlist_count=${details.allowlistCount}`,
+    ...details.allowlistDestinations.map((entry: string) => `allowlist=${entry}`),
+    `bundle_release=${manifest.release_tag}`,
+    `bundle_source_commit=${manifest.source_commit}`,
+    `platform=${process.platform}`,
+    `arch=${process.arch}`,
+    `runtime_directory=${paths.directory}`,
+    `unit=${paths.unit}`,
+  ]);
 
   if (fs.existsSync(paths.directory)) {
     throw new Error("Fence runtime invocation directory already exists");
@@ -113,7 +229,8 @@ function main(): void {
   appendState("report_path", paths.report);
   appendState("dns_report_path", paths.dnsReport);
   appendState("ready_path", paths.ready);
-  run("/usr/bin/sudo", [
+  log.info("🚀 Starting resident service");
+  const serviceArgs = [
     "/usr/bin/systemd-run",
     "--quiet",
     "--collect",
@@ -124,9 +241,16 @@ function main(): void {
     "run",
     "--config",
     paths.config,
+  ];
+  log.debugGroup("Fence debug: service launch", [
+    `executable=/usr/bin/sudo`,
+    `args=${serviceArgs.join(" ")}`,
+    `child_timeout_ms=${CHILD_TIMEOUT_MS}`,
   ]);
-  waitForReady(paths);
-  process.stdout.write("Fence readiness verified; resident controls remain active until runner teardown.\n");
+  serviceLaunchAttempted = true;
+  run("/usr/bin/sudo", serviceArgs);
+  const report = waitForReady(paths);
+  log.success(log.readyLine(report));
 }
 
 if (require.main === module) {
