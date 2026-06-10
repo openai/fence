@@ -5,6 +5,7 @@ const path = require("node:path");
 const log = require("./log.cts");
 const {
   correlateFindingsToDns,
+  materializationWaitTimeouts,
   MAX_REPORT_BYTES,
   readJsonBounded,
   runtimePaths,
@@ -45,6 +46,7 @@ function main(): void {
     dnsEvidence = readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report");
   }
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
+  const dnsMaterializationWaitTimeouts = materializationWaitTimeouts(dnsEvidence);
   log.debugGroup("Fence debug: post-job evidence", [
     `report_path=${reportPath}`,
     `dns_report_path=${effectiveDnsReportPath}`,
@@ -60,6 +62,7 @@ function main(): void {
     `ip_would_block_rows=${auditSummary.ipRows.length}`,
     `unparsed_would_block_findings=${auditSummary.unparsedCount}`,
     `source_truncated=${auditSummary.sourceTruncated}`,
+    `materialization_wait_timeouts=${dnsMaterializationWaitTimeouts}`,
   ]);
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {
@@ -68,6 +71,11 @@ function main(): void {
   }
   if (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) {
     log.warning(`Fence detected ${report.critical_findings.length} critical resident finding(s); failing this job`);
+  }
+  if (dnsMaterializationWaitTimeouts > 0) {
+    log.warning(
+      `Fence withheld ${dnsMaterializationWaitTimeouts} DNS answer(s) while matching firewall access was still being verified`,
+    );
   }
   validateReport(report, true);
   const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;

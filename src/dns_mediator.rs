@@ -85,7 +85,7 @@ const DNS_PROFILE_REFRESH_INTERVAL: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS);
 const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS);
-const DNS_MATERIALIZATION_APPLY_TIMEOUT: Duration = Duration::from_millis(500);
+const DNS_MATERIALIZATION_APPLY_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
 const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
@@ -277,6 +277,7 @@ pub struct DnsMediationEvidence {
     pub derived_cname_authorizations_truncated: bool,
     pub excluded_non_github_query_count: u64,
     pub blocked_non_profile_query_count: u64,
+    pub materialization_wait_timeouts: u64,
     pub limitations: Vec<&'static str>,
 }
 
@@ -423,6 +424,7 @@ struct ObservationState {
     truncated: bool,
     excluded_non_github_query_count: u64,
     blocked_non_profile_query_count: u64,
+    materialization_wait_timeouts: u64,
 }
 
 #[derive(Debug, Default)]
@@ -458,15 +460,23 @@ struct PendingMaterialization {
 #[derive(Debug, Default)]
 struct MaterializationQueue {
     pending: BTreeSet<PendingMaterialization>,
+    in_flight: BTreeSet<PendingMaterialization>,
     truncated: bool,
     next_generation: u64,
+    in_flight_generation: Option<u64>,
     applied_generation: u64,
 }
 
 #[derive(Debug, Default)]
 struct MaterializationCoordinator {
     state: Mutex<MaterializationQueue>,
-    applied: Condvar,
+    changed: Condvar,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DnsResponseDisposition {
+    ForwardOriginal,
+    RetryableFailure,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -637,9 +647,33 @@ impl ObservationRecorder {
         }
     }
 
-    fn record_response(&self, hostname: &str, query_type: u16, packet: &[u8]) {
+    fn record_response(
+        &self,
+        hostname: &str,
+        query_type: u16,
+        packet: &[u8],
+    ) -> DnsResponseDisposition {
+        self.record_response_with_timeout(
+            hostname,
+            query_type,
+            packet,
+            DNS_MATERIALIZATION_APPLY_TIMEOUT,
+        )
+    }
+
+    fn record_response_with_timeout(
+        &self,
+        hostname: &str,
+        query_type: u16,
+        packet: &[u8],
+        timeout: Duration,
+    ) -> DnsResponseDisposition {
         let Some(hostname) = normalize_hostname(hostname) else {
-            return;
+            return if self.scope.is_block() {
+                DnsResponseDisposition::RetryableFailure
+            } else {
+                DnsResponseDisposition::ForwardOriginal
+            };
         };
         let forwardable_block_response =
             self.scope.is_block() && self.forward_query(&hostname, query_type);
@@ -664,9 +698,10 @@ impl ObservationRecorder {
                 retain_address_answers(observation, answers.clone());
             }
         }
-        let materialization_generation = if forwardable_block_response {
-            self.materializations.as_ref().and_then(|queue| {
-                let materializations = answers.into_iter().filter_map(|answer| {
+        let materializations = if forwardable_block_response {
+            answers
+                .into_iter()
+                .filter_map(|answer| {
                     let ttl_seconds =
                         self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)?;
                     Some(PendingMaterialization {
@@ -675,27 +710,42 @@ impl ObservationRecorder {
                         address: answer.address,
                         ttl_seconds,
                     })
-                });
-                enqueue_pending_materializations(queue, materializations)
-            })
+                })
+                .collect::<Vec<_>>()
         } else {
-            None
+            Vec::new()
         };
+        drop(state);
+
+        let disposition = if materializations.is_empty() {
+            DnsResponseDisposition::ForwardOriginal
+        } else if let Some(queue) = &self.materializations {
+            match enqueue_pending_materializations(queue, materializations) {
+                Some(generation) => {
+                    if wait_for_materialization_generation(queue, generation, timeout) {
+                        DnsResponseDisposition::ForwardOriginal
+                    } else {
+                        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+                        state.materialization_wait_timeouts =
+                            state.materialization_wait_timeouts.saturating_add(1);
+                        drop(state);
+                        DnsResponseDisposition::RetryableFailure
+                    }
+                }
+                None => DnsResponseDisposition::RetryableFailure,
+            }
+        } else {
+            DnsResponseDisposition::RetryableFailure
+        };
+
+        let state = self.state.lock().expect("DNS observation lock poisoned");
         let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
         let write_result = write_report(&self.report_path, &evidence);
         drop(state);
         if write_result.is_err() {
             self.report_write_failed.store(true, Ordering::Relaxed);
         }
-        if let (Some(queue), Some(generation)) =
-            (&self.materializations, materialization_generation)
-        {
-            let _ = wait_for_materialization_generation(
-                queue,
-                generation,
-                DNS_MATERIALIZATION_APPLY_TIMEOUT,
-            );
-        }
+        disposition
     }
 
     fn reset_after_activation(&self) -> Result<(), DnsMediationError> {
@@ -1514,7 +1564,8 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
                 DnsMediatedBlockSession::establish(runtime, mediation, queue, &plan, scope)?;
             let start = Instant::now();
             loop {
-                session.poll_once(start.elapsed(), POLL_INTERVAL)?;
+                session.poll_once(start.elapsed(), Duration::ZERO)?;
+                wait_for_pending_materializations(&session.queue, POLL_INTERVAL);
             }
         }
         _ => Err(DnsMediationError::new(
@@ -1573,7 +1624,8 @@ pub fn run_selected_profile_runtime_test_service(
     )?;
     let start = Instant::now();
     loop {
-        session.poll_once(start.elapsed(), POLL_INTERVAL)?;
+        session.poll_once(start.elapsed(), Duration::ZERO)?;
+        wait_for_pending_materializations(&session.queue, POLL_INTERVAL);
     }
 }
 
@@ -1946,31 +1998,46 @@ fn enqueue_pending_materializations(
     queue: &Arc<MaterializationCoordinator>,
     materializations: impl IntoIterator<Item = PendingMaterialization>,
 ) -> Option<u64> {
+    let materializations = materializations.into_iter().collect::<BTreeSet<_>>();
+    if materializations.is_empty() {
+        return None;
+    }
     let mut state = queue
         .state
         .lock()
         .expect("DNS materialization lock poisoned");
-    let mut inserted = false;
-    let mut pending_generation = None;
+    let mut required_generation: Option<u64> = None;
+    let mut new_materializations = Vec::new();
     for materialization in materializations {
-        if state.pending.len() >= MAX_DYNAMIC_MATERIALIZATIONS
-            && !state.pending.contains(&materialization)
-        {
-            state.truncated = true;
-            break;
-        }
-        if state.pending.insert(materialization) {
-            inserted = true;
+        let existing_generation = if state.pending.contains(&materialization) {
+            Some(state.next_generation)
+        } else if state.in_flight.contains(&materialization) {
+            state.in_flight_generation
         } else {
-            pending_generation = Some(state.next_generation);
+            new_materializations.push(materialization);
+            None
+        };
+        if let Some(generation) = existing_generation {
+            required_generation =
+                Some(required_generation.map_or(generation, |current| current.max(generation)));
         }
     }
-    if inserted {
+    let new_count = new_materializations.len();
+    if state.pending.len().saturating_add(new_count) > MAX_DYNAMIC_MATERIALIZATIONS {
+        state.truncated = true;
+        return None;
+    }
+    if new_materializations.is_empty() {
+        return required_generation;
+    }
+    state.pending.extend(new_materializations);
+    let generation = {
         state.next_generation = state.next_generation.saturating_add(1);
         Some(state.next_generation)
-    } else {
-        pending_generation
-    }
+    };
+    drop(state);
+    queue.changed.notify_all();
+    generation
 }
 
 fn merge_pending_materializations(
@@ -1988,12 +2055,15 @@ fn merge_pending_materializations(
             .state
             .lock()
             .expect("DNS materialization lock poisoned");
-        let generation = (!state.pending.is_empty()).then_some(state.next_generation);
-        (
-            std::mem::take(&mut state.pending),
-            state.truncated,
-            generation,
-        )
+        if state.in_flight.is_empty() && !state.pending.is_empty() {
+            let generation = Some(state.next_generation);
+            let pending = std::mem::take(&mut state.pending);
+            state.in_flight.clone_from(&pending);
+            state.in_flight_generation = generation;
+            (pending, state.truncated, generation)
+        } else {
+            (BTreeSet::new(), state.truncated, None)
+        }
     };
     for materialization in pending {
         let key = (
@@ -2036,8 +2106,12 @@ fn mark_materialization_generation_applied(
         .expect("DNS materialization lock poisoned");
     if state.applied_generation < generation {
         state.applied_generation = generation;
-        queue.applied.notify_all();
     }
+    if state.in_flight_generation == Some(generation) {
+        state.in_flight.clear();
+        state.in_flight_generation = None;
+    }
+    queue.changed.notify_all();
 }
 
 fn wait_for_materialization_generation(
@@ -2055,7 +2129,7 @@ fn wait_for_materialization_generation(
             return false;
         };
         let (next_state, result) = queue
-            .applied
+            .changed
             .wait_timeout(state, remaining)
             .expect("DNS materialization condition variable poisoned");
         state = next_state;
@@ -2064,6 +2138,22 @@ fn wait_for_materialization_generation(
         }
     }
     state.applied_generation >= generation
+}
+
+fn wait_for_pending_materializations(queue: &Arc<MaterializationCoordinator>, timeout: Duration) {
+    let state = queue
+        .state
+        .lock()
+        .expect("DNS materialization lock poisoned");
+    if !state.pending.is_empty() {
+        return;
+    }
+    drop(
+        queue
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.pending.is_empty())
+            .expect("DNS materialization condition variable poisoned"),
+    );
 }
 
 fn effective_allowances_with_materializations(
@@ -2238,10 +2328,16 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
                 continue;
             }
             restore_client_query_id(response, bytes);
-            if let Some((hostname, query_type)) = &parsed_question {
-                recorder.record_response(hostname, *query_type, response);
-            }
-            let _ = socket.send_to(response, peer);
+            let disposition = parsed_question
+                .as_ref()
+                .map(|(hostname, query_type)| {
+                    recorder.record_response(hostname, *query_type, response)
+                })
+                .unwrap_or(DnsResponseDisposition::ForwardOriginal);
+            let Some(output) = dns_response_for_disposition(bytes, response, disposition) else {
+                continue;
+            };
+            let _ = socket.send_to(&output, peer);
         }
     }
 }
@@ -2304,11 +2400,20 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
             continue;
         }
         restore_client_query_id(&mut response, &query);
-        if let Some((hostname, query_type)) = &parsed_question {
-            recorder.record_response(hostname, *query_type, &response);
-        }
-        let _ = client.write_all(&response_length);
-        let _ = client.write_all(&response);
+        let disposition = parsed_question
+            .as_ref()
+            .map(|(hostname, query_type)| {
+                recorder.record_response(hostname, *query_type, &response)
+            })
+            .unwrap_or(DnsResponseDisposition::ForwardOriginal);
+        let Some(output) = dns_response_for_disposition(&query, &response, disposition) else {
+            continue;
+        };
+        let Ok(output_length) = u16::try_from(output.len()) else {
+            continue;
+        };
+        let _ = client.write_all(&output_length.to_be_bytes());
+        let _ = client.write_all(&output);
     }
 }
 
@@ -2427,6 +2532,44 @@ fn refused_response(query: &[u8]) -> Option<Vec<u8>> {
     let mut response = query.to_vec();
     let flags = u16::from_be_bytes([response[2], response[3]]);
     response[2..4].copy_from_slice(&((flags | 0x8000) & 0xfff0 | 0x0005).to_be_bytes());
+    response[6..12].fill(0);
+    Some(response)
+}
+
+fn dns_response_for_disposition(
+    query: &[u8],
+    response: &[u8],
+    disposition: DnsResponseDisposition,
+) -> Option<Vec<u8>> {
+    match disposition {
+        DnsResponseDisposition::ForwardOriginal => Some(response.to_vec()),
+        DnsResponseDisposition::RetryableFailure => server_failure_response(query),
+    }
+}
+
+fn server_failure_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 || u16::from_be_bytes([query[4], query[5]]) != 1 {
+        return None;
+    }
+    let mut offset = 12;
+    loop {
+        let length = usize::from(*query.get(offset)?);
+        offset += 1;
+        if length == 0 {
+            break;
+        }
+        if length > 63 || offset.checked_add(length)? > query.len() {
+            return None;
+        }
+        offset += length;
+    }
+    let question_end = offset.checked_add(4)?;
+    if question_end > query.len() {
+        return None;
+    }
+    let mut response = query[..question_end].to_vec();
+    let flags = u16::from_be_bytes([response[2], response[3]]);
+    response[2..4].copy_from_slice(&(0x8000 | (flags & 0x7900) | 0x0002).to_be_bytes());
     response[6..12].fill(0);
     Some(response)
 }
@@ -2967,6 +3110,7 @@ fn evidence_from_state_and_authorizations(
         derived_cname_authorizations_truncated: cname_authorizations.truncated,
         excluded_non_github_query_count: state.excluded_non_github_query_count,
         blocked_non_profile_query_count: state.blocked_non_profile_query_count,
+        materialization_wait_timeouts: state.materialization_wait_timeouts,
         limitations: match scope {
             DnsEvidenceScope::ProtectedHostAudit => protected_dns_audit_limitations(),
             DnsEvidenceScope::SelectedProfileRuntimeTest => vec![
@@ -3218,6 +3362,30 @@ fn fixed_command(path: &str, arguments: &[&str]) -> Result<(), DnsMediationError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static TEST_REPORT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_recorder(
+        scope: DnsEvidenceScope,
+        materializations: Option<Arc<MaterializationCoordinator>>,
+    ) -> (ObservationRecorder, PathBuf) {
+        let report_path = std::env::temp_dir().join(format!(
+            "fence-dns-response-{}-{}.json",
+            std::process::id(),
+            TEST_REPORT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let recorder = ObservationRecorder {
+            state: Arc::new(Mutex::new(ObservationState::default())),
+            cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
+            report_write_failed: Arc::new(AtomicBool::new(false)),
+            report_path: report_path.clone(),
+            scope,
+            bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
+            materializations,
+        };
+        (recorder, report_path)
+    }
 
     fn query(name: &str, query_type: u16) -> Vec<u8> {
         let mut bytes = vec![0_u8; 12];
@@ -3410,6 +3578,137 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn gates_approved_dns_answers_on_verified_materialization() {
+        let queue = Arc::new(MaterializationCoordinator::default());
+        let (recorder, report_path) =
+            test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(queue.clone()));
+        let worker_queue = queue.clone();
+        let worker = thread::spawn(move || {
+            wait_for_pending_materializations(&worker_queue, Duration::from_secs(1));
+            let mut active = BTreeMap::new();
+            let merge = merge_pending_materializations(&mut active, &worker_queue, Instant::now());
+            assert!(merge.changed);
+            mark_materialization_generation_applied(&worker_queue, merge.generation);
+        });
+
+        let disposition = recorder.record_response_with_timeout(
+            "github.com",
+            1,
+            &response_with_address("github.com", 1, 60, &[192, 0, 2, 10]),
+            Duration::from_millis(100),
+        );
+        worker.join().unwrap();
+        assert_eq!(disposition, DnsResponseDisposition::ForwardOriginal);
+        assert_eq!(
+            recorder.state.lock().unwrap().materialization_wait_timeouts,
+            0
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn materialization_timeout_fails_closed_and_records_warning_evidence() {
+        let queue = Arc::new(MaterializationCoordinator::default());
+        let (recorder, report_path) =
+            test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(queue));
+        let disposition = recorder.record_response_with_timeout(
+            "api.github.com",
+            1,
+            &response_with_address("api.github.com", 1, 60, &[192, 0, 2, 11]),
+            Duration::from_millis(1),
+        );
+        assert_eq!(disposition, DnsResponseDisposition::RetryableFailure);
+        assert_eq!(
+            recorder.state.lock().unwrap().materialization_wait_timeouts,
+            1
+        );
+        let evidence: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(evidence["materialization_wait_timeouts"], 1);
+        recorder.state.lock().unwrap().materialization_wait_timeouts = u64::MAX;
+        assert_eq!(
+            recorder.record_response_with_timeout(
+                "api.github.com",
+                1,
+                &response_with_address("api.github.com", 1, 60, &[192, 0, 2, 11]),
+                Duration::ZERO,
+            ),
+            DnsResponseDisposition::RetryableFailure
+        );
+        assert_eq!(
+            recorder.state.lock().unwrap().materialization_wait_timeouts,
+            u64::MAX
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn block_missing_coordinator_fails_closed_but_empty_and_audit_answers_forward() {
+        let (block, block_report) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        assert_eq!(
+            block.record_response_with_timeout(
+                "github.com",
+                1,
+                &response_with_address("github.com", 1, 60, &[192, 0, 2, 10]),
+                Duration::ZERO,
+            ),
+            DnsResponseDisposition::RetryableFailure
+        );
+        let mut negative_response = query("github.com", 1);
+        negative_response[2..4].copy_from_slice(&0x8183_u16.to_be_bytes());
+        assert_eq!(
+            block
+                .record_response_with_timeout("github.com", 1, &negative_response, Duration::ZERO,),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let (audit, audit_report) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        assert_eq!(
+            audit.record_response_with_timeout(
+                "example.com",
+                1,
+                &response_with_address("example.com", 1, 60, &[192, 0, 2, 12]),
+                Duration::ZERO,
+            ),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(block_report);
+        let _ = fs::remove_file(audit_report);
+    }
+
+    #[test]
+    fn server_failure_preserves_only_the_dns_question() {
+        let mut request = query("api.github.com", 1);
+        request[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
+        request[2..4].copy_from_slice(&0x0110_u16.to_be_bytes());
+        let question_length = request.len();
+        request.extend_from_slice(b"caller-controlled-additional-bytes");
+        let original = response_with_address("api.github.com", 1, 60, &[192, 0, 2, 10]);
+        assert_eq!(
+            dns_response_for_disposition(
+                &request,
+                &original,
+                DnsResponseDisposition::ForwardOriginal,
+            ),
+            Some(original)
+        );
+        let response =
+            dns_response_for_disposition(&request, &[], DnsResponseDisposition::RetryableFailure)
+                .unwrap();
+        assert_eq!(response.len(), question_length);
+        assert_eq!(&response[..2], &0x1234_u16.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([response[2], response[3]]), 0x8102);
+        assert_eq!(u16::from_be_bytes([response[2], response[3]]) & 0x000f, 2);
+        assert_eq!(&response[4..6], &1_u16.to_be_bytes());
+        assert_eq!(&response[6..12], &[0; 6]);
+        assert_eq!(
+            parse_dns_question(&response),
+            Some(("api.github.com".to_owned(), 1))
+        );
+        assert!(parse_dns_address_answers(&response).is_empty());
+        assert!(parse_dns_cname_answers(&response).is_empty());
+        assert!(server_failure_response(&[]).is_none());
     }
 
     #[test]
@@ -3851,16 +4150,23 @@ mod tests {
     #[test]
     fn materialization_generation_waits_only_until_applied() {
         let queue = Arc::new(MaterializationCoordinator::default());
-        let generation = enqueue_pending_materializations(
-            &queue,
-            [PendingMaterialization {
-                source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
-                hostname: "pipelines.actions.githubusercontent.com".to_owned(),
-                address: "192.0.2.10".parse().unwrap(),
-                ttl_seconds: 30,
-            }],
-        )
-        .unwrap();
+        let materialization = PendingMaterialization {
+            source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
+            hostname: "pipelines.actions.githubusercontent.com".to_owned(),
+            address: "192.0.2.10".parse().unwrap(),
+            ttl_seconds: 30,
+        };
+        let generation =
+            enqueue_pending_materializations(&queue, [materialization.clone()]).unwrap();
+        let mut active = BTreeMap::new();
+        let merge = merge_pending_materializations(&mut active, &queue, Instant::now());
+        assert_eq!(merge.generation, Some(generation));
+        assert_eq!(queue.state.lock().unwrap().in_flight.len(), 1);
+        assert_eq!(
+            enqueue_pending_materializations(&queue, [materialization]),
+            Some(generation)
+        );
+        assert!(queue.state.lock().unwrap().pending.is_empty());
         assert!(!wait_for_materialization_generation(
             &queue,
             generation,
@@ -3872,6 +4178,31 @@ mod tests {
             generation,
             Duration::from_millis(1)
         ));
+        assert!(queue.state.lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn materialization_enqueue_is_atomic_at_the_queue_bound() {
+        let queue = Arc::new(MaterializationCoordinator::default());
+        let materialization = |index: usize| PendingMaterialization {
+            source_hostname: "api.github.com".to_owned(),
+            hostname: "api.github.com".to_owned(),
+            address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
+            ttl_seconds: 30,
+        };
+        let initial = (0..MAX_DYNAMIC_MATERIALIZATIONS - 1)
+            .map(materialization)
+            .collect::<Vec<_>>();
+        assert_eq!(enqueue_pending_materializations(&queue, initial), Some(1));
+
+        let rejected = [
+            materialization(MAX_DYNAMIC_MATERIALIZATIONS - 1),
+            materialization(MAX_DYNAMIC_MATERIALIZATIONS),
+        ];
+        assert_eq!(enqueue_pending_materializations(&queue, rejected), None);
+        let state = queue.state.lock().unwrap();
+        assert_eq!(state.pending.len(), MAX_DYNAMIC_MATERIALIZATIONS - 1);
+        assert!(state.truncated);
     }
 
     #[test]

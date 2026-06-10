@@ -97,6 +97,19 @@ proxy threads. The recorder now retains a failure flag that resident audit or
 block verification converts into a bounded critical finding in the primary
 report.
 
+### DNS answer and firewall activation ordering
+
+The DNS mediator previously waited for an approved HTTPS address to enter the
+owned `nftables` ruleset but returned the upstream answer even when that wait
+timed out. A client could therefore attempt its first connection before the
+verified firewall update was active. Block mode now wakes the resident update
+loop when materialization work arrives and releases an approved address answer
+only after the matching generation is applied and structurally verified. A
+100-millisecond wait miss returns a minimal retryable `SERVFAIL` response and
+increments bounded warning evidence. The response contains the original DNS
+question but no answer, authority, additional, or raw upstream data. Backend
+apply and verification failures remain critical findings.
+
 ### Action child-process deadlines and dependency surface
 
 The Action launcher previously had no timeout for fixed privileged subprocess
