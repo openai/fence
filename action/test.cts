@@ -434,9 +434,16 @@ test("renders a concise healthy block results table without raw evidence fields"
         occurrences: 1,
         resolved_addresses: [],
       },
+      {
+        hostname: "github.com",
+        query_type: "type_15",
+        profile_classification: "matches_selected_profile_pattern",
+        occurrences: 1,
+        resolved_addresses: [],
+      },
     ],
     observations_truncated: false,
-    blocked_non_profile_query_count: 1,
+    blocked_non_profile_query_count: 2,
   };
   const summary = summaryLines(report, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟢 Fence Summary/);
@@ -446,9 +453,10 @@ test("renders a concise healthy block results table without raw evidence fields"
   assert.match(summary, /\| Passwordless sudo \| ✅ Disabled \|/);
   assert.match(summary, /\| Docker\/container access \| ✅ Disabled \|/);
   assert.match(summary, /#### Network activity/);
-  assert.match(summary, /\| `github.com` \| ✅ Allowed \| 2 DNS queries \|/);
-  assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 DNS query \|/);
-  assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 DNS query \|/);
+  assert.match(summary, /\| `github.com` \| ✅ Allowed \| 2 A queries \|/);
+  assert.match(summary, /\| `github.com` \| ⛔ Blocked \| 1 TYPE15 query \|/);
+  assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 AAAA query \|/);
+  assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 A query \|/);
   assert.equal(summary.match(/Fence Summary/g)?.length, 1);
   assert.doesNotMatch(summary, /Fence local evidence/);
   assert.doesNotMatch(summary, /critical findings/i);
@@ -578,7 +586,7 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.match(summary, /\| Passwordless sudo \| ➖ Available in audit mode \|/);
   assert.match(summary, /\| Docker\/container access \| ➖ Available in audit mode \|/);
   assert.match(summary, /#### Network activity/);
-  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 DNS query, 2 TCP\/443 attempts \|/);
+  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query, 2 TCP\/443 attempts \|/);
   assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
   assert.match(summary, /```yaml/);

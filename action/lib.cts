@@ -67,6 +67,12 @@ const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const MAX_AUDIT_HOSTNAME_ROWS = 10;
 const MAX_AUDIT_IP_ROWS = 10;
 const MAX_NETWORK_ACTIVITY_ROWS = 20;
+const ALLOWED_DNS_CLASSIFICATIONS = new Set([
+  "matches_selected_profile_pattern",
+  "matches_bounded_actions_suffix_authorization",
+  "matches_ttl_bounded_cname_descendant",
+]);
+const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v1";
@@ -868,12 +874,23 @@ function safePositiveInteger(value: unknown): number {
   return Number.isSafeInteger(value) && value > 0 ? Number(value) : 0;
 }
 
-function networkDecision(report: any, classification: unknown): NetworkDecision {
-  const allowed = typeof classification === "string" && classification.startsWith("matches_");
+function networkDecision(report: any, classification: unknown, queryType: unknown): NetworkDecision {
+  const allowed = ALLOWED_DNS_CLASSIFICATIONS.has(classification) &&
+    FORWARDED_DNS_QUERY_TYPES.has(queryType);
   if (allowed) {
     return "allowed";
   }
   return report.mode === "audit" ? "would_block" : "blocked";
+}
+
+function dnsQueryActivity(queryType: unknown): string {
+  if (queryType === "a" || queryType === "aaaa") {
+    return `${queryType.toUpperCase()} query`;
+  }
+  if (typeof queryType === "string" && /^type_[0-9]{1,5}$/.test(queryType)) {
+    return `TYPE${queryType.slice(5)} query`;
+  }
+  return "DNS query";
 }
 
 function addNetworkActivity(
@@ -917,8 +934,12 @@ function networkActivityRows(
         continue;
       }
       const count = safePositiveInteger(observation.occurrences);
-      const decision = networkDecision(report, observation.profile_classification);
-      addNetworkActivity(rows, observation.hostname, decision, "DNS query", count);
+      const decision = networkDecision(
+        report,
+        observation.profile_classification,
+        observation.query_type,
+      );
+      addNetworkActivity(rows, observation.hostname, decision, dnsQueryActivity(observation.query_type), count);
       if (decision === "blocked") {
         namedBlockedDnsQueries += count;
       }
@@ -991,6 +1012,9 @@ function activityLabel(row: NetworkActivityRow): string {
       }
       if (activity === "DNS query (names not retained)") {
         return `${count} DNS ${count === 1 ? "query" : "queries"} (names not retained)`;
+      }
+      if (activity.endsWith(" query")) {
+        return `${count} ${activity.slice(0, -6)} ${count === 1 ? "query" : "queries"}`;
       }
       return `${count} ${activity}${count === 1 ? "" : "s"}`;
     })
