@@ -81,6 +81,15 @@ const PROFILE_REALIZATIONS = new Map([
 ]);
 const POLICY_HASH_SCHEMA_VERSION = 3;
 const RUNTIME_EVIDENCE_SCHEMA_VERSION = 1;
+const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
+const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
+const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
+const REQUIRED_RESIDENT_WORKERS = [
+  "docker_tcp_dns",
+  "docker_udp_dns",
+  "host_tcp_dns",
+  "host_udp_dns",
+];
 const RELEASE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_ROOT = "/run/fence";
@@ -528,6 +537,9 @@ function validateReport(report: any, failOnCritical = true): any {
   if (!validIdentity) {
     fail("Fence report does not select the reviewed hosted-runner profile");
   }
+  if (report.runtime_evidence_schema_version === 2) {
+    validateResidentHealth(report.resident_health, Date.now(), !failOnCritical);
+  }
   if (!Array.isArray(report.critical_findings) || report.critical_findings_truncated !== false) {
     fail("Fence report does not contain bounded critical findings");
   }
@@ -593,12 +605,106 @@ function validateReady(ready: any, report: any): any {
     ready.policy_hash_schema_version === report.policy_hash_schema_version &&
     ready.policy_hash === report.policy_hash &&
     ready.base_ruleset_hash === report.base_ruleset_hash &&
-    ready.ruleset_hash === report.ruleset_hash &&
+    SHA256.test(ready.ruleset_hash) &&
     ready.protection_available === report.protection_available;
   if (!validIdentity) {
     fail("Fence readiness identity does not match the resident report");
   }
+  if (ready.runtime_evidence_schema_version === 2) {
+    const readyHealth = validateResidentHealth(ready.resident_health);
+    if (readyHealth.resident_pid !== report.resident_health.resident_pid) {
+      fail("Fence readiness resident process does not match the report");
+    }
+  }
   return ready;
+}
+
+function validateResidentHealth(
+  health: any,
+  nowMilliseconds = Date.now(),
+  allowCritical = false,
+): any {
+  if (health === null || Array.isArray(health) || typeof health !== "object") {
+    fail("Fence report does not contain resident health evidence");
+  }
+  const sequence = health.verification_sequence;
+  const verifiedAt = health.last_successful_verification_unix_milliseconds;
+  if (
+    (health.status !== "healthy" && !(allowCritical && health.status === "critical")) ||
+    !Number.isSafeInteger(health.resident_pid) ||
+    health.resident_pid < 1 ||
+    health.resident_pid > 0xffff_ffff ||
+    !Number.isSafeInteger(sequence) ||
+    sequence < 1 ||
+    !Number.isSafeInteger(verifiedAt) ||
+    verifiedAt < 1 ||
+    health.verification_interval_seconds !== RESIDENT_VERIFICATION_INTERVAL_SECONDS
+  ) {
+    fail("Fence resident health evidence is invalid or unhealthy");
+  }
+  if (
+    !Number.isSafeInteger(nowMilliseconds) ||
+    verifiedAt > nowMilliseconds + RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS ||
+    nowMilliseconds - verifiedAt > RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS
+  ) {
+    fail("Fence resident health evidence is stale or has an invalid timestamp");
+  }
+  if (!Array.isArray(health.workers)) {
+    fail("Fence resident worker health is missing");
+  }
+  const workers = health.workers.map((worker: any) => {
+    if (
+      worker === null ||
+      Array.isArray(worker) ||
+      typeof worker !== "object" ||
+      typeof worker.name !== "string" ||
+      worker.status !== "running" ||
+      Object.keys(worker).sort().join(",") !== "name,status"
+    ) {
+      fail("Fence resident worker health is invalid");
+    }
+    return worker.name;
+  });
+  if (JSON.stringify(workers.sort()) !== JSON.stringify(REQUIRED_RESIDENT_WORKERS)) {
+    fail("Fence resident worker set does not match the reviewed runtime");
+  }
+  return health;
+}
+
+function parseResidentUnitStatus(output: unknown): Record<string, string> {
+  if (typeof output !== "string" || output.length > 16 * 1024) {
+    fail("Fence resident service status is unavailable");
+  }
+  const status: Record<string, string> = {};
+  for (const line of output.split(/\r?\n/)) {
+    if (line.length === 0) continue;
+    const separator = line.indexOf("=");
+    if (separator < 1) {
+      fail("Fence resident service status is malformed");
+    }
+    const key = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+    if (!new Set(["ActiveState", "MainPID", "SubState"]).has(key) || key in status) {
+      fail("Fence resident service status is malformed");
+    }
+    status[key] = value;
+  }
+  if (Object.keys(status).length !== 3) {
+    fail("Fence resident service status is incomplete");
+  }
+  return status;
+}
+
+function validateResidentUnitStatus(output: unknown, expectedPid: unknown): void {
+  const status = parseResidentUnitStatus(output);
+  if (
+    status.ActiveState !== "active" ||
+    status.SubState !== "running" ||
+    !Number.isSafeInteger(expectedPid) ||
+    status.MainPID !== String(expectedPid)
+  ) {
+    fail("Fence resident service is not active with the expected main process");
+  }
 }
 
 function boundedScalar(value: unknown): string {
@@ -1099,4 +1205,6 @@ module.exports = {
   validateInlineConfig,
   validateReady,
   validateReport,
+  validateResidentHealth,
+  validateResidentUnitStatus,
 };

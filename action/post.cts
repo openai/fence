@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { spawnSync } = require("node:child_process");
 const log = require("./log.cts");
 const {
   correlateFindingsToDns,
@@ -13,15 +14,47 @@ const {
   summaryLines,
   validateBundle,
   validateReport,
+  validateResidentUnitStatus,
 } = require("./lib.cts");
 
 const ACTION_ROOT = __dirname;
 const BINARY = path.join(ACTION_ROOT, "bin", "fence");
 const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
+const CHILD_ENV = {
+  LANG: "C.UTF-8",
+  LC_ALL: "C.UTF-8",
+  PATH: "/usr/bin:/usr/sbin:/bin:/sbin",
+};
 
 function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   log.error(`Fence post-job evidence failed: ${message}`);
+}
+
+function validateResidentService(unit: string, expectedPid: unknown): void {
+  const result = spawnSync(
+    "/usr/bin/systemctl",
+    [
+      "show",
+      unit,
+      "--no-pager",
+      "--property=ActiveState",
+      "--property=SubState",
+      "--property=MainPID",
+    ],
+    {
+      encoding: "utf8",
+      env: CHILD_ENV,
+      killSignal: "SIGKILL",
+      maxBuffer: 16 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 2 * 1000,
+    },
+  );
+  if (result.error || result.status !== 0 || String(result.stderr || "").length !== 0) {
+    throw new Error("Fence resident service status could not be verified");
+  }
+  validateResidentUnitStatus(String(result.stdout || ""), expectedPid);
 }
 
 function main(): void {
@@ -41,6 +74,9 @@ function main(): void {
     readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
     false,
   );
+  if (report.runtime_evidence_schema_version === 2) {
+    validateResidentService(paths.unit, report.resident_health.resident_pid);
+  }
   let dnsEvidence;
   const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
   if (fs.existsSync(effectiveDnsReportPath)) {
@@ -66,6 +102,9 @@ function main(): void {
     `materialization_batch_count=${materializationEvidenceCounter(dnsEvidence, "materialization_batch_count")}`,
     `materialization_request_rejections=${dnsMaterializationRequestRejections}`,
     `materialization_update_max_milliseconds=${materializationEvidenceCounter(dnsEvidence, "materialization_update_max_milliseconds")}`,
+    `upstream_request_failures=${materializationEvidenceCounter(dnsEvidence, "upstream_request_failures")}`,
+    `resident_verification_sequence=${report.resident_health?.verification_sequence ?? "not_available"}`,
+    `resident_last_verified_unix_milliseconds=${report.resident_health?.last_successful_verification_unix_milliseconds ?? "not_available"}`,
   ]);
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {

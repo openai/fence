@@ -4,8 +4,12 @@ set -euo pipefail
 
 source script/env "$@"
 
-if [[ $# -ne 0 ]]; then
-  die "usage: script/test-selected-profile-runtime"
+if [[ $# -gt 1 ]]; then
+  die "usage: script/test-selected-profile-runtime [healthy|worker-failure]"
+fi
+scenario="${1:-healthy}"
+if [[ "$scenario" != "healthy" && "$scenario" != "worker-failure" ]]; then
+  die "selected-profile runtime scenario must be healthy or worker-failure"
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
@@ -63,6 +67,10 @@ fi
 # This applies the planner-selected profile on a disposable runner and
 # intentionally leaves controls resident so the platform conclusion tests the
 # test-only runtime realization.
+worker_failure_environment=()
+if [[ "$scenario" == "worker-failure" ]]; then
+  worker_failure_environment+=(--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INJECT_WORKER_FAILURE=1)
+fi
 sudo /usr/bin/systemd-run \
   --quiet \
   --collect \
@@ -72,16 +80,18 @@ sudo /usr/bin/systemd-run \
   "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_UNIT=$unit" \
   "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_ROOT=$runtime_root" \
   "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INVOCATION=$invocation" \
+  "${worker_failure_environment[@]}" \
   "${test_binaries[0]}" --ignored --exact selected_profile_runtime_worker --nocapture
 
-python3 - "$report" "$dns_report" "$ready" "$production_ready" <<'PY'
+python3 - "$report" "$dns_report" "$ready" "$production_ready" "$scenario" <<'PY'
 import json
 import pathlib
 import re
 import sys
 import time
 
-report_path, dns_path, ready_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+report_path, dns_path, ready_path, production_path = (pathlib.Path(item) for item in sys.argv[1:5])
+scenario = sys.argv[5]
 deadline = time.monotonic() + 30
 report = None
 dns = None
@@ -91,7 +101,11 @@ while time.monotonic() < deadline:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         dns = json.loads(dns_path.read_text(encoding="utf-8"))
         ready = json.loads(ready_path.read_text(encoding="utf-8"))
-        if report.get("setup_status") == "resident_selected_profile_runtime_test_only":
+        resident_status = report.get("resident_health", {}).get("status")
+        if (
+            report.get("setup_status") == "resident_selected_profile_runtime_test_only"
+            and (scenario != "worker-failure" or resident_status == "critical")
+        ):
             break
     time.sleep(0.1)
 assert report is not None, "DNS-mediated block report was not emitted"
@@ -124,6 +138,22 @@ assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
 assert report["materialization_status"] == "bounded_ttl_exact_host_and_cname_transport_policy"
 assert len(report["materialized_allowances"]) >= 1
 assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_allowances"])
+resident = report["resident_health"]
+assert resident["status"] == ("critical" if scenario == "worker-failure" else "healthy"), resident
+assert resident["resident_pid"] > 0, resident
+assert resident["verification_sequence"] >= 1, resident
+assert resident["last_successful_verification_unix_milliseconds"] > 0, resident
+assert resident["verification_interval_seconds"] == 5, resident
+expected_workers = [
+    {"name": "docker_tcp_dns", "status": "running"},
+    {"name": "docker_udp_dns", "status": "running"},
+    {"name": "host_tcp_dns", "status": "running"},
+    {
+        "name": "host_udp_dns",
+        "status": "failed" if scenario == "worker-failure" else "running",
+    },
+]
+assert resident["workers"] == expected_workers, resident
 assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"
 assert ready["runtime_evidence_schema_version"] == 2
 assert ready["protection_available"] is False
@@ -132,6 +162,8 @@ assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
 assert ready["policy_hash_schema_version"] == 4
 assert ready["policy_hash"] == report["policy_hash"]
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
+assert ready["resident_health"]["resident_pid"] == resident["resident_pid"]
+assert ready["resident_health"]["status"] == "healthy", ready
 assert dns["status"] == "selected_profile_runtime_test_only"
 assert dns["runtime_evidence_schema_version"] == 2
 assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
@@ -153,6 +185,9 @@ assert dns["bootstrap_hostnames"] == [
 assert isinstance(dns["materialization_batch_count"], int)
 assert dns["materialization_batch_count"] >= 0
 assert dns["materialization_request_rejections"] == 0
+assert isinstance(dns["upstream_request_failures"], int)
+assert dns["upstream_request_failures"] >= 0
+assert dns["resident_health"]["resident_pid"] == resident["resident_pid"]
 assert isinstance(dns["materialization_update_max_milliseconds"], int)
 assert dns["materialization_update_max_milliseconds"] >= 0
 assert dns["mode"] == "block"
@@ -191,6 +226,10 @@ assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in re
 assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in report["limitations"]
 assert "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in report["limitations"]
 assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
+if scenario == "worker-failure":
+    assert any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]), report
+else:
+    assert report["critical_findings"] == [], report
 assert not production_path.exists()
 PY
 
@@ -226,19 +265,32 @@ if docker ps --quiet >/dev/null 2>&1; then
 fi
 
 sleep 6
-python3 - "$report" "$dns_report" "$production_ready" <<'PY'
+python3 - "$report" "$dns_report" "$production_ready" "$scenario" <<'PY'
 import json
 import pathlib
 import sys
 
-report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
+report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:4])
+scenario = sys.argv[4]
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
-assert report["critical_findings"] == [], report
+if scenario == "worker-failure":
+    assert report["resident_health"]["status"] == "critical", report
+    assert report["resident_health"]["verification_sequence"] == 1, report
+    assert any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]), report
+    assert any(item["status"] == "failed" for item in report["resident_health"]["workers"]), report
+else:
+    assert report["critical_findings"] == [], report
+    assert report["resident_health"]["status"] == "healthy", report
+    assert report["resident_health"]["verification_sequence"] >= 2, report
 assert dns["blocked_non_profile_query_count"] >= 4, dns
+if scenario == "worker-failure":
+    assert dns["resident_health"]["status"] == "critical", dns
+else:
+    assert dns["resident_health"]["verification_sequence"] >= 2, dns
 assert not production_path.exists()
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY

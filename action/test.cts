@@ -18,6 +18,8 @@ const {
   validateInlineConfig,
   validateReady,
   validateReport,
+  validateResidentHealth,
+  validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
 const { run } = require("./main.cts");
@@ -398,6 +400,17 @@ test("validates stable runtime evidence", () => {
     ruleset_hash: report.ruleset_hash,
     protection_available: true,
   }, report);
+  validateReady({
+    runtime_evidence_schema_version: 1,
+    status: "ready",
+    platform_profile_id: "github_hosted_workflow_bootstrap_v1",
+    profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
+    policy_hash_schema_version: report.policy_hash_schema_version,
+    policy_hash: report.policy_hash,
+    base_ruleset_hash: report.base_ruleset_hash,
+    ruleset_hash: "d".repeat(64),
+    protection_available: true,
+  }, report);
   assert.throws(() => validateReport({ ...report, critical_findings: [{}] }), /critical resident findings/);
   assert.throws(
     () => validateReport({ ...report, network_verification_status: "critical_drift", critical_findings: [{}] }),
@@ -408,6 +421,63 @@ test("validates stable runtime evidence", () => {
   assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
   assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 0 }), /profile/);
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
+});
+
+test("validates fresh resident worker and service identity evidence", () => {
+  const now = 2_000_000;
+  const health = {
+    status: "healthy",
+    resident_pid: 4242,
+    verification_sequence: 9,
+    last_successful_verification_unix_milliseconds: now - 5_000,
+    verification_interval_seconds: 5,
+    workers: [
+      { name: "docker_tcp_dns", status: "running" },
+      { name: "docker_udp_dns", status: "running" },
+      { name: "host_tcp_dns", status: "running" },
+      { name: "host_udp_dns", status: "running" },
+    ],
+  };
+  validateResidentHealth(health, now);
+  validateResidentHealth({ ...health, status: "critical" }, now, true);
+  validateResidentUnitStatus("ActiveState=active\nSubState=running\nMainPID=4242\n", 4242);
+  assert.throws(
+    () => validateResidentHealth({ ...health, status: "critical" }, now),
+    /invalid or unhealthy/,
+  );
+  assert.throws(
+    () => validateResidentHealth({ ...health, last_successful_verification_unix_milliseconds: now - 20_001 }, now),
+    /stale/,
+  );
+  assert.throws(
+    () => validateResidentHealth({ ...health, last_successful_verification_unix_milliseconds: now + 5_001 }, now),
+    /stale/,
+  );
+  assert.throws(
+    () => validateResidentHealth({ ...health, workers: health.workers.slice(1) }, now),
+    /worker set/,
+  );
+  assert.throws(
+    () => validateResidentHealth({
+      ...health,
+      workers: health.workers.map((worker) =>
+        worker.name === "host_udp_dns" ? { ...worker, status: "failed" } : worker
+      ),
+    }, now),
+    /worker health/,
+  );
+  assert.throws(
+    () => validateResidentUnitStatus("ActiveState=inactive\nSubState=dead\nMainPID=4242\n", 4242),
+    /not active/,
+  );
+  assert.throws(
+    () => validateResidentUnitStatus("ActiveState=active\nSubState=running\nMainPID=7\n", 4242),
+    /not active/,
+  );
+  assert.throws(
+    () => validateResidentUnitStatus("ActiveState=active\nSubState=running\n", 4242),
+    /incomplete/,
+  );
 });
 
 test("renders a concise healthy block results table without raw evidence fields", () => {

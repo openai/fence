@@ -54,7 +54,7 @@ use std::sync::{
     mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
     "github_hosted_workflow_bootstrap_dns_mediation_v1";
@@ -92,6 +92,8 @@ const MAX_USER_HOSTNAME_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS);
 const MATERIALIZATION_REQUEST_QUEUE_CAPACITY: usize = 32;
+const RESIDENT_EVENT_CHANNEL_CAPACITY: usize = 32;
+const RESIDENT_WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CRITICAL_FINDINGS: usize = 64;
 const MAX_DNS_PACKET_BYTES: usize = 4096;
 const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
@@ -104,6 +106,188 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
+const REQUIRED_DNS_WORKERS: [&str; 4] = [
+    "docker_tcp_dns",
+    "docker_udp_dns",
+    "host_tcp_dns",
+    "host_udp_dns",
+];
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ResidentWorkerHealth {
+    pub name: &'static str,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct ResidentHealth {
+    pub status: &'static str,
+    pub resident_pid: u32,
+    pub verification_sequence: u64,
+    pub last_successful_verification_unix_milliseconds: u64,
+    pub verification_interval_seconds: u64,
+    pub workers: Vec<ResidentWorkerHealth>,
+}
+
+#[derive(Debug)]
+enum ResidentWorkerEvent {
+    Started(&'static str),
+    Fatal {
+        worker: &'static str,
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+#[derive(Debug)]
+struct ResidentWorkerFailure {
+    worker: &'static str,
+    code: &'static str,
+    message: &'static str,
+}
+
+struct ResidentWorkerSupervisor {
+    events: Receiver<ResidentWorkerEvent>,
+    statuses: BTreeMap<&'static str, &'static str>,
+    disconnected_reported: bool,
+}
+
+fn initial_resident_health() -> ResidentHealth {
+    ResidentHealth {
+        status: "starting",
+        resident_pid: std::process::id(),
+        verification_sequence: 0,
+        last_successful_verification_unix_milliseconds: 0,
+        verification_interval_seconds: RESIDENT_VERIFICATION_INTERVAL.as_secs(),
+        workers: REQUIRED_DNS_WORKERS
+            .into_iter()
+            .map(|name| ResidentWorkerHealth {
+                name,
+                status: "starting",
+            })
+            .collect(),
+    }
+}
+
+fn unix_time_milliseconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn advance_resident_health(
+    health: &mut ResidentHealth,
+    workers: Vec<ResidentWorkerHealth>,
+    now_milliseconds: u64,
+) {
+    health.status = "healthy";
+    health.workers = workers;
+    health.verification_sequence = health.verification_sequence.saturating_add(1);
+    health.last_successful_verification_unix_milliseconds = now_milliseconds;
+}
+
+impl ResidentWorkerSupervisor {
+    fn new(events: Receiver<ResidentWorkerEvent>) -> Self {
+        Self {
+            events,
+            statuses: REQUIRED_DNS_WORKERS
+                .into_iter()
+                .map(|worker| (worker, "starting"))
+                .collect(),
+            disconnected_reported: false,
+        }
+    }
+
+    fn wait_for_startup(&mut self) -> Result<(), DnsMediationError> {
+        let deadline = Instant::now() + RESIDENT_WORKER_START_TIMEOUT;
+        while self.statuses.values().any(|status| *status == "starting") {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(DnsMediationError::new(
+                    "resident_worker_start_timeout",
+                    "required resident DNS workers did not all report startup",
+                ));
+            }
+            match self.events.recv_timeout(remaining) {
+                Ok(event) => {
+                    if let Some(failure) = self.apply_event(event) {
+                        return Err(DnsMediationError::new(failure.code, failure.message));
+                    }
+                }
+                Err(_) => {
+                    return Err(DnsMediationError::new(
+                        "resident_worker_start_failed",
+                        "resident DNS worker supervision disconnected before readiness",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_failures(&mut self) -> Vec<ResidentWorkerFailure> {
+        let mut failures = Vec::new();
+        loop {
+            match self.events.try_recv() {
+                Ok(event) => {
+                    if let Some(failure) = self.apply_event(event) {
+                        failures.push(failure);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.disconnected_reported {
+                        self.disconnected_reported = true;
+                        failures.push(ResidentWorkerFailure {
+                            worker: "resident_event_channel",
+                            code: "resident_worker_channel_disconnected",
+                            message: "resident worker supervision channel disconnected",
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        failures
+    }
+
+    fn apply_event(&mut self, event: ResidentWorkerEvent) -> Option<ResidentWorkerFailure> {
+        match event {
+            ResidentWorkerEvent::Started(worker) => {
+                if let Some(status) = self.statuses.get_mut(worker) {
+                    *status = "running";
+                }
+                None
+            }
+            ResidentWorkerEvent::Fatal {
+                worker,
+                code,
+                message,
+            } => {
+                if let Some(status) = self.statuses.get_mut(worker) {
+                    *status = "failed";
+                }
+                Some(ResidentWorkerFailure {
+                    worker,
+                    code,
+                    message,
+                })
+            }
+        }
+    }
+
+    fn all_healthy(&self) -> bool {
+        self.statuses.values().all(|status| *status == "running")
+    }
+
+    fn worker_health(&self) -> Vec<ResidentWorkerHealth> {
+        self.statuses
+            .iter()
+            .map(|(name, status)| ResidentWorkerHealth { name, status })
+            .collect()
+    }
+}
 
 #[cfg(test)]
 fn test_hostname_policy(disable_broad_github_domains: bool) -> RuntimeHostnamePolicy {
@@ -280,6 +464,7 @@ pub struct DnsMediationEvidence {
     pub hostname_policy: RuntimeHostnamePolicy,
     pub mode: Mode,
     pub protection_available: bool,
+    pub resident_health: ResidentHealth,
     pub routing_status: &'static str,
     pub host_dns_routing: &'static str,
     pub docker_dns_routing: &'static str,
@@ -297,6 +482,7 @@ pub struct DnsMediationEvidence {
     pub materialization_request_rejections: u64,
     pub materialization_update_max_milliseconds: u64,
     pub hostname_refresh_warnings: u64,
+    pub upstream_request_failures: u64,
     pub limitations: Vec<&'static str>,
 }
 
@@ -351,6 +537,7 @@ pub struct DnsMediatedBlockEvidence {
     pub findings_truncated: bool,
     pub critical_findings: Vec<CriticalFinding>,
     pub critical_findings_truncated: bool,
+    pub resident_health: ResidentHealth,
     pub protection_available: bool,
     pub limitations: Vec<&'static str>,
 }
@@ -368,6 +555,7 @@ struct DnsMediatedBlockState<'a> {
     ruleset_hash: &'a str,
     planned_owned_state: &'a OwnedNftState,
     readiness_status: &'static str,
+    resident_health: &'a ResidentHealth,
 }
 
 #[derive(Debug, Serialize)]
@@ -381,6 +569,7 @@ struct DnsMediatedBlockReady<'a> {
     policy_hash: &'a str,
     base_ruleset_hash: &'a str,
     ruleset_hash: &'a str,
+    resident_health: &'a ResidentHealth,
     protection_available: bool,
     limitations: Vec<&'static str>,
 }
@@ -408,6 +597,7 @@ pub struct DnsMediatedAuditEvidence {
     pub findings_truncated: bool,
     pub critical_findings: Vec<CriticalFinding>,
     pub critical_findings_truncated: bool,
+    pub resident_health: ResidentHealth,
     pub protection_available: bool,
     pub limitations: Vec<&'static str>,
 }
@@ -425,6 +615,7 @@ struct DnsMediatedAuditState<'a> {
     ruleset_hash: &'a str,
     planned_owned_state: &'a OwnedNftState,
     readiness_status: &'static str,
+    resident_health: &'a ResidentHealth,
 }
 
 #[derive(Debug, Serialize)]
@@ -438,6 +629,7 @@ struct DnsMediatedAuditReady<'a> {
     policy_hash: &'a str,
     base_ruleset_hash: &'a str,
     ruleset_hash: &'a str,
+    resident_health: &'a ResidentHealth,
     protection_available: bool,
     limitations: Vec<&'static str>,
 }
@@ -452,6 +644,7 @@ struct ObservationState {
     materialization_request_rejections: u64,
     materialization_update_max_milliseconds: u64,
     hostname_refresh_warnings: u64,
+    upstream_request_failures: u64,
 }
 
 #[derive(Debug, Default)]
@@ -552,6 +745,8 @@ struct ObservationRecorder {
     state: Arc<Mutex<ObservationState>>,
     cname_authorizations: Arc<Mutex<CnameAuthorizationState>>,
     report_write_failed: Arc<AtomicBool>,
+    resident_health: Arc<Mutex<ResidentHealth>>,
+    shutdown: Arc<AtomicBool>,
     report_path: PathBuf,
     scope: DnsEvidenceScope,
     hostname_policy: RuntimeHostnamePolicy,
@@ -628,6 +823,10 @@ impl ObservationRecorder {
             self.scope,
             &authorizations,
             &self.hostname_policy,
+            &self
+                .resident_health
+                .lock()
+                .expect("resident health lock poisoned"),
         )
     }
 
@@ -747,7 +946,7 @@ impl ObservationRecorder {
             DnsResponseDisposition::ForwardOriginal
         } else if let Some(submitter) = &self.materializations {
             let materializations = materializations.into_iter().collect::<BTreeSet<_>>();
-            match submit_materialization_request(submitter, materializations) {
+            match submit_materialization_request(submitter, materializations, &self.shutdown) {
                 Ok(MaterializationCompletion::AppliedAndVerified) => {
                     DnsResponseDisposition::ForwardOriginal
                 }
@@ -804,6 +1003,17 @@ impl ObservationRecorder {
         }
     }
 
+    fn record_upstream_request_failure(&self) {
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        state.upstream_request_failures = state.upstream_request_failures.saturating_add(1);
+        let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
+        let write_result = write_report(&self.report_path, &evidence);
+        drop(state);
+        if write_result.is_err() {
+            self.report_write_failed.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn reset_after_activation(&self) -> Result<(), DnsMediationError> {
         let mut state = self.state.lock().map_err(|_| {
             DnsMediationError::new(
@@ -825,6 +1035,10 @@ impl ObservationRecorder {
             self.scope,
             &authorizations,
             &self.hostname_policy,
+            &self
+                .resident_health
+                .lock()
+                .expect("resident health lock poisoned"),
         );
         drop(authorizations);
         let write_result = write_report(&self.report_path, &evidence);
@@ -834,6 +1048,19 @@ impl ObservationRecorder {
 
     fn take_report_write_failure(&self) -> bool {
         self.report_write_failed.swap(false, Ordering::Relaxed)
+    }
+
+    fn refresh_report(&self) -> Result<(), DnsMediationError> {
+        let state = self.state.lock().map_err(|_| {
+            DnsMediationError::new(
+                "dns_observation_state_failed",
+                "DNS observation state could not be read during resident verification",
+            )
+        })?;
+        write_report(
+            &self.report_path,
+            &self.evidence_from_state(&state, self.scope.active_routing_status()),
+        )
     }
 }
 
@@ -940,7 +1167,15 @@ impl DnsRouting {
 pub struct DnsMediationSession {
     routing: DnsRouting,
     recorder: ObservationRecorder,
-    _threads: Vec<JoinHandle<()>>,
+    resident_health: Arc<Mutex<ResidentHealth>>,
+    supervisor: ResidentWorkerSupervisor,
+    stop_workers: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+struct DnsProxyRuntime {
+    threads: Vec<JoinHandle<()>>,
+    supervisor: ResidentWorkerSupervisor,
 }
 
 impl DnsMediationSession {
@@ -951,10 +1186,14 @@ impl DnsMediationSession {
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
         let report_path = runtime_directory.join("dns-report.json");
+        let resident_health = Arc::new(Mutex::new(initial_resident_health()));
+        let stop_workers = Arc::new(AtomicBool::new(false));
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
+            resident_health: Arc::clone(&resident_health),
+            shutdown: Arc::clone(&stop_workers),
             report_path,
             scope,
             hostname_policy,
@@ -974,20 +1213,112 @@ impl DnsMediationSession {
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned"),
                 &recorder.hostname_policy,
+                &resident_health
+                    .lock()
+                    .expect("resident health lock poisoned"),
             ),
         )?;
-        let threads = start_dns_proxy(recorder.clone())?;
-        let routing = DnsRouting::activate()?;
+        let DnsProxyRuntime {
+            mut threads,
+            mut supervisor,
+        } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers))?;
+        if let Err(error) = supervisor.wait_for_startup() {
+            shutdown_dns_workers(&stop_workers, &mut threads);
+            return Err(error);
+        }
+        {
+            let mut health = resident_health
+                .lock()
+                .expect("resident health lock poisoned");
+            health.workers = supervisor.worker_health();
+        }
+        let routing = match DnsRouting::activate() {
+            Ok(routing) => routing,
+            Err(error) => {
+                shutdown_dns_workers(&stop_workers, &mut threads);
+                return Err(error);
+            }
+        };
         if let Err(error) = recorder.reset_after_activation() {
             let mut routing = routing;
             let _ = routing.rollback();
+            shutdown_dns_workers(&stop_workers, &mut threads);
             return Err(error);
         }
         Ok(Self {
             routing,
             recorder,
-            _threads: threads,
+            resident_health,
+            supervisor,
+            stop_workers,
+            threads,
         })
+    }
+
+    fn drain_worker_failures(&mut self) -> Vec<ResidentWorkerFailure> {
+        let failures = self.supervisor.drain_failures();
+        if !failures.is_empty() {
+            self.mark_resident_critical();
+        }
+        self.sync_worker_health();
+        failures
+    }
+
+    fn mark_verification_successful(&mut self) {
+        let workers = self.supervisor.worker_health();
+        let mut health = self
+            .resident_health
+            .lock()
+            .expect("resident health lock poisoned");
+        if health.status == "critical" {
+            return;
+        }
+        advance_resident_health(&mut health, workers, unix_time_milliseconds());
+    }
+
+    fn mark_resident_critical(&mut self) {
+        self.resident_health
+            .lock()
+            .expect("resident health lock poisoned")
+            .status = "critical";
+    }
+
+    fn resident_health(&self) -> ResidentHealth {
+        self.resident_health
+            .lock()
+            .expect("resident health lock poisoned")
+            .clone()
+    }
+
+    fn workers_healthy(&self) -> bool {
+        self.supervisor.all_healthy()
+    }
+
+    fn sync_worker_health(&mut self) {
+        self.resident_health
+            .lock()
+            .expect("resident health lock poisoned")
+            .workers = self.supervisor.worker_health();
+    }
+
+    fn inject_test_worker_failure(&mut self) -> ResidentWorkerFailure {
+        let failure = self
+            .supervisor
+            .apply_event(ResidentWorkerEvent::Fatal {
+                worker: "host_udp_dns",
+                code: "resident_worker_test_failure",
+                message: "required resident DNS worker failed during hosted evidence",
+            })
+            .expect("test worker failure event must be fatal");
+        self.mark_resident_critical();
+        self.sync_worker_health();
+        failure
+    }
+}
+
+impl Drop for DnsMediationSession {
+    fn drop(&mut self) {
+        shutdown_dns_workers(&self.stop_workers, &mut self.threads);
     }
 }
 
@@ -1012,7 +1343,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let ruleset = render_dns_mediated_ruleset(Mode::Audit, &plan.effective_policy);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
         let expected_state = expected_dns_mediated_owned_state(Mode::Audit, &plan.effective_policy);
-        let mut evidence = initial_dns_audit_evidence(plan, ruleset_hash.clone());
+        let initial_health = mediation.resident_health();
+        let mut evidence =
+            initial_dns_audit_evidence(plan, ruleset_hash.clone(), initial_health.clone());
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedAuditState {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_STATUS,
@@ -1025,6 +1358,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             ruleset_hash: &ruleset_hash,
             planned_owned_state: &expected_state,
             readiness_status: "not_emitted",
+            resident_health: &initial_health,
         }) {
             let _ = mediation.routing.rollback();
             return Err(runtime_error(error));
@@ -1073,6 +1407,36 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             return Err(error);
         }
 
+        if let Some(failure) = mediation.drain_worker_failures().into_iter().next() {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(DnsMediationError::new(failure.code, failure.message));
+        }
+        if !mediation.workers_healthy() {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(DnsMediationError::new(
+                "resident_worker_unhealthy",
+                "required resident DNS workers were not healthy before readiness",
+            ));
+        }
+        if let Err(error) = runtime.verify_evidence_persistence(false) {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(runtime_error(error));
+        }
+        mediation.mark_verification_successful();
+        evidence.resident_health = mediation.resident_health();
+        if let Err(error) = mediation.recorder.refresh_report() {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(error);
+        }
+
         evidence.setup_status = "verified_before_observation_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
             evidence.setup_status = "failed_pre_ready";
@@ -1090,6 +1454,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
             ruleset_hash: &ruleset_hash,
+            resident_health: &evidence.resident_health,
             protection_available: false,
             limitations: protected_audit_limitations(),
         }) {
@@ -1120,6 +1485,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         finding_timeout: Duration,
     ) -> Result<(), DnsMediationError> {
         let mut changed = false;
+        for failure in self._mediation.drain_worker_failures() {
+            let _worker = failure.worker;
+            self.record_critical(failure.code, failure.message);
+            changed = true;
+        }
         if self._mediation.recorder.take_report_write_failure() {
             self.record_critical(
                 "dns_audit_evidence_write_failed",
@@ -1145,11 +1515,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         }
         let verification_due = elapsed >= self.next_verification;
         if verification_due {
+            let mut verification_succeeded = true;
             if self
                 .backend
                 .verify_owned_state(&self.expected_state)
                 .is_err()
             {
+                verification_succeeded = false;
                 self.evidence.network_verification_status = "critical_drift";
                 self.record_critical(
                     "dns_audit_network_drift",
@@ -1157,6 +1529,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 );
             }
             if self.lockdown.verify_sudo_available().is_err() {
+                verification_succeeded = false;
                 self.evidence.sudo_status = "critical_drift";
                 self.record_critical(
                     "dns_audit_sudo_drift",
@@ -1164,11 +1537,43 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 );
             }
             if self.lockdown.verify_containers_available().is_err() {
+                verification_succeeded = false;
                 self.evidence.container_status = "critical_drift";
                 self.record_critical(
                     "dns_audit_container_drift",
                     "measured container availability drifted after observation readiness",
                 );
+            }
+            if !self._mediation.workers_healthy() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_audit_worker_unhealthy",
+                    "required resident DNS worker health could not be verified after observation readiness",
+                );
+            }
+            if self.runtime.verify_evidence_persistence(true).is_err() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_audit_evidence_persistence_failed",
+                    "resident audit evidence files could not be verified after observation readiness",
+                );
+            }
+            if self._mediation.recorder.refresh_report().is_err() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_audit_evidence_write_failed",
+                    "DNS-mediated audit evidence could not be refreshed during resident verification",
+                );
+            }
+            if verification_succeeded && self.evidence.critical_findings.is_empty() {
+                self._mediation.mark_verification_successful();
+                self.evidence.resident_health = self._mediation.resident_health();
+                if self._mediation.recorder.refresh_report().is_err() {
+                    self.record_critical(
+                        "dns_audit_evidence_write_failed",
+                        "DNS-mediated audit evidence could not persist the resident verification heartbeat",
+                    );
+                }
             }
             self.next_verification = elapsed + RESIDENT_VERIFICATION_INTERVAL;
             changed = true;
@@ -1187,14 +1592,20 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                         self.evidence.counters.total_violations
                     });
             }
-            self.runtime
-                .replace_report(&self.evidence)
-                .map_err(runtime_error)?;
+            if self.runtime.replace_report(&self.evidence).is_err() {
+                self.record_critical(
+                    "dns_audit_report_write_failed",
+                    "resident audit report could not be persisted after readiness",
+                );
+                let _ = self.runtime.replace_report(&self.evidence);
+            }
         }
         Ok(())
     }
 
     fn record_critical(&mut self, code: &'static str, message: &'static str) {
+        self._mediation.mark_resident_critical();
+        self.evidence.resident_health = self._mediation.resident_health();
         if self.evidence.critical_findings.len() == MAX_CRITICAL_FINDINGS {
             self.evidence.critical_findings_truncated = true;
             return;
@@ -1262,8 +1673,15 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
         let expected_state = expected_dns_mediated_owned_state(Mode::Block, &allowances);
-        let mut evidence =
-            initial_dns_block_evidence(plan, &active, false, ruleset_hash.clone(), scope);
+        let initial_health = mediation.resident_health();
+        let mut evidence = initial_dns_block_evidence(
+            plan,
+            &active,
+            false,
+            ruleset_hash.clone(),
+            scope,
+            initial_health.clone(),
+        );
         if let Err(error) = runtime.write_state_exclusive(&DnsMediatedBlockState {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.evidence_status(),
@@ -1276,6 +1694,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             ruleset_hash: &ruleset_hash,
             planned_owned_state: &expected_state,
             readiness_status: "not_emitted",
+            resident_health: &initial_health,
         }) {
             let _ = mediation.routing.rollback();
             return Err(runtime_error(error));
@@ -1338,6 +1757,39 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(error);
         }
+        if let Some(failure) = mediation.drain_worker_failures().into_iter().next() {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status =
+                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(DnsMediationError::new(failure.code, failure.message));
+        }
+        if !mediation.workers_healthy() {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status =
+                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(DnsMediationError::new(
+                "resident_worker_unhealthy",
+                "required resident DNS workers were not healthy before readiness",
+            ));
+        }
+        if let Err(error) = runtime.verify_evidence_persistence(false) {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status =
+                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(runtime_error(error));
+        }
+        mediation.mark_verification_successful();
+        evidence.resident_health = mediation.resident_health();
+        if let Err(error) = mediation.recorder.refresh_report() {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status =
+                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(error);
+        }
         evidence.setup_status = "verified_before_test_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
             evidence.setup_status = "failed_pre_ready";
@@ -1356,6 +1808,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             policy_hash: &plan.policy_hash,
             base_ruleset_hash: &plan.ruleset_hash,
             ruleset_hash: &ruleset_hash,
+            resident_health: &evidence.resident_health,
             protection_available: scope.protection_available(),
             limitations: scope.limitations(),
         }) {
@@ -1395,6 +1848,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         finding_timeout: Duration,
     ) -> Result<(), DnsMediationError> {
         let mut changed = false;
+        for failure in self._mediation.drain_worker_failures() {
+            let _worker = failure.worker;
+            self.record_critical(failure.code, failure.message);
+            changed = true;
+        }
         if self._mediation.recorder.take_report_write_failure() {
             self.record_critical(
                 "dns_block_evidence_write_failed",
@@ -1543,11 +2001,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         if elapsed >= self.next_verification {
+            let mut verification_succeeded = true;
             if self
                 .backend
                 .verify_owned_state(&self.expected_state)
                 .is_err()
             {
+                verification_succeeded = false;
                 self.evidence.network_verification_status = "critical_drift";
                 self.record_critical(
                     "dns_block_network_drift",
@@ -1555,6 +2015,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 );
             }
             if self.lockdown.verify_sudo_disabled().is_err() {
+                verification_succeeded = false;
                 self.evidence.sudo_status = "critical_drift";
                 self.record_critical(
                     "dns_block_sudo_drift",
@@ -1564,6 +2025,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             match self.scope.lockdown_posture() {
                 LockdownPosture::StandardBlock => {
                     if self.lockdown.verify_containers_disabled().is_err() {
+                        verification_succeeded = false;
                         self.evidence.container_status = "critical_drift";
                         self.record_critical(
                             "dns_block_container_drift",
@@ -1573,6 +2035,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 }
                 LockdownPosture::UnsafePreserve => {
                     if self.lockdown.verify_containers_available().is_err() {
+                        verification_succeeded = false;
                         self.evidence.container_status = "critical_drift";
                         self.record_critical(
                             "dns_block_container_drift",
@@ -1581,6 +2044,37 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                     }
                 }
                 LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
+            }
+            if !self._mediation.workers_healthy() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_block_worker_unhealthy",
+                    "required resident DNS worker health could not be verified after readiness",
+                );
+            }
+            if self.runtime.verify_evidence_persistence(true).is_err() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_block_evidence_persistence_failed",
+                    "resident block evidence files could not be verified after readiness",
+                );
+            }
+            if self._mediation.recorder.refresh_report().is_err() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_block_evidence_write_failed",
+                    "DNS-mediated block evidence could not be refreshed during resident verification",
+                );
+            }
+            if verification_succeeded && self.evidence.critical_findings.is_empty() {
+                self._mediation.mark_verification_successful();
+                self.evidence.resident_health = self._mediation.resident_health();
+                if self._mediation.recorder.refresh_report().is_err() {
+                    self.record_critical(
+                        "dns_block_evidence_write_failed",
+                        "DNS-mediated block evidence could not persist the resident verification heartbeat",
+                    );
+                }
             }
             self.next_verification = elapsed + RESIDENT_VERIFICATION_INTERVAL;
             changed = true;
@@ -1597,9 +2091,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                     );
                     self.evidence.counters.total_violations
                 });
-            self.runtime
-                .replace_report(&self.evidence)
-                .map_err(runtime_error)?;
+            if self.runtime.replace_report(&self.evidence).is_err() {
+                self.record_critical(
+                    "dns_block_report_write_failed",
+                    "resident block report could not be persisted after readiness",
+                );
+                let _ = self.runtime.replace_report(&self.evidence);
+            }
         }
         Ok(())
     }
@@ -1643,6 +2141,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
     }
 
     fn record_critical(&mut self, code: &'static str, message: &'static str) {
+        self._mediation.mark_resident_critical();
+        self.evidence.resident_health = self._mediation.resident_health();
         if self.evidence.critical_findings.len() == MAX_CRITICAL_FINDINGS {
             self.evidence.critical_findings_truncated = true;
             return;
@@ -1750,6 +2250,7 @@ pub fn run_selected_profile_runtime_test_service(
     unit_name: &str,
     runtime_root: &Path,
     plan: &PlanData,
+    inject_worker_failure: bool,
 ) -> Result<(), DnsMediationError> {
     validate_test_service_context(unit_name)
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
@@ -1786,6 +2287,11 @@ pub fn run_selected_profile_runtime_test_service(
         plan,
         DnsBlockRuntimeScope::TestEvidence,
     )?;
+    if inject_worker_failure {
+        let failure = session._mediation.inject_test_worker_failure();
+        session.record_critical(failure.code, failure.message);
+        let _ = session.runtime.replace_report(&session.evidence);
+    }
     let start = Instant::now();
     loop {
         session.poll_once(start.elapsed(), Duration::ZERO)?;
@@ -1799,6 +2305,7 @@ fn initial_dns_block_evidence(
     materializations_truncated: bool,
     ruleset_hash: String,
     scope: DnsBlockRuntimeScope,
+    resident_health: ResidentHealth,
 ) -> DnsMediatedBlockEvidence {
     DnsMediatedBlockEvidence {
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
@@ -1833,12 +2340,17 @@ fn initial_dns_block_evidence(
         findings_truncated: false,
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
+        resident_health,
         protection_available: scope.protection_available(),
         limitations: scope.limitations(),
     }
 }
 
-fn initial_dns_audit_evidence(plan: &PlanData, ruleset_hash: String) -> DnsMediatedAuditEvidence {
+fn initial_dns_audit_evidence(
+    plan: &PlanData,
+    ruleset_hash: String,
+    resident_health: ResidentHealth,
+) -> DnsMediatedAuditEvidence {
     DnsMediatedAuditEvidence {
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: PROTECTED_AUDIT_STATUS,
@@ -1864,6 +2376,7 @@ fn initial_dns_audit_evidence(plan: &PlanData, ruleset_hash: String) -> DnsMedia
         findings_truncated: false,
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
+        resident_health,
         protection_available: false,
         limitations: protected_audit_limitations(),
     }
@@ -2248,6 +2761,7 @@ fn materialization_request_channel() -> (MaterializationSubmitter, Receiver<Mate
 fn submit_materialization_request(
     submitter: &MaterializationSubmitter,
     materializations: BTreeSet<PendingMaterialization>,
+    shutdown: &AtomicBool,
 ) -> Result<MaterializationCompletion, ()> {
     if materializations.is_empty() || materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
         return Err(());
@@ -2258,7 +2772,15 @@ fn submit_materialization_request(
         completion,
     };
     match submitter.requests.try_send(request) {
-        Ok(()) => result.recv().map_err(|_| ()),
+        Ok(()) => loop {
+            match result.recv_timeout(Duration::from_millis(250)) {
+                Ok(completion) => break Ok(completion),
+                Err(mpsc::RecvTimeoutError::Timeout) if !shutdown.load(Ordering::Relaxed) => {}
+                Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                    break Err(());
+                }
+            }
+        },
         Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => Err(()),
     }
 }
@@ -2483,9 +3005,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 fn start_dns_proxy(
     recorder: ObservationRecorder,
-) -> Result<Vec<JoinHandle<()>>, DnsMediationError> {
-    let mut threads = Vec::new();
-    for address in [HOST_DNS_BIND, DOCKER_DNS_BIND] {
+    stop: Arc<AtomicBool>,
+) -> Result<DnsProxyRuntime, DnsMediationError> {
+    let mut listeners = Vec::new();
+    for (address, udp_worker, tcp_worker) in [
+        (HOST_DNS_BIND, "host_udp_dns", "host_tcp_dns"),
+        (DOCKER_DNS_BIND, "docker_udp_dns", "docker_tcp_dns"),
+    ] {
         let udp = UdpSocket::bind(address).map_err(|_| {
             DnsMediationError::new(
                 "dns_proxy_bind_failed",
@@ -2498,19 +3024,133 @@ fn start_dns_proxy(
                 "failed to bind a fixed local DNS proxy stream listener",
             )
         })?;
-        let udp_recorder = recorder.clone();
-        threads.push(thread::spawn(move || serve_udp(udp, udp_recorder)));
-        let tcp_recorder = recorder.clone();
-        threads.push(thread::spawn(move || serve_tcp(tcp, tcp_recorder)));
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .map_err(|_| {
+                DnsMediationError::new(
+                    "dns_proxy_bind_failed",
+                    "failed to configure a fixed local DNS proxy listener",
+                )
+            })?;
+        tcp.set_nonblocking(true).map_err(|_| {
+            DnsMediationError::new(
+                "dns_proxy_bind_failed",
+                "failed to configure a fixed local DNS proxy stream listener",
+            )
+        })?;
+        listeners.push((udp_worker, udp, tcp_worker, tcp));
     }
-    Ok(threads)
+
+    let (events, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+    let mut threads = Vec::new();
+    for (udp_worker, udp, tcp_worker, tcp) in listeners {
+        let udp_recorder = recorder.clone();
+        let udp_thread =
+            spawn_supervised_worker(udp_worker, Arc::clone(&stop), events.clone(), move |stop| {
+                serve_udp(udp, udp_recorder, stop)
+            });
+        match udp_thread {
+            Ok(thread) => threads.push(thread),
+            Err(error) => {
+                shutdown_dns_workers(&stop, &mut threads);
+                return Err(error);
+            }
+        }
+        let tcp_recorder = recorder.clone();
+        let tcp_thread =
+            spawn_supervised_worker(tcp_worker, Arc::clone(&stop), events.clone(), move |stop| {
+                serve_tcp(tcp, tcp_recorder, stop)
+            });
+        match tcp_thread {
+            Ok(thread) => threads.push(thread),
+            Err(error) => {
+                shutdown_dns_workers(&stop, &mut threads);
+                return Err(error);
+            }
+        }
+    }
+    drop(events);
+    Ok(DnsProxyRuntime {
+        threads,
+        supervisor: ResidentWorkerSupervisor::new(receiver),
+    })
 }
 
-fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
+fn spawn_supervised_worker<F>(
+    name: &'static str,
+    stop: Arc<AtomicBool>,
+    events: SyncSender<ResidentWorkerEvent>,
+    worker: F,
+) -> Result<JoinHandle<()>, DnsMediationError>
+where
+    F: FnOnce(&AtomicBool) -> Result<(), DnsMediationError> + Send + 'static,
+{
+    thread::Builder::new()
+        .name(format!("fence-{name}"))
+        .spawn(move || {
+            if events.send(ResidentWorkerEvent::Started(name)).is_err() {
+                return;
+            }
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(&stop)));
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let event = match outcome {
+                Ok(Ok(())) => ResidentWorkerEvent::Fatal {
+                    worker: name,
+                    code: "resident_worker_exited",
+                    message: "required resident DNS worker exited unexpectedly",
+                },
+                Ok(Err(error)) => ResidentWorkerEvent::Fatal {
+                    worker: name,
+                    code: error.code,
+                    message: "required resident DNS worker encountered a fatal listener failure",
+                },
+                Err(_) => ResidentWorkerEvent::Fatal {
+                    worker: name,
+                    code: "resident_worker_panicked",
+                    message: "required resident DNS worker panicked",
+                },
+            };
+            let _ = events.send(event);
+        })
+        .map_err(|_| {
+            DnsMediationError::new(
+                "resident_worker_spawn_failed",
+                "failed to start a required resident DNS worker",
+            )
+        })
+}
+
+fn shutdown_dns_workers(stop: &AtomicBool, threads: &mut Vec<JoinHandle<()>>) {
+    stop.store(true, Ordering::Relaxed);
+    for thread in threads.drain(..) {
+        let _ = thread.join();
+    }
+}
+
+fn serve_udp(
+    socket: UdpSocket,
+    recorder: ObservationRecorder,
+    stop: &AtomicBool,
+) -> Result<(), DnsMediationError> {
     let mut query = [0_u8; MAX_DNS_PACKET_BYTES];
-    loop {
-        let Ok((length, peer)) = socket.recv_from(&mut query) else {
-            continue;
+    while !stop.load(Ordering::Relaxed) {
+        let (length, peer) = match socket.recv_from(&mut query) {
+            Ok(received) => received,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => {
+                return Err(DnsMediationError::new(
+                    "dns_udp_listener_failed",
+                    "resident UDP DNS listener failed",
+                ));
+            }
         };
         let bytes = &query[..length];
         let parsed_question = parse_dns_question(bytes);
@@ -2528,36 +3168,68 @@ fn serve_udp(socket: UdpSocket, recorder: ObservationRecorder) {
             recorder.record_query(hostname, *query_type, true);
         }
         let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
+            recorder.record_upstream_request_failure();
+            send_udp_retryable_failure(&socket, bytes, peer);
             continue;
         };
         let _ = upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT));
         let _ = upstream.set_write_timeout(Some(DNS_FORWARD_TIMEOUT));
         if upstream.connect(UPSTREAM_DNS).is_err() || upstream.send(&upstream_query).is_err() {
+            recorder.record_upstream_request_failure();
+            send_udp_retryable_failure(&socket, bytes, peer);
             continue;
         }
         let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
-        if let Ok(response_length) = upstream.recv(&mut response) {
-            let response = &mut response[..response_length];
-            if !response_matches_upstream_query(response, &upstream_query) {
-                continue;
-            }
-            restore_client_query_id(response, bytes);
-            let disposition = parsed_question
-                .as_ref()
-                .map(|(hostname, query_type)| {
-                    recorder.record_response(hostname, *query_type, response)
-                })
-                .unwrap_or(DnsResponseDisposition::ForwardOriginal);
-            let Some(output) = dns_response_for_disposition(bytes, response, disposition) else {
-                continue;
-            };
-            let _ = socket.send_to(&output, peer);
+        let Ok(response_length) = upstream.recv(&mut response) else {
+            recorder.record_upstream_request_failure();
+            send_udp_retryable_failure(&socket, bytes, peer);
+            continue;
+        };
+        let response = &mut response[..response_length];
+        if !response_matches_upstream_query(response, &upstream_query) {
+            recorder.record_upstream_request_failure();
+            send_udp_retryable_failure(&socket, bytes, peer);
+            continue;
         }
+        restore_client_query_id(response, bytes);
+        let disposition = parsed_question
+            .as_ref()
+            .map(|(hostname, query_type)| recorder.record_response(hostname, *query_type, response))
+            .unwrap_or(DnsResponseDisposition::ForwardOriginal);
+        let Some(output) = dns_response_for_disposition(bytes, response, disposition) else {
+            continue;
+        };
+        let _ = socket.send_to(&output, peer);
+    }
+    Ok(())
+}
+
+fn send_udp_retryable_failure(socket: &UdpSocket, query: &[u8], peer: std::net::SocketAddr) {
+    if let Some(response) = server_failure_response(query) {
+        let _ = socket.send_to(&response, peer);
     }
 }
 
-fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
-    for mut client in listener.incoming().flatten() {
+fn serve_tcp(
+    listener: TcpListener,
+    recorder: ObservationRecorder,
+    stop: &AtomicBool,
+) -> Result<(), DnsMediationError> {
+    while !stop.load(Ordering::Relaxed) {
+        let mut client = match listener.accept() {
+            Ok((client, _)) => client,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => {
+                return Err(DnsMediationError::new(
+                    "dns_tcp_listener_failed",
+                    "resident TCP DNS listener failed",
+                ));
+            }
+        };
         if set_dns_tcp_deadlines(&client).is_err() {
             continue;
         }
@@ -2589,6 +3261,8 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
             recorder.record_query(hostname, *query_type, true);
         }
         let Ok(mut upstream) = connect_upstream_tcp() else {
+            recorder.record_upstream_request_failure();
+            write_tcp_retryable_failure(&mut client, &query);
             continue;
         };
         if upstream
@@ -2596,21 +3270,31 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
             .is_err()
             || upstream.write_all(&upstream_query).is_err()
         {
+            recorder.record_upstream_request_failure();
+            write_tcp_retryable_failure(&mut client, &query);
             continue;
         }
         let mut response_length = [0_u8; 2];
         if upstream.read_exact(&mut response_length).is_err() {
+            recorder.record_upstream_request_failure();
+            write_tcp_retryable_failure(&mut client, &query);
             continue;
         }
         let size = usize::from(u16::from_be_bytes(response_length));
         if size == 0 || size > MAX_DNS_PACKET_BYTES {
+            recorder.record_upstream_request_failure();
+            write_tcp_retryable_failure(&mut client, &query);
             continue;
         }
         let mut response = vec![0_u8; size];
         if upstream.read_exact(&mut response).is_err() {
+            recorder.record_upstream_request_failure();
+            write_tcp_retryable_failure(&mut client, &query);
             continue;
         }
         if !response_matches_upstream_query(&response, &upstream_query) {
+            recorder.record_upstream_request_failure();
+            write_tcp_retryable_failure(&mut client, &query);
             continue;
         }
         restore_client_query_id(&mut response, &query);
@@ -2629,6 +3313,18 @@ fn serve_tcp(listener: TcpListener, recorder: ObservationRecorder) {
         let _ = client.write_all(&output_length.to_be_bytes());
         let _ = client.write_all(&output);
     }
+    Ok(())
+}
+
+fn write_tcp_retryable_failure(client: &mut TcpStream, query: &[u8]) {
+    let Some(response) = server_failure_response(query) else {
+        return;
+    };
+    let Ok(length) = u16::try_from(response.len()) else {
+        return;
+    };
+    let _ = client.write_all(&length.to_be_bytes());
+    let _ = client.write_all(&response);
 }
 
 fn connect_upstream_tcp() -> std::io::Result<TcpStream> {
@@ -3288,6 +3984,7 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
+        &initial_resident_health(),
     )
 }
 
@@ -3297,6 +3994,7 @@ fn evidence_from_state_and_authorizations(
     scope: DnsEvidenceScope,
     cname_authorizations: &CnameAuthorizationState,
     hostname_policy: &RuntimeHostnamePolicy,
+    resident_health: &ResidentHealth,
 ) -> DnsMediationEvidence {
     DnsMediationEvidence {
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
@@ -3308,6 +4006,7 @@ fn evidence_from_state_and_authorizations(
         hostname_policy: hostname_policy.clone(),
         mode: scope.mode(),
         protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
+        resident_health: resident_health.clone(),
         routing_status,
         host_dns_routing: match scope {
             DnsEvidenceScope::ProtectedHostAudit
@@ -3374,6 +4073,7 @@ fn evidence_from_state_and_authorizations(
         materialization_request_rejections: state.materialization_request_rejections,
         materialization_update_max_milliseconds: state.materialization_update_max_milliseconds,
         hostname_refresh_warnings: state.hostname_refresh_warnings,
+        upstream_request_failures: state.upstream_request_failures,
         limitations: match scope {
             DnsEvidenceScope::ProtectedHostAudit => protected_dns_audit_limitations(),
             DnsEvidenceScope::SelectedProfileRuntimeTest => vec![
@@ -3650,6 +4350,8 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
+            resident_health: Arc::new(Mutex::new(initial_resident_health())),
+            shutdown: Arc::new(AtomicBool::new(false)),
             report_path: report_path.clone(),
             scope,
             hostname_policy,
@@ -4091,18 +4793,22 @@ mod tests {
             state.materialization_request_rejections = u64::MAX;
             state.materialization_update_max_milliseconds = u64::MAX - 1;
             state.hostname_refresh_warnings = u64::MAX;
+            state.upstream_request_failures = u64::MAX;
         }
         recorder.record_materialization_rejection();
         recorder.record_materialization_batch(Duration::from_millis(u64::MAX));
         recorder.record_hostname_refresh_warning();
+        recorder.record_upstream_request_failure();
         let state = recorder.state.lock().unwrap();
         assert_eq!(state.materialization_batch_count, u64::MAX);
         assert_eq!(state.materialization_request_rejections, u64::MAX);
         assert_eq!(state.materialization_update_max_milliseconds, u64::MAX);
         assert_eq!(state.hostname_refresh_warnings, u64::MAX);
+        assert_eq!(state.upstream_request_failures, u64::MAX);
         drop(state);
         let evidence: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
         assert_eq!(evidence["materialization_batch_count"], u64::MAX);
+        assert_eq!(evidence["upstream_request_failures"], u64::MAX);
         assert_eq!(
             evidence["materialization_update_max_milliseconds"],
             u64::MAX
@@ -4229,6 +4935,8 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
+            resident_health: Arc::new(Mutex::new(initial_resident_health())),
+            shutdown: Arc::new(AtomicBool::new(false)),
             report_path: PathBuf::from("unused-test-report.json"),
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
             hostname_policy: test_hostname_policy(false),
@@ -5077,6 +5785,8 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
+            resident_health: Arc::new(Mutex::new(initial_resident_health())),
+            shutdown: Arc::new(AtomicBool::new(false)),
             report_path: root.join("missing/report.json"),
             scope: DnsEvidenceScope::ProtectedHostAudit,
             hostname_policy: test_hostname_policy(false),
@@ -5085,5 +5795,108 @@ mod tests {
         recorder.record_query("pipelines.actions.githubusercontent.com", 1, true);
         assert!(recorder.take_report_write_failure());
         assert!(!recorder.take_report_write_failure());
+    }
+
+    #[test]
+    fn resident_worker_supervisor_requires_all_workers_and_reports_fatal_exit() {
+        let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+        for worker in REQUIRED_DNS_WORKERS {
+            sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
+        }
+        supervisor.wait_for_startup().unwrap();
+        assert!(supervisor.all_healthy());
+        assert!(
+            supervisor
+                .worker_health()
+                .iter()
+                .all(|worker| worker.status == "running")
+        );
+
+        sender
+            .send(ResidentWorkerEvent::Fatal {
+                worker: "host_udp_dns",
+                code: "dns_udp_listener_failed",
+                message: "required resident DNS worker encountered a fatal listener failure",
+            })
+            .unwrap();
+        let failures = supervisor.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].worker, "host_udp_dns");
+        assert_eq!(failures[0].code, "dns_udp_listener_failed");
+        assert!(!supervisor.all_healthy());
+    }
+
+    #[test]
+    fn resident_worker_supervisor_reports_channel_disconnect_once() {
+        let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+        for worker in REQUIRED_DNS_WORKERS {
+            sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
+        }
+        supervisor.wait_for_startup().unwrap();
+        drop(sender);
+        let failures = supervisor.drain_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].code, "resident_worker_channel_disconnected");
+        assert!(supervisor.drain_failures().is_empty());
+    }
+
+    #[test]
+    fn supervised_worker_converts_panics_and_unexpected_exits_to_fatal_events() {
+        for panic_worker in [false, true] {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+            let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+            let handle = spawn_supervised_worker(
+                "host_udp_dns",
+                Arc::clone(&stop),
+                sender,
+                move |_| -> Result<(), DnsMediationError> {
+                    if panic_worker {
+                        panic!("bounded test panic");
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let error = supervisor.wait_for_startup().unwrap_err();
+            handle.join().unwrap();
+            assert_eq!(
+                error.code,
+                if panic_worker {
+                    "resident_worker_panicked"
+                } else {
+                    "resident_worker_exited"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn resident_verification_sequence_and_timestamp_are_bounded() {
+        let mut health = initial_resident_health();
+        health.verification_sequence = u64::MAX;
+        let workers = health
+            .workers
+            .iter()
+            .map(|worker| ResidentWorkerHealth {
+                name: worker.name,
+                status: "running",
+            })
+            .collect();
+        advance_resident_health(&mut health, workers, u64::MAX);
+        assert_eq!(health.status, "healthy");
+        assert_eq!(health.verification_sequence, u64::MAX);
+        assert_eq!(
+            health.last_successful_verification_unix_milliseconds,
+            u64::MAX
+        );
+        assert!(
+            health
+                .workers
+                .iter()
+                .all(|worker| worker.status == "running")
+        );
     }
 }
