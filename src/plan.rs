@@ -5,6 +5,7 @@ use crate::config::{
     PlatformProfile, Protocol,
 };
 use crate::error::ErrorDetail;
+use crate::hostname_policy::{RuntimeHostnamePolicy, build_runtime_hostname_policy};
 use crate::nft::{NetworkEnforcementPreview, build_preview, implicit_ipv6_control};
 use crate::platform_profile::{
     DnsMediatedCompatibilityPlan, GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
@@ -20,7 +21,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 3;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +96,8 @@ pub struct PlanData {
     pub platform_profile: PlatformProfilePlan,
     pub container_policy: Option<ContainerPolicy>,
     pub requested_policy: Vec<NormalizedAllowance>,
+    pub runtime_hostname_policy: RuntimeHostnamePolicy,
+    pub runtime_static_policy: Vec<EffectiveAllowance>,
     pub effective_policy: Vec<EffectiveAllowance>,
     pub frozen_resolution_results: Vec<ResolutionResult>,
     pub derived_runtime_paths: RuntimePaths,
@@ -116,7 +119,7 @@ struct PolicyHashInput<'a> {
     container_policy: Option<ContainerPolicy>,
     platform_profile: &'a str,
     platform_profile_dns_mediated_compatibility: Option<DnsMediatedCompatibilityPlan>,
-    allowances: &'a [EffectiveAllowance],
+    allowlist: &'a [NormalizedAllowance],
     implicit_ipv6_control: crate::nft::ImplicitIpv6Control,
 }
 
@@ -124,15 +127,29 @@ pub fn build_plan(
     config: NormalizedConfig,
     resolver: &dyn Resolver,
 ) -> Result<PlanData, ErrorDetail> {
+    build_plan_inner(config, Some(resolver))
+}
+
+pub fn build_activation_plan(config: NormalizedConfig) -> Result<PlanData, ErrorDetail> {
+    build_plan_inner(config, None)
+}
+
+fn build_plan_inner(
+    config: NormalizedConfig,
+    resolver: Option<&dyn Resolver>,
+) -> Result<PlanData, ErrorDetail> {
+    let runtime_hostname_policy = build_runtime_hostname_policy(&config);
     let platform_requested_policy = platform_requested_allowances(config.platform_profile);
     let mut resolved = BTreeMap::new();
-    let hosts = config
-        .requested_allowances
-        .iter()
-        .chain(platform_requested_policy.iter())
-        .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
-        .map(|allowance| allowance.destination.clone())
-        .collect::<BTreeSet<_>>();
+    let hosts = resolver.map_or_else(BTreeSet::new, |_| {
+        config
+            .requested_allowances
+            .iter()
+            .chain(platform_requested_policy.iter())
+            .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
+            .map(|allowance| allowance.destination.clone())
+            .collect::<BTreeSet<_>>()
+    });
     let mut consumed_budget = Duration::ZERO;
 
     for host in hosts {
@@ -145,6 +162,7 @@ pub fn build_plan(
             mut addresses,
             elapsed,
         } = resolver
+            .expect("preview hostname set requires a resolver")
             .resolve(&host, timeout)
             .map_err(|failure| match failure {
                 ResolveError::Failed => dns_error("dns_resolution_failed"),
@@ -169,11 +187,35 @@ pub fn build_plan(
         resolved.insert(host, addresses);
     }
 
-    let mut platform_effective_policy = expand_allowances(&platform_requested_policy, &resolved);
+    let mut runtime_static_policy = config
+        .requested_allowances
+        .iter()
+        .filter(|allowance| allowance.destination_type != DestinationType::Hostname)
+        .map(|allowance| EffectiveAllowance {
+            destination_type: allowance.destination_type,
+            destination: allowance.destination.clone(),
+            protocol: allowance.protocol,
+            port: allowance.port,
+        })
+        .collect::<Vec<_>>();
+    runtime_static_policy.sort();
+    runtime_static_policy.dedup();
+
+    let mut platform_effective_policy = if resolver.is_some() {
+        expand_allowances(&platform_requested_policy, &resolved)
+    } else {
+        Vec::new()
+    };
     platform_effective_policy.sort();
     platform_effective_policy.dedup();
-    let mut effective_policy = expand_allowances(&config.requested_allowances, &resolved);
-    effective_policy.extend(expand_allowances(&platform_requested_policy, &resolved));
+    let mut effective_policy = if resolver.is_some() {
+        expand_allowances(&config.requested_allowances, &resolved)
+    } else {
+        runtime_static_policy.clone()
+    };
+    if resolver.is_some() {
+        effective_policy.extend(expand_allowances(&platform_requested_policy, &resolved));
+    }
 
     let expanded_rules_before_deduplication = effective_policy.len();
     if expanded_rules_before_deduplication > MAX_EXPANDED_RULES {
@@ -185,7 +227,6 @@ pub fn build_plan(
     }
     effective_policy.sort();
     effective_policy.dedup();
-
     let frozen_resolution_results = resolved
         .iter()
         .map(|(hostname, addresses)| ResolutionResult {
@@ -205,7 +246,7 @@ pub fn build_plan(
         platform_effective_policy,
         platform_resolution_results,
     );
-    let policy_hash = policy_hash(&config, &effective_policy);
+    let policy_hash = policy_hash(&config);
     let network_enforcement_preview = build_preview(config.mode, &effective_policy);
     let ruleset_hash = sha256_hex(network_enforcement_preview.ruleset.as_bytes());
     let assurance_status = assurance_status(config.mode, config.container_policy);
@@ -223,6 +264,8 @@ pub fn build_plan(
         platform_profile,
         container_policy: config.container_policy,
         requested_policy: config.requested_allowances,
+        runtime_hostname_policy,
+        runtime_static_policy,
         effective_policy,
         frozen_resolution_results,
         derived_runtime_paths: runtime_paths(&invocation_id),
@@ -391,7 +434,7 @@ fn runtime_paths(invocation_id: &str) -> RuntimePaths {
     }
 }
 
-fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance]) -> String {
+fn policy_hash(config: &NormalizedConfig) -> String {
     let bytes = serde_json::to_vec(&PolicyHashInput {
         policy_hash_schema_version: POLICY_HASH_SCHEMA_VERSION,
         mode: config.mode,
@@ -402,7 +445,7 @@ fn policy_hash(config: &NormalizedConfig, effective_policy: &[EffectiveAllowance
                 config.disable_broad_github_domains,
             ),
         ),
-        allowances: effective_policy,
+        allowlist: &config.requested_allowances,
         implicit_ipv6_control: implicit_ipv6_control(),
     })
     .expect("typed policy hashing input must serialize");
@@ -573,7 +616,7 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
-        assert_eq!(default.policy_hash_schema_version, 3);
+        assert_eq!(default.policy_hash_schema_version, 4);
         assert_eq!(
             default.platform_profile.id,
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
@@ -748,6 +791,69 @@ mod tests {
                 .unwrap_err()
                 .code,
             "dns_budget_exceeded"
+        );
+    }
+
+    #[test]
+    fn logical_policy_hash_is_stable_across_dns_rotation() {
+        let config = parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"rotate","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443}]}"#,
+        );
+        let first = build_plan(
+            config.clone(),
+            &resolver(vec![resolved(&["192.0.2.10"], Duration::ZERO)]),
+        )
+        .unwrap();
+        let second = build_plan(
+            config,
+            &resolver(vec![resolved(&["192.0.2.20"], Duration::ZERO)]),
+        )
+        .unwrap();
+
+        assert_eq!(first.policy_hash, second.policy_hash);
+        assert_ne!(first.ruleset_hash, second.ruleset_hash);
+        assert_ne!(first.effective_policy, second.effective_policy);
+    }
+
+    #[test]
+    fn logical_policy_hash_changes_with_hostname_transport() {
+        let tcp = build_activation_plan(parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"tcp","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
+        ))
+        .unwrap();
+        let custom_tcp = build_activation_plan(parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"custom","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443}]}"#,
+        ))
+        .unwrap();
+        let udp = build_activation_plan(parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"udp","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"udp","port":53}]}"#,
+        ))
+        .unwrap();
+
+        assert_ne!(tcp.policy_hash, custom_tcp.policy_hash);
+        assert_ne!(tcp.policy_hash, udp.policy_hash);
+        assert_ne!(custom_tcp.policy_hash, udp.policy_hash);
+    }
+
+    #[test]
+    fn activation_plan_defers_hostname_resolution_to_the_dns_mediator() {
+        let plan = build_activation_plan(parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"activate","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443},{"destination_type":"ip","destination":"192.0.2.10","protocol":"udp","port":53}]}"#,
+        ))
+        .unwrap();
+
+        assert!(plan.frozen_resolution_results.is_empty());
+        assert_eq!(plan.effective_policy, plan.runtime_static_policy);
+        assert_eq!(plan.runtime_static_policy.len(), 1);
+        assert_eq!(
+            plan.runtime_hostname_policy
+                .exact_entry("example.com")
+                .unwrap()
+                .transports,
+            [crate::hostname_policy::HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: 8443,
+            }]
         );
     }
 }

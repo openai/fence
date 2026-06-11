@@ -121,6 +121,7 @@ expected = {
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
+            "actions-results-receiver-production.githubapp.com",
         ],
     },
     "standard-opt-out": {
@@ -136,6 +137,7 @@ expected = {
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
+            "actions-results-receiver-production.githubapp.com",
         ],
     },
     "unsafe-preserve": {
@@ -154,6 +156,7 @@ expected = {
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
+            "actions-results-receiver-production.githubapp.com",
         ],
     },
     "audit": {
@@ -172,6 +175,7 @@ expected = {
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
+            "actions-results-receiver-production.githubapp.com",
         ],
     },
 }[scenario]
@@ -192,14 +196,14 @@ assert report is not None, "protected report was not emitted"
 assert dns is not None, "protected DNS report was not emitted"
 assert ready is not None, "protected readiness was not emitted"
 assert report["status"] == expected["status"], report
-assert report["runtime_evidence_schema_version"] == 1, report
+assert report["runtime_evidence_schema_version"] == 2, report
 assert report["mode"] == expected["mode"], report
 assert report["setup_status"] == expected["resident"], report
 assert report["readiness_status"] == expected["ready"], report
 assert report["protection_available"] is expected["protection_available"], report
 assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", report
 assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", report
-assert report["policy_hash_schema_version"] == 3, report
+assert report["policy_hash_schema_version"] == 4, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
@@ -208,11 +212,11 @@ assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == expected["sudo_status"], report
 assert report["container_status"] == expected["container_status"], report
 if scenario != "audit":
-    assert len(report["materialized_https_allowances"]) >= 1, report
+    assert len(report["materialized_allowances"]) >= 1, report
     assert report["bootstrap_hostnames"] == expected["bootstrap_hostnames"], report
 assert report["critical_findings"] == [], report
 assert ready["status"] == expected["ready"], ready
-assert ready["runtime_evidence_schema_version"] == 1, ready
+assert ready["runtime_evidence_schema_version"] == 2, ready
 assert ready["mode"] == expected["mode"], ready
 assert ready["protection_available"] is expected["protection_available"], ready
 assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", ready
@@ -220,7 +224,7 @@ assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_
 assert ready["policy_hash"] == report["policy_hash"], (ready, report)
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"], (ready, report)
 assert dns["status"] == expected["status"], dns
-assert dns["runtime_evidence_schema_version"] == 1, dns
+assert dns["runtime_evidence_schema_version"] == 2, dns
 assert dns["mode"] == expected["mode"], dns
 assert dns["protection_available"] is expected["protection_available"], dns
 assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", dns
@@ -232,6 +236,7 @@ assert dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"], dns
 assert isinstance(dns["materialization_batch_count"], int), dns
 assert dns["materialization_batch_count"] >= 0, dns
 assert dns["materialization_request_rejections"] == 0, dns
+assert dns["hostname_refresh_warnings"] == 0, dns
 assert isinstance(dns["materialization_update_max_milliseconds"], int), dns
 assert dns["materialization_update_max_milliseconds"] >= 0, dns
 if scenario == "audit":

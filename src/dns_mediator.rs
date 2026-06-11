@@ -1,8 +1,12 @@
 use crate::config::{
-    ContainerPolicy, DestinationType, MAX_REPORT_BYTES, Mode, Protocol, parse_and_normalize,
+    ContainerPolicy, DestinationType, MAX_EXPANDED_RULES, MAX_REPORT_BYTES, Mode, Protocol,
+    parse_and_normalize,
 };
 use crate::error::ErrorDetail;
 use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
+use crate::hostname_policy::{
+    ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
+};
 use crate::lifecycle::{
     CriticalFinding, RESIDENT_VERIFICATION_INTERVAL, require_production_root_process,
     validate_production_service_context, validate_test_service_context,
@@ -14,7 +18,7 @@ use crate::nft::{
     render_dns_mediated_replacement_ruleset, render_dns_mediated_ruleset,
 };
 use crate::nft_backend::{NativeNftBackend, SystemNftExecutor};
-use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_plan};
+use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_activation_plan};
 use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES,
@@ -30,7 +34,6 @@ use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
     reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
-use crate::resolver::SystemResolver;
 use crate::runtime::{
     ProductionRuntimeStore, RuntimeDocumentStore, RuntimeError, TestRuntimeStore,
 };
@@ -55,7 +58,7 @@ use std::time::{Duration, Instant};
 
 pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
     "github_hosted_workflow_bootstrap_dns_mediation_v1";
-pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
     "selected_profile_runtime_ready_no_public_activation";
@@ -73,7 +76,8 @@ pub const SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES: [&str; 7] =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES;
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
-const MAX_DYNAMIC_MATERIALIZATIONS: usize = 128;
+const MAX_MATERIALIZATIONS_PER_UPDATE: usize = 128;
+const MAX_ACTIVE_MATERIALIZATIONS: usize = MAX_EXPANDED_RULES;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize =
@@ -84,6 +88,7 @@ const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED
 const MAX_DYNAMIC_TTL_SECONDS: u32 = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_TTL_SECONDS;
 const DNS_PROFILE_REFRESH_INTERVAL: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS);
+const MAX_USER_HOSTNAME_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const DNS_MATERIALIZATION_REFRESH_OVERLAP: Duration =
     Duration::from_secs(GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS);
 const MATERIALIZATION_REQUEST_QUEUE_CAPACITY: usize = 32;
@@ -99,6 +104,15 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
+
+#[cfg(test)]
+fn test_hostname_policy(disable_broad_github_domains: bool) -> RuntimeHostnamePolicy {
+    let config = format!(
+        r#"{{"schema_version":1,"mode":"block","invocation_id":"test-policy","disable_broad_github_domains":{disable_broad_github_domains},"allowlist":[]}}"#
+    );
+    let normalized = parse_and_normalize(config.as_bytes()).expect("test policy must parse");
+    crate::hostname_policy::build_runtime_hostname_policy(&normalized)
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DnsEvidenceScope {
@@ -135,11 +149,11 @@ impl DnsEvidenceScope {
             | Self::ProtectedHostBlock
             | Self::ProtectedHostBlockDegraded => {
                 matches_supported_block_query_type(query_type)
-                    && authorized_selected_profile_hostname(
+                    && authorized_hostname(
                         hostname,
                         &mut CnameAuthorizationState::default(),
                         Instant::now(),
-                        &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                        &test_hostname_policy(false),
                     )
             }
         }
@@ -248,7 +262,7 @@ impl DnsMediationError {
 pub struct DnsObservation {
     pub hostname: String,
     pub query_type: String,
-    pub profile_classification: &'static str,
+    pub policy_classification: &'static str,
     pub occurrences: u64,
     pub resolved_addresses: Vec<String>,
     pub minimum_observed_ttl_seconds: Option<u32>,
@@ -262,7 +276,8 @@ pub struct DnsMediationEvidence {
     pub profile_realization_id: &'static str,
     pub platform_profile_id: &'static str,
     pub authorized_domain_patterns: Vec<&'static str>,
-    pub bootstrap_hostnames: Vec<&'static str>,
+    pub bootstrap_hostnames: Vec<String>,
+    pub hostname_policy: RuntimeHostnamePolicy,
     pub mode: Mode,
     pub protection_available: bool,
     pub routing_status: &'static str,
@@ -276,11 +291,12 @@ pub struct DnsMediationEvidence {
     pub bounded_actions_suffix_authorizations_truncated: bool,
     pub derived_cname_authorizations: Vec<DnsDerivedCnameAuthorization>,
     pub derived_cname_authorizations_truncated: bool,
-    pub excluded_non_github_query_count: u64,
+    pub excluded_unretained_query_count: u64,
     pub blocked_non_profile_query_count: u64,
     pub materialization_batch_count: u64,
     pub materialization_request_rejections: u64,
     pub materialization_update_max_milliseconds: u64,
+    pub hostname_refresh_warnings: u64,
     pub limitations: Vec<&'static str>,
 }
 
@@ -293,12 +309,15 @@ pub struct DnsDerivedCnameAuthorization {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct DnsMaterializedHttpsAllowance {
+pub struct DnsMaterializedAllowance {
+    pub source_hostname: String,
     pub hostname: String,
     pub address: String,
-    pub protocol: &'static str,
+    pub protocol: Protocol,
     pub port: u16,
+    pub origins: Vec<HostnamePolicyOrigin>,
     pub observed_ttl_seconds: u32,
+    pub expires_in_seconds: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -311,7 +330,8 @@ pub struct DnsMediatedBlockEvidence {
     pub policy_hash_schema_version: u32,
     pub policy_hash: String,
     pub base_ruleset_hash: String,
-    pub bootstrap_hostnames: Vec<&'static str>,
+    pub bootstrap_hostnames: Vec<String>,
+    pub hostname_policy: RuntimeHostnamePolicy,
     pub setup_status: &'static str,
     pub network_application_status: &'static str,
     pub network_verification_status: &'static str,
@@ -322,9 +342,10 @@ pub struct DnsMediatedBlockEvidence {
     pub ruleset_hash: String,
     pub dns_upstream_policy: &'static str,
     pub materialization_status: &'static str,
-    pub materialized_https_allowances: Vec<DnsMaterializedHttpsAllowance>,
+    pub materialized_allowances: Vec<DnsMaterializedAllowance>,
     pub materializations_truncated: bool,
     pub expired_materializations: u64,
+    pub hostname_refresh_warnings: u64,
     pub counters: NetworkEvidenceCounters,
     pub findings: Vec<ConnectionFinding>,
     pub findings_truncated: bool,
@@ -425,11 +446,12 @@ struct DnsMediatedAuditReady<'a> {
 struct ObservationState {
     retained: BTreeMap<(String, u16, &'static str), RetainedObservation>,
     truncated: bool,
-    excluded_non_github_query_count: u64,
+    excluded_unretained_query_count: u64,
     blocked_non_profile_query_count: u64,
     materialization_batch_count: u64,
     materialization_request_rejections: u64,
     materialization_update_max_milliseconds: u64,
+    hostname_refresh_warnings: u64,
 }
 
 #[derive(Debug, Default)]
@@ -459,6 +481,9 @@ struct PendingMaterialization {
     source_hostname: String,
     hostname: String,
     address: IpAddr,
+    protocol: Protocol,
+    port: u16,
+    origins: Vec<HostnamePolicyOrigin>,
     ttl_seconds: u32,
 }
 
@@ -497,9 +522,14 @@ struct ActiveMaterialization {
     source_hostname: String,
     hostname: String,
     address: IpAddr,
+    protocol: Protocol,
+    port: u16,
+    origins: Vec<HostnamePolicyOrigin>,
     observed_ttl_seconds: u32,
     expires_at: Instant,
 }
+
+type ActiveMaterializationKey = (String, String, IpAddr, Protocol, u16);
 
 #[derive(Debug, Default)]
 struct CnameAuthorizationState {
@@ -524,7 +554,7 @@ struct ObservationRecorder {
     report_write_failed: Arc<AtomicBool>,
     report_path: PathBuf,
     scope: DnsEvidenceScope,
-    bootstrap_hostnames: Vec<&'static str>,
+    hostname_policy: RuntimeHostnamePolicy,
     materializations: Option<MaterializationSubmitter>,
 }
 
@@ -542,39 +572,27 @@ impl ObservationRecorder {
                     .cname_authorizations
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned");
-                authorized_selected_profile_hostname(
+                authorized_hostname(
                     hostname,
                     &mut authorizations,
                     Instant::now(),
-                    &self.bootstrap_hostnames,
+                    &self.hostname_policy,
                 )
             }
         }
     }
 
-    fn profile_classification(&self, hostname: &str) -> &'static str {
-        let classification =
-            profile_classification(self.scope, hostname, &self.bootstrap_hostnames);
-        if classification != "github_related_outside_profile" {
-            classification
-        } else {
-            let mut authorizations = self
-                .cname_authorizations
-                .lock()
-                .expect("DNS CNAME authorization lock poisoned");
-            remove_expired_cname_authorizations(&mut authorizations, Instant::now());
-            if authorizations.bounded_actions_suffix.contains(hostname) {
-                "matches_bounded_actions_suffix_authorization"
-            } else if authorizations.active.contains_key(hostname) {
-                "matches_ttl_bounded_cname_descendant"
-            } else {
-                classification
-            }
-        }
+    fn policy_classification(&self, hostname: &str) -> &'static str {
+        let mut authorizations = self
+            .cname_authorizations
+            .lock()
+            .expect("DNS CNAME authorization lock poisoned");
+        remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+        policy_classification(hostname, &authorizations, &self.hostname_policy)
     }
 
     fn materialization_ttl_seconds(&self, hostname: &str, ttl_seconds: u32) -> Option<u32> {
-        if matches_exact_selected_profile_hostname(hostname, &self.bootstrap_hostnames) {
+        if self.hostname_policy.exact_entry(hostname).is_some() {
             return bound_materialization_ttl(ttl_seconds, None);
         }
         let now = Instant::now();
@@ -609,19 +627,15 @@ impl ObservationRecorder {
             routing_status,
             self.scope,
             &authorizations,
-            &self.bootstrap_hostnames,
+            &self.hostname_policy,
         )
     }
 
     fn record_query(&self, hostname: &str, query_type: u16, forwarded: bool) {
         let normalized = normalize_hostname(hostname);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
-        if let Some(hostname) = normalized
-            .as_ref()
-            .filter(|name| reportable_github_hostname(name))
-            .cloned()
-        {
-            let classification = self.profile_classification(&hostname);
+        if let Some(hostname) = normalized {
+            let classification = self.policy_classification(&hostname);
             let key = (hostname, query_type, classification);
             if let Some(observation) = state.retained.get_mut(&key) {
                 observation.occurrences = observation.occurrences.saturating_add(1);
@@ -637,8 +651,8 @@ impl ObservationRecorder {
                 state.truncated = true;
             }
         } else {
-            state.excluded_non_github_query_count =
-                state.excluded_non_github_query_count.saturating_add(1);
+            state.excluded_unretained_query_count =
+                state.excluded_unretained_query_count.saturating_add(1);
         }
         if self.scope.is_block() && !forwarded {
             state.blocked_non_profile_query_count =
@@ -667,39 +681,61 @@ impl ObservationRecorder {
         };
         let forwardable_block_response =
             self.scope.is_block() && self.forward_query(&hostname, query_type);
-        if forwardable_block_response {
+        let policy = {
             let mut authorizations = self
                 .cname_authorizations
                 .lock()
                 .expect("DNS CNAME authorization lock poisoned");
-            retain_cname_authorizations(
-                &mut authorizations,
-                parse_dns_cname_answers(packet),
-                Instant::now(),
-                &self.bootstrap_hostnames,
+            remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+            let policy = hostname_policy_for_authorized_name(
+                &hostname,
+                &authorizations,
+                &self.hostname_policy,
             );
-        }
+            if policy.is_some() {
+                retain_cname_authorizations(
+                    &mut authorizations,
+                    parse_dns_cname_answers(packet),
+                    Instant::now(),
+                    &self.hostname_policy,
+                );
+            }
+            policy
+        };
         let answers = parse_dns_address_answers(packet);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
-        if reportable_github_hostname(&hostname) {
-            let classification = self.profile_classification(&hostname);
-            let key = (hostname.clone(), query_type, classification);
-            if let Some(observation) = state.retained.get_mut(&key) {
-                retain_address_answers(observation, answers.clone());
-            }
+        let classification = self.policy_classification(&hostname);
+        let key = (hostname.clone(), query_type, classification);
+        if let Some(observation) = state.retained.get_mut(&key) {
+            retain_address_answers(observation, answers.clone());
         }
         let materializations = if forwardable_block_response {
+            let Some((origins, transports)) = policy else {
+                drop(state);
+                self.record_materialization_rejection();
+                return DnsResponseDisposition::RetryableFailure;
+            };
             answers
                 .into_iter()
                 .filter_map(|answer| {
                     let ttl_seconds =
                         self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)?;
-                    Some(PendingMaterialization {
-                        source_hostname: hostname.clone(),
-                        hostname: answer.hostname,
-                        address: answer.address,
-                        ttl_seconds,
-                    })
+                    Some((answer, ttl_seconds))
+                })
+                .flat_map(|(answer, ttl_seconds)| {
+                    let source_hostname = hostname.clone();
+                    let origins = origins.clone();
+                    transports
+                        .iter()
+                        .map(move |transport| PendingMaterialization {
+                            source_hostname: source_hostname.clone(),
+                            hostname: answer.hostname.clone(),
+                            address: answer.address,
+                            protocol: transport.protocol,
+                            port: transport.port,
+                            origins: origins.clone(),
+                            ttl_seconds,
+                        })
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -757,6 +793,17 @@ impl ObservationRecorder {
         }
     }
 
+    fn record_hostname_refresh_warning(&self) {
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        state.hostname_refresh_warnings = state.hostname_refresh_warnings.saturating_add(1);
+        let evidence = self.evidence_from_state(&state, self.scope.active_routing_status());
+        let write_result = write_report(&self.report_path, &evidence);
+        drop(state);
+        if write_result.is_err() {
+            self.report_write_failed.store(true, Ordering::Relaxed);
+        }
+    }
+
     fn reset_after_activation(&self) -> Result<(), DnsMediationError> {
         let mut state = self.state.lock().map_err(|_| {
             DnsMediationError::new(
@@ -777,7 +824,7 @@ impl ObservationRecorder {
             self.scope.active_routing_status(),
             self.scope,
             &authorizations,
-            &self.bootstrap_hostnames,
+            &self.hostname_policy,
         );
         drop(authorizations);
         let write_result = write_report(&self.report_path, &evidence);
@@ -900,7 +947,7 @@ impl DnsMediationSession {
     fn establish(
         runtime_directory: &Path,
         scope: DnsEvidenceScope,
-        bootstrap_hostnames: Vec<&'static str>,
+        hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
         let report_path = runtime_directory.join("dns-report.json");
@@ -910,7 +957,7 @@ impl DnsMediationSession {
             report_write_failed: Arc::new(AtomicBool::new(false)),
             report_path,
             scope,
-            bootstrap_hostnames,
+            hostname_policy,
             materializations,
         };
         write_report(
@@ -926,7 +973,7 @@ impl DnsMediationSession {
                     .cname_authorizations
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned"),
-                &recorder.bootstrap_hostnames,
+                &recorder.hostname_policy,
             ),
         )?;
         let threads = start_dns_proxy(recorder.clone())?;
@@ -1169,12 +1216,12 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     reader: NflogReader,
     runtime: R,
     base_allowances: Vec<EffectiveAllowance>,
-    active: BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
+    active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
     expected_state: OwnedNftState,
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
     scope: DnsBlockRuntimeScope,
-    next_dns_refresh: Duration,
+    next_hostname_refresh: BTreeMap<String, Duration>,
     next_verification: Duration,
 }
 
@@ -1186,8 +1233,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         plan: &PlanData,
         scope: DnsBlockRuntimeScope,
     ) -> Result<Self, DnsMediationError> {
-        let bootstrap_hostnames = mediation.recorder.bootstrap_hostnames.clone();
-        let prehydrated = match prehydrate_bootstrap_names(&bootstrap_hostnames) {
+        let hostname_policy = mediation.recorder.hostname_policy.clone();
+        let prehydrated = match prehydrate_exact_hostnames(&hostname_policy) {
             Ok(materializations) => materializations,
             Err(error) => {
                 let _ = mediation.routing.rollback();
@@ -1196,9 +1243,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         };
         let mut active = BTreeMap::new();
         let merge = merge_materializations(&mut active, prehydrated, Instant::now());
-        if !merge.rules_changed
-            || !active_covers_selected_profile_bootstrap_roots(&active, &bootstrap_hostnames)
-        {
+        if !merge.rules_changed || !active_covers_exact_hostname_policy(&active, &hostname_policy) {
             let _ = mediation.routing.rollback();
             return Err(DnsMediationError::new(
                 "dns_block_prehydration_failed",
@@ -1206,7 +1251,14 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             ));
         }
         let allowances =
-            effective_allowances_with_materializations(&plan.effective_policy, &active);
+            effective_allowances_with_materializations(&plan.runtime_static_policy, &active);
+        if allowances.len() > MAX_EXPANDED_RULES {
+            let _ = mediation.routing.rollback();
+            return Err(DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "DNS-mediated policy exceeded the fixed effective-rule bound before activation",
+            ));
+        }
         let ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
         let ruleset_hash = sha256_hex(ruleset.as_bytes());
         let expected_state = expected_dns_mediated_owned_state(Mode::Block, &allowances);
@@ -1316,6 +1368,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         evidence.setup_status = scope.resident_status();
         evidence.readiness_status = scope.ready_status();
         runtime.replace_report(&evidence).map_err(runtime_error)?;
+        let next_hostname_refresh =
+            hostname_refresh_schedule(&hostname_policy, &active, Duration::ZERO);
         Ok(Self {
             _mediation: mediation,
             materialization_requests,
@@ -1324,13 +1378,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             lockdown,
             reader,
             runtime,
-            base_allowances: plan.effective_policy.clone(),
+            base_allowances: plan.runtime_static_policy.clone(),
             active,
             expected_state,
             evidence,
             findings: FindingCollection::empty(),
             scope,
-            next_dns_refresh: DNS_PROFILE_REFRESH_INTERVAL,
+            next_hostname_refresh,
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
         })
     }
@@ -1365,17 +1419,40 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
 
         let mut root_refresh_error = None;
         let mut refresh_materializations = BTreeSet::new();
-        if elapsed >= self.next_dns_refresh {
-            match prehydrate_bootstrap_names(&self._mediation.recorder.bootstrap_hostnames) {
+        let due_hostname = self
+            .next_hostname_refresh
+            .iter()
+            .find_map(|(hostname, due)| (*due <= elapsed).then(|| hostname.clone()));
+        if let Some(hostname) = due_hostname {
+            let entry = self
+                ._mediation
+                .recorder
+                .hostname_policy
+                .exact_entry(&hostname)
+                .expect("refresh schedule contains only exact policy hostnames")
+                .clone();
+            match prehydrate_exact_hostname(&entry, &self._mediation.recorder.hostname_policy) {
                 Ok(materializations) => {
+                    let refresh_interval = hostname_refresh_interval(&entry, &materializations);
                     refresh_materializations.extend(materializations);
+                    self.next_hostname_refresh
+                        .insert(hostname, elapsed + refresh_interval);
                 }
-                Err(error) => root_refresh_error = Some(error),
+                Err(error) => {
+                    if matches!(error, PrehydrationError::Transient(_)) {
+                        self.evidence.hostname_refresh_warnings =
+                            self.evidence.hostname_refresh_warnings.saturating_add(1);
+                        self._mediation.recorder.record_hostname_refresh_warning();
+                    }
+                    self.next_hostname_refresh
+                        .insert(hostname, elapsed + DNS_PROFILE_REFRESH_INTERVAL);
+                    root_refresh_error = Some(error);
+                }
             };
-            self.next_dns_refresh = elapsed + DNS_PROFILE_REFRESH_INTERVAL;
             changed = true;
         }
 
+        let refresh_attempted = !refresh_materializations.is_empty();
         let (materializations, accepted_requests, rejected_requests) =
             self.collect_materialization_batch(refresh_materializations);
         if rejected_requests > 0 {
@@ -1386,32 +1463,51 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let batch_has_work = !materializations.is_empty();
         let mut proposed = self.active.clone();
         let merge = merge_materializations(&mut proposed, materializations, Instant::now());
+        let proposed_allowances =
+            effective_allowances_with_materializations(&self.base_allowances, &proposed);
+        let effective_rule_limit_exceeded = proposed_allowances.len() > MAX_EXPANDED_RULES;
         let update_succeeded = if merge.rules_changed {
-            let allowances =
-                effective_allowances_with_materializations(&self.base_allowances, &proposed);
-            let ruleset = render_dns_mediated_replacement_ruleset(Mode::Block, &allowances);
-            let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
-            let expected = expected_dns_mediated_owned_state(Mode::Block, &allowances);
-            if self.backend.preflight(&ruleset).is_ok()
-                && self.backend.replace_owned_state(&ruleset).is_ok()
-                && self.backend.verify_owned_state(&expected).is_ok()
-            {
-                self.active = proposed;
-                self.expected_state = expected;
-                self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
-                self.evidence.network_verification_status = "verified";
-                true
-            } else {
-                self.evidence.network_verification_status = "critical_dynamic_update_failed";
-                self.record_critical(
-                    "dns_block_dynamic_update_failed",
-                    "approved DNS-derived owned nftables replacement failed after readiness",
-                );
+            if effective_rule_limit_exceeded {
+                self.evidence.materializations_truncated = true;
+                for _ in 0..accepted_requests.len() {
+                    self._mediation.recorder.record_materialization_rejection();
+                }
+                if refresh_attempted {
+                    self.evidence.hostname_refresh_warnings =
+                        self.evidence.hostname_refresh_warnings.saturating_add(1);
+                    self._mediation.recorder.record_hostname_refresh_warning();
+                }
                 false
+            } else {
+                let ruleset =
+                    render_dns_mediated_replacement_ruleset(Mode::Block, &proposed_allowances);
+                let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &proposed_allowances);
+                let expected = expected_dns_mediated_owned_state(Mode::Block, &proposed_allowances);
+                if self.backend.preflight(&ruleset).is_ok()
+                    && self.backend.replace_owned_state(&ruleset).is_ok()
+                    && self.backend.verify_owned_state(&expected).is_ok()
+                {
+                    self.active = proposed;
+                    self.expected_state = expected;
+                    self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
+                    self.evidence.network_verification_status = "verified";
+                    true
+                } else {
+                    self.evidence.network_verification_status = "critical_dynamic_update_failed";
+                    self.record_critical(
+                        "dns_block_dynamic_update_failed",
+                        "approved DNS-derived owned nftables replacement failed after readiness",
+                    );
+                    false
+                }
             }
         } else {
-            self.active = proposed;
-            true
+            if effective_rule_limit_exceeded {
+                false
+            } else {
+                self.active = proposed;
+                true
+            }
         };
         if batch_has_work {
             self._mediation
@@ -1420,7 +1516,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
         if update_succeeded {
             if merge.metadata_changed || merge.rules_changed {
-                self.evidence.materialized_https_allowances = report_materializations(&self.active);
+                self.evidence.materialized_allowances = report_materializations(&self.active);
                 self.evidence.expired_materializations = self
                     .evidence
                     .expired_materializations
@@ -1439,7 +1535,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         if let Some((code, message)) = root_refresh_critical_finding(
             root_refresh_error.as_ref(),
             &self.active,
-            &self._mediation.recorder.bootstrap_hostnames,
+            &self._mediation.recorder.hostname_policy,
         ) {
             self.evidence.network_verification_status = "critical_dynamic_update_failed";
             self.record_critical(code, message);
@@ -1573,7 +1669,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             "trusted launcher configuration invocation identifier must match its runtime directory",
         ));
     }
-    let plan = build_plan(normalized, &SystemResolver).map_err(config_error)?;
+    let plan = build_activation_plan(normalized).map_err(config_error)?;
     if plan.platform_profile.id != GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
         || plan
             .platform_profile
@@ -1588,13 +1684,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             "protected run accepts only reviewed block or audit modes with the hosted workflow-bootstrap profile",
         ));
     }
-    let bootstrap_hostnames = plan
-        .platform_profile
-        .dns_mediated_compatibility
-        .as_ref()
-        .expect("reviewed DNS-mediated profile checked above")
-        .bootstrap_hostnames
-        .clone();
+    let hostname_policy = plan.runtime_hostname_policy.clone();
     let mut fingerprint = SystemLockdownControl::new(runtime.directory());
     fingerprint
         .verify_supported_host()
@@ -1605,7 +1695,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
                 DnsEvidenceScope::ProtectedHostAudit,
-                bootstrap_hostnames.clone(),
+                hostname_policy.clone(),
                 None,
             )?;
             let mut session = DnsMediatedAuditSession::establish(runtime, mediation, &plan)?;
@@ -1633,7 +1723,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
                 scope.dns_scope(),
-                bootstrap_hostnames.clone(),
+                hostname_policy.clone(),
                 Some(materialization_submitter),
             )?;
             let mut session = DnsMediatedBlockSession::establish(
@@ -1683,17 +1773,10 @@ pub fn run_selected_profile_runtime_test_service(
     let runtime =
         TestRuntimeStore::create(runtime_root, &plan.invocation_id).map_err(runtime_error)?;
     let (materialization_submitter, materialization_requests) = materialization_request_channel();
-    let bootstrap_hostnames = plan
-        .platform_profile
-        .dns_mediated_compatibility
-        .as_ref()
-        .expect("reviewed DNS-mediated profile checked above")
-        .bootstrap_hostnames
-        .clone();
     let mediation = DnsMediationSession::establish(
         &runtime.directory,
         DnsBlockRuntimeScope::TestEvidence.dns_scope(),
-        bootstrap_hostnames,
+        plan.runtime_hostname_policy.clone(),
         Some(materialization_submitter),
     )?;
     let mut session = DnsMediatedBlockSession::establish(
@@ -1712,7 +1795,7 @@ pub fn run_selected_profile_runtime_test_service(
 
 fn initial_dns_block_evidence(
     plan: &PlanData,
-    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
     materializations_truncated: bool,
     ruleset_hash: String,
     scope: DnsBlockRuntimeScope,
@@ -1726,12 +1809,8 @@ fn initial_dns_block_evidence(
         policy_hash_schema_version: plan.policy_hash_schema_version,
         policy_hash: plan.policy_hash.clone(),
         base_ruleset_hash: plan.ruleset_hash.clone(),
-        bootstrap_hostnames: plan
-            .platform_profile
-            .dns_mediated_compatibility
-            .as_ref()
-            .map(|profile| profile.bootstrap_hostnames.clone())
-            .unwrap_or_default(),
+        bootstrap_hostnames: plan.runtime_hostname_policy.platform_hostnames(),
+        hostname_policy: plan.runtime_hostname_policy.clone(),
         setup_status: "setting_up",
         network_application_status: "not_applied",
         network_verification_status: "not_verified",
@@ -1741,10 +1820,11 @@ fn initial_dns_block_evidence(
         rollback_status: "not_required",
         ruleset_hash,
         dns_upstream_policy: "root_resident_mediator_only_udp_53",
-        materialization_status: "bounded_ttl_plus_refresh_overlap_constrained_actions_or_cname_descendant_https_only",
-        materialized_https_allowances: report_materializations(active),
+        materialization_status: "bounded_ttl_exact_host_and_cname_transport_policy",
+        materialized_allowances: report_materializations(active),
         materializations_truncated,
         expired_materializations: 0,
+        hostname_refresh_warnings: 0,
         counters: NetworkEvidenceCounters {
             total_violations: 0,
             sampled_violations: 0,
@@ -1876,38 +1956,105 @@ impl PrehydrationError {
     }
 }
 
-fn prehydrate_bootstrap_names(
-    bootstrap_hostnames: &[&'static str],
+fn prehydrate_exact_hostnames(
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
     let mut materializations = Vec::new();
-    let now = Instant::now();
-    for hostname in bootstrap_hostnames {
-        let hostname_materializations = materializations_from_bootstrap_query_results(
-            hostname,
-            now,
-            bootstrap_hostnames,
-            [1_u16, 28_u16].map(|query_type| {
-                (
-                    query_type,
-                    query_fixed_upstream_for_prehydration(hostname, query_type),
-                )
-            }),
-        )?;
+    for entry in &hostname_policy.exact {
+        let hostname_materializations = prehydrate_exact_hostname(entry, hostname_policy)?;
         materializations.extend(hostname_materializations);
-        if materializations.len() > MAX_DYNAMIC_MATERIALIZATIONS {
+        if materializations.len() > MAX_ACTIVE_MATERIALIZATIONS {
             return Err(PrehydrationError::Fatal(DnsMediationError::new(
                 "dns_block_prehydration_failed",
-                "fixed DNS-mediated bootstrap hostnames exceeded the materialization bound",
+                "exact DNS-mediated hostnames exceeded the active materialization bound",
             )));
         }
     }
     Ok(materializations)
 }
 
+fn prehydrate_exact_hostname(
+    entry: &ExactHostnamePolicy,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
+    let hostname = &entry.hostname;
+    let materializations = materializations_from_bootstrap_query_results(
+        hostname,
+        Instant::now(),
+        hostname_policy,
+        [1_u16, 28_u16].map(|query_type| {
+            (
+                query_type,
+                query_fixed_upstream_for_prehydration(hostname, query_type),
+            )
+        }),
+    )?;
+    if materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+        return Err(PrehydrationError::Fatal(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "one exact hostname exceeded the fixed per-update materialization bound",
+        )));
+    }
+    Ok(materializations)
+}
+
+fn hostname_refresh_schedule(
+    hostname_policy: &RuntimeHostnamePolicy,
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    elapsed: Duration,
+) -> BTreeMap<String, Duration> {
+    hostname_policy
+        .exact
+        .iter()
+        .map(|entry| {
+            (
+                entry.hostname.clone(),
+                elapsed + hostname_refresh_interval_from_active(entry, active),
+            )
+        })
+        .collect()
+}
+
+fn hostname_refresh_interval(
+    entry: &ExactHostnamePolicy,
+    materializations: &[PendingMaterialization],
+) -> Duration {
+    if entry.origins.contains(&HostnamePolicyOrigin::Platform) {
+        return DNS_PROFILE_REFRESH_INTERVAL;
+    }
+    let minimum_ttl = materializations
+        .iter()
+        .map(|materialization| materialization.ttl_seconds)
+        .min()
+        .unwrap_or(1);
+    user_hostname_refresh_interval(minimum_ttl)
+}
+
+fn hostname_refresh_interval_from_active(
+    entry: &ExactHostnamePolicy,
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+) -> Duration {
+    if entry.origins.contains(&HostnamePolicyOrigin::Platform) {
+        return DNS_PROFILE_REFRESH_INTERVAL;
+    }
+    let minimum_ttl = active
+        .values()
+        .filter(|materialization| materialization.source_hostname == entry.hostname)
+        .map(|materialization| materialization.observed_ttl_seconds)
+        .min()
+        .unwrap_or(1);
+    user_hostname_refresh_interval(minimum_ttl)
+}
+
+fn user_hostname_refresh_interval(ttl_seconds: u32) -> Duration {
+    let half_ttl = u64::from(ttl_seconds).div_ceil(2).max(1);
+    Duration::from_secs(half_ttl).min(MAX_USER_HOSTNAME_REFRESH_INTERVAL)
+}
+
 fn materializations_from_bootstrap_query_results(
     hostname: &str,
     now: Instant,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
     results: impl IntoIterator<Item = (u16, Result<Vec<u8>, PrehydrationQueryError>)>,
 ) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
     let mut materializations = Vec::new();
@@ -1920,7 +2067,7 @@ fn materializations_from_bootstrap_query_results(
                     query_type,
                     &response,
                     now,
-                    bootstrap_hostnames,
+                    hostname_policy,
                 )
                 .map_err(PrehydrationError::Fatal)?,
             ),
@@ -1948,8 +2095,8 @@ fn materializations_from_bootstrap_query_results(
 
 fn root_refresh_critical_finding(
     error: Option<&PrehydrationError>,
-    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
-    bootstrap_hostnames: &[&'static str],
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> Option<(&'static str, &'static str)> {
     match error {
         Some(PrehydrationError::Fatal(_)) => Some((
@@ -1957,7 +2104,7 @@ fn root_refresh_critical_finding(
             "DNS-mediated exact-root refresh received invalid bootstrap DNS evidence after readiness",
         )),
         Some(PrehydrationError::Transient(_))
-            if !active_covers_selected_profile_bootstrap_roots(active, bootstrap_hostnames) =>
+            if !active_covers_exact_hostname_policy(active, hostname_policy) =>
         {
             Some((
                 "dns_block_root_refresh_failed",
@@ -2012,7 +2159,7 @@ fn pending_materializations_from_bootstrap_response(
     query_type: u16,
     packet: &[u8],
     now: Instant,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, DnsMediationError> {
     if parse_dns_question(packet) != Some((queried_hostname.to_owned(), query_type)) {
         return Err(DnsMediationError::new(
@@ -2025,7 +2172,7 @@ fn pending_materializations_from_bootstrap_response(
         &mut authorizations,
         parse_dns_cname_answers(packet),
         now,
-        bootstrap_hostnames,
+        hostname_policy,
     );
 
     let mut materializations = Vec::new();
@@ -2035,20 +2182,37 @@ fn pending_materializations_from_bootstrap_response(
             &answer.hostname,
             answer.ttl_seconds,
             now,
-            bootstrap_hostnames,
+            hostname_policy,
         ) else {
             continue;
         };
-        materializations.push(PendingMaterialization {
-            source_hostname: queried_hostname.to_owned(),
-            hostname: answer.hostname,
-            address: answer.address,
-            ttl_seconds,
-        });
+        let Some(entry) = hostname_policy.exact_entry(queried_hostname) else {
+            return Err(DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "an exact prehydration hostname was absent from the logical policy",
+            ));
+        };
+        for transport in &entry.transports {
+            materializations.push(PendingMaterialization {
+                source_hostname: queried_hostname.to_owned(),
+                hostname: answer.hostname.clone(),
+                address: answer.address,
+                protocol: transport.protocol,
+                port: transport.port,
+                origins: entry.origins.clone(),
+                ttl_seconds,
+            });
+        }
     }
     materializations.sort();
     materializations.dedup();
-    if materializations.len() > MAX_RETAINED_ADDRESSES_PER_OBSERVATION {
+    if materializations
+        .iter()
+        .map(|materialization| materialization.address)
+        .collect::<BTreeSet<_>>()
+        .len()
+        > MAX_RETAINED_ADDRESSES_PER_OBSERVATION
+    {
         return Err(DnsMediationError::new(
             "dns_block_prehydration_failed",
             "a fixed DNS-mediated bootstrap hostname exceeded the address bound",
@@ -2062,9 +2226,9 @@ fn prehydration_materialization_ttl_seconds(
     hostname: &str,
     ttl_seconds: u32,
     now: Instant,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> Option<u32> {
-    if matches_exact_selected_profile_hostname(hostname, bootstrap_hostnames) {
+    if hostname_policy.exact_entry(hostname).is_some() {
         return bound_materialization_ttl(ttl_seconds, None);
     }
     let remaining_seconds = authorizations
@@ -2085,7 +2249,7 @@ fn submit_materialization_request(
     submitter: &MaterializationSubmitter,
     materializations: BTreeSet<PendingMaterialization>,
 ) -> Result<MaterializationCompletion, ()> {
-    if materializations.is_empty() || materializations.len() > MAX_DYNAMIC_MATERIALIZATIONS {
+    if materializations.is_empty() || materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
         return Err(());
     }
     let (completion, result) = mpsc::sync_channel(1);
@@ -2113,7 +2277,7 @@ fn build_bounded_materialization_batch(
     for request in requests {
         let mut combined = materializations.clone();
         combined.extend(request.materializations.iter().cloned());
-        if combined.len() > MAX_DYNAMIC_MATERIALIZATIONS {
+        if combined.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
             rejected.push(request);
         } else {
             materializations = combined;
@@ -2124,13 +2288,19 @@ fn build_bounded_materialization_batch(
 }
 
 fn merge_materializations(
-    active: &mut BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
+    active: &mut BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
     materializations: impl IntoIterator<Item = PendingMaterialization>,
     now: Instant,
 ) -> MaterializationMerge {
-    let addresses_before = active
+    let rules_before = active
         .values()
-        .map(|materialization| materialization.address)
+        .map(|materialization| {
+            (
+                materialization.address,
+                materialization.protocol,
+                materialization.port,
+            )
+        })
         .collect::<BTreeSet<_>>();
     let expired = active
         .extract_if(.., |_, materialization| materialization.expires_at <= now)
@@ -2141,11 +2311,16 @@ fn merge_materializations(
             materialization.source_hostname.clone(),
             materialization.hostname.clone(),
             materialization.address,
+            materialization.protocol,
+            materialization.port,
         );
         let replacement = ActiveMaterialization {
             source_hostname: materialization.source_hostname,
             hostname: materialization.hostname,
             address: materialization.address,
+            protocol: materialization.protocol,
+            port: materialization.port,
+            origins: materialization.origins,
             observed_ttl_seconds: materialization.ttl_seconds,
             expires_at: now
                 + Duration::from_secs(u64::from(materialization.ttl_seconds))
@@ -2157,12 +2332,18 @@ fn merge_materializations(
         });
         active.insert(key, replacement);
     }
-    let addresses_after = active
+    let rules_after = active
         .values()
-        .map(|materialization| materialization.address)
+        .map(|materialization| {
+            (
+                materialization.address,
+                materialization.protocol,
+                materialization.port,
+            )
+        })
         .collect::<BTreeSet<_>>();
     MaterializationMerge {
-        rules_changed: addresses_before != addresses_after,
+        rules_changed: rules_before != rules_after,
         metadata_changed,
         expired,
     }
@@ -2179,7 +2360,7 @@ fn complete_materialization_requests(
 
 fn effective_allowances_with_materializations(
     base_allowances: &[EffectiveAllowance],
-    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
 ) -> Vec<EffectiveAllowance> {
     base_allowances
         .iter()
@@ -2187,8 +2368,8 @@ fn effective_allowances_with_materializations(
         .chain(active.values().map(|materialization| EffectiveAllowance {
             destination_type: DestinationType::Ip,
             destination: materialization.address.to_string(),
-            protocol: Protocol::Tcp,
-            port: 443,
+            protocol: materialization.protocol,
+            port: materialization.port,
         }))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -2196,37 +2377,49 @@ fn effective_allowances_with_materializations(
 }
 
 fn report_materializations(
-    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
-) -> Vec<DnsMaterializedHttpsAllowance> {
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+) -> Vec<DnsMaterializedAllowance> {
+    let now = Instant::now();
     active
         .values()
-        .map(|materialization| DnsMaterializedHttpsAllowance {
+        .map(|materialization| DnsMaterializedAllowance {
+            source_hostname: materialization.source_hostname.clone(),
             hostname: materialization.hostname.clone(),
             address: materialization.address.to_string(),
-            protocol: "tcp",
-            port: 443,
+            protocol: materialization.protocol,
+            port: materialization.port,
+            origins: materialization.origins.clone(),
             observed_ttl_seconds: materialization.observed_ttl_seconds,
+            expires_in_seconds: materialization
+                .expires_at
+                .saturating_duration_since(now)
+                .as_secs(),
         })
         .collect()
 }
 
-fn active_covers_selected_profile_bootstrap_roots(
-    active: &BTreeMap<(String, String, IpAddr), ActiveMaterialization>,
-    bootstrap_hostnames: &[&'static str],
+fn active_covers_exact_hostname_policy(
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
     let covered = active
         .values()
-        .filter(|materialization| {
-            matches_exact_selected_profile_hostname(
-                &materialization.source_hostname,
-                bootstrap_hostnames,
+        .map(|materialization| {
+            (
+                materialization.source_hostname.as_str(),
+                HostnameTransport {
+                    protocol: materialization.protocol,
+                    port: materialization.port,
+                },
             )
         })
-        .map(|materialization| materialization.source_hostname.as_str())
         .collect::<BTreeSet<_>>();
-    bootstrap_hostnames
-        .iter()
-        .all(|hostname| covered.contains(hostname))
+    hostname_policy.exact.iter().all(|entry| {
+        entry
+            .transports
+            .iter()
+            .all(|transport| covered.contains(&(entry.hostname.as_str(), *transport)))
+    })
 }
 
 fn rollback_dns_block_setup(
@@ -2825,23 +3018,53 @@ fn bound_materialization_ttl(
     (bounded_ttl > 0).then_some(bounded_ttl)
 }
 
-fn authorized_selected_profile_hostname(
+fn platform_transport_policy() -> (Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>) {
+    (
+        vec![HostnamePolicyOrigin::Platform],
+        vec![HostnameTransport {
+            protocol: Protocol::Tcp,
+            port: 443,
+        }],
+    )
+}
+
+fn hostname_policy_for_authorized_name(
+    hostname: &str,
+    state: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> Option<(Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>)> {
+    if let Some(entry) = hostname_policy.exact_entry(hostname) {
+        return Some((entry.origins.clone(), entry.transports.clone()));
+    }
+    if state.bounded_actions_suffix.contains(hostname) {
+        return Some(platform_transport_policy());
+    }
+    let mut current = hostname;
+    for _ in 0..MAX_DERIVED_CNAME_DEPTH {
+        let authorization = state.active.get(current)?;
+        current = &authorization.source_hostname;
+        if let Some(entry) = hostname_policy.exact_entry(current) {
+            return Some((entry.origins.clone(), entry.transports.clone()));
+        }
+        if state.bounded_actions_suffix.contains(current) {
+            return Some(platform_transport_policy());
+        }
+    }
+    None
+}
+
+fn authorized_hostname(
     hostname: &str,
     state: &mut CnameAuthorizationState,
     now: Instant,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
     remove_expired_cname_authorizations(state, now);
-    if matches_exact_selected_profile_hostname(hostname, bootstrap_hostnames)
-        || state.active.contains_key(hostname)
-    {
+    if hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some() {
         return true;
     }
-    if !matches_constrained_dynamic_actions_suffix_hostname(hostname, bootstrap_hostnames) {
+    if !matches_constrained_dynamic_actions_suffix_hostname(hostname, hostname_policy) {
         return false;
-    }
-    if state.bounded_actions_suffix.contains(hostname) {
-        return true;
     }
     if state.bounded_actions_suffix.len() >= MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
         state.bounded_actions_suffix_truncated = true;
@@ -2855,24 +3078,23 @@ fn retain_cname_authorizations(
     state: &mut CnameAuthorizationState,
     aliases: impl IntoIterator<Item = DnsCnameAnswer>,
     now: Instant,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) {
     remove_expired_cname_authorizations(state, now);
     let mut pending: Vec<DnsCnameAnswer> = aliases.into_iter().collect();
     for _ in 0..MAX_DERIVED_CNAME_DEPTH {
         let mut progressed = false;
         pending.retain(|alias| {
-            let source_depth =
-                if matches_exact_selected_profile_hostname(&alias.owner, bootstrap_hostnames)
-                    || state.bounded_actions_suffix.contains(&alias.owner)
-                {
-                    Some(0)
-                } else {
-                    state
-                        .active
-                        .get(&alias.owner)
-                        .map(|authorization| authorization.depth)
-                };
+            let source_depth = if hostname_policy.exact_entry(&alias.owner).is_some()
+                || state.bounded_actions_suffix.contains(&alias.owner)
+            {
+                Some(0)
+            } else {
+                state
+                    .active
+                    .get(&alias.owner)
+                    .map(|authorization| authorization.depth)
+            };
             let Some(source_depth) = source_depth else {
                 return true;
             };
@@ -2953,29 +3175,28 @@ fn normalize_hostname(hostname: &str) -> Option<String> {
         .then_some(hostname)
 }
 
-fn reportable_github_hostname(hostname: &str) -> bool {
-    hostname == "github.com"
-        || hostname.ends_with(".github.com")
-        || hostname.ends_with(".githubusercontent.com")
-        || hostname.ends_with(".githubapp.com")
-        || (hostname.starts_with("productionresultssa")
-            && hostname.ends_with(".blob.core.windows.net"))
-}
-
-fn matches_selected_profile_pattern(hostname: &str, bootstrap_hostnames: &[&'static str]) -> bool {
-    matches_actions_suffix_hostname(hostname)
-        || matches_exact_selected_profile_hostname(hostname, bootstrap_hostnames)
-        || hostname == "actions-results-receiver-production.githubapp.com"
-}
-
-fn matches_exact_selected_profile_hostname(
+#[cfg(test)]
+fn matches_selected_profile_pattern(
     hostname: &str,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
-    bootstrap_hostnames.contains(&hostname)
+    matches_actions_suffix_hostname(hostname)
+        || hostname_policy
+            .exact_entry(hostname)
+            .is_some_and(|entry| entry.origins.contains(&HostnamePolicyOrigin::Platform))
         || hostname == "actions-results-receiver-production.githubapp.com"
 }
 
+fn matches_exact_platform_hostname(
+    hostname: &str,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> bool {
+    hostname_policy
+        .exact_entry(hostname)
+        .is_some_and(|entry| entry.origins.contains(&HostnamePolicyOrigin::Platform))
+}
+
+#[cfg(test)]
 fn matches_actions_suffix_hostname(hostname: &str) -> bool {
     hostname.ends_with(".actions.githubusercontent.com")
         && hostname != "actions.githubusercontent.com"
@@ -2983,13 +3204,13 @@ fn matches_actions_suffix_hostname(hostname: &str) -> bool {
 
 fn matches_constrained_dynamic_actions_suffix_hostname(
     hostname: &str,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
     let Some(prefix) = hostname.strip_suffix(".actions.githubusercontent.com") else {
         return false;
     };
     let labels: Vec<&str> = prefix.split('.').collect();
-    !matches_exact_selected_profile_hostname(hostname, bootstrap_hostnames)
+    !matches_exact_platform_hostname(hostname, hostname_policy)
         && !labels.is_empty()
         && labels.len() <= MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS
         && labels.iter().all(|label| {
@@ -3007,27 +3228,39 @@ fn matches_supported_block_query_type(query_type: u16) -> bool {
     matches!(query_type, 1 | 28)
 }
 
-fn profile_classification(
-    scope: DnsEvidenceScope,
+fn policy_classification(
     hostname: &str,
-    bootstrap_hostnames: &[&'static str],
+    authorizations: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> &'static str {
-    match scope {
-        DnsEvidenceScope::ProtectedHostAudit
-            if matches_selected_profile_pattern(hostname, bootstrap_hostnames)
-                || matches_exact_selected_profile_hostname(hostname, bootstrap_hostnames) =>
-        {
-            "matches_selected_profile_pattern"
-        }
-        DnsEvidenceScope::SelectedProfileRuntimeTest
-        | DnsEvidenceScope::ProtectedHostBlock
-        | DnsEvidenceScope::ProtectedHostBlockDegraded
-            if matches_exact_selected_profile_hostname(hostname, bootstrap_hostnames) =>
-        {
-            "matches_selected_profile_pattern"
-        }
-        _ => "github_related_outside_profile",
+    if let Some(entry) = hostname_policy.exact_entry(hostname) {
+        return match (
+            entry.origins.contains(&HostnamePolicyOrigin::Platform),
+            entry.origins.contains(&HostnamePolicyOrigin::User),
+        ) {
+            (true, true) => "platform_and_user_allowlist",
+            (true, false) => "platform_profile",
+            (false, true) => "user_allowlist",
+            (false, false) => "outside_policy",
+        };
     }
+    if authorizations.bounded_actions_suffix.contains(hostname) {
+        return "dynamic_platform";
+    }
+    if let Some(authorization) = authorizations.active.get(hostname) {
+        return if hostname_policy_for_authorized_name(
+            &authorization.source_hostname,
+            authorizations,
+            hostname_policy,
+        )
+        .is_some_and(|(origins, _)| origins.contains(&HostnamePolicyOrigin::User))
+        {
+            "user_cname_derived"
+        } else {
+            "platform_cname_derived"
+        };
+    }
+    "outside_policy"
 }
 
 fn query_type_name(query_type: u16) -> String {
@@ -3044,12 +3277,17 @@ fn evidence_from_state(
     routing_status: &'static str,
     scope: DnsEvidenceScope,
 ) -> DnsMediationEvidence {
+    let config = parse_and_normalize(
+        br#"{"schema_version":1,"mode":"block","invocation_id":"evidence","allowlist":[]}"#,
+    )
+    .expect("test hostname policy must parse");
+    let hostname_policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
     evidence_from_state_and_authorizations(
         state,
         routing_status,
         scope,
         &CnameAuthorizationState::default(),
-        &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+        &hostname_policy,
     )
 }
 
@@ -3058,7 +3296,7 @@ fn evidence_from_state_and_authorizations(
     routing_status: &'static str,
     scope: DnsEvidenceScope,
     cname_authorizations: &CnameAuthorizationState,
-    bootstrap_hostnames: &[&'static str],
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> DnsMediationEvidence {
     DnsMediationEvidence {
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
@@ -3066,7 +3304,8 @@ fn evidence_from_state_and_authorizations(
         profile_realization_id: scope.profile_realization_id(),
         platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
         authorized_domain_patterns: DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec(),
-        bootstrap_hostnames: bootstrap_hostnames.to_vec(),
+        bootstrap_hostnames: hostname_policy.platform_hostnames(),
+        hostname_policy: hostname_policy.clone(),
         mode: scope.mode(),
         protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
         routing_status,
@@ -3098,7 +3337,7 @@ fn evidence_from_state_and_authorizations(
                 |((hostname, query_type, classification), observation)| DnsObservation {
                     hostname: hostname.clone(),
                     query_type: query_type_name(*query_type),
-                    profile_classification: classification,
+                    policy_classification: classification,
                     occurrences: observation.occurrences,
                     resolved_addresses: observation
                         .resolved_addresses
@@ -3129,11 +3368,12 @@ fn evidence_from_state_and_authorizations(
             })
             .collect(),
         derived_cname_authorizations_truncated: cname_authorizations.truncated,
-        excluded_non_github_query_count: state.excluded_non_github_query_count,
+        excluded_unretained_query_count: state.excluded_unretained_query_count,
         blocked_non_profile_query_count: state.blocked_non_profile_query_count,
         materialization_batch_count: state.materialization_batch_count,
         materialization_request_rejections: state.materialization_request_rejections,
         materialization_update_max_milliseconds: state.materialization_update_max_milliseconds,
+        hostname_refresh_warnings: state.hostname_refresh_warnings,
         limitations: match scope {
             DnsEvidenceScope::ProtectedHostAudit => protected_dns_audit_limitations(),
             DnsEvidenceScope::SelectedProfileRuntimeTest => vec![
@@ -3393,6 +3633,14 @@ mod tests {
         scope: DnsEvidenceScope,
         materializations: Option<MaterializationSubmitter>,
     ) -> (ObservationRecorder, PathBuf) {
+        test_recorder_with_policy(scope, materializations, test_hostname_policy(false))
+    }
+
+    fn test_recorder_with_policy(
+        scope: DnsEvidenceScope,
+        materializations: Option<MaterializationSubmitter>,
+        hostname_policy: RuntimeHostnamePolicy,
+    ) -> (ObservationRecorder, PathBuf) {
         let report_path = std::env::temp_dir().join(format!(
             "fence-dns-response-{}-{}.json",
             std::process::id(),
@@ -3404,7 +3652,7 @@ mod tests {
             report_write_failed: Arc::new(AtomicBool::new(false)),
             report_path: report_path.clone(),
             scope,
-            bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
+            hostname_policy,
             materializations,
         };
         (recorder, report_path)
@@ -3429,21 +3677,33 @@ mod tests {
 
     fn active_with_all_bootstrap_roots(
         now: Instant,
-    ) -> BTreeMap<(String, String, IpAddr), ActiveMaterialization> {
-        SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-            .iter()
-            .map(|hostname| {
+    ) -> BTreeMap<ActiveMaterializationKey, ActiveMaterialization> {
+        test_hostname_policy(false)
+            .exact
+            .into_iter()
+            .flat_map(|entry| {
                 let address = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
-                (
-                    ((*hostname).to_owned(), (*hostname).to_owned(), address),
-                    ActiveMaterialization {
-                        source_hostname: (*hostname).to_owned(),
-                        hostname: (*hostname).to_owned(),
-                        address,
-                        observed_ttl_seconds: 60,
-                        expires_at: now + Duration::from_secs(60),
-                    },
-                )
+                entry.transports.into_iter().map(move |transport| {
+                    (
+                        (
+                            entry.hostname.clone(),
+                            entry.hostname.clone(),
+                            address,
+                            transport.protocol,
+                            transport.port,
+                        ),
+                        ActiveMaterialization {
+                            source_hostname: entry.hostname.clone(),
+                            hostname: entry.hostname.clone(),
+                            address,
+                            protocol: transport.protocol,
+                            port: transport.port,
+                            origins: entry.origins.clone(),
+                            observed_ttl_seconds: 60,
+                            expires_at: now + Duration::from_secs(60),
+                        },
+                    )
+                })
             })
             .collect()
     }
@@ -3630,6 +3890,93 @@ mod tests {
     }
 
     #[test]
+    fn user_hostname_answers_materialize_every_transport_and_cname_descendant() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"user-host","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"example.com","protocol":"udp","port":53}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            policy,
+        );
+        let caller = thread::spawn(move || {
+            recorder.record_response(
+                "example.com",
+                1,
+                &response_with_cname_and_address(
+                    "example.com",
+                    "edge.example.net",
+                    60,
+                    60,
+                    &[192, 0, 2, 10],
+                ),
+            )
+        });
+        let request = requests.recv().unwrap();
+        assert_eq!(
+            request
+                .materializations
+                .iter()
+                .map(|materialization| (
+                    materialization.hostname.as_str(),
+                    materialization.protocol,
+                    materialization.port,
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("edge.example.net", Protocol::Tcp, 8443),
+                ("edge.example.net", Protocol::Udp, 53),
+            ]
+        );
+        assert!(
+            request
+                .materializations
+                .iter()
+                .all(|materialization| { materialization.origins == [HostnamePolicyOrigin::User] })
+        );
+        request
+            .completion
+            .send(MaterializationCompletion::AppliedAndVerified)
+            .unwrap();
+        assert_eq!(
+            caller.join().unwrap(),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn audit_retains_and_classifies_arbitrary_hostnames() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-host","allowlist":[{"destination_type":"hostname","destination":"allowed.example","protocol":"tcp","port":443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (recorder, report_path) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+
+        recorder.record_query("allowed.example", 1, true);
+        recorder.record_query("outside.example", 28, true);
+        let state = recorder.state.lock().unwrap();
+        assert!(
+            state
+                .retained
+                .contains_key(&("allowed.example".to_owned(), 1, "user_allowlist",))
+        );
+        assert!(
+            state
+                .retained
+                .contains_key(&("outside.example".to_owned(), 28, "outside_policy",))
+        );
+        assert_eq!(state.excluded_unretained_query_count, 0);
+        drop(state);
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
     fn failed_disconnected_and_saturated_materialization_requests_fail_closed() {
         let (submitter, requests) = materialization_request_channel();
         let (recorder, report_path) =
@@ -3700,6 +4047,9 @@ mod tests {
                         source_hostname: "api.github.com".to_owned(),
                         hostname: "api.github.com".to_owned(),
                         address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                        origins: vec![HostnamePolicyOrigin::Platform],
                         ttl_seconds: 30,
                     }]
                     .into_iter()
@@ -3740,13 +4090,16 @@ mod tests {
             state.materialization_batch_count = u64::MAX;
             state.materialization_request_rejections = u64::MAX;
             state.materialization_update_max_milliseconds = u64::MAX - 1;
+            state.hostname_refresh_warnings = u64::MAX;
         }
         recorder.record_materialization_rejection();
         recorder.record_materialization_batch(Duration::from_millis(u64::MAX));
+        recorder.record_hostname_refresh_warning();
         let state = recorder.state.lock().unwrap();
         assert_eq!(state.materialization_batch_count, u64::MAX);
         assert_eq!(state.materialization_request_rejections, u64::MAX);
         assert_eq!(state.materialization_update_max_milliseconds, u64::MAX);
+        assert_eq!(state.hostname_refresh_warnings, u64::MAX);
         drop(state);
         let evidence: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
         assert_eq!(evidence["materialization_batch_count"], u64::MAX);
@@ -3761,6 +4114,49 @@ mod tests {
                 .any(|window| window == b"raw-dns-payload")
         );
         let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn exact_hostname_refresh_intervals_are_origin_and_ttl_aware() {
+        let platform = ExactHostnamePolicy {
+            hostname: "github.com".to_owned(),
+            origins: vec![HostnamePolicyOrigin::Platform],
+            transports: vec![HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: 443,
+            }],
+        };
+        let user = ExactHostnamePolicy {
+            hostname: "example.com".to_owned(),
+            origins: vec![HostnamePolicyOrigin::User],
+            transports: vec![HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: 8443,
+            }],
+        };
+        let materialization = |ttl_seconds| PendingMaterialization {
+            source_hostname: "example.com".to_owned(),
+            hostname: "example.com".to_owned(),
+            address: "192.0.2.10".parse().unwrap(),
+            protocol: Protocol::Tcp,
+            port: 8443,
+            origins: vec![HostnamePolicyOrigin::User],
+            ttl_seconds,
+        };
+
+        assert_eq!(
+            hostname_refresh_interval(&platform, &[materialization(300)]),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            hostname_refresh_interval(&user, &[materialization(300)]),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            hostname_refresh_interval(&user, &[materialization(9)]),
+            Duration::from_secs(5)
+        );
+        assert_eq!(user_hostname_refresh_interval(1), Duration::from_secs(1));
     }
 
     #[test]
@@ -3835,7 +4231,7 @@ mod tests {
             report_write_failed: Arc::new(AtomicBool::new(false)),
             report_path: PathBuf::from("unused-test-report.json"),
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
-            bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
+            hostname_policy: test_hostname_policy(false),
             materializations: None,
         };
         let mut malformed = query("malformed.actions.githubusercontent.com", 1);
@@ -3866,95 +4262,61 @@ mod tests {
 
     #[test]
     fn classifies_selected_profile_patterns_without_authorizing_extra_hosts() {
-        let opt_out_bootstrap_hostnames = [
-            "vstoken.actions.githubusercontent.com",
-            "pipelines.actions.githubusercontent.com",
-            "payload.pipelines.actions.githubusercontent.com",
-            "results-receiver.actions.githubusercontent.com",
-        ];
+        let policy = test_hostname_policy(false);
+        let opt_out = test_hostname_policy(true);
+        let authorizations = CnameAuthorizationState::default();
         assert!(matches_selected_profile_pattern(
             "pipelines.actions.githubusercontent.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+            &policy
         ));
         assert!(matches_selected_profile_pattern(
             "actions-results-receiver-production.githubapp.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+            &policy
         ));
         assert!(!matches_selected_profile_pattern(
             "productionresultssa17.blob.core.windows.net",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+            &policy
         ));
         assert!(!matches_selected_profile_pattern(
             "codeload.github.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+            &policy
         ));
-        assert!(matches_selected_profile_pattern(
-            "api.github.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-        ));
-        assert!(matches_exact_selected_profile_hostname(
-            "github.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-        ));
-        assert!(matches_exact_selected_profile_hostname(
-            "api.github.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-        ));
-        assert!(matches_exact_selected_profile_hostname(
+        assert!(matches_selected_profile_pattern("api.github.com", &policy));
+        assert!(matches_exact_platform_hostname("github.com", &policy));
+        assert!(matches_exact_platform_hostname("api.github.com", &policy));
+        assert!(matches_exact_platform_hostname(
             "release-assets.githubusercontent.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+            &policy
         ));
-        assert!(!matches_exact_selected_profile_hostname(
+        assert!(!matches_exact_platform_hostname(
             "uploads.github.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
+            &policy
         ));
         assert!(!matches_selected_profile_pattern(
             "unrelated.example.com",
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-        ));
-        assert!(reportable_github_hostname("api.github.com"));
-        assert!(!reportable_github_hostname(
-            "unclassified-account.blob.core.windows.net"
+            &policy
         ));
         assert_eq!(
-            profile_classification(
-                DnsEvidenceScope::ProtectedHostAudit,
-                "api.github.com",
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-            ),
-            "matches_selected_profile_pattern"
+            policy_classification("api.github.com", &authorizations, &policy),
+            "platform_profile"
         );
         assert_eq!(
-            profile_classification(
-                DnsEvidenceScope::ProtectedHostAudit,
-                "uploads.github.com",
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-            ),
-            "github_related_outside_profile"
+            policy_classification("uploads.github.com", &authorizations, &policy),
+            "outside_policy"
         );
-        assert!(!matches_exact_selected_profile_hostname(
-            "github.com",
-            &opt_out_bootstrap_hostnames
-        ));
-        assert!(!matches_exact_selected_profile_hostname(
-            "api.github.com",
-            &opt_out_bootstrap_hostnames
-        ));
-        assert!(!matches_exact_selected_profile_hostname(
+        assert!(!matches_exact_platform_hostname("github.com", &opt_out));
+        assert!(!matches_exact_platform_hostname("api.github.com", &opt_out));
+        assert!(!matches_exact_platform_hostname(
             "release-assets.githubusercontent.com",
-            &opt_out_bootstrap_hostnames
+            &opt_out
         ));
-        assert!(matches_exact_selected_profile_hostname(
+        assert!(matches_exact_platform_hostname(
             "pipelines.actions.githubusercontent.com",
-            &opt_out_bootstrap_hostnames
+            &opt_out
         ));
         assert_eq!(
-            profile_classification(
-                DnsEvidenceScope::ProtectedHostBlock,
-                "api.github.com",
-                &opt_out_bootstrap_hostnames
-            ),
-            "github_related_outside_profile"
+            policy_classification("api.github.com", &authorizations, &opt_out),
+            "outside_policy"
         );
     }
 
@@ -4025,43 +4387,44 @@ mod tests {
     #[test]
     fn bounds_dynamic_actions_suffix_names_for_the_profile_lifetime() {
         let now = Instant::now();
+        let policy = test_hostname_policy(false);
         let mut authorizations = CnameAuthorizationState::default();
         for index in 0..MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
-            assert!(authorized_selected_profile_hostname(
+            assert!(authorized_hostname(
                 &format!("dynamic-{index}.actions.githubusercontent.com"),
                 &mut authorizations,
                 now,
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                &policy,
             ));
         }
         assert_eq!(
             authorizations.bounded_actions_suffix.len(),
             MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS
         );
-        assert!(authorized_selected_profile_hostname(
+        assert!(authorized_hostname(
             "dynamic-0.actions.githubusercontent.com",
             &mut authorizations,
             now + Duration::from_secs(600),
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
-        assert!(!authorized_selected_profile_hostname(
+        assert!(!authorized_hostname(
             "dynamic-overflow.actions.githubusercontent.com",
             &mut authorizations,
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
         assert!(authorizations.bounded_actions_suffix_truncated);
-        assert!(!authorized_selected_profile_hostname(
+        assert!(!authorized_hostname(
             "three.labels.deep.actions.githubusercontent.com",
             &mut CnameAuthorizationState::default(),
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
-        assert!(!authorized_selected_profile_hostname(
+        assert!(!authorized_hostname(
             "-invalid.actions.githubusercontent.com",
             &mut CnameAuthorizationState::default(),
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
     }
 
@@ -4102,6 +4465,7 @@ mod tests {
     #[test]
     fn authorizes_only_bounded_ttl_cname_descendants_of_exact_roots() {
         let now = Instant::now();
+        let policy = test_hostname_policy(false);
         let mut authorizations = CnameAuthorizationState::default();
         assert_eq!(bound_materialization_ttl(600, None), Some(300));
         assert_eq!(
@@ -4112,11 +4476,11 @@ mod tests {
             bound_materialization_ttl(300, Some(Duration::from_millis(999))),
             None
         );
-        assert!(!authorized_selected_profile_hostname(
+        assert!(!authorized_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
         retain_cname_authorizations(
             &mut authorizations,
@@ -4126,19 +4490,19 @@ mod tests {
                 60,
             )),
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         );
-        assert!(authorized_selected_profile_hostname(
+        assert!(authorized_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
-        assert!(!authorized_selected_profile_hostname(
+        assert!(!authorized_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now + Duration::from_secs(61),
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
         retain_cname_authorizations(
             &mut authorizations,
@@ -4148,13 +4512,13 @@ mod tests {
                 ttl_seconds: 60,
             }],
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         );
-        assert!(authorized_selected_profile_hostname(
+        assert!(authorized_hostname(
             "edge.example.net",
             &mut authorizations,
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
         retain_cname_authorizations(
             &mut authorizations,
@@ -4164,13 +4528,13 @@ mod tests {
                 ttl_seconds: 60,
             }],
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         );
-        assert!(!authorized_selected_profile_hostname(
+        assert!(!authorized_hostname(
             "not-derived.example.net",
             &mut authorizations,
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         ));
         let mut truncated = response_with_cname(
             "payload.pipelines.actions.githubusercontent.com",
@@ -4218,12 +4582,15 @@ mod tests {
     }
 
     #[test]
-    fn materializes_only_bounded_ttl_https_addresses_and_expires_them() {
+    fn materializes_only_bounded_ttl_transport_rules_and_expires_them() {
         let now = Instant::now();
         let materialization = PendingMaterialization {
             source_hostname: "pipelines.actions.githubusercontent.com".to_owned(),
             hostname: "pipelines.actions.githubusercontent.com".to_owned(),
             address: "192.0.2.10".parse().unwrap(),
+            protocol: Protocol::Tcp,
+            port: 443,
+            origins: vec![HostnamePolicyOrigin::Platform],
             ttl_seconds: 30,
         };
         let mut active = BTreeMap::new();
@@ -4267,9 +4634,12 @@ mod tests {
             source_hostname: "api.github.com".to_owned(),
             hostname: "api.github.com".to_owned(),
             address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
+            protocol: Protocol::Tcp,
+            port: 443,
+            origins: vec![HostnamePolicyOrigin::Platform],
             ttl_seconds: 30,
         };
-        let initial = (0..MAX_DYNAMIC_MATERIALIZATIONS - 1)
+        let initial = (0..MAX_MATERIALIZATIONS_PER_UPDATE - 1)
             .map(materialization)
             .collect::<BTreeSet<_>>();
         let request = |values: BTreeSet<PendingMaterialization>| {
@@ -4282,15 +4652,15 @@ mod tests {
         let duplicate = request([materialization(0)].into_iter().collect());
         let overflow = request(
             [
-                materialization(MAX_DYNAMIC_MATERIALIZATIONS - 1),
-                materialization(MAX_DYNAMIC_MATERIALIZATIONS),
+                materialization(MAX_MATERIALIZATIONS_PER_UPDATE - 1),
+                materialization(MAX_MATERIALIZATIONS_PER_UPDATE),
             ]
             .into_iter()
             .collect(),
         );
         let (combined, accepted, rejected) =
             build_bounded_materialization_batch(initial, vec![duplicate, overflow]);
-        assert_eq!(combined.len(), MAX_DYNAMIC_MATERIALIZATIONS - 1);
+        assert_eq!(combined.len(), MAX_MATERIALIZATIONS_PER_UPDATE - 1);
         assert_eq!(accepted.len(), 1);
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].materializations.len(), 2);
@@ -4299,12 +4669,13 @@ mod tests {
     #[test]
     fn prehydrated_bootstrap_materializations_are_deterministic_and_bounded() {
         let now = Instant::now();
+        let policy = test_hostname_policy(false);
         let root_materializations = pending_materializations_from_bootstrap_response(
             "github.com",
             1,
             &response_with_address("github.com", 1, 600, &[192, 0, 2, 10]),
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         )
         .unwrap();
         let cname_materializations = pending_materializations_from_bootstrap_response(
@@ -4318,7 +4689,7 @@ mod tests {
                 &[192, 0, 2, 20],
             ),
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         )
         .unwrap();
         let unrelated_materializations = pending_materializations_from_bootstrap_response(
@@ -4331,7 +4702,7 @@ mod tests {
                 &[192, 0, 2, 30],
             ),
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
         )
         .unwrap();
         let mut materializations = root_materializations;
@@ -4365,32 +4736,11 @@ mod tests {
         assert!(merge.metadata_changed);
         assert_eq!(merge.expired, 0);
         assert_eq!(active.len(), 2);
-        assert!(active_covers_selected_profile_bootstrap_roots(
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-                .iter()
-                .map(|hostname| {
-                    (
-                        (
-                            (*hostname).to_owned(),
-                            (*hostname).to_owned(),
-                            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
-                        ),
-                        ActiveMaterialization {
-                            source_hostname: (*hostname).to_owned(),
-                            hostname: (*hostname).to_owned(),
-                            address: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
-                            observed_ttl_seconds: 60,
-                            expires_at: now + Duration::from_secs(60),
-                        },
-                    )
-                })
-                .collect(),
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+        assert!(active_covers_exact_hostname_policy(
+            &active_with_all_bootstrap_roots(now),
+            &policy,
         ));
-        assert!(!active_covers_selected_profile_bootstrap_roots(
-            &active,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES
-        ));
+        assert!(!active_covers_exact_hostname_policy(&active, &policy));
 
         assert_eq!(
             pending_materializations_from_bootstrap_response(
@@ -4398,7 +4748,7 @@ mod tests {
                 1,
                 &response_with_address("github.com", 1, 60, &[192, 0, 2, 10]),
                 now,
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                &policy,
             )
             .unwrap_err()
             .code,
@@ -4422,7 +4772,7 @@ mod tests {
                 1,
                 &oversized,
                 now,
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                &policy,
             )
             .unwrap_err()
             .code,
@@ -4433,10 +4783,11 @@ mod tests {
     #[test]
     fn bootstrap_prehydration_tolerates_one_transient_query_family_failure() {
         let now = Instant::now();
+        let policy = test_hostname_policy(false);
         let materializations = materializations_from_bootstrap_query_results(
             "github.com",
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
             [
                 (1, Err(PrehydrationQueryError::Transient)),
                 (
@@ -4463,7 +4814,7 @@ mod tests {
         let error = materializations_from_bootstrap_query_results(
             "github.com",
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
             [
                 (1, Err(PrehydrationQueryError::Transient)),
                 (28, Err(PrehydrationQueryError::Transient)),
@@ -4479,7 +4830,7 @@ mod tests {
         let error = materializations_from_bootstrap_query_results(
             "github.com",
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
             [
                 (
                     1,
@@ -4511,7 +4862,7 @@ mod tests {
         let error = materializations_from_bootstrap_query_results(
             "github.com",
             now,
-            &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+            &policy,
             [(
                 1,
                 Ok(response_with_address(
@@ -4533,6 +4884,7 @@ mod tests {
     #[test]
     fn post_ready_root_refresh_preserves_fatal_error_classification() {
         let now = Instant::now();
+        let policy = test_hostname_policy(false);
         let active = active_with_all_bootstrap_roots(now);
         assert_eq!(
             root_refresh_critical_finding(
@@ -4541,7 +4893,7 @@ mod tests {
                     "transient refresh miss"
                 ))),
                 &active,
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                &policy,
             ),
             None
         );
@@ -4552,7 +4904,7 @@ mod tests {
                     "invalid refresh response"
                 ))),
                 &active,
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                &policy,
             )
             .map(|(code, _)| code),
             Some("dns_block_root_refresh_integrity_failed")
@@ -4564,7 +4916,7 @@ mod tests {
                     "transient refresh miss"
                 ))),
                 &BTreeMap::new(),
-                &SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES,
+                &policy,
             )
             .map(|(code, _)| code),
             Some("dns_block_root_refresh_failed")
@@ -4590,7 +4942,7 @@ mod tests {
                 addresses_truncated: false,
             },
         );
-        state.excluded_non_github_query_count = 1;
+        state.excluded_unretained_query_count = 1;
         let evidence = evidence_from_state(&state, "active", DnsEvidenceScope::ProtectedHostAudit);
         assert_eq!(evidence.observations.len(), 1);
         assert_eq!(evidence.observations[0].query_type, "a");
@@ -4604,7 +4956,7 @@ mod tests {
             Some(30)
         );
         assert!(!evidence.observations[0].addresses_truncated);
-        assert_eq!(evidence.excluded_non_github_query_count, 1);
+        assert_eq!(evidence.excluded_unretained_query_count, 1);
         assert!(!evidence.protection_available);
     }
 
@@ -4727,7 +5079,7 @@ mod tests {
             report_write_failed: Arc::new(AtomicBool::new(false)),
             report_path: root.join("missing/report.json"),
             scope: DnsEvidenceScope::ProtectedHostAudit,
-            bootstrap_hostnames: SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES.to_vec(),
+            hostname_policy: test_hostname_policy(false),
             materializations: None,
         };
         recorder.record_query("pipelines.actions.githubusercontent.com", 1, true);

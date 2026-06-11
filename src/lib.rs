@@ -8,6 +8,7 @@ pub mod dns_mediator;
 pub mod error;
 pub mod findings;
 pub mod hosted_runner;
+pub mod hostname_policy;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod lifecycle;
