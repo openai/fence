@@ -98,11 +98,11 @@ assert report is not None, "DNS-mediated block report was not emitted"
 assert dns is not None, "DNS-mediated block DNS report was not emitted"
 assert ready is not None, "DNS-mediated block test readiness was not emitted"
 assert report["status"] == "selected_profile_runtime_test_only"
-assert report["runtime_evidence_schema_version"] == 1
+assert report["runtime_evidence_schema_version"] == 2
 assert report["mode"] == "block"
 assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
 assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
-assert report["policy_hash_schema_version"] == 3
+assert report["policy_hash_schema_version"] == 4
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"])
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"])
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"])
@@ -114,25 +114,26 @@ assert report["bootstrap_hostnames"] == [
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
+    "actions-results-receiver-production.githubapp.com",
 ]
 assert report["network_application_status"] == "applied"
 assert report["network_verification_status"] == "verified"
 assert report["sudo_status"] == "disabled_verified"
 assert report["container_status"] == "disabled_verified"
 assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
-assert report["materialization_status"] == "bounded_ttl_plus_refresh_overlap_constrained_actions_or_cname_descendant_https_only"
-assert len(report["materialized_https_allowances"]) >= 1
-assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_https_allowances"])
+assert report["materialization_status"] == "bounded_ttl_exact_host_and_cname_transport_policy"
+assert len(report["materialized_allowances"]) >= 1
+assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_allowances"])
 assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"
-assert ready["runtime_evidence_schema_version"] == 1
+assert ready["runtime_evidence_schema_version"] == 2
 assert ready["protection_available"] is False
 assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
 assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
-assert ready["policy_hash_schema_version"] == 3
+assert ready["policy_hash_schema_version"] == 4
 assert ready["policy_hash"] == report["policy_hash"]
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
 assert dns["status"] == "selected_profile_runtime_test_only"
-assert dns["runtime_evidence_schema_version"] == 1
+assert dns["runtime_evidence_schema_version"] == 2
 assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1"
 assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1"
 assert dns["authorized_domain_patterns"] == [
@@ -147,6 +148,7 @@ assert dns["bootstrap_hostnames"] == [
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
+    "actions-results-receiver-production.githubapp.com",
 ]
 assert isinstance(dns["materialization_batch_count"], int)
 assert dns["materialization_batch_count"] >= 0

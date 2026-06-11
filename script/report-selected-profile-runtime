@@ -38,16 +38,16 @@ report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.arg
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 assert report["status"] == "selected_profile_runtime_test_only", report
-assert report["runtime_evidence_schema_version"] == 1, report
+assert report["runtime_evidence_schema_version"] == 2, report
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 assert dns["status"] == "selected_profile_runtime_test_only", dns
-assert dns["runtime_evidence_schema_version"] == 1, dns
+assert dns["runtime_evidence_schema_version"] == 2, dns
 assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", report
 assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", dns
-assert report["policy_hash_schema_version"] == 3, report
+assert report["policy_hash_schema_version"] == 4, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
@@ -66,11 +66,12 @@ summary = {
     "base_ruleset_hash": report["base_ruleset_hash"],
     "active_ruleset_hash": report["ruleset_hash"],
     "bootstrap_hostnames": dns["bootstrap_hostnames"],
-    "excluded_non_github_query_count": dns["excluded_non_github_query_count"],
+    "excluded_unretained_query_count": dns["excluded_unretained_query_count"],
     "blocked_non_profile_query_count": dns["blocked_non_profile_query_count"],
     "materialization_batch_count": dns["materialization_batch_count"],
     "materialization_request_rejections": dns["materialization_request_rejections"],
     "materialization_update_max_milliseconds": dns["materialization_update_max_milliseconds"],
+    "hostname_refresh_warnings": dns["hostname_refresh_warnings"],
     "network_counters": report["counters"],
     "network_findings": report["findings"][:64],
     "network_findings_truncated": report["findings_truncated"] or len(report["findings"]) > 64,
