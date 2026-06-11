@@ -120,21 +120,25 @@ to `tcp` port `443`. IPv6 or non-hostname entries should use the explicit
 ## How It Works 🔧
 
 1. Your workflow starts with `uses: GrantBirki/fence@<commit-sha>`.
-2. The Action writes a small root-owned config under `/run/fence/`.
-3. The bundled Fence agent starts through `sudo` and `systemd`.
-4. Fence checks that the runner matches the supported GitHub-hosted Linux shape.
-5. In default `block` mode, Fence allows GitHub workflow traffic plus your
+2. The Action protects its post-job code and bundled agent with a root-owned,
+   read-only mount.
+3. The Action writes a small root-owned config under `/run/fence/`.
+4. The bundled Fence agent starts through `sudo` and `systemd`.
+5. Fence checks that the runner matches the supported GitHub-hosted Linux shape.
+6. In default `block` mode, Fence allows GitHub workflow traffic plus your
    `allowlist`, blocks other outbound network access, turns off passwordless
    sudo, and disables Docker/container access.
-6. Fence keeps running until the runner is destroyed and records local evidence.
-7. The post-job hook prints a compact **Fence Summary** with control results and
-   observed network activity, then fails the job if Fence sees critical drift.
+7. Fence keeps running until the runner is destroyed and records local evidence.
+8. The protected post-job hook prints a compact **Fence Summary** with control
+   results and observed network activity, then fails the job if Fence sees
+   critical drift.
 
 ```mermaid
 flowchart TD
     start["GitHub-hosted Linux job starts"] --> action["Fence Action runs first"]
     action --> input["Read native Action inputs<br/>default: block mode + empty allowlist"]
-    input --> config["Write root-owned config<br/>under /run/fence/"]
+    input --> protect["Protect Action runtime<br/>root-owned + read-only"]
+    protect --> config["Write root-owned config<br/>under /run/fence/"]
     config --> launch["Launch bundled agent<br/>with sudo + systemd"]
 
     launch --> support["Check supported runner shape"]
@@ -152,7 +156,7 @@ flowchart TD
     audit --> ready
 
     ready --> resident["Fence keeps running<br/>checks controls every 5 seconds"]
-    resident --> post["Post hook reads local evidence"]
+    resident --> post["Protected post hook<br/>verifies runtime + evidence"]
     post --> summary["Render Fence Summary<br/>fail on critical drift"]
     summary --> teardown["Runner teardown removes the VM"]
 ```

@@ -23,6 +23,7 @@ fi
 
 require_cmd docker
 require_cmd curl
+require_cmd findmnt
 require_cmd python3
 require_cmd sudo
 
@@ -31,6 +32,56 @@ directory="/run/fence/$invocation"
 ready="$directory/ready.json"
 report="$directory/report.json"
 dns_report="$directory/dns-report.json"
+launcher_directory="/run/fence-launcher/$invocation"
+launcher_integrity="$launcher_directory/integrity.json"
+
+assert_action_runtime_immutable() {
+  local action_root="$DIR/action"
+  local replacement="$RUNNER_TEMP/fence-action-replacement-$invocation"
+  local options
+  local target
+
+  printf '%s\n' 'replacement' >"$replacement"
+  options="$(findmnt --noheadings --mountpoint "$action_root" --output OPTIONS)"
+  for required in ro nodev nosuid; do
+    if [[ ",$options," != *",$required,"* ]]; then
+      die "Fence Action runtime mount is missing $required"
+    fi
+  done
+  for relative in main.cts post.cts lib.cts log.cts bundle-manifest.json bin/fence; do
+    target="$action_root/$relative"
+    if printf '%s\n' 'tamper' >>"$target" 2>/dev/null; then
+      die "Fence Action runtime allowed overwrite: $relative"
+    fi
+    if rm -f "$target" 2>/dev/null; then
+      die "Fence Action runtime allowed unlink: $relative"
+    fi
+    if chmod u+w "$target" 2>/dev/null; then
+      die "Fence Action runtime allowed chmod: $relative"
+    fi
+    if mv "$target" "$target.moved" 2>/dev/null; then
+      die "Fence Action runtime allowed rename: $relative"
+    fi
+    if cp "$replacement" "$target" 2>/dev/null; then
+      die "Fence Action runtime allowed replacement: $relative"
+    fi
+  done
+  rm -f "$replacement"
+  python3 - "$launcher_integrity" <<'PY'
+import json
+import pathlib
+import stat
+import sys
+
+integrity_path = pathlib.Path(sys.argv[1])
+metadata = integrity_path.stat()
+assert stat.S_IMODE(metadata.st_mode) == 0o444, oct(stat.S_IMODE(metadata.st_mode))
+assert metadata.st_uid == 0, metadata.st_uid
+integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
+assert integrity["schema_version"] == 1, integrity
+assert len(integrity["files"]) == 6, integrity
+PY
+}
 
 python3 - "$scenario" "$report" "$dns_report" "$ready" "action/bundle-manifest.json" <<'PY'
 import json
@@ -109,6 +160,10 @@ sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.sendto(b"fence-action-audit-probe", ("192.0.2.10", 443))
 PY
   curl --head --silent --show-error --max-time 10 --retry 0 https://www.google.com >/dev/null
+fi
+
+if [[ "$scenario" == "standard" ]]; then
+  assert_action_runtime_immutable
 fi
 
 sleep 6

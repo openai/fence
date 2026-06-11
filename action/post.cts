@@ -5,14 +5,19 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const log = require("./log.cts");
 const {
+  actionRuntimeFileDigests,
   correlateFindingsToDns,
   materializationRequestRejections,
   materializationEvidenceCounter,
   MAX_REPORT_BYTES,
   readJsonBounded,
+  readLauncherIntegrity,
   runtimePaths,
   summaryLines,
   validateBundle,
+  validateLauncherIntegrity,
+  validateProtectedActionRuntime,
+  validateReadOnlyActionMount,
   validateReport,
   validateResidentUnitStatus,
 } = require("./lib.cts");
@@ -57,11 +62,31 @@ function validateResidentService(unit: string, expectedPid: unknown): void {
   validateResidentUnitStatus(String(result.stdout || ""), expectedPid);
 }
 
+function validateProtectedActionMount(actionRoot: string): void {
+  const result = spawnSync(
+    "/usr/bin/findmnt",
+    ["--json", "--mountpoint", actionRoot, "--output", "TARGET,OPTIONS"],
+    {
+      encoding: "utf8",
+      env: CHILD_ENV,
+      killSignal: "SIGKILL",
+      maxBuffer: 16 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 2 * 1000,
+    },
+  );
+  if (result.error || result.status !== 0 || String(result.stderr || "").length !== 0) {
+    throw new Error("Fence protected Action mount could not be verified");
+  }
+  validateReadOnlyActionMount(String(result.stdout || ""), actionRoot);
+}
+
 function main(): void {
   log.info("📋 Validating Fence evidence");
   const invocationId = process.env.STATE_invocation_id;
   const reportPath = process.env.STATE_report_path;
   const dnsReportPath = process.env.STATE_dns_report_path;
+  const launcherIntegrityPath = process.env.STATE_launcher_integrity_path;
   const paths = invocationId ? runtimePaths(invocationId) : undefined;
   if (!invocationId || !paths || paths.report !== reportPath) {
     throw new Error("Fence post-job report path is missing or invalid");
@@ -69,6 +94,19 @@ function main(): void {
   if (dnsReportPath && paths.dnsReport !== dnsReportPath) {
     throw new Error("Fence post-job DNS report path is invalid");
   }
+  if (paths.launcherIntegrity !== launcherIntegrityPath) {
+    throw new Error("Fence post-job launcher integrity path is missing or invalid");
+  }
+  validateProtectedActionMount(ACTION_ROOT);
+  validateProtectedActionRuntime(ACTION_ROOT);
+  const actionFiles = actionRuntimeFileDigests(ACTION_ROOT);
+  validateLauncherIntegrity(
+    readLauncherIntegrity(launcherIntegrityPath),
+    invocationId,
+    ACTION_ROOT,
+    paths.launcherActionDirectory,
+    actionFiles,
+  );
   validateBundle(MANIFEST, BINARY);
   const report = validateReport(
     readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
@@ -88,6 +126,7 @@ function main(): void {
     `report_path=${reportPath}`,
     `dns_report_path=${effectiveDnsReportPath}`,
     `dns_report_present=${dnsEvidence !== undefined}`,
+    `protected_action_runtime=verified`,
     `mode=${report.mode}`,
     `status=${report.status}`,
     `readiness=${report.readiness_status}`,
