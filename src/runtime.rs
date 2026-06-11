@@ -37,6 +37,7 @@ pub trait RuntimeDocumentStore {
     fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
     fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
     fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
+    fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError>;
 }
 
 impl TestRuntimeStore {
@@ -72,6 +73,15 @@ impl TestRuntimeStore {
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         replace_report(&self.directory, &self.report, value)
     }
+
+    pub fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError> {
+        require_evidence_file(&self.state, None, 0o600)?;
+        require_evidence_file(&self.report, None, 0o644)?;
+        if require_ready {
+            require_evidence_file(&self.ready, None, 0o644)?;
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeDocumentStore for TestRuntimeStore {
@@ -89,6 +99,10 @@ impl RuntimeDocumentStore for TestRuntimeStore {
 
     fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         self.replace_report(value)
+    }
+
+    fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError> {
+        self.verify_evidence_persistence(require_ready)
     }
 }
 
@@ -163,6 +177,15 @@ impl ProductionRuntimeStore {
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         replace_report(&self.directory, &self.report, value)
     }
+
+    pub fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError> {
+        require_evidence_file(&self.state, Some(self.expected_uid), 0o600)?;
+        require_evidence_file(&self.report, Some(self.expected_uid), 0o644)?;
+        if require_ready {
+            require_evidence_file(&self.ready, Some(self.expected_uid), 0o644)?;
+        }
+        Ok(())
+    }
 }
 
 impl RuntimeDocumentStore for ProductionRuntimeStore {
@@ -181,6 +204,30 @@ impl RuntimeDocumentStore for ProductionRuntimeStore {
     fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         self.replace_report(value)
     }
+
+    fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError> {
+        self.verify_evidence_persistence(require_ready)
+    }
+}
+
+fn require_evidence_file(
+    path: &Path,
+    expected_uid: Option<u32>,
+    mode: u32,
+) -> Result<(), RuntimeError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| io_error("runtime_evidence_missing", error))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || expected_uid.is_some_and(|uid| metadata.uid() != uid)
+        || metadata.permissions().mode() & 0o777 != mode
+    {
+        return Err(RuntimeError::new(
+            "unsafe_runtime_evidence",
+            "resident lifecycle evidence is missing or has unsafe ownership, type, or permissions",
+        ));
+    }
+    Ok(())
 }
 
 fn production_invocation_id(root: &Path, config: &Path) -> Result<String, RuntimeError> {
@@ -421,11 +468,17 @@ mod tests {
                 value: "second".to_owned(),
             })
             .unwrap();
+        store.verify_evidence_persistence(false).unwrap();
+        assert_eq!(
+            store.verify_evidence_persistence(true).unwrap_err().code,
+            "runtime_evidence_missing"
+        );
         store
             .write_ready_exclusive(&Document {
                 value: TEST_READY_STATUS.to_owned(),
             })
             .unwrap();
+        store.verify_evidence_persistence(true).unwrap();
 
         assert_eq!(
             fs::read_to_string(&store.report).unwrap(),
@@ -531,6 +584,7 @@ mod tests {
                 value: "ready".to_owned(),
             })
             .unwrap();
+        store.verify_evidence_persistence(true).unwrap();
 
         assert_eq!(
             fs::metadata(&store.state).unwrap().permissions().mode() & 0o777,
@@ -543,6 +597,41 @@ mod tests {
         assert_eq!(
             fs::metadata(&store.ready).unwrap().permissions().mode() & 0o777,
             0o644
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_symlinked_and_mode_changed_resident_evidence() {
+        let root = root();
+        let store = TestRuntimeStore::create(&root, "resident-proof").unwrap();
+        store
+            .write_state_exclusive(&Document {
+                value: "state".to_owned(),
+            })
+            .unwrap();
+        store
+            .replace_report(&Document {
+                value: "report".to_owned(),
+            })
+            .unwrap();
+        store
+            .write_ready_exclusive(&Document {
+                value: "ready".to_owned(),
+            })
+            .unwrap();
+        store.verify_evidence_persistence(true).unwrap();
+
+        fs::set_permissions(&store.report, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            store.verify_evidence_persistence(true).unwrap_err().code,
+            "unsafe_runtime_evidence"
+        );
+        fs::remove_file(&store.report).unwrap();
+        symlink(&store.ready, &store.report).unwrap();
+        assert_eq!(
+            store.verify_evidence_persistence(true).unwrap_err().code,
+            "unsafe_runtime_evidence"
         );
         fs::remove_dir_all(root).unwrap();
     }

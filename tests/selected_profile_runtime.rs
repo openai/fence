@@ -25,6 +25,7 @@ fn selected_profile_runtime_worker() {
         &std::env::var("FENCE_SELECTED_PROFILE_RUNTIME_UNIT").unwrap(),
         &PathBuf::from(std::env::var_os("FENCE_SELECTED_PROFILE_RUNTIME_ROOT").unwrap()),
         &plan,
+        std::env::var_os("FENCE_SELECTED_PROFILE_RUNTIME_INJECT_WORKER_FAILURE").is_some(),
     )
     .unwrap();
 }

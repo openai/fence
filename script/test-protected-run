@@ -215,6 +215,18 @@ if scenario != "audit":
     assert len(report["materialized_allowances"]) >= 1, report
     assert report["bootstrap_hostnames"] == expected["bootstrap_hostnames"], report
 assert report["critical_findings"] == [], report
+resident = report["resident_health"]
+assert resident["status"] == "healthy", resident
+assert resident["resident_pid"] > 0, resident
+assert resident["verification_sequence"] >= 1, resident
+assert resident["last_successful_verification_unix_milliseconds"] > 0, resident
+assert resident["verification_interval_seconds"] == 5, resident
+assert resident["workers"] == [
+    {"name": "docker_tcp_dns", "status": "running"},
+    {"name": "docker_udp_dns", "status": "running"},
+    {"name": "host_tcp_dns", "status": "running"},
+    {"name": "host_udp_dns", "status": "running"},
+], resident
 assert ready["status"] == expected["ready"], ready
 assert ready["runtime_evidence_schema_version"] == 2, ready
 assert ready["mode"] == expected["mode"], ready
@@ -223,6 +235,7 @@ assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", re
 assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", ready
 assert ready["policy_hash"] == report["policy_hash"], (ready, report)
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"], (ready, report)
+assert ready["resident_health"]["resident_pid"] == resident["resident_pid"], ready
 assert dns["status"] == expected["status"], dns
 assert dns["runtime_evidence_schema_version"] == 2, dns
 assert dns["mode"] == expected["mode"], dns
@@ -237,6 +250,9 @@ assert isinstance(dns["materialization_batch_count"], int), dns
 assert dns["materialization_batch_count"] >= 0, dns
 assert dns["materialization_request_rejections"] == 0, dns
 assert dns["hostname_refresh_warnings"] == 0, dns
+assert isinstance(dns["upstream_request_failures"], int), dns
+assert dns["upstream_request_failures"] >= 0, dns
+assert dns["resident_health"]["resident_pid"] == resident["resident_pid"], dns
 assert isinstance(dns["materialization_update_max_milliseconds"], int), dns
 assert dns["materialization_update_max_milliseconds"] >= 0, dns
 if scenario == "audit":
@@ -350,10 +366,15 @@ assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == expected["sudo_status"], report
 assert report["container_status"] == expected["container_status"], report
 assert report["critical_findings"] == [], report
+assert report["resident_health"]["status"] == "healthy", report
+assert report["resident_health"]["verification_sequence"] >= 2, report
 assert dns["status"] == expected["status"], dns
 assert isinstance(dns["materialization_batch_count"], int), dns
 assert dns["materialization_batch_count"] >= 0, dns
 assert dns["materialization_request_rejections"] == 0, dns
+assert isinstance(dns["upstream_request_failures"], int), dns
+assert dns["upstream_request_failures"] >= 0, dns
+assert dns["resident_health"]["verification_sequence"] >= 2, dns
 assert isinstance(dns["materialization_update_max_milliseconds"], int), dns
 assert dns["materialization_update_max_milliseconds"] >= 0, dns
 if scenario == "audit":

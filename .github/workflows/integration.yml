@@ -51,7 +51,11 @@ jobs:
         run: script/test-lockdown "${{ matrix.scenario }}"
 
   selected-profile-runtime:
-    name: selected profile runtime evidence
+    name: selected profile runtime ${{ matrix.scenario }}
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [healthy, worker-failure]
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -75,12 +79,13 @@ jobs:
 
       - name: run selected profile runtime evidence
         env:
-          SELECTED_PROFILE_RUNTIME_REPLICA: required
-        run: script/test-selected-profile-runtime
+          SELECTED_PROFILE_RUNTIME_REPLICA: ${{ matrix.scenario }}
+        run: script/test-selected-profile-runtime "${{ matrix.scenario }}"
 
       - name: emit bounded late selected profile evidence
+        if: ${{ matrix.scenario == 'healthy' }}
         env:
-          SELECTED_PROFILE_RUNTIME_REPLICA: required
+          SELECTED_PROFILE_RUNTIME_REPLICA: ${{ matrix.scenario }}
         run: script/report-selected-profile-runtime
 
   protected-run:
