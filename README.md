@@ -127,8 +127,8 @@ to `tcp` port `443`. IPv6 or non-hostname entries should use the explicit
    `allowlist`, blocks other outbound network access, turns off passwordless
    sudo, and disables Docker/container access.
 6. Fence keeps running until the runner is destroyed and records local evidence.
-7. The post-job hook prints a concise **Fence Summary** and fails the job if
-   Fence sees critical drift after startup.
+7. The post-job hook prints a compact **Fence Summary** with control results and
+   observed network activity, then fails the job if Fence sees critical drift.
 
 ```mermaid
 flowchart TD
@@ -184,8 +184,9 @@ claim. Pin Fence to a full immutable commit SHA, not `@main`.
 
 ## Troubleshooting 🧯
 
-Fence prints a short progress log during setup and a concise **Fence Summary**
-at the end of the job. If setup fails and you need more detail, enable the
+Fence prints a short progress log during setup and a compact **Fence Summary**
+with control and network-activity tables at the end of the job. If setup fails
+and you need more detail, enable the
 standard GitHub Actions debug flag by setting the repository secret
 `ACTIONS_STEP_DEBUG` to `true`. Debug logs include bounded service status and
 Fence-specific diagnostics, but they avoid raw config bodies, environment

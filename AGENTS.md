@@ -190,9 +190,10 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Must never become an Action runtime step.
 
 - `script/test-action-wrapper`
-  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, report validation, concise job-summary rendering, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, report validation, compact control and network-activity summary tables, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
   - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
   - Action logs should stay concise by default and may use emoji plus ANSI colors for human readability. Debug logs are allowed only through GitHub Actions debug mode, must remain bounded and sanitized, and must not print raw config bodies, environment dumps, tokens, packet payloads, raw DNS packets, unrelated system logs, or arbitrary report JSON.
+  - Job summaries should prefer bounded result tables over explanatory prose: show mode, network, sudo, and container outcomes plus reportable destinations and decisions; keep detailed evidence in local JSON and keep audit allowlist guidance collapsed.
   - Proves that omitted Action input derives a bounded invocation identifier from GitHub run metadata and emits strict schema-`1` standard block with an empty `allowlist`; also proves native `mode`, `invocation_id`, `container_policy`, `platform_profile`, `disable_broad_github_domains`, and multiline `allowlist` inputs without requiring raw JSON config.
   - Keeps raw `config` as an advanced strict-JSON escape hatch and rejects any attempt to combine it with native config inputs.
   - The wrapper and hosted acceptance assertions require runtime-evidence schema `1` and stable profile-realization fields.
