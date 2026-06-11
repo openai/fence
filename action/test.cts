@@ -410,17 +410,60 @@ test("validates stable runtime evidence", () => {
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
 });
 
-test("renders a concise healthy block summary without raw evidence fields", () => {
-  const summary = summaryLines(report).join("\n");
+test("renders a concise healthy block results table without raw evidence fields", () => {
+  const dnsEvidence = {
+    observations: [
+      {
+        hostname: "github.com",
+        query_type: "a",
+        profile_classification: "matches_selected_profile_pattern",
+        occurrences: 2,
+        resolved_addresses: ["192.0.2.1"],
+      },
+      {
+        hostname: "api.github.com",
+        query_type: "aaaa",
+        profile_classification: "matches_selected_profile_pattern",
+        occurrences: 1,
+        resolved_addresses: ["2001:db8::1"],
+      },
+      {
+        hostname: "codeload.github.com",
+        query_type: "a",
+        profile_classification: "github_related_outside_profile",
+        occurrences: 1,
+        resolved_addresses: [],
+      },
+      {
+        hostname: "github.com",
+        query_type: "type_15",
+        profile_classification: "matches_selected_profile_pattern",
+        occurrences: 1,
+        resolved_addresses: [],
+      },
+    ],
+    observations_truncated: false,
+    blocked_non_profile_query_count: 2,
+  };
+  const summary = summaryLines(report, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟢 Fence Summary/);
-  assert.match(summary, /\*\*Network restrictions active\*\*/);
-  assert.match(summary, /GitHub workflow support channel/);
+  assert.match(summary, /#### Controls/);
+  assert.match(summary, /\| Mode \| 🔒 Block \|/);
+  assert.match(summary, /\| Outbound network \| ✅ Restricted \|/);
+  assert.match(summary, /\| Passwordless sudo \| ✅ Disabled \|/);
+  assert.match(summary, /\| Docker\/container access \| ✅ Disabled \|/);
+  assert.match(summary, /#### Network activity/);
+  assert.match(summary, /\| `github.com` \| ✅ Allowed \| 2 A queries \|/);
+  assert.match(summary, /\| `github.com` \| ⛔ Blocked \| 1 TYPE15 query \|/);
+  assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 AAAA query \|/);
+  assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 A query \|/);
   assert.equal(summary.match(/Fence Summary/g)?.length, 1);
   assert.doesNotMatch(summary, /Fence local evidence/);
   assert.doesNotMatch(summary, /critical findings/i);
   assert.doesNotMatch(summary, /platform profile/i);
   assert.doesNotMatch(summary, /readiness/i);
   assert.doesNotMatch(summary, /protected_host_block/);
+  assert.doesNotMatch(summary, /Fence limited outbound traffic/);
   assert.doesNotMatch(summaryLines({ ...report, mode: "block\n| injected" }).join("\n"), /\n\| injected/);
 });
 
@@ -435,10 +478,10 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   };
   validateReport(degraded);
   const degradedSummary = summaryLines(degraded).join("\n");
-  assert.match(degradedSummary, /^### Fence Summary/);
+  assert.match(degradedSummary, /^### 🟡 Fence Summary/);
   assert.doesNotMatch(degradedSummary, /🟢/);
-  assert.match(degradedSummary, /\*\*Limited assurance\*\*/);
-  assert.match(degradedSummary, /Docker\/container access was preserved/);
+  assert.match(degradedSummary, /\| Passwordless sudo \| ✅ Disabled \|/);
+  assert.match(degradedSummary, /\| Docker\/container access \| ⚠️ Available; limited assurance \|/);
 
   const critical = {
     ...report,
@@ -452,9 +495,11 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   validateReport(critical, false);
   assert.throws(() => validateReport(critical, true), /critical resident findings/);
   const criticalSummary = summaryLines(critical).join("\n");
-  assert.match(criticalSummary, /^### Fence Summary/);
+  assert.match(criticalSummary, /^### 🔴 Fence Summary/);
   assert.doesNotMatch(criticalSummary, /🟢/);
-  assert.match(criticalSummary, /\*\*Fence needs attention\*\*/);
+  assert.match(criticalSummary, /\| Outbound network \| ❌ Verification failed \|/);
+  assert.match(criticalSummary, /#### Critical findings/);
+  assert.match(criticalSummary, /\| ❌ Critical \|/);
   assert.match(criticalSummary, /`owned_nftables_state_missing`/);
   assert.match(criticalSummary, /Fence-owned network state changed after readiness/);
 });
@@ -536,10 +581,13 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟢 Fence Summary/);
-  assert.match(summary, /\*\*Observing only\*\*/);
-  assert.match(summary, /#### Would Be Blocked In Block Mode/);
-  assert.match(summary, /\| `www.google.com` \| `tcp` \| `443` \| `2` \|/);
-  assert.match(summary, /\| `192.0.2.10` \| `udp` \| `443` \| `1` \|/);
+  assert.match(summary, /\| Mode \| 👀 Audit \|/);
+  assert.match(summary, /\| Outbound network \| ⚠️ Observing only \|/);
+  assert.match(summary, /\| Passwordless sudo \| ➖ Available in audit mode \|/);
+  assert.match(summary, /\| Docker\/container access \| ➖ Available in audit mode \|/);
+  assert.match(summary, /#### Network activity/);
+  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query, 2 TCP\/443 attempts \|/);
+  assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
   assert.match(summary, /```yaml/);
   assert.match(summary, /GrantBirki\/fence@<commit-sha>/);
@@ -586,10 +634,10 @@ test("renders audit IP-only and missing-DNS fallbacks safely", () => {
     findings_truncated: false,
   };
   const summary = summaryLines(audit).join("\n");
-  assert.match(summary, /^### Fence Summary/);
+  assert.match(summary, /^### 🟡 Fence Summary/);
   assert.doesNotMatch(summary, /🟢/);
-  assert.match(summary, /DNS audit evidence was unavailable/);
-  assert.match(summary, /Manual review required for IP-only findings/);
+  assert.match(summary, /DNS evidence was unavailable; IP-level findings may require manual review/);
+  assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /could not be mapped to an endpoint/);
   assert.doesNotMatch(summary, /View allowlist example/);
 });
@@ -626,9 +674,8 @@ test("renders audit IP-only findings when DNS evidence excludes non-GitHub names
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟢 Fence Summary/);
-  assert.match(summary, /\| `203.0.113.10` \| `tcp` \| `443` \| `1` \|/);
-  assert.match(summary, /Manual review required for IP-only findings/);
-  assert.doesNotMatch(summary, /DNS audit evidence was unavailable/);
+  assert.match(summary, /\| `203.0.113.10` \| ⚠️ Would block \| 1 TCP\/443 attempt \|/);
+  assert.doesNotMatch(summary, /DNS evidence was unavailable/);
   assert.doesNotMatch(summary, /View allowlist example/);
 });
 
@@ -643,13 +690,14 @@ test("renders DNS materialization request rejection evidence as a non-critical w
   assert.equal(materializationRequestRejections({ materialization_request_rejections: "2" }), 0);
   assert.match(
     materializationWarningLines(dnsEvidence).join("\n"),
-    /withheld 2 DNS answer\(s\).*firewall update work could not be accepted/,
+    /DNS answers withheld while firewall updates were unavailable \| `2`/,
   );
   const summary = summaryLines(report, dnsEvidence).join("\n");
-  assert.match(summary, /^### Fence Summary/);
+  assert.match(summary, /^### 🟡 Fence Summary/);
   assert.doesNotMatch(summary, /🟢/);
-  assert.match(summary, /Some DNS answers were withheld/);
-  assert.doesNotMatch(summary, /critical issue/);
+  assert.match(summary, /#### Warnings/);
+  assert.match(summary, /DNS answers withheld while firewall updates were unavailable/);
+  assert.doesNotMatch(summary, /Critical findings/);
 });
 
 test("renders bounded allowlist YAML snippets", () => {

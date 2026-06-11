@@ -50,11 +50,29 @@ type AuditSummary = {
   unparsedCount: number;
   sourceTruncated: boolean;
 };
+type NetworkDecision = "allowed" | "blocked" | "would_block";
+type NetworkActivityRow = {
+  destination: string;
+  decision: NetworkDecision;
+  activities: Map<string, number>;
+  totalCount: number;
+};
+type NetworkActivitySummary = {
+  rows: NetworkActivityRow[];
+  omittedRows: number;
+};
 
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const MAX_AUDIT_HOSTNAME_ROWS = 10;
 const MAX_AUDIT_IP_ROWS = 10;
+const MAX_NETWORK_ACTIVITY_ROWS = 20;
+const ALLOWED_DNS_CLASSIFICATIONS = new Set([
+  "matches_selected_profile_pattern",
+  "matches_bounded_actions_suffix_authorization",
+  "matches_ttl_bounded_cname_descendant",
+]);
+const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v1";
@@ -726,8 +744,11 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
   };
 }
 
-function summaryHeading(summaryState: { healthy: boolean }): string {
-  return summaryState.healthy ? "### 🟢 Fence Summary" : "### Fence Summary";
+function summaryHeading(summaryState: { healthy: boolean; critical: boolean }): string {
+  if (summaryState.critical) {
+    return "### 🔴 Fence Summary";
+  }
+  return summaryState.healthy ? "### 🟢 Fence Summary" : "### 🟡 Fence Summary";
 }
 
 function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence: any): boolean {
@@ -761,9 +782,11 @@ function materializationWarningLines(dnsEvidence: any): string[] {
   }
   return [
     "",
-    "**Some DNS answers were withheld**",
+    "#### Warnings",
     "",
-    `Fence withheld ${count} DNS answer(s) because firewall update work could not be accepted. Clients may have retried those lookups.`,
+    "| Warning | Count |",
+    "| --- | ---: |",
+    `| ⚠️ DNS answers withheld while firewall updates were unavailable | ${markdownCode(count)} |`,
   ];
 }
 
@@ -773,51 +796,47 @@ function criticalFindingLines(report: any): string[] {
   }
   const lines = [
     "",
-    "| Finding | Detail |",
-    "| --- | --- |",
+    "#### Critical findings",
+    "",
+    "| Result | Finding | Detail |",
+    "| --- | --- | --- |",
   ];
   for (const finding of report.critical_findings.slice(0, 5)) {
-    lines.push(`| ${markdownCode(finding && finding.code)} | ${boundedText(finding && finding.message)} |`);
+    lines.push(`| ❌ Critical | ${markdownCode(finding && finding.code)} | ${boundedText(finding && finding.message)} |`);
   }
   if (report.critical_findings.length > 5) {
-    lines.push(`| ${markdownCode("additional_findings_omitted")} | ${report.critical_findings.length - 5} more critical findings are available in the local report. |`);
+    lines.push(`| ❌ Critical | ${markdownCode("additional_findings_omitted")} | ${report.critical_findings.length - 5} more critical findings are available in the local report. |`);
   }
   return lines;
 }
 
-function modeStatusCard(report: any): string[] {
-  if (
-    report.network_verification_status !== "verified" ||
-    (Array.isArray(report.critical_findings) && report.critical_findings.length > 0)
-  ) {
-    return [
-      "**Fence needs attention**",
-      "",
-      "Fence detected a critical issue after startup and marked this job as failed.",
-      ...criticalFindingLines(report),
-    ];
-  }
-
-  if (report.status === "protected_host_block_degraded") {
-    return [
-      "**Limited assurance**",
-      "",
-      "Fence limited outbound traffic and locked down passwordless sudo, but Docker/container access was preserved. Container access can bypass the ordinary containment claim.",
-    ];
-  }
-
-  if (report.mode === "audit") {
-    return [
-      "**Observing only**",
-      "",
-      "Fence did not block traffic in audit mode. The destinations below would need review before switching this workflow to block mode.",
-    ];
-  }
-
+function controlsSummary(report: any): string[] {
+  const network = report.network_verification_status !== "verified"
+    ? "❌ Verification failed"
+    : report.mode === "audit"
+      ? "⚠️ Observing only"
+      : "✅ Restricted";
+  const sudo = report.sudo_status === "disabled_verified"
+    ? "✅ Disabled"
+    : report.sudo_status === "preserved_verified"
+      ? "➖ Available in audit mode"
+      : "❌ Unverified";
+  const containers = report.container_status === "disabled_verified"
+    ? "✅ Disabled"
+    : report.container_status === "preserved_unsafe"
+      ? "⚠️ Available; limited assurance"
+      : report.container_status === "preserved_verified"
+        ? "➖ Available in audit mode"
+        : "❌ Unverified";
   return [
-    "**Network restrictions active**",
+    "#### Controls",
     "",
-    "Fence limited outbound traffic to the GitHub workflow support channel and your `allowlist`. Passwordless sudo and Docker/container access were locked down. Controls remain active until the runner is torn down.",
+    "| Control | Result |",
+    "| --- | --- |",
+    `| Mode | ${report.mode === "audit" ? "👀 Audit" : "🔒 Block"} |`,
+    `| Outbound network | ${network} |`,
+    `| Passwordless sudo | ${sudo} |`,
+    `| Docker/container access | ${containers} |`,
   ];
 }
 
@@ -851,54 +870,212 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
   ];
 }
 
-function auditWouldBlockSummary(report: any, dnsEvidence: any = undefined, auditSummary: AuditSummary = correlateFindingsToDns(report, dnsEvidence)): string[] {
-  if (report.mode !== "audit") {
-    return [];
+function safePositiveInteger(value: unknown): number {
+  return Number.isSafeInteger(value) && value > 0 ? Number(value) : 0;
+}
+
+function networkDecision(report: any, classification: unknown, queryType: unknown): NetworkDecision {
+  const allowed = ALLOWED_DNS_CLASSIFICATIONS.has(classification) &&
+    FORWARDED_DNS_QUERY_TYPES.has(queryType);
+  if (allowed) {
+    return "allowed";
+  }
+  return report.mode === "audit" ? "would_block" : "blocked";
+}
+
+function dnsQueryActivity(queryType: unknown): string {
+  if (queryType === "a" || queryType === "aaaa") {
+    return `${queryType.toUpperCase()} query`;
+  }
+  if (typeof queryType === "string" && /^type_[0-9]{1,5}$/.test(queryType)) {
+    return `TYPE${queryType.slice(5)} query`;
+  }
+  return "DNS query";
+}
+
+function addNetworkActivity(
+  rows: Map<string, NetworkActivityRow>,
+  destination: string,
+  decision: NetworkDecision,
+  activity: string,
+  count: number,
+): void {
+  if (count === 0) {
+    return;
+  }
+  const key = `${destination}\0${decision}`;
+  const row = rows.get(key) || {
+    destination,
+    decision,
+    activities: new Map<string, number>(),
+    totalCount: 0,
+  };
+  row.activities.set(activity, (row.activities.get(activity) || 0) + count);
+  row.totalCount += count;
+  rows.set(key, row);
+}
+
+function networkActivityRows(
+  report: any,
+  dnsEvidence: any,
+  auditSummary: AuditSummary,
+): NetworkActivitySummary {
+  const rows = new Map<string, NetworkActivityRow>();
+  let namedBlockedDnsQueries = 0;
+
+  if (dnsEvidence && Array.isArray(dnsEvidence.observations)) {
+    for (const observation of dnsEvidence.observations) {
+      if (
+        observation === null ||
+        Array.isArray(observation) ||
+        typeof observation !== "object" ||
+        !isSafeHostname(observation.hostname)
+      ) {
+        continue;
+      }
+      const count = safePositiveInteger(observation.occurrences);
+      const decision = networkDecision(
+        report,
+        observation.profile_classification,
+        observation.query_type,
+      );
+      addNetworkActivity(rows, observation.hostname, decision, dnsQueryActivity(observation.query_type), count);
+      if (decision === "blocked") {
+        namedBlockedDnsQueries += count;
+      }
+    }
   }
 
-  const rows = [...auditSummary.hostnameRows, ...auditSummary.ipRows];
-  const lines = ["", "#### Would Be Blocked In Block Mode", ""];
-  if (auditSummary.dnsMissing) {
-    lines.push("DNS audit evidence was unavailable, so Fence could only report IP-level findings.", "");
+  if (report.mode === "audit") {
+    for (const row of [...auditSummary.hostnameRows, ...auditSummary.ipRows]) {
+      addNetworkActivity(
+        rows,
+        row.destination,
+        "would_block",
+        `${row.protocol.toUpperCase()}/${row.port} attempt`,
+        row.count,
+      );
+    }
+    addNetworkActivity(
+      rows,
+      "Other DNS names",
+      "would_block",
+      "DNS query (names not retained)",
+      safePositiveInteger(dnsEvidence && dnsEvidence.excluded_non_github_query_count),
+    );
+  } else {
+    const unnamedBlocked = Math.max(
+      0,
+      safePositiveInteger(dnsEvidence && dnsEvidence.blocked_non_profile_query_count) - namedBlockedDnsQueries,
+    );
+    addNetworkActivity(
+      rows,
+      "Other DNS names",
+      "blocked",
+      "DNS query (names not retained)",
+      unnamedBlocked,
+    );
   }
-  if (rows.length === 0 && auditSummary.unparsedCount === 0) {
-    lines.push("No would-block destinations were observed during this audit run.");
+
+  const priority: Record<NetworkDecision, number> = {
+    blocked: 0,
+    would_block: 1,
+    allowed: 2,
+  };
+  const sorted = Array.from(rows.values()).sort((left, right) =>
+    priority[left.decision] - priority[right.decision] ||
+    right.totalCount - left.totalCount ||
+    left.destination.localeCompare(right.destination)
+  );
+  return {
+    rows: sorted.slice(0, MAX_NETWORK_ACTIVITY_ROWS),
+    omittedRows: Math.max(0, sorted.length - MAX_NETWORK_ACTIVITY_ROWS),
+  };
+}
+
+function decisionLabel(decision: NetworkDecision): string {
+  if (decision === "allowed") {
+    return "✅ Allowed";
+  }
+  if (decision === "blocked") {
+    return "⛔ Blocked";
+  }
+  return "⚠️ Would block";
+}
+
+function activityLabel(row: NetworkActivityRow): string {
+  return Array.from(row.activities.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([activity, count]) => {
+      if (activity === "DNS query") {
+        return `${count} DNS ${count === 1 ? "query" : "queries"}`;
+      }
+      if (activity === "DNS query (names not retained)") {
+        return `${count} DNS ${count === 1 ? "query" : "queries"} (names not retained)`;
+      }
+      if (activity.endsWith(" query")) {
+        return `${count} ${activity.slice(0, -6)} ${count === 1 ? "query" : "queries"}`;
+      }
+      return `${count} ${activity}${count === 1 ? "" : "s"}`;
+    })
+    .join(", ");
+}
+
+function networkActivitySummary(
+  report: any,
+  dnsEvidence: any = undefined,
+  auditSummary: AuditSummary = correlateFindingsToDns(report, dnsEvidence),
+): string[] {
+  const activity = networkActivityRows(report, dnsEvidence, auditSummary);
+  const lines = ["", "#### Network activity", ""];
+  if (activity.rows.length === 0) {
+    lines.push("_No reportable network activity was observed._");
     return lines;
   }
 
-  if (rows.length > 0) {
-    lines.push("| Destination | Protocol | Port | Count |");
-    lines.push("| --- | --- | ---: | ---: |");
-    for (const row of rows) {
-      lines.push(`| ${markdownCode(row.destination)} | ${markdownCode(row.protocol)} | ${markdownCode(row.port)} | ${markdownCode(row.count)} |`);
-    }
-    lines.push("");
+  lines.push("| Destination | Result | Activity |");
+  lines.push("| --- | --- | ---: |");
+  for (const row of activity.rows) {
+    lines.push(`| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} |`);
   }
-  if (auditSummary.ipRows.length > 0 && auditSummary.hostnameRows.length === 0) {
-    lines.push("Manual review required for IP-only findings.");
-    lines.push("");
+  if (activity.omittedRows > 0) {
+    lines.push(`| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) |`);
+  }
+  lines.push("");
+
+  if (report.mode === "audit" && auditSummary.dnsMissing) {
+    lines.push("⚠️ DNS evidence was unavailable; IP-level findings may require manual review.", "");
   }
   if (auditSummary.unparsedCount > 0) {
-    lines.push(`${auditSummary.unparsedCount} would-block finding(s) could not be mapped to an endpoint from the bounded packet prefix.`);
+    lines.push(`⚠️ ${auditSummary.unparsedCount} would-block finding(s) could not be mapped to an endpoint.`);
     lines.push("");
   }
   if (auditSummary.sourceTruncated || auditSummary.omittedHostnameRows > 0 || auditSummary.omittedIpRows > 0) {
     const omitted = auditSummary.omittedHostnameRows + auditSummary.omittedIpRows;
-    lines.push(`Some audit evidence was truncated or omitted from this summary. Review the local report for full bounded evidence${omitted > 0 ? `; ${omitted} grouped row(s) were omitted here` : ""}.`);
+    lines.push(`⚠️ Network evidence was truncated${omitted > 0 ? `; ${omitted} grouped row(s) were omitted` : ""}.`);
+    lines.push("");
   }
-  lines.push(...allowlistYamlSnippet(auditSummary.hostnameRows));
+  if (report.mode === "audit") {
+    lines.push(...allowlistYamlSnippet(auditSummary.hostnameRows));
+  }
   return lines;
 }
 
 function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
-  const summaryState = { healthy: !summaryHasWarnings(report, auditSummary, dnsEvidence) };
+  const critical = report.network_verification_status !== "verified" ||
+    (Array.isArray(report.critical_findings) && report.critical_findings.length > 0);
+  const summaryState = {
+    healthy: !summaryHasWarnings(report, auditSummary, dnsEvidence),
+    critical,
+  };
   return [
     summaryHeading(summaryState),
     "",
-    ...modeStatusCard(report),
+    ...controlsSummary(report),
+    ...criticalFindingLines(report),
     ...materializationWarningLines(dnsEvidence),
-    ...auditWouldBlockSummary(report, dnsEvidence, auditSummary),
+    ...networkActivitySummary(report, dnsEvidence, auditSummary),
     "",
   ];
 }
@@ -906,13 +1083,13 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 module.exports = {
   MAX_REPORT_BYTES,
   allowlistYamlSnippet,
-  auditWouldBlockSummary,
   correlateFindingsToDns,
+  controlsSummary,
   defaultInlineConfig,
-  modeStatusCard,
   materializationRequestRejections,
   materializationEvidenceCounter,
   materializationWarningLines,
+  networkActivitySummary,
   nativeInputsFromEnvironment,
   readJsonBounded,
   runtimePaths,
