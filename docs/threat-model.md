@@ -10,10 +10,10 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree defines the schema-`5` policy and schema-`3` runtime-evidence
-contract. A released Action bundle adopts that contract atomically by updating
-its agent and wrapper validators together. The bundle remains
-governed by `action/bundle-manifest.json` and the wrapper schema constants; the
+The source tree and released Action bundle use the schema-`5` policy and
+schema-`3` runtime-evidence contract. Bundle updates change the attested agent
+and wrapper validators atomically. The bundle remains governed by
+`action/bundle-manifest.json` and the wrapper schema constants; the
 wrapper rejects older evidence, stale verification state, an incomplete worker
 set, or a resident PID that does not match the active systemd service. This
 atomic contract is the critical-adoption gate for this model.

@@ -4,9 +4,14 @@ set -euo pipefail
 
 source script/env "$@"
 
-if [[ $# -ne 0 ]]; then
-  die "usage: script/verify-protected-finalization"
+if [[ $# -gt 1 ]]; then
+  die "usage: script/verify-protected-finalization [integration|action]"
 fi
+job_set="${1:-integration}"
+case "$job_set" in
+  integration|action) ;;
+  *) die "finalization job set must be integration or action" ;;
+esac
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
   die "protected finalization verification runs only in GitHub Actions"
 fi
@@ -16,7 +21,7 @@ fi
 
 require_cmd python3
 
-python3 <<'PY'
+FENCE_FINALIZATION_JOB_SET="$job_set" python3 <<'PY'
 import datetime
 import io
 import json
@@ -30,13 +35,22 @@ import zipfile
 repository = os.environ["GITHUB_REPOSITORY"]
 run_id = os.environ["GITHUB_RUN_ID"]
 token = os.environ["GITHUB_TOKEN"]
+job_set = os.environ["FENCE_FINALIZATION_JOB_SET"]
 api_root = f"https://api.github.com/repos/{repository}"
-expected_jobs = {
-    "protected finalization quiet-1",
-    "protected finalization quiet-2",
-    "protected finalization quiet-3",
-    "protected standard-opt-out required",
-}
+expected_jobs = (
+    {
+        "protected finalization quiet-1",
+        "protected finalization quiet-2",
+        "protected finalization quiet-3",
+        "protected standard-opt-out required",
+    }
+    if job_set == "integration"
+    else {
+        "action finalization quiet-1",
+        "action finalization quiet-2",
+        "action finalization quiet-3",
+    }
+)
 authorization_marker = b"fence-results-storage-authorization-observed"
 authorization_observed = False
 
@@ -138,10 +152,10 @@ for name in sorted(expected_jobs):
             marker_observed = any(authorization_marker in bundle.read(entry) for entry in files)
     else:
         marker_observed = authorization_marker in archive
-    if name.startswith("protected finalization "):
+    if job_set == "integration" and name.startswith("protected finalization "):
         authorization_observed = authorization_observed or marker_observed
 
-print("protected finalization and downloadable job logs verified")
+print(f"{job_set} finalization and downloadable job logs verified")
 if authorization_observed:
     print("runner-authorized results storage was observed after Fence readiness")
 PY

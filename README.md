@@ -28,6 +28,11 @@ It also allows `github.com`, `api.github.com`, and
 common setup steps. Those allowed GitHub domains are still places later
 workflow code can send data.
 
+GitHub uploads job logs and summaries to a per-run Azure storage account.
+Fence authorizes at most four exact results-storage hostnames, and only when
+the DNS request comes from the pinned GitHub runner process. It does not allow
+the general `*.blob.core.windows.net` domain.
+
 ## Examples 🧪
 
 Run in audit mode first to see what would be blocked:
@@ -185,7 +190,9 @@ Actions reporting, checkout, API, and release-asset flows working, but later
 workflow code can also send data to those allowed GitHub destinations. Set
 `disable_broad_github_domains: true` if you want to remove `github.com`,
 `api.github.com`, and `release-assets.githubusercontent.com` from the default
-allowlist.
+allowlist. GitHub's exact runner-authorized results-storage account also
+becomes a reachable destination for the rest of the job; Fence records that
+authorization locally and limits it to TCP port `443`.
 
 Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support

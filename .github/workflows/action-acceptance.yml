@@ -148,9 +148,58 @@ jobs:
       - name: fail the post hook on post-ready drift
         run: script/test-action-tamper
 
+  action-finalization:
+    name: action finalization ${{ matrix.replica }}
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [quiet-1, quiet-2, quiet-3]
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
+
+      - name: activate bundled Fence agent without post-ready warming
+        uses: ./
+        with:
+          invocation_id: action-finalization-${{ matrix.replica }}
+
+  verify-action-finalization:
+    name: verify Action finalization
+    needs: [action-finalization]
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: verify terminal jobs and downloadable logs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: script/verify-protected-finalization action
+
   acceptance:
     name: action acceptance
-    needs: [action, zero-input, setup-failure, tamper]
+    needs: [action, zero-input, setup-failure, tamper, verify-action-finalization]
     runs-on: ubuntu-24.04
 
     steps:

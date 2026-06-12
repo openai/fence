@@ -52,18 +52,18 @@ function residentHealth(overrides: Record<string, unknown> = {}): Record<string,
 }
 
 const report = {
-  runtime_evidence_schema_version: 2,
+  runtime_evidence_schema_version: 3,
   status: "protected_host_block",
   mode: "block",
   readiness_status: "ready",
-  platform_profile_id: "github_hosted_workflow_bootstrap_v1",
-  profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
+  platform_profile_id: "github_hosted_workflow_bootstrap_v2",
+  profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v2",
   network_verification_status: "verified",
   setup_status: "resident_protected",
   protection_available: true,
   sudo_status: "disabled_verified",
   container_status: "disabled_verified",
-  policy_hash_schema_version: 4,
+  policy_hash_schema_version: 5,
   policy_hash: "a".repeat(64),
   base_ruleset_hash: "b".repeat(64),
   ruleset_hash: "c".repeat(64),
@@ -153,7 +153,7 @@ test("validates explicit and zero-input inline configurations", () => {
       invocationId: "custom-run",
       mode: "block",
       containerPolicy: "unsafe_preserve",
-      platformProfile: "github_hosted_workflow_bootstrap_v1",
+      platformProfile: "github_hosted_workflow_bootstrap_v2",
       disableBroadGithubDomains: "true",
       allowlist: [
         "# comments are ignored",
@@ -182,7 +182,7 @@ test("validates explicit and zero-input inline configurations", () => {
         { destination_type: "cidr", destination: "2001:db8::/64", protocol: "tcp", port: 443 },
       ],
       container_policy: "unsafe_preserve",
-      platform_profile: "github_hosted_workflow_bootstrap_v1",
+      platform_profile: "github_hosted_workflow_bootstrap_v2",
       disable_broad_github_domains: true,
     }),
   );
@@ -203,7 +203,7 @@ test("validates explicit and zero-input inline configurations", () => {
   for (const nativeInput of [
     { invocationId: "native-run" },
     { containerPolicy: "disable" },
-    { platformProfile: "github_hosted_workflow_bootstrap_v1" },
+    { platformProfile: "github_hosted_workflow_bootstrap_v2" },
     { disableBroadGithubDomains: "true" },
     { allowlist: "example.com" },
   ]) {
@@ -283,7 +283,7 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
   assert.equal(details.mode, "block");
   assert.equal(details.source, "native inputs");
   assert.equal(details.containerPolicy, "disable");
-  assert.equal(details.platformProfile, "github_hosted_workflow_bootstrap_v1");
+  assert.equal(details.platformProfile, "github_hosted_workflow_bootstrap_v2");
   assert.equal(details.disableBroadGithubDomains, false);
   assert.equal(details.allowlistCount, 1);
   assert.deepEqual(details.allowlistDestinations, ["hostname:api.example.com:tcp:443"]);
@@ -500,21 +500,48 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
 test("validates stable runtime evidence", () => {
   validateReport(report);
   const dnsEvidence = {
-    runtime_evidence_schema_version: 2,
+    runtime_evidence_schema_version: 3,
     status: report.status,
     mode: report.mode,
     platform_profile_id: report.platform_profile_id,
     profile_realization_id: report.profile_realization_id,
     protection_available: report.protection_available,
     routing_status: "active",
+    host_dns_routing: "direct_client_to_root_resident_mediator",
+    docker_dns_routing: "local_root_resident_mediator",
+    answer_attribution_status: "bounded_reportable_hostname_answers_only",
+    proxy_policy_status: "block_forwards_exact_roots_bounded_actions_suffix_names_runner_authorized_results_storage_and_bounded_cname_descendants",
+    runner_authorized_results_storage: [],
+    runner_authorized_results_storage_truncated: false,
+    results_storage_authorization_count: 0,
+    results_storage_attribution_failures: 0,
+    results_storage_request_rejections: 0,
     resident_health: report.resident_health,
   };
   validateDnsEvidence(dnsEvidence, report);
+  const auditReport = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+  };
+  validateReport(auditReport);
+  validateDnsEvidence({
+    ...dnsEvidence,
+    status: auditReport.status,
+    mode: auditReport.mode,
+    protection_available: false,
+    proxy_policy_status: "audit_forwards_without_name_authorization",
+  }, auditReport);
   validateReady({
-    runtime_evidence_schema_version: 2,
+    runtime_evidence_schema_version: 3,
     status: "ready",
-    platform_profile_id: "github_hosted_workflow_bootstrap_v1",
-    profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
+    platform_profile_id: "github_hosted_workflow_bootstrap_v2",
+    profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v2",
     policy_hash_schema_version: report.policy_hash_schema_version,
     policy_hash: report.policy_hash,
     base_ruleset_hash: report.base_ruleset_hash,
@@ -523,10 +550,10 @@ test("validates stable runtime evidence", () => {
     resident_health: report.resident_health,
   }, report);
   validateReady({
-    runtime_evidence_schema_version: 2,
+    runtime_evidence_schema_version: 3,
     status: "ready",
-    platform_profile_id: "github_hosted_workflow_bootstrap_v1",
-    profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
+    platform_profile_id: "github_hosted_workflow_bootstrap_v2",
+    profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v2",
     policy_hash_schema_version: report.policy_hash_schema_version,
     policy_hash: report.policy_hash,
     base_ruleset_hash: report.base_ruleset_hash,
@@ -547,6 +574,40 @@ test("validates stable runtime evidence", () => {
   assert.throws(
     () => validateDnsEvidence({ ...dnsEvidence, runtime_evidence_schema_version: 1 }, report),
     /does not match/,
+  );
+  validateDnsEvidence({
+    ...dnsEvidence,
+    runner_authorized_results_storage: [{
+      hostname: "productionresultssa17.blob.core.windows.net",
+      authorization_origin: "pinned_runner_worker_dns",
+    }],
+    results_storage_authorization_count: 1,
+  }, report);
+  assert.throws(
+    () => validateDnsEvidence({
+      ...dnsEvidence,
+      runner_authorized_results_storage: [{
+        hostname: "example.blob.core.windows.net",
+        authorization_origin: "pinned_runner_worker_dns",
+      }],
+      results_storage_authorization_count: 1,
+    }, report),
+    /invalid results-storage authorization/,
+  );
+  assert.throws(
+    () => validateDnsEvidence({
+      ...dnsEvidence,
+      runner_authorized_results_storage: [{
+        hostname: "productionresultssa17.blob.core.windows.net",
+        authorization_origin: "workflow_dns",
+      }],
+      results_storage_authorization_count: 1,
+    }, report),
+    /invalid results-storage authorization/,
+  );
+  assert.throws(
+    () => validateDnsEvidence({ ...dnsEvidence, results_storage_authorization_count: 1 }, report),
+    /bounded runner provenance/,
   );
   assert.throws(
     () => validateDnsEvidence({
@@ -659,6 +720,20 @@ test("renders a concise healthy block results table without raw evidence fields"
         resolved_addresses: ["2001:db8::1"],
       },
       {
+        hostname: "productionresultssa17.blob.core.windows.net",
+        query_type: "a",
+        policy_classification: "runner_authorized_results_storage",
+        occurrences: 1,
+        resolved_addresses: ["192.0.2.17"],
+      },
+      {
+        hostname: "result-storage-cname.example.net",
+        query_type: "aaaa",
+        policy_classification: "runner_authorized_results_storage_cname_derived",
+        occurrences: 1,
+        resolved_addresses: ["2001:db8::17"],
+      },
+      {
         hostname: "codeload.github.com",
         query_type: "a",
         policy_classification: "outside_policy",
@@ -687,6 +762,8 @@ test("renders a concise healthy block results table without raw evidence fields"
   assert.match(summary, /\| `github.com` \| ✅ Allowed \| 2 A queries \|/);
   assert.match(summary, /\| `github.com` \| ⛔ Blocked \| 1 TYPE15 query \|/);
   assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 AAAA query \|/);
+  assert.match(summary, /\| `productionresultssa17.blob.core.windows.net` \| ✅ Allowed \| 1 A query \|/);
+  assert.match(summary, /\| `result-storage-cname.example.net` \| ✅ Allowed \| 1 AAAA query \|/);
   assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 A query \|/);
   assert.equal(summary.match(/Fence Summary/g)?.length, 1);
   assert.doesNotMatch(summary, /Fence local evidence/);
@@ -1016,6 +1093,24 @@ test("renders DNS materialization request rejection evidence as a non-critical w
   assert.match(summary, /#### Warnings/);
   assert.match(summary, /DNS answers withheld while firewall updates were unavailable/);
   assert.doesNotMatch(summary, /Critical findings/);
+});
+
+test("renders bounded results-storage provenance warnings without a healthy indicator", () => {
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    materialization_request_rejections: 1,
+    results_storage_attribution_failures: 2,
+    results_storage_request_rejections: 3,
+    runner_authorized_results_storage_truncated: true,
+  };
+  const summary = summaryLines(report, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟡 Fence Summary/);
+  assert.doesNotMatch(summary, /🟢/);
+  assert.equal((summary.match(/#### Warnings/g) || []).length, 1);
+  assert.match(summary, /GitHub results-storage requests could not be attributed \| `2`/);
+  assert.match(summary, /GitHub results-storage requests were rejected \| `3`/);
+  assert.match(summary, /Additional results-storage accounts were denied/);
 });
 
 test("renders bounded allowlist YAML snippets", () => {
