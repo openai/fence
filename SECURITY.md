@@ -7,7 +7,10 @@ latest `main` branch and the latest published stable release. The implemented
 protection boundary is intentionally limited to GitHub-hosted `ubuntu-24.04`
 x64 host jobs as documented in `docs/v0.md`. Audit mode is observation-only,
 and `unsafe_preserve` is explicitly degraded because it retains container
-control paths. Stable `0.1.3` is the current supported agent publication.
+control paths. `Cargo.toml` is the checked-out source-agent version authority,
+and `action/bundle-manifest.json` identifies the agent carried by the Action.
+The latest stable GitHub Release is the supported publication; this policy does
+not duplicate a version number that can become stale.
 
 ## Dependency Policy
 
@@ -60,8 +63,9 @@ The published Fence agent target is limited to `x86_64-unknown-linux-gnu` on
 GitHub-hosted `ubuntu-24.04` x64 after its documented security assertions are
 proved. Release publication, Action-bundle refresh, artifact upload/download,
 and attestation verification are intentionally GitHub-networked operations.
-The current public review notes and residual boundaries are recorded in
-[`docs/security-review.md`](docs/security-review.md).
+The current threat model and residual boundaries are recorded in
+[`docs/threat-model.md`](docs/threat-model.md). Focused review findings are
+recorded in [`docs/security-review.md`](docs/security-review.md).
 
 ## Reporting Vulnerabilities
 

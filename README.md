@@ -117,6 +117,10 @@ Blank lines and lines starting with `#` are ignored. Hostname shortcuts default
 to `tcp` port `443`. IPv6 or non-hostname entries should use the explicit
 `ip` or `cidr` form.
 
+Fence resolves exact hostname entries before lockdown is ready and refreshes
+their approved addresses while the job runs. Each hostname keeps the protocol
+and port you configured as DNS answers change.
+
 ## How It Works 🔧
 
 1. Your workflow starts with `uses: GrantBirki/fence@<commit-sha>`.
@@ -237,8 +241,10 @@ Action/systemd path.
 ## Further Reading 📚
 
 - [Fence v0 security contract](docs/v0.md)
+- [Threat model](docs/threat-model.md)
 - [Security policy](SECURITY.md)
 - [Security review](docs/security-review.md)
+- [Implementation history](docs/history.md)
 - [Repository settings](docs/repository-settings.md)
 - [Hermetic Builds](https://software.birki.io/posts/hermetic-builds/)
 
