@@ -124,17 +124,22 @@ for name in sorted(expected_jobs):
             raise SystemExit(f"protected finalization log archive was unavailable: {name}")
         time.sleep(5)
     if not archive or len(archive) > 8 * 1024 * 1024:
-        raise SystemExit(f"protected finalization log archive was empty or oversized: {name}")
-    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-        files = [entry for entry in bundle.infolist() if not entry.is_dir() and entry.file_size > 0]
-        if not files:
-            raise SystemExit(f"protected finalization log archive had no nonempty files: {name}")
-        if sum(entry.file_size for entry in files) > 16 * 1024 * 1024:
-            raise SystemExit(f"protected finalization log archive expanded past its fixed bound: {name}")
-        if name.startswith("protected finalization "):
-            authorization_observed = authorization_observed or any(
-                authorization_marker in bundle.read(entry) for entry in files
-            )
+        raise SystemExit(f"protected finalization job log was empty or oversized: {name}")
+    if zipfile.is_zipfile(io.BytesIO(archive)):
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            files = [
+                entry for entry in bundle.infolist()
+                if not entry.is_dir() and entry.file_size > 0
+            ]
+            if not files:
+                raise SystemExit(f"protected finalization log archive had no nonempty files: {name}")
+            if sum(entry.file_size for entry in files) > 16 * 1024 * 1024:
+                raise SystemExit(f"protected finalization log archive expanded past its fixed bound: {name}")
+            marker_observed = any(authorization_marker in bundle.read(entry) for entry in files)
+    else:
+        marker_observed = authorization_marker in archive
+    if name.startswith("protected finalization "):
+        authorization_observed = authorization_observed or marker_observed
 
 if not authorization_observed:
     raise SystemExit("quiet protected jobs did not observe runner-authorized results storage")
