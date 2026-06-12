@@ -7,15 +7,22 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  ACTION_RUNTIME_FILES,
+  actionRuntimeDigest,
+  actionRuntimeFileDigests,
   allowlistYamlSnippet,
   correlateFindingsToDns,
   defaultInlineConfig,
+  launcherIntegrityDocument,
   materializationRequestRejections,
   materializationWarningLines,
   runtimePaths,
   summaryLines,
   validateBundle,
   validateInlineConfig,
+  validateLauncherIntegrity,
+  validateProtectedActionRuntime,
+  validateReadOnlyActionMount,
   validateReady,
   validateReport,
   validateResidentHealth,
@@ -382,9 +389,91 @@ test("derives only bounded fixed runtime paths", () => {
     report: "/run/fence/action-test/report.json",
     dnsReport: "/run/fence/action-test/dns-report.json",
     unit: "fence-action-test.service",
+    launcherDirectory: "/run/fence-launcher/action-test",
+    launcherActionDirectory: "/run/fence-launcher/action-test/action",
+    launcherIntegrity: "/run/fence-launcher/action-test/integrity.json",
   });
   assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
+});
+
+test("binds launcher integrity to the exact Action runtime file set", () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-runtime-"));
+  try {
+    fs.mkdirSync(path.join(temporary, "bin"));
+    for (const relativePath of ACTION_RUNTIME_FILES) {
+      const file = path.join(temporary, relativePath);
+      fs.writeFileSync(file, `runtime:${relativePath}`, "utf8");
+      fs.chmodSync(file, relativePath === "bin/fence" ? 0o755 : 0o644);
+    }
+    const files = actionRuntimeFileDigests(temporary);
+    assert.equal(files.length, ACTION_RUNTIME_FILES.length);
+    assert.match(actionRuntimeDigest(files), /^[0-9a-f]{64}$/);
+    const integrity = launcherIntegrityDocument(
+      "action-test",
+      "/opt/actions/fence/action",
+      "/run/fence-launcher/action-test/action",
+      files,
+    );
+    validateLauncherIntegrity(
+      integrity,
+      "action-test",
+      "/opt/actions/fence/action",
+      "/run/fence-launcher/action-test/action",
+      files,
+    );
+    assert.throws(
+      () => validateLauncherIntegrity(
+        { ...integrity, runtime_digest: "0".repeat(64) },
+        "action-test",
+        "/opt/actions/fence/action",
+        "/run/fence-launcher/action-test/action",
+        files,
+      ),
+      /does not match/,
+    );
+    fs.writeFileSync(path.join(temporary, "post.cts"), "modified", "utf8");
+    const modified = actionRuntimeFileDigests(temporary);
+    assert.notEqual(actionRuntimeDigest(files), actionRuntimeDigest(modified));
+    assert.throws(
+      () => validateLauncherIntegrity(
+        integrity,
+        "action-test",
+        "/opt/actions/fence/action",
+        "/run/fence-launcher/action-test/action",
+        modified,
+      ),
+      /does not match/,
+    );
+    assert.throws(() => validateProtectedActionRuntime(temporary), /unsafe ownership or mode/);
+    fs.renameSync(path.join(temporary, "bin"), path.join(temporary, "real-bin"));
+    fs.symlinkSync(path.join(temporary, "real-bin"), path.join(temporary, "bin"));
+    assert.throws(() => actionRuntimeFileDigests(temporary), /binary directory/);
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("requires the registered Action runtime mount to be read-only, nodev, and nosuid", () => {
+  const target = "/opt/actions/fence/action";
+  validateReadOnlyActionMount(JSON.stringify({
+    filesystems: [{ target, options: "ro,nosuid,nodev,relatime" }],
+  }), target);
+  for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
+    assert.throws(
+      () => validateReadOnlyActionMount(JSON.stringify({
+        filesystems: [{ target, options }],
+      }), target),
+      /missing/,
+    );
+  }
+  assert.throws(
+    () => validateReadOnlyActionMount(JSON.stringify({
+      filesystems: [{ target: "/different", options: "ro,nosuid,nodev" }],
+    }), target),
+    /does not match/,
+  );
+  assert.throws(() => validateReadOnlyActionMount("not-json", target), /malformed/);
 });
 
 test("validates stable runtime evidence", () => {

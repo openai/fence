@@ -191,7 +191,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Must never become an Action runtime step.
 
 - `script/test-action-wrapper`
-  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, report validation, compact control and network-activity summary tables, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, protected-runtime integrity records, read-only mount evidence, report validation, compact control and network-activity summary tables, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
   - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
   - Action logs should stay concise by default and may use emoji plus ANSI colors for human readability. Debug logs are allowed only through GitHub Actions debug mode, must remain bounded and sanitized, and must not print raw config bodies, environment dumps, tokens, packet payloads, raw DNS packets, unrelated system logs, or arbitrary report JSON.
   - Job summaries should prefer bounded result tables over explanatory prose: show mode, network, sudo, and container outcomes plus reportable destinations and decisions; keep detailed evidence in local JSON and keep audit allowlist guidance collapsed.
@@ -202,7 +202,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-acceptance`
   - Linux x64-only, GitHub-Actions-only hosted acceptance entrypoint invoked after `uses: ./`.
-  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown. Audit acceptance also exercises a non-profile public hostname so the Action summary has DNS-backed would-block evidence to turn into `allowlist` guidance.
+  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown. Standard block also proves the root-owned Action runtime is mounted read-only, `nodev`, and `nosuid`, and that runner-user overwrite, unlink, chmod, rename, and replacement attempts fail for every executable wrapper file and the bundled agent. Audit acceptance also exercises a non-profile public hostname so the Action summary has DNS-backed would-block evidence to turn into `allowlist` guidance.
   - Must not stop the service, restore controls, download an agent, or fetch policy.
 
 - `script/test-action-setup-failure`
@@ -211,7 +211,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-tamper`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
-  - Launches the bundled audit lifecycle through the Action entrypoint, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the post hook fails without stopping the service or restoring network state.
+  - Launches the bundled audit lifecycle through the Action entrypoint, proves direct runner-user modification of the registered protected post hook fails, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the protected post hook fails without stopping the service or restoring network state.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.

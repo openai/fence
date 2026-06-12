@@ -13,6 +13,13 @@ type RuntimePaths = {
   report: string;
   dnsReport: string;
   unit: string;
+  launcherDirectory: string;
+  launcherActionDirectory: string;
+  launcherIntegrity: string;
+};
+type ActionRuntimeFileDigest = {
+  path: string;
+  sha256: string;
 };
 type InlineConfig = {
   invocationId: string;
@@ -93,6 +100,16 @@ const REQUIRED_RESIDENT_WORKERS = [
 const RELEASE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_ROOT = "/run/fence";
+const LAUNCHER_RUNTIME_ROOT = "/run/fence-launcher";
+const ACTION_RUNTIME_FILES = [
+  "bin/fence",
+  "bundle-manifest.json",
+  "lib.cts",
+  "log.cts",
+  "main.cts",
+  "post.cts",
+] as const;
+const MAX_ACTION_RUNTIME_FILE_BYTES = 64 * 1024 * 1024;
 const REPORT_STATUSES = new Set([
   "protected_host_block",
   "protected_host_block_degraded",
@@ -459,6 +476,7 @@ function runtimePaths(invocationId: unknown): RuntimePaths {
     fail("runtime invocation_id must use the Fence lowercase slug grammar");
   }
   const directory = path.join(RUNTIME_ROOT, invocationId);
+  const launcherDirectory = path.join(LAUNCHER_RUNTIME_ROOT, invocationId);
   return {
     directory,
     config: path.join(directory, "config.json"),
@@ -466,7 +484,179 @@ function runtimePaths(invocationId: unknown): RuntimePaths {
     report: path.join(directory, "report.json"),
     dnsReport: path.join(directory, "dns-report.json"),
     unit: `fence-${invocationId}.service`,
+    launcherDirectory,
+    launcherActionDirectory: path.join(launcherDirectory, "action"),
+    launcherIntegrity: path.join(launcherDirectory, "integrity.json"),
   };
+}
+
+function actionRuntimeFileDigests(actionRoot: string): ActionRuntimeFileDigest[] {
+  const rootStat = fs.lstatSync(actionRoot);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+    fail("Fence Action runtime root is not a regular directory");
+  }
+  const binaryDirectoryStat = fs.lstatSync(path.join(actionRoot, "bin"));
+  if (!binaryDirectoryStat.isDirectory() || binaryDirectoryStat.isSymbolicLink()) {
+    fail("Fence Action binary directory is not a regular directory");
+  }
+  return ACTION_RUNTIME_FILES.map((relativePath) => {
+    const file = path.join(actionRoot, relativePath);
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_ACTION_RUNTIME_FILE_BYTES) {
+      fail(`Fence Action runtime file is unsafe: ${relativePath}`);
+    }
+    if (relativePath === "bin/fence" && (stat.mode & 0o111) === 0) {
+      fail("bundled Fence binary is not executable");
+    }
+    return {
+      path: relativePath,
+      sha256: crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex"),
+    };
+  });
+}
+
+function actionRuntimeDigest(files: ActionRuntimeFileDigest[]): string {
+  if (
+    !Array.isArray(files) ||
+    files.length !== ACTION_RUNTIME_FILES.length ||
+    files.some((file, index) =>
+      file === null ||
+      typeof file !== "object" ||
+      file.path !== ACTION_RUNTIME_FILES[index] ||
+      !SHA256.test(file.sha256)
+    )
+  ) {
+    fail("Fence Action runtime file digest set is invalid");
+  }
+  return crypto.createHash("sha256").update(JSON.stringify(files)).digest("hex");
+}
+
+function launcherIntegrityDocument(
+  invocationId: string,
+  actionRuntimePath: string,
+  protectedCopyPath: string,
+  files: ActionRuntimeFileDigest[],
+): Record<string, unknown> {
+  runtimePaths(invocationId);
+  if (!path.isAbsolute(actionRuntimePath) || !path.isAbsolute(protectedCopyPath)) {
+    fail("Fence Action integrity paths must be absolute");
+  }
+  return {
+    schema_version: 1,
+    invocation_id: invocationId,
+    action_runtime_path: actionRuntimePath,
+    protected_copy_path: protectedCopyPath,
+    runtime_digest: actionRuntimeDigest(files),
+    files,
+  };
+}
+
+function validateLauncherIntegrity(
+  integrity: any,
+  invocationId: string,
+  actionRuntimePath: string,
+  protectedCopyPath: string,
+  files: ActionRuntimeFileDigest[],
+): void {
+  if (integrity === null || Array.isArray(integrity) || typeof integrity !== "object") {
+    fail("Fence Action launcher integrity evidence is invalid");
+  }
+  const expectedKeys = [
+    "action_runtime_path",
+    "files",
+    "invocation_id",
+    "protected_copy_path",
+    "runtime_digest",
+    "schema_version",
+  ];
+  if (
+    JSON.stringify(Object.keys(integrity).sort()) !== JSON.stringify(expectedKeys) ||
+    integrity.schema_version !== 1 ||
+    integrity.invocation_id !== invocationId ||
+    integrity.action_runtime_path !== actionRuntimePath ||
+    integrity.protected_copy_path !== protectedCopyPath ||
+    integrity.runtime_digest !== actionRuntimeDigest(files) ||
+    JSON.stringify(integrity.files) !== JSON.stringify(files)
+  ) {
+    fail("Fence Action launcher integrity evidence does not match the protected runtime");
+  }
+}
+
+function readLauncherIntegrity(file: string): any {
+  const stat = fs.lstatSync(file);
+  if (
+    !stat.isFile() ||
+    stat.isSymbolicLink() ||
+    stat.uid !== 0 ||
+    (stat.mode & 0o777) !== 0o444 ||
+    stat.size > 64 * 1024
+  ) {
+    fail("Fence Action launcher integrity file is unsafe");
+  }
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function validateProtectedActionRuntime(actionRoot: string): void {
+  const expectedModes = new Map<string, number>([
+    [".", 0o555],
+    ["bin", 0o555],
+    ["bin/fence", 0o555],
+    ["bundle-manifest.json", 0o444],
+    ["lib.cts", 0o444],
+    ["log.cts", 0o444],
+    ["main.cts", 0o444],
+    ["post.cts", 0o444],
+  ]);
+  for (const [relativePath, expectedMode] of expectedModes) {
+    const item = relativePath === "." ? actionRoot : path.join(actionRoot, relativePath);
+    const stat = fs.lstatSync(item);
+    const expectsDirectory = relativePath === "." || relativePath === "bin";
+    if (
+      stat.isSymbolicLink() ||
+      stat.uid !== 0 ||
+      (stat.mode & 0o777) !== expectedMode ||
+      (expectsDirectory ? !stat.isDirectory() : !stat.isFile())
+    ) {
+      fail(`Fence protected Action runtime has unsafe ownership or mode: ${relativePath}`);
+    }
+  }
+}
+
+function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void {
+  if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
+    fail("Fence protected Action mount evidence is unavailable");
+  }
+  let document: any;
+  try {
+    document = JSON.parse(raw);
+  } catch {
+    fail("Fence protected Action mount evidence is malformed");
+  }
+  if (
+    document === null ||
+    Array.isArray(document) ||
+    typeof document !== "object" ||
+    !Array.isArray(document.filesystems) ||
+    document.filesystems.length !== 1
+  ) {
+    fail("Fence protected Action mount evidence is incomplete");
+  }
+  const mount = document.filesystems[0];
+  if (
+    mount === null ||
+    Array.isArray(mount) ||
+    typeof mount !== "object" ||
+    mount.target !== expectedTarget ||
+    typeof mount.options !== "string"
+  ) {
+    fail("Fence protected Action mount does not match the registered runtime");
+  }
+  const options = new Set(mount.options.split(","));
+  for (const required of ["ro", "nodev", "nosuid"]) {
+    if (!options.has(required)) {
+      fail(`Fence protected Action mount is missing ${required}`);
+    }
+  }
 }
 
 function validateBundle(manifestPath: string, binaryPath: string): any {
@@ -1187,7 +1377,10 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 }
 
 module.exports = {
+  ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  actionRuntimeDigest,
+  actionRuntimeFileDigests,
   allowlistYamlSnippet,
   correlateFindingsToDns,
   controlsSummary,
@@ -1198,11 +1391,16 @@ module.exports = {
   networkActivitySummary,
   nativeInputsFromEnvironment,
   readJsonBounded,
+  readLauncherIntegrity,
+  launcherIntegrityDocument,
   runtimePaths,
   summaryHeading,
   summaryLines,
   validateBundle,
   validateInlineConfig,
+  validateLauncherIntegrity,
+  validateProtectedActionRuntime,
+  validateReadOnlyActionMount,
   validateReady,
   validateReport,
   validateResidentHealth,

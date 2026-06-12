@@ -5,12 +5,20 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const log = require("./log.cts");
 const {
+  ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  actionRuntimeDigest,
+  actionRuntimeFileDigests,
+  launcherIntegrityDocument,
   nativeInputsFromEnvironment,
   readJsonBounded,
+  readLauncherIntegrity,
   runtimePaths,
   validateBundle,
   validateInlineConfig,
+  validateLauncherIntegrity,
+  validateProtectedActionRuntime,
+  validateReadOnlyActionMount,
   validateReady,
   validateReport,
 } = require("./lib.cts");
@@ -29,6 +37,11 @@ const CHILD_ENV = {
 
 let diagnosticPaths: { unit: string } | undefined;
 let serviceLaunchAttempted = false;
+let serviceLaunchSucceeded = false;
+let launcherPaths: ReturnType<typeof runtimePaths> | undefined;
+let protectedActionMounted = false;
+let readinessObserved = false;
+let runtimeDirectoryCreated = false;
 
 function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
@@ -80,6 +93,14 @@ function capture(
     stderr: String(result.stderr || ""),
     error: result.error ? result.error.message : undefined,
   };
+}
+
+function captureRequired(executable: string, args: string[]): string {
+  const result = capture(executable, args);
+  if (result.error || result.status !== 0) {
+    throw new Error(`${path.basename(executable)} could not verify protected Action state`);
+  }
+  return result.stdout;
 }
 
 function compactServiceStatus(output: string): string {
@@ -146,6 +167,207 @@ function assertRootDirectory(directory: string): void {
   }
 }
 
+function pathEntryExists(entry: string): boolean {
+  try {
+    fs.lstatSync(entry);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function createOrValidateRootDirectory(directory: string): void {
+  if (!pathEntryExists(directory)) {
+    run("/usr/bin/sudo", [
+      "/usr/bin/install",
+      "-d",
+      "-o",
+      "root",
+      "-g",
+      "root",
+      "-m",
+      "0755",
+      directory,
+    ]);
+  }
+  assertRootDirectory(directory);
+}
+
+function mountEvidence(actionRoot: string): string {
+  return captureRequired("/usr/bin/findmnt", [
+    "--json",
+    "--mountpoint",
+    actionRoot,
+    "--output",
+    "TARGET,OPTIONS",
+  ]);
+}
+
+function installProtectedActionRuntime(
+  invocationId: string,
+  paths: ReturnType<typeof runtimePaths>,
+): void {
+  if (pathEntryExists(paths.launcherDirectory)) {
+    throw new Error("Fence launcher invocation directory already exists");
+  }
+  const sourceFiles = actionRuntimeFileDigests(ACTION_ROOT);
+  createOrValidateRootDirectory("/run/fence-launcher");
+  run("/usr/bin/sudo", [
+    "/usr/bin/install",
+    "-d",
+    "-o",
+    "root",
+    "-g",
+    "root",
+    "-m",
+    "0755",
+    paths.launcherDirectory,
+    paths.launcherActionDirectory,
+    path.join(paths.launcherActionDirectory, "bin"),
+  ]);
+  assertRootDirectory(paths.launcherDirectory);
+  for (const relativePath of ACTION_RUNTIME_FILES) {
+    const mode = relativePath === "bin/fence" ? "0555" : "0444";
+    run("/usr/bin/sudo", [
+      "/usr/bin/install",
+      "-o",
+      "root",
+      "-g",
+      "root",
+      "-m",
+      mode,
+      path.join(ACTION_ROOT, relativePath),
+      path.join(paths.launcherActionDirectory, relativePath),
+    ]);
+  }
+  run("/usr/bin/sudo", [
+    "/usr/bin/chmod",
+    "0555",
+    paths.launcherActionDirectory,
+    path.join(paths.launcherActionDirectory, "bin"),
+  ]);
+  validateProtectedActionRuntime(paths.launcherActionDirectory);
+  const protectedFiles = actionRuntimeFileDigests(paths.launcherActionDirectory);
+  if (actionRuntimeDigest(sourceFiles) !== actionRuntimeDigest(protectedFiles)) {
+    throw new Error("Fence protected Action copy does not match the registered runtime");
+  }
+  const integrity = launcherIntegrityDocument(
+    invocationId,
+    ACTION_ROOT,
+    paths.launcherActionDirectory,
+    protectedFiles,
+  );
+  run("/usr/bin/sudo", [
+    "/usr/bin/install",
+    "-o",
+    "root",
+    "-g",
+    "root",
+    "-m",
+    "0600",
+    "/dev/null",
+    paths.launcherIntegrity,
+  ]);
+  run("/usr/bin/sudo", ["/usr/bin/tee", paths.launcherIntegrity], JSON.stringify(integrity), true);
+  run("/usr/bin/sudo", ["/usr/bin/chmod", "0444", paths.launcherIntegrity]);
+  validateLauncherIntegrity(
+    readLauncherIntegrity(paths.launcherIntegrity),
+    invocationId,
+    ACTION_ROOT,
+    paths.launcherActionDirectory,
+    protectedFiles,
+  );
+
+  run("/usr/bin/sudo", [
+    "/usr/bin/mount",
+    "--bind",
+    paths.launcherActionDirectory,
+    ACTION_ROOT,
+  ]);
+  protectedActionMounted = true;
+  run("/usr/bin/sudo", [
+    "/usr/bin/mount",
+    "-o",
+    "remount,bind,ro,nodev,nosuid",
+    paths.launcherActionDirectory,
+    ACTION_ROOT,
+  ]);
+  validateReadOnlyActionMount(mountEvidence(ACTION_ROOT), ACTION_ROOT);
+  validateProtectedActionRuntime(ACTION_ROOT);
+  const mountedFiles = actionRuntimeFileDigests(ACTION_ROOT);
+  validateLauncherIntegrity(
+    readLauncherIntegrity(paths.launcherIntegrity),
+    invocationId,
+    ACTION_ROOT,
+    paths.launcherActionDirectory,
+    mountedFiles,
+  );
+  validateBundle(MANIFEST, BINARY);
+  log.debugGroup("Fence debug: protected Action runtime", [
+    `action_runtime_path=${ACTION_ROOT}`,
+    `protected_copy_path=${paths.launcherActionDirectory}`,
+    `integrity_path=${paths.launcherIntegrity}`,
+    `runtime_digest=${actionRuntimeDigest(mountedFiles)}`,
+    `mount_options=ro,nodev,nosuid`,
+  ]);
+}
+
+function serviceRemainsActive(paths: ReturnType<typeof runtimePaths>): boolean {
+  if (!serviceLaunchSucceeded) {
+    return false;
+  }
+  const status = capture("/usr/bin/systemctl", [
+    "show",
+    paths.unit,
+    "--no-pager",
+    "--property=ActiveState",
+  ]);
+  if (status.error || status.status !== 0) {
+    return true;
+  }
+  const state = status.stdout.trim();
+  return state !== "ActiveState=inactive" && state !== "ActiveState=failed";
+}
+
+function cleanupLauncherBeforeReadiness(): void {
+  if (!launcherPaths || readinessObserved || !pathEntryExists(launcherPaths.launcherDirectory)) {
+    return;
+  }
+  if (serviceRemainsActive(launcherPaths)) {
+    log.warning("Fence left the protected Action runtime mounted because the resident service is still active");
+    return;
+  }
+  try {
+    if (protectedActionMounted) {
+      run("/usr/bin/sudo", ["/usr/bin/umount", ACTION_ROOT]);
+      protectedActionMounted = false;
+    }
+    if (runtimeDirectoryCreated && pathEntryExists(launcherPaths.directory)) {
+      run("/usr/bin/sudo", [
+        "/usr/bin/rm",
+        "--recursive",
+        "--force",
+        "--one-file-system",
+        launcherPaths.directory,
+      ]);
+      runtimeDirectoryCreated = false;
+    }
+    run("/usr/bin/sudo", [
+      "/usr/bin/rm",
+      "--recursive",
+      "--force",
+      "--one-file-system",
+      launcherPaths.launcherDirectory,
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log.warning(`Fence could not remove provisional launcher state: ${message}`);
+  }
+}
+
 function appendState(name: string, value: string): void {
   const state = process.env.GITHUB_STATE;
   if (!state) {
@@ -194,6 +416,7 @@ function main(): void {
   const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, nativeInputsFromEnvironment(process.env));
   const paths = runtimePaths(config.invocationId);
   diagnosticPaths = paths;
+  launcherPaths = paths;
   const details = log.configLogDetails(config.raw, config.usingDefault);
 
   for (const line of log.setupLines(manifest, details)) {
@@ -216,11 +439,13 @@ function main(): void {
     `unit=${paths.unit}`,
   ]);
 
-  if (fs.existsSync(paths.directory)) {
+  if (pathEntryExists(paths.directory)) {
     throw new Error("Fence runtime invocation directory already exists");
   }
-  run("/usr/bin/sudo", ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", "/run/fence", paths.directory]);
-  assertRootDirectory("/run/fence");
+  installProtectedActionRuntime(config.invocationId, paths);
+  createOrValidateRootDirectory("/run/fence");
+  run("/usr/bin/sudo", ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", paths.directory]);
+  runtimeDirectoryCreated = true;
   assertRootDirectory(paths.directory);
   run("/usr/bin/sudo", ["/usr/bin/install", "-o", "root", "-g", "root", "-m", "0600", "/dev/null", paths.config]);
   run("/usr/bin/sudo", ["/usr/bin/tee", paths.config], config.raw, true);
@@ -229,6 +454,7 @@ function main(): void {
   appendState("report_path", paths.report);
   appendState("dns_report_path", paths.dnsReport);
   appendState("ready_path", paths.ready);
+  appendState("launcher_integrity_path", paths.launcherIntegrity);
   log.info("🚀 Starting resident service");
   const serviceArgs = [
     "/usr/bin/systemd-run",
@@ -249,7 +475,9 @@ function main(): void {
   ]);
   serviceLaunchAttempted = true;
   run("/usr/bin/sudo", serviceArgs);
+  serviceLaunchSucceeded = true;
   const report = waitForReady(paths);
+  readinessObserved = true;
   log.success(log.readyLine(report));
 }
 
@@ -258,6 +486,7 @@ if (require.main === module) {
     main();
   } catch (error) {
     emitError(error);
+    cleanupLauncherBeforeReadiness();
     process.exitCode = 1;
   }
 }

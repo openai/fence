@@ -15,6 +15,7 @@ require_cmd node
 require_cmd python3
 require_cmd sleep
 require_cmd sudo
+require_cmd findmnt
 if [[ ! -x /usr/bin/systemctl || ! -x /usr/sbin/nft ]]; then
   die "Action tamper evidence requires systemctl and /usr/sbin/nft"
 fi
@@ -25,6 +26,7 @@ trap 'remove_generated_path "$temporary_directory" "Action tamper scratch direct
 invocation="action-tamper"
 directory="/run/fence/$invocation"
 report="$directory/report.json"
+launcher_integrity="/run/fence-launcher/$invocation/integrity.json"
 state="$temporary_directory/state"
 summary="$temporary_directory/summary"
 post_stdout="$temporary_directory/post-stdout"
@@ -46,8 +48,22 @@ INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"action-tamper"
 
 grep -Fxq "invocation_id=$invocation" "$state"
 grep -Fxq "report_path=$report" "$state"
+grep -Fxq "launcher_integrity_path=$launcher_integrity" "$state"
 sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
 sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null
+
+mount_options="$(findmnt --noheadings --mountpoint "$DIR/action" --output OPTIONS)"
+for required in ro nodev nosuid; do
+  if [[ ",$mount_options," != *",$required,"* ]]; then
+    die "Action tamper evidence found an unsafe Action runtime mount"
+  fi
+done
+if printf '%s\n' 'tamper' >>action/post.cts 2>/dev/null; then
+  die "Action tamper evidence overwrote the registered post hook"
+fi
+if rm -f action/post.cts 2>/dev/null; then
+  die "Action tamper evidence unlinked the registered post hook"
+fi
 
 sudo --non-interactive /usr/sbin/nft delete table inet fence_v0
 sleep 7
@@ -72,6 +88,7 @@ sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.s
 
 if STATE_invocation_id="$invocation" \
   STATE_report_path="$report" \
+  STATE_launcher_integrity_path="$launcher_integrity" \
   GITHUB_STEP_SUMMARY="$summary" \
   node action/post.cts >"$post_stdout" 2>"$post_stderr"; then
   die "Action post hook unexpectedly accepted critical resident drift"
