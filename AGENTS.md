@@ -172,7 +172,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/verify-protected-finalization`
   - GitHub-Actions-only downstream verifier for the quiet protected-run replicas and broad-domain opt-out scenario.
-  - Uses a read-only Actions token to inspect only the current workflow run, requires the expected jobs to finish successfully within 180 seconds, follows the job-log redirect without forwarding the bearer token, verifies each downloaded ZIP contains nonempty log files, and requires at least one quiet replica to have naturally observed runner-authorized results storage.
+  - Uses a read-only Actions token to inspect only the current workflow run, requires the expected jobs to finish successfully within 180 seconds, follows the job-log redirect without forwarding the bearer token, and verifies each bounded downloaded log payload is nonempty. A naturally observed runner-authorized results-storage request is additional evidence rather than a required event because the runner may resolve or establish that path before Fence readiness or after the final readable report snapshot.
   - Accepts only bounded HTTPS redirects to reviewed GitHub Actions, GitHub content, or Azure Blob host suffixes. It must not print signed URLs, query strings, tokens, archive contents, or unrelated job metadata.
 
 - `script/observe-hosted-runner`
