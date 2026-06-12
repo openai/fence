@@ -80,6 +80,8 @@ const ALLOWED_DNS_CLASSIFICATIONS = new Set([
   "platform_and_user_allowlist",
   "platform_cname_derived",
   "platform_profile",
+  "runner_authorized_results_storage",
+  "runner_authorized_results_storage_cname_derived",
   "user_allowlist",
   "user_cname_derived",
 ]);

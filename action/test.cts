@@ -720,6 +720,20 @@ test("renders a concise healthy block results table without raw evidence fields"
         resolved_addresses: ["2001:db8::1"],
       },
       {
+        hostname: "productionresultssa17.blob.core.windows.net",
+        query_type: "a",
+        policy_classification: "runner_authorized_results_storage",
+        occurrences: 1,
+        resolved_addresses: ["192.0.2.17"],
+      },
+      {
+        hostname: "result-storage-cname.example.net",
+        query_type: "aaaa",
+        policy_classification: "runner_authorized_results_storage_cname_derived",
+        occurrences: 1,
+        resolved_addresses: ["2001:db8::17"],
+      },
+      {
         hostname: "codeload.github.com",
         query_type: "a",
         policy_classification: "outside_policy",
@@ -748,6 +762,8 @@ test("renders a concise healthy block results table without raw evidence fields"
   assert.match(summary, /\| `github.com` \| ✅ Allowed \| 2 A queries \|/);
   assert.match(summary, /\| `github.com` \| ⛔ Blocked \| 1 TYPE15 query \|/);
   assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 AAAA query \|/);
+  assert.match(summary, /\| `productionresultssa17.blob.core.windows.net` \| ✅ Allowed \| 1 A query \|/);
+  assert.match(summary, /\| `result-storage-cname.example.net` \| ✅ Allowed \| 1 AAAA query \|/);
   assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 A query \|/);
   assert.equal(summary.match(/Fence Summary/g)?.length, 1);
   assert.doesNotMatch(summary, /Fence local evidence/);
