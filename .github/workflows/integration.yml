@@ -130,12 +130,76 @@ jobs:
       - name: run packaged trusted-launcher block
         run: script/test-protected-run "${{ matrix.scenario }}"
 
-  integration:
-    name: integration
-    needs: [lockdown, selected-profile-runtime, protected-run]
+  protected-finalization:
+    name: protected finalization ${{ matrix.replica }}
+    strategy:
+      fail-fast: false
+      matrix:
+        replica: [quiet-1, quiet-2, quiet-3]
+    timeout-minutes: 3
     runs-on: ubuntu-24.04
 
     steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: run quiet packaged trusted-launcher block
+        run: script/test-protected-run standard-finalization
+
+  verify-protected-finalization:
+    name: verify protected finalization
+    needs: [protected-finalization, protected-run]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: verify terminal jobs and downloadable logs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: script/verify-protected-finalization
+
+  integration:
+    name: integration
+    needs: [lockdown, selected-profile-runtime, protected-run, verify-protected-finalization]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: require prerequisite evidence
+        env:
+          LOCKDOWN_RESULT: ${{ needs.lockdown.result }}
+          PROFILE_RESULT: ${{ needs.selected-profile-runtime.result }}
+          PROTECTED_RESULT: ${{ needs.protected-run.result }}
+          FINALIZATION_RESULT: ${{ needs.verify-protected-finalization.result }}
+        run: |
+          for result in "$LOCKDOWN_RESULT" "$PROFILE_RESULT" "$PROTECTED_RESULT" "$FINALIZATION_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              echo "required integration evidence did not succeed" >&2
+              exit 1
+            fi
+          done
+
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:

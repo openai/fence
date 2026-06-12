@@ -10,8 +10,9 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree and committed Action bundle enforce the schema-`4` policy and
-schema-`2` runtime-evidence hardening contract together. The bundle remains
+The source tree defines the schema-`5` policy and schema-`3` runtime-evidence
+contract. A released Action bundle adopts that contract atomically by updating
+its agent and wrapper validators together. The bundle remains
 governed by `action/bundle-manifest.json` and the wrapper schema constants; the
 wrapper rejects older evidence, stale verification state, an incomplete worker
 set, or a resident PID that does not match the active systemd service. This
@@ -82,7 +83,7 @@ GitHub profile requires a new threat-model review.
   verifies state every five seconds (`src/cli.rs`, `src/lifecycle.rs`,
   `src/dns_mediator.rs`).
 - **Network boundary:** a generated native `inet` ruleset, local DNS mediator,
-  and NFLOG reader implement and verify host egress policy
+  pinned `Runner.Worker` identity, and NFLOG reader implement and verify host egress policy
   (`src/nft.rs`, `src/nft_backend.rs`, `src/nflog.rs`).
 - **Privilege boundary:** hosted-runner fingerprint checks, passwordless-sudo
   relocation, and Docker/containerd stop and runtime masking remove ordinary
@@ -110,14 +111,20 @@ GitHub profile requires a new threat-model review.
   generated rules mutate only reviewed sudo, container, resolver, and owned
   `nftables` state. Subprocess output and execution time are bounded
   (`src/lockdown.rs`, `src/nft_backend.rs`, `src/dns_mediator.rs`).
-- **Workflow process -> DNS mediator:** local UDP/TCP DNS accepts bounded
-  packets. Block mode canonicalizes and forwards only authorized `A`/`AAAA`
-  names; audit forwards observation traffic without a containment claim
+- **Workflow process -> DNS mediator:** a reviewed read-only resolver mount
+  sends host UDP/TCP DNS directly to Fence so caller sockets remain visible;
+  Docker uses its separate local route. Block mode canonicalizes and forwards
+  only authorized `A`/`AAAA` names; audit forwards observation traffic without a containment claim
   (`src/dns_mediator.rs`).
 - **DNS mediator -> fixed resolver and firewall owner:** bounded queries go to
   the reviewed resolver path. An approved answer is withheld until all matching
   transport rules are applied and structurally verified
   (`src/dns_mediator.rs::MaterializationSubmitter`).
+- **Pinned runner -> GitHub results storage:** Fence accepts a bounded exact
+  results-storage name only when its host DNS socket belongs to the unique
+  pinned `Runner.Worker` identity. The resulting HTTPS address grant is then
+  available to other local code and remains an explicit residual channel
+  (`src/attribution.rs::TrustedRunnerWorker`, `src/dns_mediator.rs`).
 - **Kernel NFLOG -> resident agent:** group `4242` may copy at most 64 packet
   bytes. Fence immediately reduces this to endpoint metadata and drops raw
   bytes (`src/nflog.rs`, `src/findings.rs`).
@@ -126,7 +133,7 @@ GitHub profile requires a new threat-model review.
   status, actor class, PID, executable basename, and four parent basenames;
   local endpoints are not serialized (`src/attribution.rs`).
 - **Resident agent -> post hook:** root-owned `ready.json`, `report.json`, and
-  `dns-report.json` are runner-readable but not runner-writable. For schema-`2`
+  `dns-report.json` are runner-readable but not runner-writable. For schema-`3`
   evidence, the post hook also verifies the live systemd PID and evidence
   freshness before trusting the report. Protected-mount and runtime-digest
   checks apply at the wrapper boundary, and all five supervised resident
@@ -195,7 +202,8 @@ flowchart TD
 | Action native inputs | Workflow YAML | Author -> launcher | Bounded strings and multiline allowlist grammar; raw JSON is mutually exclusive. | `action/lib.cts::defaultInlineConfig` |
 | Agent configuration | Root-owned config file | Launcher -> root agent | 256 KiB cap, strict schema, typed hostname/IP/CIDR and port validation. | `src/config.rs::read_config_bounded`, `parse_and_normalize` |
 | Trusted service entry | `fence run --config` | Root process -> protected lifecycle | Requires root, fixed config path, matching systemd unit and MainPID. | `src/lifecycle.rs::validate_production_service_context` |
-| Local DNS UDP/TCP | Host and Docker resolver traffic | Workflow process -> root mediator | Canonical bounded queries, fixed listener addresses, deadlines, policy classification. | `src/dns_mediator.rs::start_dns_proxy` |
+| Local DNS UDP/TCP | Host and Docker resolver traffic | Workflow process -> root mediator | Direct host resolver mount, separate Docker routing, canonical bounded queries, fixed listeners, deadlines, policy classification. | `src/dns_mediator.rs::start_dns_proxy` |
+| Results-storage DNS | Exact GitHub storage hostname | Pinned runner -> root mediator | Unique `Runner.Worker` identity, socket ownership, strict grammar, four-account cap, HTTPS-only materialization. | `src/attribution.rs::TrustedRunnerWorker`, `src/dns_mediator.rs::matches_results_storage_hostname` |
 | NFLOG netlink socket | Owned kernel log group | Kernel -> agent | Fixed group/prefix, 64-byte copy bound, duplicate/trailing attribute rejection. | `src/nflog.rs::extract_logged_prefix` |
 | `/proc` attribution | Internal finding tuple | Agent -> kernel process metadata | Fixed queue and scan caps; ambiguous ownership is not guessed. | `src/attribution.rs::ProcAttributor` |
 | `nft` subprocess | Generated program and structured state | Agent -> kernel firewall | Fixed binary/args, bounded IO/time, JSON verification, singleton owned table. | `src/nft_backend.rs::NativeNftBackend` |
@@ -225,7 +233,7 @@ flowchart TD
    so post-job validation reports success. Fence root-copies and bind-mounts
    the runtime read-only, then checks its digest and mount flags in post.
 6. **Forge or replay evidence:** later code writes a false report or leaves a
-   stale healthy file after killing the service. In the schema-`2` runtime
+   stale healthy file after killing the service. In the schema-`3` runtime
    contract, root ownership, active MainPID checks, worker health, monotonic
    verification sequence, and a 20-second freshness bound reject the evidence.
 7. **Disable or alter firewall state after readiness:** later code or host drift
@@ -239,6 +247,10 @@ flowchart TD
 9. **Exhaust local evidence work:** later code floods DNS, NFLOG, or attribution
    paths. Fixed queues, sample rates, scan caps, finding caps, and report size
    bounds protect memory, but the attacker can still slow or fail its own job.
+10. **Reuse an authorized results account:** after the pinned runner authorizes
+    one exact storage account, later workflow code connects to the same resolved
+    HTTPS addresses. Fence cannot determine whether an encrypted request carries
+    a GitHub-issued signed URL, another valid credential, or unrelated data.
 
 ## Threat model table
 
@@ -247,12 +259,13 @@ flowchart TD
 | TM-001 | Malicious workflow process | Residual root-equivalent path or unsupported host drift | Regain privilege and change firewall or agent state | Arbitrary egress and forged evidence | Credentials, policy, reports | Fingerprint gate and verified sudo/container lockdown (`src/hosted_runner.rs`, `src/lockdown.rs`) | New runner layouts can invalidate assumptions | Keep fail-closed fingerprint updates reviewable; add support only with hosted proof | Critical lockdown finding and support mismatch | Medium | High | High |
 | TM-002 | Malicious workflow process | Access to an approved GitHub or user destination | Exfiltrate sensitive data through allowed HTTPS or DNS behavior | Credential/source disclosure | Credentials, source | Exact profile roots, opt-out for broad roots, typed allowlist, disclosed limits (`src/hostname_policy.rs`, `README.md`) | Core GitHub reporting and shared IPs remain channels | Continue narrowing the profile when hosted evidence permits; keep least-privilege job tokens | DNS/finding summary and audit-mode tuning | High | High | High |
 | TM-003 | Malicious workflow process or DNS response | Authorized name, suffix, CNAME, or address rotation | Expand usable addresses or race first connection | Policy broadening or unexpected denial | Effective policy, job availability | Canonical A/AAAA queries, depth/name/TTL caps, completion-driven verified materialization (`src/dns_mediator.rs`) | IP authorization cannot prove TLS service identity | Preserve exact-host user policy; review suffix and CNAME bounds before expansion | DNS evidence counters, materialized allowances, critical backend findings | Medium | High | High |
-| TM-004 | Malicious workflow process | Writable launcher/post/binary or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, read-only bind mount, digests, no-follow files, and schema-`2` live PID/freshness checks (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | Kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact runtime manifest, worker set, freshness bounds, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
+| TM-004 | Malicious workflow process | Writable launcher/post/binary or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, read-only bind mount, digests, no-follow files, and schema-`3` live PID/freshness checks (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | Kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact runtime manifest, worker set, freshness bounds, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
 | TM-005 | Local process or host drift | Ability to alter owned kernel state after readiness | Remove or replace firewall rules | Temporary or persistent unintended egress | Network policy | Exact structured state verification every five seconds and terminal critical health (`src/nft_backend.rs`, `src/dns_mediator.rs`) | Detection is periodic rather than instantaneous | Keep interval fixed and evaluate event-driven integrity only with bounded complexity | Critical drift finding; Action post failure | Medium | High | High |
 | TM-006 | Workflow author or malicious config producer | Control of Action inputs before launcher validation | Inject paths, nft syntax, oversized policy, or ambiguous JSON | Privileged mutation or resource exhaustion | Host state, availability | Strict JSON, unknown-field rejection, fixed paths, typed entries, fixed limits (`action/lib.cts`, `src/config.rs`) | Raw JSON remains an advanced surface | Preserve schema-`1` strictness; add fields only through reviewed typed models | Structured pre-mutation setup failure | Low | High | Medium |
 | TM-007 | Supply-chain attacker | Ability to alter a release asset, workflow dependency, or bundle refresh | Distribute an agent not built by the reviewed workflow | Fleet-wide compromise | Release agent, downstream workflows | SHA-pinned actions, protected release environment, checksums, attestations, offline bundle validation (`.github/workflows/release.yml`, `script/validate-action-bundle`) | Attestation trusts GitHub identity and workflow | Add SBOM and auditable/reproducible binary work as post-v0 hardening | Release verification job and bundle validation | Low | High | Medium |
 | TM-008 | Malicious workflow process | Ability to generate local load | Saturate DNS, NFLOG, reports, or attribution scans | Job slowdown or failure | Job availability, evidence completeness | Queue/sample/query/scan/report caps and explicit truncation (`src/dns_mediator.rs`, `src/attribution.rs`, `src/findings.rs`) | Fence does not guarantee availability against later code | Keep limits non-configurable in v0; review CPU cost with real workloads | Warning counters, truncation, critical worker health | High | Medium | Medium |
 | TM-009 | Local process race or namespace boundary | Socket disappears, is shared, or is outside the scanned namespace | Produce missing or ambiguous process attribution | Reduced incident context, not control bypass | Local evidence | Unique-owner requirement, bounded statuses, no guessing (`src/attribution.rs`) | Attribution is inherently best effort | Keep attribution advisory; do not gate containment on individual matches | `not_found`, `ambiguous`, and limit statuses | High | Low | Low |
+| TM-010 | Malicious workflow process | A results-storage account was already authorized by the pinned runner | Reuse its resolved HTTPS address or a usable signed URL | Data exfiltration through a required GitHub channel | Credentials, source | Strict runner-bound authorization, exact grammar, four-account cap, TTL bounds, and explicit evidence (`src/attribution.rs`, `src/dns_mediator.rs`) | Fence cannot inspect TLS semantics or revoke per-request signed URLs | Keep the class provenance-bound and disclose it; never broaden to a storage wildcard | Authorized-account evidence and DNS counters | Medium | High | High |
 
 ## Criticality calibration
 
@@ -285,12 +298,12 @@ because attribution is not an enforcement input. Kernel compromise would be
 | `src/lifecycle.rs` | Enforces root/MainPID trusted-service identity and resident lifecycle rules. | TM-001, TM-004 |
 | `src/runtime.rs` | Protects root-owned config, readiness, state, and report filesystem boundaries. | TM-004, TM-006 |
 | `src/hostname_policy.rs` | Merges platform and user hostname transports into the logical policy. | TM-002, TM-003 |
-| `src/dns_mediator.rs` | Implements DNS authorization, refresh, materialization ordering, worker supervision, and reports. | TM-002, TM-003, TM-005, TM-008 |
+| `src/dns_mediator.rs` | Implements DNS authorization, runner-bound results storage, refresh, materialization ordering, worker supervision, and reports. | TM-002, TM-003, TM-005, TM-008, TM-010 |
 | `src/nft.rs` | Renders the deterministic owned firewall program and rule classes. | TM-001, TM-005 |
 | `src/nft_backend.rs` | Applies and structurally verifies privileged kernel state through bounded subprocesses. | TM-001, TM-005 |
 | `src/nflog.rs` | Parses the bounded kernel event wire format and rejects ambiguous attributes. | TM-008, TM-009 |
 | `src/findings.rs` | Reduces packet prefixes to approved report metadata and keeps local tuples internal. | TM-008, TM-009 |
-| `src/attribution.rs` | Scans bounded `/proc` state and defines the privacy boundary for local actor evidence. | TM-008, TM-009 |
+| `src/attribution.rs` | Scans bounded `/proc` state, pins `Runner.Worker`, attributes DNS sockets, and defines the local metadata privacy boundary. | TM-008, TM-009, TM-010 |
 | `src/lockdown.rs` | Removes and verifies sudo and container bypass paths. | TM-001 |
 | `.github/workflows/release.yml` | Connects reviewed source to immutable checksummed and attested release assets. | TM-007 |
 | `script/update-action-bundle` | Installs the committed runtime binary only after release and attestation verification. | TM-007 |

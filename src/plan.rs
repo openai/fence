@@ -21,7 +21,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 4;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,7 +315,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV1 => Vec::new(),
+        PlatformProfile::GithubHostedWorkflowBootstrapV2 => Vec::new(),
     }
 }
 
@@ -355,7 +355,7 @@ fn platform_plan(
     frozen_resolution_results: Vec<ResolutionResult>,
 ) -> PlatformProfilePlan {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV1 => {
+        PlatformProfile::GithubHostedWorkflowBootstrapV2 => {
             let mut limitations = vec![
                 "dns_mediated_runtime_materialization_requires_trusted_launcher",
                 "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
@@ -366,7 +366,7 @@ fn platform_plan(
                 "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
                 "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "post_ready_codeload_traffic_is_not_authorized",
-                "post_ready_results_storage_traffic_is_not_authorized",
+                "runner_authorized_results_storage_accounts_remain_egress_channels",
             ];
             if disable_broad_github_domains {
                 limitations.push("broad_github_web_api_and_release_asset_destinations_disabled");
@@ -602,7 +602,7 @@ mod tests {
         )
         .unwrap();
         let explicit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v1","allowlist":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v2","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
@@ -616,7 +616,7 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
-        assert_eq!(default.policy_hash_schema_version, 4);
+        assert_eq!(default.policy_hash_schema_version, 5);
         assert_eq!(
             default.platform_profile.id,
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID

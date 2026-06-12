@@ -336,7 +336,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_workflow_bootstrap_v1\"")
+                .contains("\"id\":\"github_hosted_workflow_bootstrap_v2\"")
         );
         assert!(
             output

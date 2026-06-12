@@ -1,0 +1,143 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/verify-protected-finalization"
+fi
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "protected finalization verification runs only in GitHub Actions"
+fi
+if [[ -z "${GITHUB_TOKEN:-}" || -z "${GITHUB_REPOSITORY:-}" || -z "${GITHUB_RUN_ID:-}" ]]; then
+  die "protected finalization verification requires bounded GitHub run identity"
+fi
+
+require_cmd python3
+
+python3 <<'PY'
+import datetime
+import io
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+import urllib.parse
+import zipfile
+
+repository = os.environ["GITHUB_REPOSITORY"]
+run_id = os.environ["GITHUB_RUN_ID"]
+token = os.environ["GITHUB_TOKEN"]
+api_root = f"https://api.github.com/repos/{repository}"
+expected_jobs = {
+    "protected finalization quiet-1",
+    "protected finalization quiet-2",
+    "protected finalization quiet-3",
+    "protected standard-opt-out required",
+}
+authorization_marker = b"fence-results-storage-authorization-observed"
+authorization_observed = False
+
+
+def request(path):
+    return urllib.request.Request(
+        f"{api_root}{path}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "fence-finalization-verifier",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def log_archive(job_id):
+    opener = urllib.request.build_opener(NoRedirect)
+    try:
+        opener.open(request(f"/actions/jobs/{job_id}/logs"), timeout=15)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        if error.code not in {301, 302, 303, 307, 308}:
+            raise
+        location = error.headers.get("Location", "")
+    else:
+        raise RuntimeError("job log endpoint did not return an immutable archive redirect")
+    parsed = urllib.parse.urlparse(location)
+    hostname = parsed.hostname or ""
+    accepted_suffixes = (
+        ".actions.githubusercontent.com",
+        ".blob.core.windows.net",
+        ".githubusercontent.com",
+    )
+    if parsed.scheme != "https" or not hostname.endswith(accepted_suffixes):
+        raise RuntimeError("job log endpoint returned an unexpected archive location")
+    unsigned = urllib.request.Request(
+        location,
+        headers={"User-Agent": "fence-finalization-verifier"},
+    )
+    unsigned_opener = urllib.request.build_opener(NoRedirect)
+    try:
+        with unsigned_opener.open(unsigned, timeout=20) as response:
+            return response.read(8 * 1024 * 1024 + 1)
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise RuntimeError("job log archive download failed") from None
+    except urllib.error.URLError:
+        raise RuntimeError("job log archive download failed") from None
+
+
+with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page=100"), timeout=15) as response:
+    body = response.read(1024 * 1024 + 1)
+if len(body) > 1024 * 1024:
+    raise SystemExit("protected finalization job metadata exceeded its fixed bound")
+document = json.loads(body)
+
+jobs = {job.get("name"): job for job in document.get("jobs", []) if isinstance(job, dict)}
+missing = sorted(expected_jobs - jobs.keys())
+if missing:
+    raise SystemExit(f"protected finalization jobs were not observable: {', '.join(missing)}")
+
+for name in sorted(expected_jobs):
+    job = jobs[name]
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        raise SystemExit(f"protected finalization job did not complete successfully: {name}")
+    started = datetime.datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
+    completed = datetime.datetime.fromisoformat(job["completed_at"].replace("Z", "+00:00"))
+    if (completed - started).total_seconds() > 180:
+        raise SystemExit(f"protected finalization job exceeded 180 seconds: {name}")
+
+    archive = None
+    for attempt in range(6):
+        archive = log_archive(job["id"])
+        if archive is not None:
+            break
+        if attempt == 5:
+            raise SystemExit(f"protected finalization log archive was unavailable: {name}")
+        time.sleep(5)
+    if not archive or len(archive) > 8 * 1024 * 1024:
+        raise SystemExit(f"protected finalization log archive was empty or oversized: {name}")
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        files = [entry for entry in bundle.infolist() if not entry.is_dir() and entry.file_size > 0]
+        if not files:
+            raise SystemExit(f"protected finalization log archive had no nonempty files: {name}")
+        if sum(entry.file_size for entry in files) > 16 * 1024 * 1024:
+            raise SystemExit(f"protected finalization log archive expanded past its fixed bound: {name}")
+        if name.startswith("protected finalization "):
+            authorization_observed = authorization_observed or any(
+                authorization_marker in bundle.read(entry) for entry in files
+            )
+
+if not authorization_observed:
+    raise SystemExit("quiet protected jobs did not observe runner-authorized results storage")
+
+print("protected finalization and downloadable job logs verified")
+PY

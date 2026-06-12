@@ -1,5 +1,6 @@
 use crate::attribution::{
-    ATTRIBUTION_WORKER_NAME, AttributionCoordinator, AttributionSubmission, attribution_channel,
+    ATTRIBUTION_WORKER_NAME, AttributionCoordinator, AttributionSubmission, DnsCallerProvenance,
+    DnsClientSocket, SocketProtocol, TrustedRunnerWorker, attribution_channel,
 };
 use crate::config::{
     ContainerPolicy, DestinationType, MAX_EXPANDED_RULES, MAX_REPORT_BYTES, Mode, Protocol,
@@ -9,6 +10,7 @@ use crate::error::ErrorDetail;
 use crate::findings::{
     ConnectionEvent, ConnectionFinding, FindingCollection, bounded_timestamp_now,
 };
+use crate::hosted_runner::hosted_runner_fingerprint_requirement;
 use crate::hostname_policy::{
     ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
 };
@@ -27,15 +29,16 @@ use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_activatio
 use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES,
-    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_TTL_SECONDS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
     reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
@@ -50,7 +53,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -62,8 +65,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
-    "github_hosted_workflow_bootstrap_dns_mediation_v1";
-pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+    "github_hosted_workflow_bootstrap_dns_provenance_v2";
+pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
     "selected_profile_runtime_ready_no_public_activation";
@@ -73,12 +76,11 @@ pub const PROTECTED_DEGRADED_BLOCK_STATUS: &str = "protected_host_block_degraded
 pub const PROTECTED_DEGRADED_BLOCK_READY_STATUS: &str = "ready_degraded";
 pub const PROTECTED_AUDIT_STATUS: &str = "protected_host_audit_observation";
 pub const PROTECTED_AUDIT_READY_STATUS: &str = "ready_observation_only";
-pub const DNS_MEDIATED_COMPATIBILITY_PATTERNS: [&str; 2] = [
+pub const DNS_MEDIATED_COMPATIBILITY_PATTERNS: [&str; 3] = [
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES[0],
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
 ];
-pub const SELECTED_PROFILE_RUNTIME_BOOTSTRAP_HOSTNAMES: [&str; 7] =
-    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES;
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_MATERIALIZATIONS_PER_UPDATE: usize = 128;
@@ -87,6 +89,8 @@ const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS;
+const MAX_RESULTS_STORAGE_AUTHORIZATIONS: usize =
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS;
 const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS;
 const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH;
@@ -104,12 +108,13 @@ const MAX_DNS_PACKET_BYTES: usize = 4096;
 const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
 const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
-const RESOLVED_DROP_IN_DIR: &str = "/etc/systemd/resolved.conf.d";
-const RESOLVED_DROP_IN_PATH: &str = "/etc/systemd/resolved.conf.d/90-fence-evidence.conf";
+const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
+const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
 const DOCKER_DAEMON_PATH: &str = "/etc/docker/daemon.json";
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
+const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 const REQUIRED_RESIDENT_WORKERS: [&str; 5] = [
     "docker_tcp_dns",
@@ -344,6 +349,7 @@ impl DnsEvidenceScope {
                         &mut CnameAuthorizationState::default(),
                         Instant::now(),
                         &test_hostname_policy(false),
+                        DnsQueryProvenance::Untrusted,
                     )
             }
         }
@@ -480,6 +486,11 @@ pub struct DnsMediationEvidence {
     pub observations_truncated: bool,
     pub bounded_actions_suffix_authorizations: Vec<String>,
     pub bounded_actions_suffix_authorizations_truncated: bool,
+    pub runner_authorized_results_storage: Vec<DnsResultsStorageAuthorization>,
+    pub runner_authorized_results_storage_truncated: bool,
+    pub results_storage_authorization_count: u64,
+    pub results_storage_attribution_failures: u64,
+    pub results_storage_request_rejections: u64,
     pub derived_cname_authorizations: Vec<DnsDerivedCnameAuthorization>,
     pub derived_cname_authorizations_truncated: bool,
     pub excluded_unretained_query_count: u64,
@@ -498,6 +509,12 @@ pub struct DnsDerivedCnameAuthorization {
     pub source_hostname: String,
     pub observed_ttl_seconds: u32,
     pub depth: u8,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct DnsResultsStorageAuthorization {
+    pub hostname: String,
+    pub authorization_origin: &'static str,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -651,6 +668,9 @@ struct ObservationState {
     materialization_update_max_milliseconds: u64,
     hostname_refresh_warnings: u64,
     upstream_request_failures: u64,
+    results_storage_authorization_count: u64,
+    results_storage_attribution_failures: u64,
+    results_storage_request_rejections: u64,
 }
 
 #[derive(Debug, Default)]
@@ -710,6 +730,39 @@ enum DnsResponseDisposition {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DnsQueryAuthorization {
+    Forward(Option<&'static str>),
+    Refused(Option<&'static str>),
+    RetryableFailure(Option<&'static str>),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DnsQueryDispatch {
+    Forward(Vec<u8>, Option<&'static str>),
+    Refused(Option<&'static str>),
+    RetryableFailure(Option<&'static str>),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DnsListenerKind {
+    Host,
+    Docker,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DnsQueryClient {
+    listener_kind: DnsListenerKind,
+    socket: DnsClientSocket,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DnsQueryProvenance {
+    TrustedRunnerWorker,
+    Untrusted,
+    AttributionFailed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct MaterializationMerge {
     rules_changed: bool,
     metadata_changed: bool,
@@ -734,6 +787,8 @@ type ActiveMaterializationKey = (String, String, IpAddr, Protocol, u16);
 struct CnameAuthorizationState {
     bounded_actions_suffix: BTreeSet<String>,
     bounded_actions_suffix_truncated: bool,
+    runner_authorized_results_storage: BTreeSet<String>,
+    runner_authorized_results_storage_truncated: bool,
     active: BTreeMap<String, ActiveCnameAuthorization>,
     truncated: bool,
 }
@@ -757,29 +812,175 @@ struct ObservationRecorder {
     scope: DnsEvidenceScope,
     hostname_policy: RuntimeHostnamePolicy,
     materializations: Option<MaterializationSubmitter>,
+    trusted_runner_worker: Option<Arc<TrustedRunnerWorker>>,
 }
 
 impl ObservationRecorder {
-    fn forward_query(&self, hostname: &str, query_type: u16) -> bool {
+    fn forward_query(
+        &self,
+        hostname: &str,
+        query_type: u16,
+        client: Option<DnsQueryClient>,
+    ) -> Result<DnsQueryAuthorization, DnsMediationError> {
         match self.scope {
-            DnsEvidenceScope::ProtectedHostAudit => true,
-            DnsEvidenceScope::SelectedProfileRuntimeTest
-            | DnsEvidenceScope::ProtectedHostBlock
-            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
+            DnsEvidenceScope::ProtectedHostAudit => {
                 if !matches_supported_block_query_type(query_type) {
-                    return false;
+                    return Ok(DnsQueryAuthorization::Forward(None));
                 }
+                let requires_runner_provenance = {
+                    let mut authorizations = self
+                        .cname_authorizations
+                        .lock()
+                        .expect("DNS CNAME authorization lock poisoned");
+                    remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+                    requires_runner_results_storage_provenance(hostname, &authorizations)
+                };
+                if !requires_runner_provenance {
+                    return Ok(DnsQueryAuthorization::Forward(None));
+                }
+                let provenance = self.results_storage_provenance(client)?;
                 let mut authorizations = self
                     .cname_authorizations
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned");
-                authorized_hostname(
+                let previous_results_storage_count =
+                    authorizations.runner_authorized_results_storage.len();
+                let authorized = authorized_hostname(
                     hostname,
                     &mut authorizations,
                     Instant::now(),
                     &self.hostname_policy,
-                )
+                    provenance,
+                );
+                let authorization_added = authorizations.runner_authorized_results_storage.len()
+                    > previous_results_storage_count;
+                drop(authorizations);
+                self.record_results_storage_observation(authorization_added, provenance);
+                Ok(DnsQueryAuthorization::Forward(
+                    (!authorized).then_some("outside_policy"),
+                ))
             }
+            DnsEvidenceScope::SelectedProfileRuntimeTest
+            | DnsEvidenceScope::ProtectedHostBlock
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
+                if !matches_supported_block_query_type(query_type) {
+                    return Ok(DnsQueryAuthorization::Refused(None));
+                }
+                let requires_runner_provenance = {
+                    let mut authorizations = self
+                        .cname_authorizations
+                        .lock()
+                        .expect("DNS CNAME authorization lock poisoned");
+                    remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+                    requires_runner_results_storage_provenance(hostname, &authorizations)
+                };
+                let provenance = if requires_runner_provenance {
+                    self.results_storage_provenance(client)?
+                } else {
+                    DnsQueryProvenance::Untrusted
+                };
+                let mut authorizations = self
+                    .cname_authorizations
+                    .lock()
+                    .expect("DNS CNAME authorization lock poisoned");
+                let previous_results_storage_count =
+                    authorizations.runner_authorized_results_storage.len();
+                let authorized = authorized_hostname(
+                    hostname,
+                    &mut authorizations,
+                    Instant::now(),
+                    &self.hostname_policy,
+                    provenance,
+                );
+                let authorization_added = authorizations.runner_authorized_results_storage.len()
+                    > previous_results_storage_count;
+                drop(authorizations);
+                if requires_runner_provenance {
+                    self.record_results_storage_decision(
+                        authorized,
+                        authorization_added,
+                        provenance,
+                    );
+                }
+                Ok(query_authorization(
+                    authorized,
+                    requires_runner_provenance,
+                    provenance,
+                ))
+            }
+        }
+    }
+
+    fn results_storage_provenance(
+        &self,
+        client: Option<DnsQueryClient>,
+    ) -> Result<DnsQueryProvenance, DnsMediationError> {
+        let Some(client) = client else {
+            return Ok(DnsQueryProvenance::AttributionFailed);
+        };
+        if client.listener_kind != DnsListenerKind::Host {
+            return Ok(DnsQueryProvenance::Untrusted);
+        }
+        let Some(worker) = &self.trusted_runner_worker else {
+            return Ok(DnsQueryProvenance::AttributionFailed);
+        };
+        match worker.classify_dns_client(client.socket) {
+            Ok(provenance) => Ok(match provenance {
+                DnsCallerProvenance::TrustedRunnerWorker => DnsQueryProvenance::TrustedRunnerWorker,
+                DnsCallerProvenance::Untrusted => DnsQueryProvenance::Untrusted,
+                DnsCallerProvenance::AttributionFailed => DnsQueryProvenance::AttributionFailed,
+            }),
+            Err(error) => {
+                self.record_results_storage_identity_failure();
+                Err(DnsMediationError::new(error.code, error.message))
+            }
+        }
+    }
+
+    fn record_results_storage_observation(
+        &self,
+        authorization_added: bool,
+        provenance: DnsQueryProvenance,
+    ) {
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        if authorization_added {
+            state.results_storage_authorization_count =
+                state.results_storage_authorization_count.saturating_add(1);
+        }
+        if provenance == DnsQueryProvenance::AttributionFailed {
+            state.results_storage_attribution_failures =
+                state.results_storage_attribution_failures.saturating_add(1);
+        }
+    }
+
+    fn record_results_storage_identity_failure(&self) {
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        state.results_storage_attribution_failures =
+            state.results_storage_attribution_failures.saturating_add(1);
+        if self.scope.is_block() {
+            state.results_storage_request_rejections =
+                state.results_storage_request_rejections.saturating_add(1);
+        }
+    }
+
+    fn record_results_storage_decision(
+        &self,
+        authorized: bool,
+        authorization_added: bool,
+        provenance: DnsQueryProvenance,
+    ) {
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        if authorization_added {
+            state.results_storage_authorization_count =
+                state.results_storage_authorization_count.saturating_add(1);
+        }
+        if provenance == DnsQueryProvenance::AttributionFailed {
+            state.results_storage_attribution_failures =
+                state.results_storage_attribution_failures.saturating_add(1);
+        }
+        if !authorized {
+            state.results_storage_request_rejections =
+                state.results_storage_request_rejections.saturating_add(1);
         }
     }
 
@@ -836,11 +1037,18 @@ impl ObservationRecorder {
         )
     }
 
-    fn record_query(&self, hostname: &str, query_type: u16, forwarded: bool) {
+    fn record_query(
+        &self,
+        hostname: &str,
+        query_type: u16,
+        forwarded: bool,
+        classification_override: Option<&'static str>,
+    ) {
         let normalized = normalize_hostname(hostname);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         if let Some(hostname) = normalized {
-            let classification = self.policy_classification(&hostname);
+            let classification =
+                classification_override.unwrap_or_else(|| self.policy_classification(&hostname));
             let key = (hostname, query_type, classification);
             if let Some(observation) = state.retained.get_mut(&key) {
                 observation.occurrences = observation.occurrences.saturating_add(1);
@@ -876,6 +1084,7 @@ impl ObservationRecorder {
         hostname: &str,
         query_type: u16,
         packet: &[u8],
+        classification_override: Option<&'static str>,
     ) -> DnsResponseDisposition {
         let Some(hostname) = normalize_hostname(hostname) else {
             return if self.scope.is_block() {
@@ -884,8 +1093,7 @@ impl ObservationRecorder {
                 DnsResponseDisposition::ForwardOriginal
             };
         };
-        let forwardable_block_response =
-            self.scope.is_block() && self.forward_query(&hostname, query_type);
+        let forwardable_block_response = self.scope.is_block();
         let policy = {
             let mut authorizations = self
                 .cname_authorizations
@@ -909,7 +1117,8 @@ impl ObservationRecorder {
         };
         let answers = parse_dns_address_answers(packet);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
-        let classification = self.policy_classification(&hostname);
+        let classification =
+            classification_override.unwrap_or_else(|| self.policy_classification(&hostname));
         let key = (hostname.clone(), query_type, classification);
         if let Some(observation) = state.retained.get_mut(&key) {
             retain_address_answers(observation, answers.clone());
@@ -1070,17 +1279,40 @@ impl ObservationRecorder {
     }
 }
 
+fn query_authorization(
+    authorized: bool,
+    requires_runner_provenance: bool,
+    provenance: DnsQueryProvenance,
+) -> DnsQueryAuthorization {
+    if authorized {
+        DnsQueryAuthorization::Forward(None)
+    } else if requires_runner_provenance && provenance != DnsQueryProvenance::Untrusted {
+        DnsQueryAuthorization::RetryableFailure(Some("outside_policy"))
+    } else if requires_runner_provenance {
+        DnsQueryAuthorization::Refused(Some("outside_policy"))
+    } else {
+        DnsQueryAuthorization::Refused(None)
+    }
+}
+
 struct DnsRouting {
     docker_original: Option<Vec<u8>>,
-    resolved_drop_in_created: bool,
+    resolver_source: PathBuf,
+    resolver_target: PathBuf,
+    resolver_source_created: bool,
+    resolver_mounted: bool,
     docker_changed: bool,
 }
 
 impl DnsRouting {
-    fn activate() -> Result<Self, DnsMediationError> {
+    fn activate(runtime_directory: &Path) -> Result<Self, DnsMediationError> {
+        let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
         let mut routing = Self {
             docker_original: None,
-            resolved_drop_in_created: false,
+            resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
+            resolver_target: PathBuf::from(accepted.canonical_target),
+            resolver_source_created: false,
+            resolver_mounted: false,
             docker_changed: false,
         };
         let result = routing.activate_inner();
@@ -1091,26 +1323,45 @@ impl DnsRouting {
     }
 
     fn activate_inner(&mut self) -> Result<(), DnsMediationError> {
-        if Path::new(RESOLVED_DROP_IN_PATH).exists() {
+        self.verify_supported_resolver_layout()?;
+        if self.resolver_source.exists() {
             return Err(DnsMediationError::new(
                 "dns_routing_conflict",
-                "test DNS routing refuses a preexisting owned resolver drop-in",
+                "DNS routing refuses a preexisting owned resolver file",
             ));
         }
-        fs::create_dir_all(RESOLVED_DROP_IN_DIR).map_err(|_| {
+        write_new_file(&self.resolver_source, RESOLVER_SOURCE_CONTENTS, 0o644).map_err(|_| {
             DnsMediationError::new(
                 "dns_routing_setup_failed",
-                "failed to prepare resolver drop-in directory",
+                "failed to create the owned resolver routing file",
             )
         })?;
-        write_new_file(
-            Path::new(RESOLVED_DROP_IN_PATH),
-            b"[Resolve]\nDNS=127.0.0.1\nDomains=~.\n",
-            0o644,
+        self.resolver_source_created = true;
+        let source = self.resolver_source.to_str().ok_or_else(|| {
+            DnsMediationError::new(
+                "dns_routing_setup_failed",
+                "owned resolver source path is not valid UTF-8",
+            )
+        })?;
+        let target = self.resolver_target.to_str().ok_or_else(|| {
+            DnsMediationError::new(
+                "dns_routing_setup_failed",
+                "accepted resolver target path is not valid UTF-8",
+            )
+        })?;
+        if let Err(error) = fixed_command("/usr/bin/mount", &["--bind", source, target]) {
+            self.resolver_mounted = paths_have_same_identity(
+                self.resolver_source.as_path(),
+                self.resolver_target.as_path(),
+            );
+            return Err(error);
+        }
+        self.resolver_mounted = true;
+        fixed_command(
+            "/usr/bin/mount",
+            &["-o", "remount,bind,ro,nodev,nosuid", source, target],
         )?;
-        self.resolved_drop_in_created = true;
-        fixed_command("/usr/bin/systemctl", &["restart", "systemd-resolved"])?;
-        let _ = fixed_command("/usr/bin/resolvectl", &["flush-caches"]);
+        self.verify_active_resolver_mount()?;
 
         let docker_path = Path::new(DOCKER_DAEMON_PATH);
         self.docker_original = read_optional_external_file(docker_path)?;
@@ -1141,11 +1392,12 @@ impl DnsRouting {
         })?;
         replace_external_file(docker_path, &docker_bytes)?;
         self.docker_changed = true;
-        fixed_command("/usr/bin/systemctl", &["restart", "docker.service"])
+        fixed_command("/usr/bin/systemctl", &["restart", "docker.service"])?;
+        self.verify_active()
     }
 
     fn rollback(&mut self) -> Result<bool, DnsMediationError> {
-        let changed = self.resolved_drop_in_created || self.docker_changed;
+        let changed = self.resolver_source_created || self.resolver_mounted || self.docker_changed;
         if self.docker_changed {
             match self.docker_original.as_deref() {
                 Some(bytes) => replace_external_file(Path::new(DOCKER_DAEMON_PATH), bytes)?,
@@ -1156,18 +1408,140 @@ impl DnsRouting {
             fixed_command("/usr/bin/systemctl", &["restart", "docker.service"])?;
             self.docker_changed = false;
         }
-        if self.resolved_drop_in_created {
-            fs::remove_file(RESOLVED_DROP_IN_PATH).map_err(|_| {
+        if self.resolver_mounted {
+            let target = self.resolver_target.to_str().ok_or_else(|| {
+                DnsMediationError::new(
+                    "dns_routing_rollback_failed",
+                    "accepted resolver target path is not valid UTF-8",
+                )
+            })?;
+            fixed_command("/usr/bin/umount", &[target])?;
+            self.resolver_mounted = false;
+        }
+        if self.resolver_source_created {
+            fs::remove_file(&self.resolver_source).map_err(|_| {
                 DnsMediationError::new(
                     "dns_routing_rollback_failed",
                     "failed to remove provisional resolver routing",
                 )
             })?;
-            fixed_command("/usr/bin/systemctl", &["restart", "systemd-resolved"])?;
-            self.resolved_drop_in_created = false;
+            self.resolver_source_created = false;
         }
         Ok(changed)
     }
+
+    fn verify_active(&self) -> Result<(), DnsMediationError> {
+        self.verify_active_resolver_mount()?;
+        verify_docker_dns_route()
+    }
+
+    fn verify_supported_resolver_layout(&self) -> Result<(), DnsMediationError> {
+        let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
+        let resolv_conf = Path::new(accepted.resolv_conf_path);
+        let metadata = fs::symlink_metadata(resolv_conf).map_err(|_| {
+            DnsMediationError::new(
+                "unsupported_resolver_layout",
+                "host resolver layout does not match the reviewed runner fingerprint",
+            )
+        })?;
+        let canonical = fs::canonicalize(resolv_conf).map_err(|_| {
+            DnsMediationError::new(
+                "unsupported_resolver_layout",
+                "host resolver target could not be resolved safely",
+            )
+        })?;
+        let target_metadata = fs::symlink_metadata(&canonical).map_err(|_| {
+            DnsMediationError::new(
+                "unsupported_resolver_layout",
+                "host resolver target could not be inspected safely",
+            )
+        })?;
+        if !resolver_layout_is_supported(
+            metadata.file_type().is_symlink(),
+            &canonical,
+            Path::new(accepted.canonical_target),
+            target_metadata.file_type().is_file(),
+            target_metadata.file_type().is_symlink(),
+            target_metadata.uid(),
+            target_metadata.permissions().mode() & 0o777,
+        ) {
+            return Err(DnsMediationError::new(
+                "unsupported_resolver_layout",
+                "host resolver layout does not match the reviewed runner fingerprint",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_active_resolver_mount(&self) -> Result<(), DnsMediationError> {
+        let source_metadata = fs::symlink_metadata(&self.resolver_source).map_err(|_| {
+            DnsMediationError::new(
+                "dns_routing_verification_failed",
+                "owned resolver source is unavailable",
+            )
+        })?;
+        let target_metadata = fs::symlink_metadata(&self.resolver_target).map_err(|_| {
+            DnsMediationError::new(
+                "dns_routing_verification_failed",
+                "active resolver mount target is unavailable",
+            )
+        })?;
+        let source_contents = fs::read(&self.resolver_source).map_err(|_| {
+            DnsMediationError::new(
+                "dns_routing_verification_failed",
+                "owned resolver source could not be verified",
+            )
+        })?;
+        let target_contents = fs::read(&self.resolver_target).map_err(|_| {
+            DnsMediationError::new(
+                "dns_routing_verification_failed",
+                "active resolver contents could not be verified",
+            )
+        })?;
+        if !source_metadata.file_type().is_file()
+            || source_metadata.file_type().is_symlink()
+            || source_metadata.uid() != 0
+            || source_metadata.permissions().mode() & 0o777 != 0o644
+            || source_metadata.dev() != target_metadata.dev()
+            || source_metadata.ino() != target_metadata.ino()
+            || source_contents != RESOLVER_SOURCE_CONTENTS
+            || target_contents != RESOLVER_SOURCE_CONTENTS
+            || !mount_has_required_options(&self.resolver_target)
+        {
+            return Err(DnsMediationError::new(
+                "dns_routing_verification_failed",
+                "active resolver mount does not match the reviewed direct-query routing",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn resolver_layout_is_supported(
+    resolv_conf_is_symlink: bool,
+    canonical_target: &Path,
+    expected_target: &Path,
+    target_is_file: bool,
+    target_is_symlink: bool,
+    target_uid: u32,
+    target_mode: u32,
+) -> bool {
+    resolv_conf_is_symlink
+        && canonical_target == expected_target
+        && target_is_file
+        && !target_is_symlink
+        && target_uid == 0
+        && target_mode == 0o644
+}
+
+fn paths_have_same_identity(left: &Path, right: &Path) -> bool {
+    let Ok(left) = fs::symlink_metadata(left) else {
+        return false;
+    };
+    let Ok(right) = fs::symlink_metadata(right) else {
+        return false;
+    };
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 pub struct DnsMediationSession {
@@ -1193,6 +1567,10 @@ impl DnsMediationSession {
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
+        let trusted_runner_worker = Arc::new(
+            TrustedRunnerWorker::discover_system()
+                .map_err(|error| DnsMediationError::new(error.code, error.message))?,
+        );
         let report_path = runtime_directory.join("dns-report.json");
         let resident_health = Arc::new(Mutex::new(initial_resident_health()));
         let stop_workers = Arc::new(AtomicBool::new(false));
@@ -1206,6 +1584,7 @@ impl DnsMediationSession {
             scope,
             hostname_policy,
             materializations,
+            trusted_runner_worker: Some(trusted_runner_worker),
         };
         write_report(
             &recorder.report_path,
@@ -1241,7 +1620,7 @@ impl DnsMediationSession {
                 .expect("resident health lock poisoned");
             health.workers = supervisor.worker_health();
         }
-        let routing = match DnsRouting::activate() {
+        let routing = match DnsRouting::activate(runtime_directory) {
             Ok(routing) => routing,
             Err(error) => {
                 shutdown_dns_workers(&stop_workers, &mut threads);
@@ -1570,6 +1949,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let verification_due = elapsed >= self.next_verification;
         if verification_due {
             let mut verification_succeeded = true;
+            if self._mediation.routing.verify_active().is_err() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_audit_routing_drift",
+                    "DNS-mediated audit routing drifted after observation readiness",
+                );
+            }
             if self
                 .backend
                 .verify_owned_state(&self.expected_state)
@@ -2059,6 +2445,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
 
         if elapsed >= self.next_verification {
             let mut verification_succeeded = true;
+            if self._mediation.routing.verify_active().is_err() {
+                verification_succeeded = false;
+                self.record_critical(
+                    "dns_block_routing_drift",
+                    "DNS-mediated direct-query routing drifted after readiness",
+                );
+            }
             if self
                 .backend
                 .verify_owned_state(&self.expected_state)
@@ -2448,7 +2841,9 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "block_dns_queries_are_canonicalized_before_upstream_forwarding",
         "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
-        "post_ready_results_storage_traffic_is_not_authorized",
+        "runner_authorized_results_storage_accounts_remain_egress_channels",
+        "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
+        "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
@@ -2468,7 +2863,7 @@ fn protected_audit_limitations() -> Vec<&'static str> {
     vec![
         "audit_observation_only_no_containment_claim",
         "audit_installs_owned_non_blocking_nftables_observation_rules",
-        "audit_routes_host_and_docker_dns_through_local_root_resident_mediator",
+        "audit_routes_host_dns_directly_and_docker_dns_separately_through_local_root_resident_mediator",
         "audit_forwards_dns_without_name_authorization",
         "audit_preserves_passwordless_sudo_and_container_control",
         "later_workflow_code_retains_arbitrary_egress_in_audit_mode",
@@ -2500,7 +2895,9 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
         "block_dns_queries_are_canonicalized_before_upstream_forwarding",
         "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
-        "post_ready_results_storage_traffic_is_not_authorized",
+        "runner_authorized_results_storage_accounts_remain_egress_channels",
+        "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
+        "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "bootstrap_roots_refresh_every_5_seconds",
@@ -3074,9 +3471,19 @@ fn start_dns_proxy(
     stop: Arc<AtomicBool>,
 ) -> Result<DnsProxyRuntime, DnsMediationError> {
     let mut listeners = Vec::new();
-    for (address, udp_worker, tcp_worker) in [
-        (HOST_DNS_BIND, "host_udp_dns", "host_tcp_dns"),
-        (DOCKER_DNS_BIND, "docker_udp_dns", "docker_tcp_dns"),
+    for (address, listener_kind, udp_worker, tcp_worker) in [
+        (
+            HOST_DNS_BIND,
+            DnsListenerKind::Host,
+            "host_udp_dns",
+            "host_tcp_dns",
+        ),
+        (
+            DOCKER_DNS_BIND,
+            DnsListenerKind::Docker,
+            "docker_udp_dns",
+            "docker_tcp_dns",
+        ),
     ] {
         let udp = UdpSocket::bind(address).map_err(|_| {
             DnsMediationError::new(
@@ -3103,18 +3510,18 @@ fn start_dns_proxy(
                 "failed to configure a fixed local DNS proxy stream listener",
             )
         })?;
-        listeners.push((udp_worker, udp, tcp_worker, tcp));
+        listeners.push((listener_kind, udp_worker, udp, tcp_worker, tcp));
     }
 
     let (events, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
     let (attribution, attribution_worker) =
         attribution_channel().map_err(|error| DnsMediationError::new(error.code, error.message))?;
     let mut threads = Vec::new();
-    for (udp_worker, udp, tcp_worker, tcp) in listeners {
+    for (listener_kind, udp_worker, udp, tcp_worker, tcp) in listeners {
         let udp_recorder = recorder.clone();
         let udp_thread =
             spawn_supervised_worker(udp_worker, Arc::clone(&stop), events.clone(), move |stop| {
-                serve_udp(udp, udp_recorder, stop)
+                serve_udp(udp, listener_kind, udp_recorder, stop)
             });
         match udp_thread {
             Ok(thread) => threads.push(thread),
@@ -3126,7 +3533,7 @@ fn start_dns_proxy(
         let tcp_recorder = recorder.clone();
         let tcp_thread =
             spawn_supervised_worker(tcp_worker, Arc::clone(&stop), events.clone(), move |stop| {
-                serve_tcp(tcp, tcp_recorder, stop)
+                serve_tcp(tcp, listener_kind, tcp_recorder, stop)
             });
         match tcp_thread {
             Ok(thread) => threads.push(thread),
@@ -3215,9 +3622,16 @@ fn shutdown_dns_workers(stop: &AtomicBool, threads: &mut Vec<JoinHandle<()>>) {
 
 fn serve_udp(
     socket: UdpSocket,
+    listener_kind: DnsListenerKind,
     recorder: ObservationRecorder,
     stop: &AtomicBool,
 ) -> Result<(), DnsMediationError> {
+    let listener = socket.local_addr().map_err(|_| {
+        DnsMediationError::new(
+            "dns_udp_listener_failed",
+            "resident UDP DNS listener address could not be verified",
+        )
+    })?;
     let mut query = [0_u8; MAX_DNS_PACKET_BYTES];
     while !stop.load(Ordering::Relaxed) {
         let (length, peer) = match socket.recv_from(&mut query) {
@@ -3239,19 +3653,43 @@ fn serve_udp(
         };
         let bytes = &query[..length];
         let parsed_question = parse_dns_question(bytes);
-        let Some(upstream_query) = query_for_upstream(&recorder, bytes, parsed_question.as_ref())
-        else {
-            if let Some((hostname, query_type)) = &parsed_question {
-                recorder.record_query(hostname, *query_type, false);
-            }
-            if let Some(response) = refused_response(bytes) {
-                let _ = socket.send_to(&response, peer);
-            }
-            continue;
+        let client = DnsQueryClient {
+            listener_kind,
+            socket: DnsClientSocket {
+                protocol: SocketProtocol::Udp,
+                peer,
+                listener,
+            },
         };
-        if let Some((hostname, query_type)) = &parsed_question {
-            recorder.record_query(hostname, *query_type, true);
-        }
+        let (upstream_query, response_classification) =
+            match query_for_upstream(&recorder, bytes, parsed_question.as_ref(), Some(client))? {
+                DnsQueryDispatch::Forward(query, classification_override) => {
+                    if let Some((hostname, query_type)) = &parsed_question {
+                        recorder.record_query(hostname, *query_type, true, classification_override);
+                    }
+                    (query, classification_override)
+                }
+                DnsQueryDispatch::Refused(classification_override) => {
+                    record_rejected_query(
+                        &recorder,
+                        parsed_question.as_ref(),
+                        classification_override,
+                    );
+                    if let Some(response) = refused_response(bytes) {
+                        let _ = socket.send_to(&response, peer);
+                    }
+                    continue;
+                }
+                DnsQueryDispatch::RetryableFailure(classification_override) => {
+                    record_rejected_query(
+                        &recorder,
+                        parsed_question.as_ref(),
+                        classification_override,
+                    );
+                    send_udp_retryable_failure(&socket, bytes, peer);
+                    continue;
+                }
+            };
         let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
             recorder.record_upstream_request_failure();
             send_udp_retryable_failure(&socket, bytes, peer);
@@ -3279,7 +3717,9 @@ fn serve_udp(
         restore_client_query_id(response, bytes);
         let disposition = parsed_question
             .as_ref()
-            .map(|(hostname, query_type)| recorder.record_response(hostname, *query_type, response))
+            .map(|(hostname, query_type)| {
+                recorder.record_response(hostname, *query_type, response, response_classification)
+            })
             .unwrap_or(DnsResponseDisposition::ForwardOriginal);
         let Some(output) = dns_response_for_disposition(bytes, response, disposition) else {
             continue;
@@ -3297,12 +3737,13 @@ fn send_udp_retryable_failure(socket: &UdpSocket, query: &[u8], peer: std::net::
 
 fn serve_tcp(
     listener: TcpListener,
+    listener_kind: DnsListenerKind,
     recorder: ObservationRecorder,
     stop: &AtomicBool,
 ) -> Result<(), DnsMediationError> {
     while !stop.load(Ordering::Relaxed) {
-        let mut client = match listener.accept() {
-            Ok((client, _)) => client,
+        let (mut client, peer) = match listener.accept() {
+            Ok(connection) => connection,
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
                 continue;
@@ -3318,6 +3759,9 @@ fn serve_tcp(
         if set_dns_tcp_deadlines(&client).is_err() {
             continue;
         }
+        let Ok(local) = client.local_addr() else {
+            continue;
+        };
         let mut length = [0_u8; 2];
         if client.read_exact(&mut length).is_err() {
             continue;
@@ -3331,20 +3775,40 @@ fn serve_tcp(
             continue;
         }
         let parsed_question = parse_dns_question(&query);
-        let Some(upstream_query) = query_for_upstream(&recorder, &query, parsed_question.as_ref())
-        else {
-            if let Some((hostname, query_type)) = &parsed_question {
-                recorder.record_query(hostname, *query_type, false);
-            }
-            if let Some(response) = refused_response(&query) {
-                let _ = client.write_all(&(response.len() as u16).to_be_bytes());
-                let _ = client.write_all(&response);
-            }
-            continue;
+        let query_client = DnsQueryClient {
+            listener_kind,
+            socket: DnsClientSocket {
+                protocol: SocketProtocol::Tcp,
+                peer,
+                listener: local,
+            },
         };
-        if let Some((hostname, query_type)) = &parsed_question {
-            recorder.record_query(hostname, *query_type, true);
-        }
+        let (upstream_query, response_classification) = match query_for_upstream(
+            &recorder,
+            &query,
+            parsed_question.as_ref(),
+            Some(query_client),
+        )? {
+            DnsQueryDispatch::Forward(query, classification_override) => {
+                if let Some((hostname, query_type)) = &parsed_question {
+                    recorder.record_query(hostname, *query_type, true, classification_override);
+                }
+                (query, classification_override)
+            }
+            DnsQueryDispatch::Refused(classification_override) => {
+                record_rejected_query(&recorder, parsed_question.as_ref(), classification_override);
+                if let Some(response) = refused_response(&query) {
+                    let _ = client.write_all(&(response.len() as u16).to_be_bytes());
+                    let _ = client.write_all(&response);
+                }
+                continue;
+            }
+            DnsQueryDispatch::RetryableFailure(classification_override) => {
+                record_rejected_query(&recorder, parsed_question.as_ref(), classification_override);
+                write_tcp_retryable_failure(&mut client, &query);
+                continue;
+            }
+        };
         let Ok(mut upstream) = connect_upstream_tcp() else {
             recorder.record_upstream_request_failure();
             write_tcp_retryable_failure(&mut client, &query);
@@ -3386,7 +3850,7 @@ fn serve_tcp(
         let disposition = parsed_question
             .as_ref()
             .map(|(hostname, query_type)| {
-                recorder.record_response(hostname, *query_type, &response)
+                recorder.record_response(hostname, *query_type, &response, response_classification)
             })
             .unwrap_or(DnsResponseDisposition::ForwardOriginal);
         let Some(output) = dns_response_for_disposition(&query, &response, disposition) else {
@@ -3437,26 +3901,62 @@ fn query_for_upstream(
     recorder: &ObservationRecorder,
     query: &[u8],
     parsed_question: Option<&(String, u16)>,
-) -> Option<Vec<u8>> {
+    client: Option<DnsQueryClient>,
+) -> Result<DnsQueryDispatch, DnsMediationError> {
     match (recorder.scope, parsed_question) {
-        (DnsEvidenceScope::ProtectedHostAudit, _) => Some(query.to_vec()),
+        (DnsEvidenceScope::ProtectedHostAudit, Some((hostname, query_type))) => recorder
+            .forward_query(hostname, *query_type, client)
+            .map(|authorization| match authorization {
+                DnsQueryAuthorization::Forward(classification) => {
+                    DnsQueryDispatch::Forward(query.to_vec(), classification)
+                }
+                DnsQueryAuthorization::Refused(classification)
+                | DnsQueryAuthorization::RetryableFailure(classification) => {
+                    DnsQueryDispatch::Forward(query.to_vec(), classification)
+                }
+            }),
+        (DnsEvidenceScope::ProtectedHostAudit, None) => {
+            Ok(DnsQueryDispatch::Forward(query.to_vec(), None))
+        }
         (
             DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded,
             Some((hostname, query_type)),
         ) => {
-            let canonical = canonical_block_query(hostname, *query_type, query)?;
+            let Some(canonical) = canonical_block_query(hostname, *query_type, query) else {
+                return Ok(DnsQueryDispatch::Refused(None));
+            };
             recorder
-                .forward_query(hostname, *query_type)
-                .then_some(canonical)
+                .forward_query(hostname, *query_type, client)
+                .map(|authorization| match authorization {
+                    DnsQueryAuthorization::Forward(classification) => {
+                        DnsQueryDispatch::Forward(canonical, classification)
+                    }
+                    DnsQueryAuthorization::Refused(classification) => {
+                        DnsQueryDispatch::Refused(classification)
+                    }
+                    DnsQueryAuthorization::RetryableFailure(classification) => {
+                        DnsQueryDispatch::RetryableFailure(classification)
+                    }
+                })
         }
         (
             DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded,
             None,
-        ) => None,
+        ) => Ok(DnsQueryDispatch::Refused(None)),
+    }
+}
+
+fn record_rejected_query(
+    recorder: &ObservationRecorder,
+    parsed_question: Option<&(String, u16)>,
+    classification_override: Option<&'static str>,
+) {
+    if let Some((hostname, query_type)) = parsed_question {
+        recorder.record_query(hostname, *query_type, false, classification_override);
     }
 }
 
@@ -3820,6 +4320,9 @@ fn hostname_policy_for_authorized_name(
     if state.bounded_actions_suffix.contains(hostname) {
         return Some(platform_transport_policy());
     }
+    if state.runner_authorized_results_storage.contains(hostname) {
+        return Some(platform_transport_policy());
+    }
     let mut current = hostname;
     for _ in 0..MAX_DERIVED_CNAME_DEPTH {
         let authorization = state.active.get(current)?;
@@ -3828,6 +4331,9 @@ fn hostname_policy_for_authorized_name(
             return Some((entry.origins.clone(), entry.transports.clone()));
         }
         if state.bounded_actions_suffix.contains(current) {
+            return Some(platform_transport_policy());
+        }
+        if state.runner_authorized_results_storage.contains(current) {
             return Some(platform_transport_policy());
         }
     }
@@ -3839,9 +4345,25 @@ fn authorized_hostname(
     state: &mut CnameAuthorizationState,
     now: Instant,
     hostname_policy: &RuntimeHostnamePolicy,
+    provenance: DnsQueryProvenance,
 ) -> bool {
     remove_expired_cname_authorizations(state, now);
+    if requires_runner_results_storage_provenance(hostname, state)
+        && provenance != DnsQueryProvenance::TrustedRunnerWorker
+    {
+        return false;
+    }
     if hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some() {
+        return true;
+    }
+    if matches_results_storage_hostname(hostname) {
+        if state.runner_authorized_results_storage.len() >= MAX_RESULTS_STORAGE_AUTHORIZATIONS {
+            state.runner_authorized_results_storage_truncated = true;
+            return false;
+        }
+        state
+            .runner_authorized_results_storage
+            .insert(hostname.to_owned());
         return true;
     }
     if !matches_constrained_dynamic_actions_suffix_hostname(hostname, hostname_policy) {
@@ -3868,6 +4390,9 @@ fn retain_cname_authorizations(
         pending.retain(|alias| {
             let source_depth = if hostname_policy.exact_entry(&alias.owner).is_some()
                 || state.bounded_actions_suffix.contains(&alias.owner)
+                || state
+                    .runner_authorized_results_storage
+                    .contains(&alias.owner)
             {
                 Some(0)
             } else {
@@ -3908,6 +4433,38 @@ fn retain_cname_authorizations(
             break;
         }
     }
+}
+
+fn requires_runner_results_storage_provenance(
+    hostname: &str,
+    state: &CnameAuthorizationState,
+) -> bool {
+    if matches_results_storage_hostname(hostname)
+        || state.runner_authorized_results_storage.contains(hostname)
+    {
+        return true;
+    }
+    let mut current = hostname;
+    for _ in 0..MAX_DERIVED_CNAME_DEPTH {
+        let Some(authorization) = state.active.get(current) else {
+            return false;
+        };
+        current = &authorization.source_hostname;
+        if state.runner_authorized_results_storage.contains(current) {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_results_storage_hostname(hostname: &str) -> bool {
+    let Some(account) = hostname
+        .strip_prefix("productionresultssa")
+        .and_then(|value| value.strip_suffix(".blob.core.windows.net"))
+    else {
+        return false;
+    };
+    !account.is_empty() && account.len() <= 5 && account.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn retain_address_answers(
@@ -4028,7 +4585,16 @@ fn policy_classification(
     if authorizations.bounded_actions_suffix.contains(hostname) {
         return "dynamic_platform";
     }
+    if authorizations
+        .runner_authorized_results_storage
+        .contains(hostname)
+    {
+        return "runner_authorized_results_storage";
+    }
     if let Some(authorization) = authorizations.active.get(hostname) {
+        if requires_runner_results_storage_provenance(hostname, authorizations) {
+            return "runner_authorized_results_storage_cname_derived";
+        }
         return if hostname_policy_for_authorized_name(
             &authorization.source_hostname,
             authorizations,
@@ -4096,7 +4662,9 @@ fn evidence_from_state_and_authorizations(
         host_dns_routing: match scope {
             DnsEvidenceScope::ProtectedHostAudit
             | DnsEvidenceScope::ProtectedHostBlock
-            | DnsEvidenceScope::ProtectedHostBlockDegraded => "local_root_resident_mediator",
+            | DnsEvidenceScope::ProtectedHostBlockDegraded => {
+                "direct_client_to_root_resident_mediator"
+            }
             _ => "local_mediator_test_only",
         },
         docker_dns_routing: match scope {
@@ -4111,7 +4679,7 @@ fn evidence_from_state_and_authorizations(
             DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded => {
-                "block_forwards_exact_roots_bounded_actions_suffix_names_and_bounded_cname_descendants"
+                "block_forwards_exact_roots_bounded_actions_suffix_names_runner_authorized_results_storage_and_bounded_cname_descendants"
             }
         },
         observations: state
@@ -4141,6 +4709,19 @@ fn evidence_from_state_and_authorizations(
             .collect(),
         bounded_actions_suffix_authorizations_truncated: cname_authorizations
             .bounded_actions_suffix_truncated,
+        runner_authorized_results_storage: cname_authorizations
+            .runner_authorized_results_storage
+            .iter()
+            .map(|hostname| DnsResultsStorageAuthorization {
+                hostname: hostname.clone(),
+                authorization_origin: "pinned_runner_worker_dns",
+            })
+            .collect(),
+        runner_authorized_results_storage_truncated: cname_authorizations
+            .runner_authorized_results_storage_truncated,
+        results_storage_authorization_count: state.results_storage_authorization_count,
+        results_storage_attribution_failures: state.results_storage_attribution_failures,
+        results_storage_request_rejections: state.results_storage_request_rejections,
         derived_cname_authorizations: cname_authorizations
             .active
             .iter()
@@ -4169,7 +4750,8 @@ fn evidence_from_state_and_authorizations(
                 "block_dns_queries_are_canonicalized_before_upstream_forwarding",
                 "dns_query_timing_and_count_remain_egress_limitations",
                 "post_ready_codeload_traffic_is_not_authorized",
-                "post_ready_results_storage_traffic_is_not_authorized",
+                "runner_authorized_results_storage_accounts_remain_egress_channels",
+                "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
                 "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
@@ -4193,7 +4775,9 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
         "block_dns_queries_are_canonicalized_before_upstream_forwarding",
         "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
-        "post_ready_results_storage_traffic_is_not_authorized",
+        "runner_authorized_results_storage_accounts_remain_egress_channels",
+        "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
+        "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
         "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
@@ -4213,7 +4797,7 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
 fn protected_dns_audit_limitations() -> Vec<&'static str> {
     vec![
         "audit_observation_only_no_containment_claim",
-        "audit_routes_host_and_docker_dns_through_local_root_resident_mediator",
+        "audit_routes_host_dns_directly_and_docker_dns_separately_through_local_root_resident_mediator",
         "audit_forwards_dns_without_name_authorization",
         "dns_query_timing_and_count_remain_egress_limitations",
         "dns_answers_attribute_addresses_without_authorizing_firewall_rules",
@@ -4362,6 +4946,67 @@ fn read_optional_external_file(path: &Path) -> Result<Option<Vec<u8>>, DnsMediat
     Ok(Some(bytes))
 }
 
+fn verify_docker_dns_route() -> Result<(), DnsMediationError> {
+    let Some(bytes) = read_optional_external_file(Path::new(DOCKER_DAEMON_PATH))? else {
+        return Err(DnsMediationError::new(
+            "dns_routing_verification_failed",
+            "Docker DNS routing configuration is unavailable",
+        ));
+    };
+    let document = serde_json::from_slice::<Value>(&bytes).map_err(|_| {
+        DnsMediationError::new(
+            "dns_routing_verification_failed",
+            "Docker DNS routing configuration is not structured JSON",
+        )
+    })?;
+    if document.get("dns") != Some(&Value::Array(vec![Value::String("172.17.0.1".to_owned())])) {
+        return Err(DnsMediationError::new(
+            "dns_routing_verification_failed",
+            "Docker DNS routing configuration drifted from the local mediator",
+        ));
+    }
+    Ok(())
+}
+
+fn mount_has_required_options(target: &Path) -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/proc/self/mountinfo")
+    else {
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_MOUNTINFO_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .is_err()
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MOUNTINFO_BYTES
+    {
+        return false;
+    }
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Some(target) = target.to_str() else {
+        return false;
+    };
+    mountinfo_has_required_options(contents, target)
+}
+
+fn mountinfo_has_required_options(contents: &str, target: &str) -> bool {
+    contents.lines().any(|line| {
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() < 6 || fields[4] != target {
+            return false;
+        }
+        let options = fields[5].split(',').collect::<BTreeSet<_>>();
+        ["ro", "nodev", "nosuid"]
+            .into_iter()
+            .all(|required| options.contains(required))
+    })
+}
+
 fn fixed_command(path: &str, arguments: &[&str]) -> Result<(), DnsMediationError> {
     let mut child = Command::new(path)
         .args(arguments)
@@ -4441,6 +5086,7 @@ mod tests {
             scope,
             hostname_policy,
             materializations,
+            trusted_runner_worker: None,
         };
         (recorder, report_path)
     }
@@ -4660,6 +5306,7 @@ mod tests {
                 "github.com",
                 1,
                 &response_with_address("github.com", 1, 60, &[192, 0, 2, 10]),
+                None,
             )
         });
         let request = requests.recv().unwrap();
@@ -4700,6 +5347,7 @@ mod tests {
                     60,
                     &[192, 0, 2, 10],
                 ),
+                None,
             )
         });
         let request = requests.recv().unwrap();
@@ -4745,8 +5393,8 @@ mod tests {
         let (recorder, report_path) =
             test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
 
-        recorder.record_query("allowed.example", 1, true);
-        recorder.record_query("outside.example", 28, true);
+        recorder.record_query("allowed.example", 1, true, None);
+        recorder.record_query("outside.example", 28, true, None);
         let state = recorder.state.lock().unwrap();
         assert!(
             state
@@ -4774,6 +5422,7 @@ mod tests {
                 "api.github.com",
                 1,
                 &response_with_address("api.github.com", 1, 60, &[192, 0, 2, 11]),
+                None,
             )
         });
         requests
@@ -4803,6 +5452,7 @@ mod tests {
                 "api.github.com",
                 1,
                 &response_with_address("api.github.com", 1, 60, &[192, 0, 2, 11]),
+                None,
             )
         });
         drop(abandoned_requests.recv().unwrap());
@@ -4820,6 +5470,7 @@ mod tests {
                 "api.github.com",
                 1,
                 &response_with_address("api.github.com", 1, 60, &[192, 0, 2, 11]),
+                None,
             ),
             DnsResponseDisposition::RetryableFailure
         );
@@ -4852,6 +5503,7 @@ mod tests {
                 "api.github.com",
                 1,
                 &response_with_address("api.github.com", 1, 60, &[192, 0, 2, 11]),
+                None,
             ),
             DnsResponseDisposition::RetryableFailure
         );
@@ -4958,13 +5610,14 @@ mod tests {
                 "github.com",
                 1,
                 &response_with_address("github.com", 1, 60, &[192, 0, 2, 10]),
+                None,
             ),
             DnsResponseDisposition::RetryableFailure
         );
         let mut negative_response = query("github.com", 1);
         negative_response[2..4].copy_from_slice(&0x8183_u16.to_be_bytes());
         assert_eq!(
-            block.record_response("github.com", 1, &negative_response),
+            block.record_response("github.com", 1, &negative_response, None),
             DnsResponseDisposition::ForwardOriginal
         );
         let (audit, audit_report) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
@@ -4973,6 +5626,7 @@ mod tests {
                 "example.com",
                 1,
                 &response_with_address("example.com", 1, 60, &[192, 0, 2, 12]),
+                None,
             ),
             DnsResponseDisposition::ForwardOriginal
         );
@@ -5026,11 +5680,15 @@ mod tests {
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
             hostname_policy: test_hostname_policy(false),
             materializations: None,
+            trusted_runner_worker: None,
         };
         let mut malformed = query("malformed.actions.githubusercontent.com", 1);
         malformed[4..6].copy_from_slice(&2_u16.to_be_bytes());
         let parsed = parse_dns_question(&malformed);
-        assert!(query_for_upstream(&recorder, &malformed, parsed.as_ref()).is_none());
+        assert_eq!(
+            query_for_upstream(&recorder, &malformed, parsed.as_ref(), None).unwrap(),
+            DnsQueryDispatch::Refused(None)
+        );
         assert!(
             recorder
                 .cname_authorizations
@@ -5042,7 +5700,10 @@ mod tests {
 
         let valid = query("validated.actions.githubusercontent.com", 1);
         let parsed = parse_dns_question(&valid);
-        assert!(query_for_upstream(&recorder, &valid, parsed.as_ref()).is_some());
+        assert!(matches!(
+            query_for_upstream(&recorder, &valid, parsed.as_ref(), None).unwrap(),
+            DnsQueryDispatch::Forward(_, None)
+        ));
         assert!(
             recorder
                 .cname_authorizations
@@ -5111,6 +5772,237 @@ mod tests {
             policy_classification("api.github.com", &authorizations, &opt_out),
             "outside_policy"
         );
+    }
+
+    #[test]
+    fn results_storage_grammar_and_runner_authorization_are_strict_and_bounded() {
+        for hostname in [
+            "productionresultssa0.blob.core.windows.net",
+            "productionresultssa17.blob.core.windows.net",
+            "productionresultssa99999.blob.core.windows.net",
+        ] {
+            assert!(matches_results_storage_hostname(hostname));
+        }
+        for hostname in [
+            "productionresultssa.blob.core.windows.net",
+            "productionresultssa100000.blob.core.windows.net",
+            "productionresults-17.blob.core.windows.net",
+            "productionresultssa17.example.com",
+            "prefix.productionresultssa17.blob.core.windows.net",
+        ] {
+            assert!(!matches_results_storage_hostname(hostname));
+        }
+
+        let policy = test_hostname_policy(false);
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        assert!(!authorized_hostname(
+            "productionresultssa1.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(authorizations.runner_authorized_results_storage.is_empty());
+        for account in 1..=MAX_RESULTS_STORAGE_AUTHORIZATIONS {
+            assert!(authorized_hostname(
+                &format!("productionresultssa{account}.blob.core.windows.net"),
+                &mut authorizations,
+                now,
+                &policy,
+                DnsQueryProvenance::TrustedRunnerWorker,
+            ));
+        }
+        assert!(!authorized_hostname(
+            "productionresultssa5.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        assert!(authorizations.runner_authorized_results_storage_truncated);
+
+        let state = ObservationState {
+            results_storage_authorization_count: 4,
+            results_storage_request_rejections: 1,
+            ..ObservationState::default()
+        };
+        let evidence = evidence_from_state_and_authorizations(
+            &state,
+            "active",
+            DnsEvidenceScope::ProtectedHostBlock,
+            &authorizations,
+            &policy,
+            &initial_resident_health(),
+        );
+        assert_eq!(evidence.runner_authorized_results_storage.len(), 4);
+        assert!(
+            evidence
+                .runner_authorized_results_storage
+                .iter()
+                .all(|item| item.authorization_origin == "pinned_runner_worker_dns")
+        );
+        assert!(evidence.runner_authorized_results_storage_truncated);
+        assert_eq!(evidence.results_storage_authorization_count, 4);
+        assert_eq!(evidence.results_storage_request_rejections, 1);
+
+        let mut opt_out_authorizations = CnameAuthorizationState::default();
+        assert!(authorized_hostname(
+            "productionresultssa17.blob.core.windows.net",
+            &mut opt_out_authorizations,
+            now,
+            &test_hostname_policy(true),
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+    }
+
+    #[test]
+    fn results_storage_cname_descendants_preserve_runner_provenance() {
+        let policy = test_hostname_policy(false);
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        let root = "productionresultssa17.blob.core.windows.net";
+        assert!(authorized_hostname(
+            root,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        retain_cname_authorizations(
+            &mut authorizations,
+            [DnsCnameAnswer {
+                owner: root.to_owned(),
+                target: "blob.region.store.core.windows.net".to_owned(),
+                ttl_seconds: 60,
+            }],
+            now,
+            &policy,
+        );
+        assert!(!authorized_hostname(
+            "blob.region.store.core.windows.net",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(authorized_hostname(
+            "blob.region.store.core.windows.net",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        assert_eq!(
+            policy_classification(
+                "blob.region.store.core.windows.net",
+                &authorizations,
+                &policy,
+            ),
+            "runner_authorized_results_storage_cname_derived"
+        );
+    }
+
+    #[test]
+    fn untrusted_and_unattributed_results_storage_queries_fail_closed() {
+        let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        let request = query("productionresultssa17.blob.core.windows.net", 1);
+        let parsed = parse_dns_question(&request);
+        let docker = DnsQueryClient {
+            listener_kind: DnsListenerKind::Docker,
+            socket: DnsClientSocket {
+                protocol: SocketProtocol::Udp,
+                peer: "172.17.0.2:40000".parse().unwrap(),
+                listener: "172.17.0.1:53".parse().unwrap(),
+            },
+        };
+        assert_eq!(
+            query_for_upstream(&recorder, &request, parsed.as_ref(), Some(docker)).unwrap(),
+            DnsQueryDispatch::Refused(Some("outside_policy"))
+        );
+        assert_eq!(
+            query_for_upstream(&recorder, &request, parsed.as_ref(), None).unwrap(),
+            DnsQueryDispatch::RetryableFailure(Some("outside_policy"))
+        );
+        let state = recorder.state.lock().unwrap();
+        assert_eq!(state.results_storage_authorization_count, 0);
+        assert_eq!(state.results_storage_attribution_failures, 1);
+        assert_eq!(state.results_storage_request_rejections, 2);
+        drop(state);
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn trusted_results_storage_capacity_rejection_is_retryable() {
+        assert_eq!(
+            query_authorization(false, true, DnsQueryProvenance::TrustedRunnerWorker,),
+            DnsQueryAuthorization::RetryableFailure(Some("outside_policy"))
+        );
+        assert_eq!(
+            query_authorization(false, true, DnsQueryProvenance::AttributionFailed),
+            DnsQueryAuthorization::RetryableFailure(Some("outside_policy"))
+        );
+        assert_eq!(
+            query_authorization(false, true, DnsQueryProvenance::Untrusted),
+            DnsQueryAuthorization::Refused(Some("outside_policy"))
+        );
+    }
+
+    #[test]
+    fn audit_forwards_unattributed_results_storage_without_calling_it_allowed() {
+        let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        let request = query("productionresultssa17.blob.core.windows.net", 1);
+        let parsed = parse_dns_question(&request);
+        let dispatch = query_for_upstream(&recorder, &request, parsed.as_ref(), None).unwrap();
+        assert_eq!(
+            dispatch,
+            DnsQueryDispatch::Forward(request, Some("outside_policy"))
+        );
+        recorder.record_query(
+            "productionresultssa17.blob.core.windows.net",
+            1,
+            true,
+            Some("outside_policy"),
+        );
+        assert_eq!(
+            recorder.record_response(
+                "productionresultssa17.blob.core.windows.net",
+                1,
+                &response_with_address(
+                    "productionresultssa17.blob.core.windows.net",
+                    1,
+                    60,
+                    &[192, 0, 2, 17],
+                ),
+                Some("outside_policy"),
+            ),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let state = recorder.state.lock().unwrap();
+        assert_eq!(state.results_storage_attribution_failures, 1);
+        assert_eq!(state.results_storage_request_rejections, 0);
+        assert!(
+            state
+                .retained
+                .keys()
+                .any(|(_, _, classification)| { *classification == "outside_policy" })
+        );
+        assert!(
+            state
+                .retained
+                .get(&(
+                    "productionresultssa17.blob.core.windows.net".to_owned(),
+                    1,
+                    "outside_policy",
+                ))
+                .is_some_and(|observation| {
+                    observation
+                        .resolved_addresses
+                        .contains(&"192.0.2.17".parse().unwrap())
+                })
+        );
+        drop(state);
+        let _ = fs::remove_file(report_path);
     }
 
     #[test]
@@ -5188,6 +6080,7 @@ mod tests {
                 &mut authorizations,
                 now,
                 &policy,
+                DnsQueryProvenance::Untrusted,
             ));
         }
         assert_eq!(
@@ -5199,12 +6092,14 @@ mod tests {
             &mut authorizations,
             now + Duration::from_secs(600),
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         assert!(!authorized_hostname(
             "dynamic-overflow.actions.githubusercontent.com",
             &mut authorizations,
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         assert!(authorizations.bounded_actions_suffix_truncated);
         assert!(!authorized_hostname(
@@ -5212,12 +6107,14 @@ mod tests {
             &mut CnameAuthorizationState::default(),
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         assert!(!authorized_hostname(
             "-invalid.actions.githubusercontent.com",
             &mut CnameAuthorizationState::default(),
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
     }
 
@@ -5274,6 +6171,7 @@ mod tests {
             &mut authorizations,
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         retain_cname_authorizations(
             &mut authorizations,
@@ -5290,12 +6188,14 @@ mod tests {
             &mut authorizations,
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         assert!(!authorized_hostname(
             "glb-example.github.com",
             &mut authorizations,
             now + Duration::from_secs(61),
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         retain_cname_authorizations(
             &mut authorizations,
@@ -5312,6 +6212,7 @@ mod tests {
             &mut authorizations,
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         retain_cname_authorizations(
             &mut authorizations,
@@ -5328,6 +6229,7 @@ mod tests {
             &mut authorizations,
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
         ));
         let mut truncated = response_with_cname(
             "payload.pipelines.actions.githubusercontent.com",
@@ -5863,6 +6765,68 @@ mod tests {
     }
 
     #[test]
+    fn resolver_mount_evidence_requires_the_exact_target_and_read_only_options() {
+        let mountinfo = concat!(
+            "31 22 0:28 / / rw,relatime - ext4 /dev/root rw\n",
+            "44 31 0:28 /run/fence/example/resolv.conf /run/systemd/resolve/stub-resolv.conf ro,nosuid,nodev,relatime - ext4 /dev/root rw\n",
+        );
+        assert!(mountinfo_has_required_options(
+            mountinfo,
+            "/run/systemd/resolve/stub-resolv.conf"
+        ));
+        assert!(!mountinfo_has_required_options(
+            mountinfo,
+            "/run/systemd/resolve/resolv.conf"
+        ));
+        assert!(!mountinfo_has_required_options(
+            "44 31 0:28 /source /run/systemd/resolve/stub-resolv.conf rw,relatime - ext4 /dev/root rw\n",
+            "/run/systemd/resolve/stub-resolv.conf"
+        ));
+    }
+
+    #[test]
+    fn resolver_mount_identity_requires_the_same_backing_file() {
+        let root = Path::new("target/tmp/dns-mediator-resolver-identity");
+        let _ = fs::remove_dir_all(root);
+        fs::create_dir_all(root).unwrap();
+        let source = root.join("source");
+        let same = root.join("same");
+        let different = root.join("different");
+        fs::write(&source, RESOLVER_SOURCE_CONTENTS).unwrap();
+        fs::hard_link(&source, &same).unwrap();
+        fs::write(&different, RESOLVER_SOURCE_CONTENTS).unwrap();
+        assert!(paths_have_same_identity(&source, &same));
+        assert!(!paths_have_same_identity(&source, &different));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolver_layout_rejects_unreviewed_targets_owners_and_modes() {
+        let accepted = Path::new("/run/systemd/resolve/stub-resolv.conf");
+        assert!(resolver_layout_is_supported(
+            true, accepted, accepted, true, false, 0, 0o644,
+        ));
+        for unsupported in [
+            resolver_layout_is_supported(false, accepted, accepted, true, false, 0, 0o644),
+            resolver_layout_is_supported(
+                true,
+                Path::new("/run/systemd/resolve/resolv.conf"),
+                accepted,
+                true,
+                false,
+                0,
+                0o644,
+            ),
+            resolver_layout_is_supported(true, accepted, accepted, false, false, 0, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, true, 0, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, false, 1000, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, false, 0, 0o666),
+        ] {
+            assert!(!unsupported);
+        }
+    }
+
+    #[test]
     fn retains_dns_observation_report_write_failures_for_resident_checks() {
         let root = Path::new("target/tmp/dns-mediator-report-write-failure");
         let _ = fs::remove_dir_all(root);
@@ -5876,8 +6840,9 @@ mod tests {
             scope: DnsEvidenceScope::ProtectedHostAudit,
             hostname_policy: test_hostname_policy(false),
             materializations: None,
+            trusted_runner_worker: None,
         };
-        recorder.record_query("pipelines.actions.githubusercontent.com", 1, true);
+        recorder.record_query("pipelines.actions.githubusercontent.com", 1, true, None);
         assert!(recorder.take_report_write_failure());
         assert!(!recorder.take_report_write_failure());
     }

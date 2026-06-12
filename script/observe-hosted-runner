@@ -38,11 +38,13 @@ MAX_POLICY_SOURCE_BYTES = 256 * 1024
 FIXED_PATHS = [
     "/usr/bin/docker",
     "/usr/bin/id",
+    "/usr/bin/mount",
     "/usr/bin/stat",
     "/usr/bin/sudo",
     "/usr/bin/systemctl",
     "/usr/bin/systemd-run",
     "/usr/bin/true",
+    "/usr/bin/umount",
     "/usr/sbin/visudo",
     "/usr/sbin/nft",
 ]
@@ -180,6 +182,25 @@ def principal_groups(principal):
     return values[:64]
 
 
+def resolver_layout():
+    path = pathlib.Path("/etc/resolv.conf")
+    try:
+        metadata = path.lstat()
+        canonical = path.resolve(strict=True)
+        target = canonical.stat()
+    except (FileNotFoundError, OSError):
+        return {"status": "unavailable"}
+    return {
+        "status": "observed",
+        "path": str(path),
+        "is_symlink": stat.S_ISLNK(metadata.st_mode),
+        "canonical_target": str(canonical)[:256],
+        "target_type": "regular" if stat.S_ISREG(target.st_mode) else "unexpected_type",
+        "target_mode": format(stat.S_IMODE(target.st_mode), "04o"),
+        "target_uid": target.st_uid,
+    }
+
+
 runner_groups = principal_groups(sys.argv[1])
 sudo_sources = []
 main_sudoers = regular_file_observation("/etc/sudoers", sys.argv[1], runner_groups)
@@ -223,6 +244,7 @@ result = {
     "required_paths": [
         {"path": path, "executable": os.access(path, os.X_OK)} for path in FIXED_PATHS
     ],
+    "resolver": resolver_layout(),
     "systemd": {"units": [unit_state(unit) for unit in FIXED_UNITS]},
     "sudo": {
         "noninteractive_root_observation_succeeded": True,

@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -ne 1 ]]; then
-  die "usage: script/test-protected-run <standard|standard-opt-out|unsafe-preserve|audit>"
+  die "usage: script/test-protected-run <standard|standard-finalization|standard-opt-out|unsafe-preserve|audit>"
 fi
 
 scenario="$1"
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve|audit) ;;
+  standard|standard-finalization|standard-opt-out|unsafe-preserve|audit) ;;
   *) die "unknown protected run scenario: $scenario" ;;
 esac
 
@@ -28,7 +28,7 @@ require_cmd docker
 require_cmd python3
 require_cmd sudo
 
-for required in /usr/bin/install /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/resolvectl /usr/sbin/nft; do
+for required in /usr/bin/install /usr/bin/mount /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/umount /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
     die "protected block proof requires executable $required"
   fi
@@ -70,7 +70,7 @@ document = {
     "invocation_id": invocation_id,
     "allowlist": [],
 }
-if scenario == "standard":
+if scenario in {"standard", "standard-finalization"}:
     document["container_policy"] = "disable"
 elif scenario == "standard-opt-out":
     document["container_policy"] = "disable"
@@ -104,7 +104,7 @@ import time
 
 scenario = sys.argv[1]
 report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:])
-expected = {
+expected_by_scenario = {
     "standard": {
         "mode": "block",
         "status": "protected_host_block",
@@ -178,7 +178,9 @@ expected = {
             "actions-results-receiver-production.githubapp.com",
         ],
     },
-}[scenario]
+}
+expected_by_scenario["standard-finalization"] = expected_by_scenario["standard"]
+expected = expected_by_scenario[scenario]
 deadline = time.monotonic() + 30
 report = None
 dns = None
@@ -196,14 +198,14 @@ assert report is not None, "protected report was not emitted"
 assert dns is not None, "protected DNS report was not emitted"
 assert ready is not None, "protected readiness was not emitted"
 assert report["status"] == expected["status"], report
-assert report["runtime_evidence_schema_version"] == 2, report
+assert report["runtime_evidence_schema_version"] == 3, report
 assert report["mode"] == expected["mode"], report
 assert report["setup_status"] == expected["resident"], report
 assert report["readiness_status"] == expected["ready"], report
 assert report["protection_available"] is expected["protection_available"], report
-assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", report
-assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", report
-assert report["policy_hash_schema_version"] == 4, report
+assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", report
+assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", report
+assert report["policy_hash_schema_version"] == 5, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
@@ -229,27 +231,32 @@ assert resident["workers"] == [
     {"name": "process_attribution", "status": "running"},
 ], resident
 assert ready["status"] == expected["ready"], ready
-assert ready["runtime_evidence_schema_version"] == 2, ready
+assert ready["runtime_evidence_schema_version"] == 3, ready
 assert ready["mode"] == expected["mode"], ready
 assert ready["protection_available"] is expected["protection_available"], ready
-assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", ready
-assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", ready
+assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", ready
+assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", ready
 assert ready["policy_hash"] == report["policy_hash"], (ready, report)
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"], (ready, report)
 assert ready["resident_health"]["resident_pid"] == resident["resident_pid"], ready
 assert dns["status"] == expected["status"], dns
-assert dns["runtime_evidence_schema_version"] == 2, dns
+assert dns["runtime_evidence_schema_version"] == 3, dns
 assert dns["mode"] == expected["mode"], dns
 assert dns["protection_available"] is expected["protection_available"], dns
-assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", dns
-assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", dns
+assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", dns
+assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", dns
 assert dns["routing_status"] == "active", dns
-assert dns["host_dns_routing"] == "local_root_resident_mediator", dns
+assert dns["host_dns_routing"] == "direct_client_to_root_resident_mediator", dns
 assert dns["docker_dns_routing"] == "local_root_resident_mediator", dns
 assert dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"], dns
 assert isinstance(dns["materialization_batch_count"], int), dns
 assert dns["materialization_batch_count"] >= 0, dns
 assert dns["materialization_request_rejections"] == 0, dns
+assert isinstance(dns["results_storage_authorization_count"], int), dns
+assert dns["results_storage_authorization_count"] >= 0, dns
+assert dns["results_storage_attribution_failures"] == 0, dns
+assert dns["results_storage_request_rejections"] == 0, dns
+assert isinstance(dns["runner_authorized_results_storage"], list), dns
 assert dns["hostname_refresh_warnings"] == 0, dns
 assert isinstance(dns["upstream_request_failures"], int), dns
 assert dns["upstream_request_failures"] >= 0, dns
@@ -263,6 +270,7 @@ if scenario == "audit":
 else:
     assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
     assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in report["limitations"]
+    assert "runner_authorized_results_storage_accounts_remain_egress_channels" in report["limitations"]
     assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
 if scenario == "unsafe-preserve":
     assert "container_control_preserved_invalidates_containment" in report["limitations"]
@@ -290,8 +298,21 @@ case "$scenario" in
     ;;
 esac
 
+if [[ "$scenario" == "standard" ]]; then
+  python3 <<'PY'
+import socket
+
+try:
+    socket.getaddrinfo("productionresultssa99999.blob.core.windows.net", 443)
+except socket.gaierror:
+    pass
+else:
+    raise SystemExit("workflow process unexpectedly authorized a results-storage hostname")
+PY
+fi
+
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve)
+  standard|standard-finalization|standard-opt-out|unsafe-preserve)
     if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
       die "protected block proof did not disable runner passwordless sudo"
     fi
@@ -301,7 +322,7 @@ case "$scenario" in
     ;;
 esac
 case "$scenario" in
-  standard|standard-opt-out)
+  standard|standard-finalization|standard-opt-out)
     if docker ps --quiet >/dev/null 2>&1; then
       die "protected standard-block proof did not disable runner Docker access"
     fi
@@ -331,7 +352,7 @@ import sys
 
 scenario = sys.argv[1]
 report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
-expected = {
+expected_by_scenario = {
     "standard": {
         "mode": "block",
         "status": "protected_host_block",
@@ -360,7 +381,9 @@ expected = {
         "sudo_status": "preserved_verified",
         "container_status": "preserved_verified",
     },
-}[scenario]
+}
+expected_by_scenario["standard-finalization"] = expected_by_scenario["standard"]
+expected = expected_by_scenario[scenario]
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 assert report["status"] == expected["status"], report
@@ -376,6 +399,23 @@ assert dns["status"] == expected["status"], dns
 assert isinstance(dns["materialization_batch_count"], int), dns
 assert dns["materialization_batch_count"] >= 0, dns
 assert dns["materialization_request_rejections"] == 0, dns
+assert dns["results_storage_attribution_failures"] == 0, dns
+if scenario == "standard":
+    assert dns["results_storage_request_rejections"] >= 1, dns
+else:
+    assert dns["results_storage_request_rejections"] == 0, dns
+if scenario == "standard-finalization":
+    authorizations = dns["runner_authorized_results_storage"]
+    if dns["results_storage_authorization_count"] > 0:
+        assert authorizations, dns
+        assert all(
+            item["authorization_origin"] == "pinned_runner_worker_dns"
+            for item in authorizations
+        ), dns
+        print("fence-results-storage-authorization-observed")
+    else:
+        assert not authorizations, dns
+        print("fence-results-storage-authorization-not-observed")
 assert isinstance(dns["upstream_request_failures"], int), dns
 assert dns["upstream_request_failures"] >= 0, dns
 assert dns["resident_health"]["verification_sequence"] >= 2, dns
@@ -407,7 +447,8 @@ if scenario == "audit":
     }, attribution
     assert "fence-audit-probe" not in json.dumps(report, sort_keys=True), report
     assert "fence-audit-probe" not in json.dumps(dns, sort_keys=True), dns
-print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+if scenario != "standard-finalization":
+    print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY
 
 echo -e "${GREEN}protected trusted-launcher block verified: $scenario${OFF}"

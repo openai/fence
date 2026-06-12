@@ -19,10 +19,19 @@ pub struct AcceptedHostedRunnerFactsV1 {
     pub expected_principal: &'static str,
     pub required_runner_groups: Vec<&'static str>,
     pub executable_paths: Vec<&'static str>,
+    pub resolver: AcceptedResolverV1,
     pub sudo_policy_sources: Vec<AcceptedSudoPolicySourceV1>,
     pub container_units: Vec<AcceptedUnitV1>,
     pub container_sockets: Vec<AcceptedSocketV1>,
     pub required_docker_running_workload_count: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct AcceptedResolverV1 {
+    pub resolv_conf_path: &'static str,
+    pub canonical_target: &'static str,
+    pub target_owner: &'static str,
+    pub target_mode: &'static str,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -68,14 +77,22 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV1 {
             executable_paths: vec![
                 "/usr/bin/docker",
                 "/usr/bin/id",
+                "/usr/bin/mount",
                 "/usr/bin/stat",
                 "/usr/bin/sudo",
                 "/usr/bin/systemctl",
                 "/usr/bin/systemd-run",
                 "/usr/bin/true",
+                "/usr/bin/umount",
                 "/usr/sbin/visudo",
                 "/usr/sbin/nft",
             ],
+            resolver: AcceptedResolverV1 {
+                resolv_conf_path: "/etc/resolv.conf",
+                canonical_target: "/run/systemd/resolve/stub-resolv.conf",
+                target_owner: "root",
+                target_mode: "0644",
+            },
             sudo_policy_sources: vec![
                 AcceptedSudoPolicySourceV1 {
                     path_class: "main_policy",
@@ -180,6 +197,10 @@ mod tests {
         );
         assert_eq!(requirement.status, "accepted_reference_not_checked");
         assert_eq!(requirement.accepted.expected_principal, "runner");
+        assert_eq!(
+            requirement.accepted.resolver.canonical_target,
+            "/run/systemd/resolve/stub-resolv.conf"
+        );
         assert!(
             requirement
                 .accepted

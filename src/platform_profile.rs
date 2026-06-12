@@ -1,8 +1,10 @@
 use serde::Serialize;
 
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID: &str = "github_hosted_workflow_bootstrap_v1";
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID: &str = "github_hosted_workflow_bootstrap_v2";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN: &str =
     "*.actions.githubusercontent.com";
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN: &str =
+    "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES: [&str; 1] =
     ["actions-results-receiver-production.githubapp.com"];
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 3] = [
@@ -28,6 +30,7 @@ pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES: [&str; 7] = [
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS: &str = "168.63.129.16:53";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize = 8;
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize = 2;
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS: usize = 4;
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS: usize = 32;
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH: u8 = 4;
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_TTL_SECONDS: u32 = 300;
@@ -45,6 +48,9 @@ pub struct DnsMediatedCompatibilityPlan {
     pub bounded_actions_suffix_pattern: &'static str,
     pub max_dynamic_actions_suffix_authorizations: usize,
     pub max_dynamic_actions_suffix_prefix_labels: usize,
+    pub runner_authorized_results_storage_pattern: &'static str,
+    pub max_runner_authorized_results_storage_accounts: usize,
+    pub results_storage_authorization_origin: &'static str,
     pub forwarded_query_types: Vec<&'static str>,
     pub max_derived_cname_authorizations: usize,
     pub max_derived_cname_depth: u8,
@@ -83,6 +89,11 @@ pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
         max_dynamic_actions_suffix_prefix_labels:
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
+        runner_authorized_results_storage_pattern:
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
+        max_runner_authorized_results_storage_accounts:
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS,
+        results_storage_authorization_origin: "pinned_runner_worker_dns",
         forwarded_query_types: vec!["a", "aaaa"],
         max_derived_cname_authorizations:
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS,
@@ -115,7 +126,7 @@ mod tests {
 
         assert_eq!(
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
-            "github_hosted_workflow_bootstrap_v1"
+            "github_hosted_workflow_bootstrap_v2"
         );
         assert_eq!(
             profile.bootstrap_hostnames,
@@ -132,6 +143,11 @@ mod tests {
         assert_eq!(profile.exact_compatibility_hostnames.len(), 1);
         assert_eq!(profile.max_dynamic_actions_suffix_authorizations, 8);
         assert_eq!(profile.max_dynamic_actions_suffix_prefix_labels, 2);
+        assert_eq!(profile.max_runner_authorized_results_storage_accounts, 4);
+        assert_eq!(
+            profile.runner_authorized_results_storage_pattern,
+            "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net"
+        );
         assert_eq!(profile.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(profile.https_materialization_protocol, "tcp");
         assert_eq!(profile.https_materialization_port, 443);
