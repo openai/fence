@@ -23,6 +23,9 @@ channels that later workflow code may use. The exact `github.com`,
 channels are intentional compatibility exceptions by default. Workflows may set
 `disable_broad_github_domains: true` to remove those three broad GitHub roots
 while keeping core Actions status and finalization endpoints available.
+GitHub results-storage accounts are authorized separately: Fence accepts only a
+bounded exact hostname requested by the pinned `Runner.Worker` process and then
+materializes HTTPS access after verified firewall application.
 
 ## Release Provenance
 
@@ -125,6 +128,19 @@ original DNS question but no answer, authority, additional, or raw upstream
 data. Queue rejections increment bounded warning evidence; backend apply and
 verification failures remain critical findings.
 
+### Runner-bound results-storage authorization
+
+GitHub's runner uploads job logs and summaries to signed Azure Blob URLs. A
+static numeric account list would be brittle, while a general
+`*.blob.core.windows.net` rule would authorize unrelated globally registered
+storage accounts. Fence instead routes host DNS directly to its local mediator,
+pins the unique reviewed `Runner.Worker` identity, and authorizes at most four
+exact `productionresultssa<digits>.blob.core.windows.net` accounts only when a
+matching host DNS socket belongs to that pinned process. PID reuse, executable
+replacement, ambiguous ownership, Docker-originated requests, and ordinary
+workflow-process requests fail closed. The DNS answer remains withheld until
+TCP `443` access is atomically applied and structurally verified.
+
 ### Action child-process deadlines and dependency surface
 
 The Action launcher previously had no timeout for fixed privileged subprocess
@@ -143,6 +159,9 @@ compile TypeScript at workflow runtime. See Node's
   `release-assets.githubusercontent.com`; `disable_broad_github_domains: true`
   removes those three broad roots but retains core Actions status/finalization
   channels.
+- An exact GitHub results-storage account authorized for the pinned runner is
+  also reachable by later workflow code at its resolved HTTPS addresses. Fence
+  does not inspect signed URLs, credentials, or encrypted request content.
 - The fixed upstream DNS resolver remains a trusted platform dependency. Fence
   bounds, canonicalizes, and filters requests and validates response source and
   transaction identity, but does not add DNSSEC validation.

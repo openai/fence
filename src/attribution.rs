@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Result as IoResult};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -19,7 +20,10 @@ const MAX_PARENT_EXECUTABLES: usize = 4;
 const MAX_PROC_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_STATUS_FILE_BYTES: u64 = 64 * 1024;
 const MAX_EXECUTABLE_BASENAME_BYTES: usize = 128;
+const MAX_RUNNER_WORKER_ANCESTRY: usize = 8;
 const WORKER_IDLE_INTERVAL: Duration = Duration::from_millis(100);
+const RUNNER_WORKER_BASENAME: &str = "Runner.Worker";
+const RUNNER_LISTENER_BASENAME: &str = "Runner.Listener";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum SocketFamily {
@@ -41,6 +45,180 @@ pub(crate) struct SocketTuple {
     pub local_port: u16,
     pub remote_address: IpAddr,
     pub remote_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct DnsClientSocket {
+    pub protocol: SocketProtocol,
+    pub peer: SocketAddr,
+    pub listener: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum DnsCallerProvenance {
+    TrustedRunnerWorker,
+    Untrusted,
+    AttributionFailed,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct TrustedRunnerWorkerError {
+    pub code: &'static str,
+    pub message: &'static str,
+}
+
+impl TrustedRunnerWorkerError {
+    fn new(code: &'static str, message: &'static str) -> Self {
+        Self { code, message }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TrustedRunnerWorker {
+    proc_root: PathBuf,
+    runner_uid: u32,
+    pid: u32,
+    start_time_ticks: u64,
+    executable_device: u64,
+    executable_inode: u64,
+}
+
+impl TrustedRunnerWorker {
+    pub(crate) fn discover_system() -> Result<Self, TrustedRunnerWorkerError> {
+        let runner_uid = runner_uid_from_passwd(Path::new("/etc/passwd")).map_err(|_| {
+            TrustedRunnerWorkerError::new(
+                "runner_worker_identity_unavailable",
+                "the fixed runner principal could not be resolved",
+            )
+        })?;
+        Self::discover(PathBuf::from("/proc"), runner_uid)
+    }
+
+    fn discover(proc_root: PathBuf, runner_uid: u32) -> Result<Self, TrustedRunnerWorkerError> {
+        let mut process_ids = numeric_process_ids(&proc_root).map_err(|_| {
+            TrustedRunnerWorkerError::new(
+                "runner_worker_identity_unavailable",
+                "the hosted runner process set could not be inspected",
+            )
+        })?;
+        if process_ids.len() > MAX_PROCESSES {
+            return Err(TrustedRunnerWorkerError::new(
+                "runner_worker_identity_ambiguous",
+                "the hosted runner process set exceeded its fixed bound",
+            ));
+        }
+        process_ids.sort_unstable();
+        let candidates = process_ids
+            .into_iter()
+            .filter_map(|pid| {
+                let (uid, _) = process_identity_at(&proc_root, pid)?;
+                (uid == runner_uid
+                    && executable_basename_at(&proc_root, pid).as_deref()
+                        == Some(RUNNER_WORKER_BASENAME)
+                    && has_runner_listener_ancestor(&proc_root, pid, runner_uid))
+                .then_some(pid)
+            })
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return Err(TrustedRunnerWorkerError::new(
+                "runner_worker_identity_ambiguous",
+                "exactly one reviewed Runner.Worker process is required",
+            ));
+        }
+        let pid = candidates[0];
+        let start_time_ticks = process_start_time_at(&proc_root, pid).ok_or_else(|| {
+            TrustedRunnerWorkerError::new(
+                "runner_worker_identity_unavailable",
+                "Runner.Worker start identity could not be pinned",
+            )
+        })?;
+        let metadata = fs::metadata(proc_root.join(pid.to_string()).join("exe")).map_err(|_| {
+            TrustedRunnerWorkerError::new(
+                "runner_worker_identity_unavailable",
+                "Runner.Worker executable identity could not be pinned",
+            )
+        })?;
+        Ok(Self {
+            proc_root,
+            runner_uid,
+            pid,
+            start_time_ticks,
+            executable_device: metadata.dev(),
+            executable_inode: metadata.ino(),
+        })
+    }
+
+    pub(crate) fn classify_dns_client(
+        &self,
+        client: DnsClientSocket,
+    ) -> Result<DnsCallerProvenance, TrustedRunnerWorkerError> {
+        self.revalidate()?;
+        let Some((family, table)) = dns_socket_table(client) else {
+            return Ok(DnsCallerProvenance::AttributionFailed);
+        };
+        let table_path = self.proc_root.join("net").join(table);
+        let Ok(contents) = read_bounded(&table_path, MAX_PROC_FILE_BYTES) else {
+            return Ok(DnsCallerProvenance::AttributionFailed);
+        };
+        let Some(inodes) = dns_socket_inodes(&contents, client, family) else {
+            return Ok(DnsCallerProvenance::AttributionFailed);
+        };
+        if inodes.len() != 1 {
+            return Ok(DnsCallerProvenance::AttributionFailed);
+        }
+        let inode = *inodes.first().expect("one inode exists");
+        let owners = match socket_inode_owners(&self.proc_root, inode) {
+            Ok(BoundedScan::Values(owners)) => owners,
+            Ok(BoundedScan::LimitExceeded) | Err(_) => {
+                return Ok(DnsCallerProvenance::AttributionFailed);
+            }
+        };
+        if owners != BTreeSet::from([self.pid]) {
+            return Ok(if !owners.is_empty() && !owners.contains(&self.pid) {
+                DnsCallerProvenance::Untrusted
+            } else {
+                DnsCallerProvenance::AttributionFailed
+            });
+        }
+        self.revalidate()?;
+        let Ok(current) = read_bounded(&table_path, MAX_PROC_FILE_BYTES) else {
+            return Ok(DnsCallerProvenance::AttributionFailed);
+        };
+        let current_inodes = dns_socket_inodes(&current, client, family);
+        let current_owners = match socket_inode_owners(&self.proc_root, inode) {
+            Ok(BoundedScan::Values(owners)) => Some(owners),
+            Ok(BoundedScan::LimitExceeded) | Err(_) => None,
+        };
+        Ok(
+            if current_inodes.as_ref() == Some(&inodes) && current_owners.as_ref() == Some(&owners)
+            {
+                DnsCallerProvenance::TrustedRunnerWorker
+            } else {
+                DnsCallerProvenance::AttributionFailed
+            },
+        )
+    }
+
+    fn revalidate(&self) -> Result<(), TrustedRunnerWorkerError> {
+        let valid_process = process_identity_at(&self.proc_root, self.pid)
+            .is_some_and(|(uid, _)| uid == self.runner_uid)
+            && process_start_time_at(&self.proc_root, self.pid) == Some(self.start_time_ticks)
+            && executable_basename_at(&self.proc_root, self.pid).as_deref()
+                == Some(RUNNER_WORKER_BASENAME)
+            && has_runner_listener_ancestor(&self.proc_root, self.pid, self.runner_uid);
+        let valid_executable = fs::metadata(self.proc_root.join(self.pid.to_string()).join("exe"))
+            .is_ok_and(|metadata| {
+                metadata.dev() == self.executable_device && metadata.ino() == self.executable_inode
+            });
+        if valid_process && valid_executable {
+            Ok(())
+        } else {
+            Err(TrustedRunnerWorkerError::new(
+                "runner_worker_identity_drift",
+                "the pinned Runner.Worker identity changed or disappeared",
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -318,80 +496,15 @@ impl ProcAttributor {
     }
 
     fn socket_owners(&self, inode: u64) -> Result<BoundedScan<u32>, AttributionError> {
-        let mut process_ids = Vec::new();
-        for entry in fs::read_dir(&self.proc_root).map_err(|_| {
-            AttributionError::new(
-                "attribution_process_scan_failed",
-                "process attribution could not enumerate local processes",
-            )
-        })? {
-            let Ok(entry) = entry else { continue };
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if name.bytes().all(|byte| byte.is_ascii_digit())
-                && let Ok(pid) = name.parse::<u32>()
-            {
-                process_ids.push(pid);
-                if process_ids.len() > MAX_PROCESSES {
-                    return Ok(BoundedScan::LimitExceeded);
-                }
-            }
-        }
-        process_ids.sort_unstable();
-
-        let expected = format!("socket:[{inode}]");
-        let mut inspected_descriptors = 0_usize;
-        let mut owners = BTreeSet::new();
-        for pid in process_ids {
-            let Ok(descriptors) = fs::read_dir(self.proc_root.join(pid.to_string()).join("fd"))
-            else {
-                continue;
-            };
-            for descriptor in descriptors {
-                let Ok(descriptor) = descriptor else { continue };
-                inspected_descriptors = inspected_descriptors.saturating_add(1);
-                if inspected_descriptors > MAX_FILE_DESCRIPTORS {
-                    return Ok(BoundedScan::LimitExceeded);
-                }
-                if fs::read_link(descriptor.path())
-                    .ok()
-                    .and_then(|target| target.to_str().map(str::to_owned))
-                    .as_deref()
-                    == Some(expected.as_str())
-                {
-                    owners.insert(pid);
-                }
-            }
-        }
-        Ok(BoundedScan::Values(owners))
+        socket_inode_owners(&self.proc_root, inode)
     }
 
     fn process_identity(&self, pid: u32) -> Option<(u32, u32)> {
-        let status = read_bounded(
-            &self.proc_root.join(pid.to_string()).join("status"),
-            MAX_STATUS_FILE_BYTES,
-        )
-        .ok()?;
-        let uid = status
-            .lines()
-            .find_map(|line| line.strip_prefix("Uid:"))?
-            .split_ascii_whitespace()
-            .next()?
-            .parse::<u32>()
-            .ok()?;
-        let parent = status
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:"))?
-            .trim()
-            .parse::<u32>()
-            .ok()?;
-        Some((uid, parent))
+        process_identity_at(&self.proc_root, pid)
     }
 
     fn executable_basename(&self, pid: u32) -> Option<String> {
-        let target = fs::read_link(self.proc_root.join(pid.to_string()).join("exe")).ok()?;
-        sanitize_executable_basename(target.file_name()?.to_str()?)
+        executable_basename_at(&self.proc_root, pid)
     }
 
     fn parent_executables(&self, pid: u32, mut parent_pid: u32) -> Vec<String> {
@@ -416,6 +529,175 @@ impl ProcAttributor {
 enum BoundedScan<T> {
     Values(BTreeSet<T>),
     LimitExceeded,
+}
+
+fn numeric_process_ids(proc_root: &Path) -> IoResult<Vec<u32>> {
+    let mut process_ids = Vec::new();
+    for entry in fs::read_dir(proc_root)? {
+        let Ok(entry) = entry else { continue };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.bytes().all(|byte| byte.is_ascii_digit())
+            && let Ok(pid) = name.parse::<u32>()
+        {
+            process_ids.push(pid);
+        }
+    }
+    Ok(process_ids)
+}
+
+fn socket_inode_owners(proc_root: &Path, inode: u64) -> Result<BoundedScan<u32>, AttributionError> {
+    let mut process_ids = numeric_process_ids(proc_root).map_err(|_| {
+        AttributionError::new(
+            "attribution_process_scan_failed",
+            "process attribution could not enumerate local processes",
+        )
+    })?;
+    if process_ids.len() > MAX_PROCESSES {
+        return Ok(BoundedScan::LimitExceeded);
+    }
+    process_ids.sort_unstable();
+
+    let expected = format!("socket:[{inode}]");
+    let mut inspected_descriptors = 0_usize;
+    let mut owners = BTreeSet::new();
+    for pid in process_ids {
+        let Ok(descriptors) = fs::read_dir(proc_root.join(pid.to_string()).join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors {
+            let Ok(descriptor) = descriptor else { continue };
+            inspected_descriptors = inspected_descriptors.saturating_add(1);
+            if inspected_descriptors > MAX_FILE_DESCRIPTORS {
+                return Ok(BoundedScan::LimitExceeded);
+            }
+            if fs::read_link(descriptor.path())
+                .ok()
+                .and_then(|target| target.to_str().map(str::to_owned))
+                .as_deref()
+                == Some(expected.as_str())
+            {
+                owners.insert(pid);
+            }
+        }
+    }
+    Ok(BoundedScan::Values(owners))
+}
+
+fn process_identity_at(proc_root: &Path, pid: u32) -> Option<(u32, u32)> {
+    let status = read_bounded(
+        &proc_root.join(pid.to_string()).join("status"),
+        MAX_STATUS_FILE_BYTES,
+    )
+    .ok()?;
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_ascii_whitespace()
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    let parent = status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    Some((uid, parent))
+}
+
+fn process_start_time_at(proc_root: &Path, pid: u32) -> Option<u64> {
+    let stat = read_bounded(
+        &proc_root.join(pid.to_string()).join("stat"),
+        MAX_STATUS_FILE_BYTES,
+    )
+    .ok()?;
+    let end = stat.rfind(')')?;
+    stat.get(end + 1..)?
+        .split_ascii_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
+}
+
+fn executable_basename_at(proc_root: &Path, pid: u32) -> Option<String> {
+    let target = fs::read_link(proc_root.join(pid.to_string()).join("exe")).ok()?;
+    sanitize_executable_basename(target.file_name()?.to_str()?)
+}
+
+fn has_runner_listener_ancestor(proc_root: &Path, pid: u32, runner_uid: u32) -> bool {
+    let Some((_, mut parent)) = process_identity_at(proc_root, pid) else {
+        return false;
+    };
+    let mut visited = BTreeSet::from([pid]);
+    for _ in 0..MAX_RUNNER_WORKER_ANCESTRY {
+        if parent == 0 || !visited.insert(parent) {
+            return false;
+        }
+        let Some((uid, next_parent)) = process_identity_at(proc_root, parent) else {
+            return false;
+        };
+        if uid == runner_uid
+            && executable_basename_at(proc_root, parent).as_deref()
+                == Some(RUNNER_LISTENER_BASENAME)
+        {
+            return true;
+        }
+        parent = next_parent;
+    }
+    false
+}
+
+fn dns_socket_table(client: DnsClientSocket) -> Option<(SocketFamily, &'static str)> {
+    let family = match (client.peer, client.listener) {
+        (SocketAddr::V4(_), SocketAddr::V4(_)) => SocketFamily::Ipv4,
+        (SocketAddr::V6(_), SocketAddr::V6(_)) => SocketFamily::Ipv6,
+        _ => return None,
+    };
+    let table = match (family, client.protocol) {
+        (SocketFamily::Ipv4, SocketProtocol::Tcp) => "tcp",
+        (SocketFamily::Ipv4, SocketProtocol::Udp) => "udp",
+        (SocketFamily::Ipv6, SocketProtocol::Tcp) => "tcp6",
+        (SocketFamily::Ipv6, SocketProtocol::Udp) => "udp6",
+    };
+    Some((family, table))
+}
+
+fn dns_socket_inodes(
+    contents: &str,
+    client: DnsClientSocket,
+    family: SocketFamily,
+) -> Option<BTreeSet<u64>> {
+    let local = proc_endpoint(&client.peer.ip(), client.peer.port(), family);
+    let unspecified = match family {
+        SocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let wildcard_local = proc_endpoint(&unspecified, client.peer.port(), family);
+    let remote = proc_endpoint(&client.listener.ip(), client.listener.port(), family);
+    let wildcard_remote = proc_endpoint(&unspecified, 0, family);
+    let mut inodes = BTreeSet::new();
+    for (index, line) in contents.lines().skip(1).enumerate() {
+        if index >= MAX_SOCKET_ROWS {
+            return None;
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let local_matches = fields.len() > 9
+            && (fields[1].eq_ignore_ascii_case(&local)
+                || (client.protocol == SocketProtocol::Udp
+                    && fields[1].eq_ignore_ascii_case(&wildcard_local)));
+        if !local_matches {
+            continue;
+        }
+        let remote_matches = fields[2].eq_ignore_ascii_case(&remote)
+            || (client.protocol == SocketProtocol::Udp
+                && fields[2].eq_ignore_ascii_case(&wildcard_remote));
+        if remote_matches && let Ok(inode) = fields[9].parse::<u64>() {
+            inodes.insert(inode);
+        }
+    }
+    Some(inodes)
 }
 
 fn runner_uid_from_passwd(path: &Path) -> Result<u32, AttributionError> {
@@ -541,6 +823,73 @@ mod tests {
         .unwrap();
         symlink(format!("/usr/bin/{executable}"), directory.join("exe")).unwrap();
         symlink(format!("socket:[{inode}]"), directory.join("fd/3")).unwrap();
+    }
+
+    fn write_trusted_process(
+        root: &Path,
+        pid: u32,
+        uid: u32,
+        parent: u32,
+        executable: &str,
+        start_time: u64,
+        socket_inode: Option<u64>,
+    ) {
+        let directory = root.join(pid.to_string());
+        fs::create_dir_all(directory.join("fd")).unwrap();
+        fs::write(
+            directory.join("status"),
+            format!("Name:\t{executable}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nPPid:\t{parent}\n"),
+        )
+        .unwrap();
+        let mut stat_fields = vec!["0".to_owned(); 20];
+        stat_fields[0] = "S".to_owned();
+        stat_fields[1] = parent.to_string();
+        stat_fields[19] = start_time.to_string();
+        fs::write(
+            directory.join("stat"),
+            format!("{pid} ({executable}) {}\n", stat_fields.join(" ")),
+        )
+        .unwrap();
+        let executables = root.join("executables");
+        fs::create_dir_all(&executables).unwrap();
+        let executable_path = executables.join(executable);
+        if !executable_path.exists() {
+            fs::write(&executable_path, b"test executable").unwrap();
+        }
+        symlink(&executable_path, directory.join("exe")).unwrap();
+        if let Some(inode) = socket_inode {
+            symlink(format!("socket:[{inode}]"), directory.join("fd/3")).unwrap();
+        }
+    }
+
+    fn write_dns_client_socket(
+        root: &Path,
+        client: DnsClientSocket,
+        inode: u64,
+        wildcard_udp_endpoints: bool,
+    ) {
+        let (family, table) = dns_socket_table(client).unwrap();
+        let unspecified = match family {
+            SocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let local = if wildcard_udp_endpoints {
+            proc_endpoint(&unspecified, client.peer.port(), family)
+        } else {
+            proc_endpoint(&client.peer.ip(), client.peer.port(), family)
+        };
+        let remote = if wildcard_udp_endpoints {
+            proc_endpoint(&unspecified, 0, family)
+        } else {
+            proc_endpoint(&client.listener.ip(), client.listener.port(), family)
+        };
+        fs::write(
+            root.join("net").join(table),
+            format!(
+                "  sl  local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n   0: {local} {remote} 01 00000000:00000000 00:00000000 00000000 1001 0 {inode}\n"
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -812,6 +1161,135 @@ mod tests {
         assert_eq!(
             worker.run(&AtomicBool::new(false)).unwrap_err().code,
             "attribution_result_channel_failed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pins_one_runner_worker_and_attributes_udp_and_tcp_dns_sockets() {
+        let root = root();
+        write_trusted_process(&root, 100, 1001, 1, RUNNER_LISTENER_BASENAME, 10, None);
+        write_trusted_process(&root, 200, 1001, 100, RUNNER_WORKER_BASENAME, 20, Some(501));
+        let worker = TrustedRunnerWorker::discover(root.clone(), 1001).unwrap();
+
+        let udp = DnsClientSocket {
+            protocol: SocketProtocol::Udp,
+            peer: "127.0.0.1:40000".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        write_dns_client_socket(&root, udp, 501, true);
+        assert_eq!(
+            worker.classify_dns_client(udp).unwrap(),
+            DnsCallerProvenance::TrustedRunnerWorker
+        );
+
+        fs::remove_file(root.join("200/fd/3")).unwrap();
+        write_trusted_process(&root, 250, 1001, 100, "workflow", 25, Some(501));
+        assert_eq!(
+            worker.classify_dns_client(udp).unwrap(),
+            DnsCallerProvenance::Untrusted
+        );
+        fs::remove_file(root.join("250/fd/3")).unwrap();
+        let tcp = DnsClientSocket {
+            protocol: SocketProtocol::Tcp,
+            peer: "127.0.0.1:40001".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        write_dns_client_socket(&root, tcp, 502, false);
+        write_trusted_process(&root, 300, 1001, 100, "workflow", 30, Some(502));
+        assert_eq!(
+            worker.classify_dns_client(tcp).unwrap(),
+            DnsCallerProvenance::Untrusted
+        );
+        symlink("socket:[502]", root.join("200/fd/4")).unwrap();
+        assert_eq!(
+            worker.classify_dns_client(tcp).unwrap(),
+            DnsCallerProvenance::AttributionFailed
+        );
+        fs::remove_file(root.join("300/fd/3")).unwrap();
+        assert_eq!(
+            worker.classify_dns_client(tcp).unwrap(),
+            DnsCallerProvenance::TrustedRunnerWorker
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runner_worker_identity_drift_and_ambiguity_fail_closed() {
+        let root = root();
+        write_trusted_process(&root, 100, 1001, 1, RUNNER_LISTENER_BASENAME, 10, None);
+        write_trusted_process(&root, 200, 1001, 100, RUNNER_WORKER_BASENAME, 20, Some(601));
+        let worker = TrustedRunnerWorker::discover(root.clone(), 1001).unwrap();
+        let client = DnsClientSocket {
+            protocol: SocketProtocol::Udp,
+            peer: "127.0.0.1:41000".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        write_dns_client_socket(&root, client, 601, false);
+        let mut stat_fields = vec!["0".to_owned(); 20];
+        stat_fields[0] = "S".to_owned();
+        stat_fields[1] = "100".to_owned();
+        stat_fields[19] = "21".to_owned();
+        fs::write(
+            root.join("200/stat"),
+            format!("200 ({RUNNER_WORKER_BASENAME}) {}\n", stat_fields.join(" ")),
+        )
+        .unwrap();
+        assert_eq!(
+            worker.classify_dns_client(client).unwrap_err().code,
+            "runner_worker_identity_drift"
+        );
+
+        stat_fields[19] = "20".to_owned();
+        fs::write(
+            root.join("200/stat"),
+            format!("200 ({RUNNER_WORKER_BASENAME}) {}\n", stat_fields.join(" ")),
+        )
+        .unwrap();
+        let alternate = root.join("alternate").join(RUNNER_WORKER_BASENAME);
+        fs::create_dir_all(alternate.parent().unwrap()).unwrap();
+        fs::write(&alternate, b"replacement executable").unwrap();
+        fs::remove_file(root.join("200/exe")).unwrap();
+        symlink(&alternate, root.join("200/exe")).unwrap();
+        assert_eq!(
+            worker.classify_dns_client(client).unwrap_err().code,
+            "runner_worker_identity_drift"
+        );
+
+        write_trusted_process(&root, 201, 1001, 100, RUNNER_WORKER_BASENAME, 30, None);
+        assert_eq!(
+            TrustedRunnerWorker::discover(root.clone(), 1001)
+                .unwrap_err()
+                .code,
+            "runner_worker_identity_ambiguous"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_dns_socket_ownership_is_not_attributed() {
+        let root = root();
+        write_trusted_process(&root, 100, 1001, 1, RUNNER_LISTENER_BASENAME, 10, None);
+        write_trusted_process(&root, 200, 1001, 100, RUNNER_WORKER_BASENAME, 20, Some(701));
+        let worker = TrustedRunnerWorker::discover(root.clone(), 1001).unwrap();
+        let client = DnsClientSocket {
+            protocol: SocketProtocol::Udp,
+            peer: "127.0.0.1:42000".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        let (family, table) = dns_socket_table(client).unwrap();
+        let local = proc_endpoint(&client.peer.ip(), client.peer.port(), family);
+        let remote = proc_endpoint(&client.listener.ip(), client.listener.port(), family);
+        fs::write(
+            root.join("net").join(table),
+            format!(
+                "  sl  local_address rem_address st tx_queue tr tm->when retrnsmt uid timeout inode\n   0: {local} {remote} 01 00000000:00000000 00:00000000 00000000 1001 0 701\n   1: {local} {remote} 01 00000000:00000000 00:00000000 00000000 1001 0 702\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            worker.classify_dns_client(client).unwrap(),
+            DnsCallerProvenance::AttributionFailed
         );
         fs::remove_dir_all(root).unwrap();
     }
