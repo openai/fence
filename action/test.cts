@@ -24,6 +24,7 @@ const {
   validateLauncherIntegrity,
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,
+  validateDnsEvidence,
   validateReady,
   validateReport,
   validateResidentHealth,
@@ -32,8 +33,26 @@ const {
 const actionLog = require("./log.cts");
 const { run } = require("./main.cts");
 
+function residentHealth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    status: "healthy",
+    resident_pid: 4242,
+    verification_sequence: 9,
+    last_successful_verification_unix_milliseconds: Date.now() - 1_000,
+    verification_interval_seconds: 5,
+    workers: [
+      { name: "docker_tcp_dns", status: "running" },
+      { name: "docker_udp_dns", status: "running" },
+      { name: "host_tcp_dns", status: "running" },
+      { name: "host_udp_dns", status: "running" },
+      { name: "process_attribution", status: "running" },
+    ],
+    ...overrides,
+  };
+}
+
 const report = {
-  runtime_evidence_schema_version: 1,
+  runtime_evidence_schema_version: 2,
   status: "protected_host_block",
   mode: "block",
   readiness_status: "ready",
@@ -44,12 +63,13 @@ const report = {
   protection_available: true,
   sudo_status: "disabled_verified",
   container_status: "disabled_verified",
-  policy_hash_schema_version: 3,
+  policy_hash_schema_version: 4,
   policy_hash: "a".repeat(64),
   base_ruleset_hash: "b".repeat(64),
   ruleset_hash: "c".repeat(64),
   critical_findings: [],
   critical_findings_truncated: false,
+  resident_health: residentHealth(),
 };
 
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
@@ -479,8 +499,19 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
 
 test("validates stable runtime evidence", () => {
   validateReport(report);
+  const dnsEvidence = {
+    runtime_evidence_schema_version: 2,
+    status: report.status,
+    mode: report.mode,
+    platform_profile_id: report.platform_profile_id,
+    profile_realization_id: report.profile_realization_id,
+    protection_available: report.protection_available,
+    routing_status: "active",
+    resident_health: report.resident_health,
+  };
+  validateDnsEvidence(dnsEvidence, report);
   validateReady({
-    runtime_evidence_schema_version: 1,
+    runtime_evidence_schema_version: 2,
     status: "ready",
     platform_profile_id: "github_hosted_workflow_bootstrap_v1",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
@@ -489,9 +520,10 @@ test("validates stable runtime evidence", () => {
     base_ruleset_hash: report.base_ruleset_hash,
     ruleset_hash: report.ruleset_hash,
     protection_available: true,
+    resident_health: report.resident_health,
   }, report);
   validateReady({
-    runtime_evidence_schema_version: 1,
+    runtime_evidence_schema_version: 2,
     status: "ready",
     platform_profile_id: "github_hosted_workflow_bootstrap_v1",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
@@ -500,6 +532,7 @@ test("validates stable runtime evidence", () => {
     base_ruleset_hash: report.base_ruleset_hash,
     ruleset_hash: "d".repeat(64),
     protection_available: true,
+    resident_health: report.resident_health,
   }, report);
   assert.throws(() => validateReport({ ...report, critical_findings: [{}] }), /critical resident findings/);
   assert.throws(
@@ -509,7 +542,19 @@ test("validates stable runtime evidence", () => {
   assert.throws(() => validateReport({ ...report, network_verification_status: "critical_drift" }), /verified network state/);
   assert.throws(() => validateReport({ ...report, critical_findings_truncated: true }), /bounded critical findings/);
   assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
-  assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 0 }), /profile/);
+  assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 1 }), /profile/);
+  assert.throws(() => validateReport({ ...report, policy_hash_schema_version: 3 }), /profile/);
+  assert.throws(
+    () => validateDnsEvidence({ ...dnsEvidence, runtime_evidence_schema_version: 1 }, report),
+    /does not match/,
+  );
+  assert.throws(
+    () => validateDnsEvidence({
+      ...dnsEvidence,
+      resident_health: residentHealth({ resident_pid: 7 }),
+    }, report),
+    /resident process/,
+  );
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
 });
 
@@ -526,6 +571,7 @@ test("validates fresh resident worker and service identity evidence", () => {
       { name: "docker_udp_dns", status: "running" },
       { name: "host_tcp_dns", status: "running" },
       { name: "host_udp_dns", status: "running" },
+      { name: "process_attribution", status: "running" },
     ],
   };
   validateResidentHealth(health, now);
@@ -552,6 +598,22 @@ test("validates fresh resident worker and service identity evidence", () => {
       ...health,
       workers: health.workers.map((worker) =>
         worker.name === "host_udp_dns" ? { ...worker, status: "failed" } : worker
+      ),
+    }, now),
+    /worker health/,
+  );
+  assert.throws(
+    () => validateResidentHealth({
+      ...health,
+      workers: health.workers.filter((worker) => worker.name !== "process_attribution"),
+    }, now),
+    /worker set/,
+  );
+  assert.throws(
+    () => validateResidentHealth({
+      ...health,
+      workers: health.workers.map((worker) =>
+        worker.name === "process_attribution" ? { ...worker, status: "failed" } : worker
       ),
     }, now),
     /worker health/,

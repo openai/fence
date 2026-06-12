@@ -87,6 +87,30 @@ python3 - "$scenario" "$report" "$dns_report" "$ready" "action/bundle-manifest.j
 import json
 import pathlib
 import sys
+import time
+
+expected_workers = [
+    {"name": "docker_tcp_dns", "status": "running"},
+    {"name": "docker_udp_dns", "status": "running"},
+    {"name": "host_tcp_dns", "status": "running"},
+    {"name": "host_udp_dns", "status": "running"},
+    {"name": "process_attribution", "status": "running"},
+]
+
+
+def assert_resident_health(document, expected_pid=None, minimum_sequence=1):
+    health = document["resident_health"]
+    assert health["status"] == "healthy", health
+    assert isinstance(health["resident_pid"], int) and health["resident_pid"] > 0, health
+    if expected_pid is not None:
+        assert health["resident_pid"] == expected_pid, health
+    assert health["verification_sequence"] >= minimum_sequence, health
+    assert health["verification_interval_seconds"] == 5, health
+    verified_at = health["last_successful_verification_unix_milliseconds"]
+    now = int(time.time() * 1000)
+    assert now - 20_000 <= verified_at <= now + 5_000, health
+    assert health["workers"] == expected_workers, health
+    return health["resident_pid"]
 
 scenario = sys.argv[1]
 report_path, dns_path, ready_path, manifest_path = (pathlib.Path(item) for item in sys.argv[2:])
@@ -114,15 +138,20 @@ assert report["network_verification_status"] == "verified", report
 assert report["critical_findings"] == [], report
 assert ready["status"] == readiness, ready
 assert dns["routing_status"] == "active", dns
-assert report["runtime_evidence_schema_version"] == 1, report
+assert report["runtime_evidence_schema_version"] == 2, report
+assert report["policy_hash_schema_version"] == 4, report
 assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", report
 assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", report
-assert ready["runtime_evidence_schema_version"] == 1, ready
+assert ready["runtime_evidence_schema_version"] == 2, ready
+assert ready["policy_hash_schema_version"] == 4, ready
 assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", ready
 assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", ready
-assert dns["runtime_evidence_schema_version"] == 1, dns
+assert dns["runtime_evidence_schema_version"] == 2, dns
 assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v1", dns
 assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_mediation_v1", dns
+resident_pid = assert_resident_health(report)
+assert_resident_health(ready, resident_pid)
+assert_resident_health(dns, resident_pid)
 broad_roots = {"github.com", "api.github.com", "release-assets.githubusercontent.com"}
 bootstrap_roots = set(dns["bootstrap_hostnames"])
 if scenario == "standard-opt-out":
@@ -171,13 +200,36 @@ python3 - "$scenario" "$report" "$dns_report" <<'PY'
 import json
 import pathlib
 import sys
+import time
+
+expected_workers = [
+    {"name": "docker_tcp_dns", "status": "running"},
+    {"name": "docker_udp_dns", "status": "running"},
+    {"name": "host_tcp_dns", "status": "running"},
+    {"name": "host_udp_dns", "status": "running"},
+    {"name": "process_attribution", "status": "running"},
+]
 
 scenario = sys.argv[1]
 report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
+assert report["runtime_evidence_schema_version"] == 2, report
+assert report["policy_hash_schema_version"] == 4, report
 assert report["network_verification_status"] == "verified", report
 assert report["critical_findings"] == [], report
+resident = report["resident_health"]
+assert resident["status"] == "healthy", resident
+assert resident["verification_sequence"] >= 2, resident
+assert resident["verification_interval_seconds"] == 5, resident
+assert resident["workers"] == expected_workers, resident
+verified_at = resident["last_successful_verification_unix_milliseconds"]
+now = int(time.time() * 1000)
+assert now - 20_000 <= verified_at <= now + 5_000, resident
+assert dns["runtime_evidence_schema_version"] == 2, dns
+assert dns["resident_health"]["resident_pid"] == resident["resident_pid"], dns
+assert dns["resident_health"]["workers"] == expected_workers, dns
+assert dns["resident_health"]["verification_sequence"] >= 2, dns
 assert "fence-action-audit-probe" not in json.dumps(report, sort_keys=True), report
 assert "fence-action-audit-probe" not in json.dumps(dns, sort_keys=True), dns
 if scenario == "audit":
