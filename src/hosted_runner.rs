@@ -30,7 +30,7 @@ pub struct AcceptedHostedRunnerFactsV1 {
 pub struct AcceptedResolverV1 {
     pub resolv_conf_path: &'static str,
     pub canonical_target: &'static str,
-    pub target_owner: &'static str,
+    pub target_uid: u32,
     pub target_mode: &'static str,
 }
 
@@ -90,7 +90,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV1 {
             resolver: AcceptedResolverV1 {
                 resolv_conf_path: "/etc/resolv.conf",
                 canonical_target: "/run/systemd/resolve/stub-resolv.conf",
-                target_owner: "root",
+                target_uid: 991,
                 target_mode: "0644",
             },
             sudo_policy_sources: vec![
@@ -201,6 +201,7 @@ mod tests {
             requirement.accepted.resolver.canonical_target,
             "/run/systemd/resolve/stub-resolv.conf"
         );
+        assert_eq!(requirement.accepted.resolver.target_uid, 991);
         assert!(
             requirement
                 .accepted

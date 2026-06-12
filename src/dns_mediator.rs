@@ -1463,6 +1463,7 @@ impl DnsRouting {
             target_metadata.file_type().is_file(),
             target_metadata.file_type().is_symlink(),
             target_metadata.uid(),
+            accepted.target_uid,
             target_metadata.permissions().mode() & 0o777,
         ) {
             return Err(DnsMediationError::new(
@@ -1524,13 +1525,14 @@ fn resolver_layout_is_supported(
     target_is_file: bool,
     target_is_symlink: bool,
     target_uid: u32,
+    expected_target_uid: u32,
     target_mode: u32,
 ) -> bool {
     resolv_conf_is_symlink
         && canonical_target == expected_target
         && target_is_file
         && !target_is_symlink
-        && target_uid == 0
+        && target_uid == expected_target_uid
         && target_mode == 0o644
 }
 
@@ -6695,7 +6697,10 @@ mod tests {
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
         );
         assert_eq!(evidence.routing_status, "active");
-        assert_eq!(evidence.host_dns_routing, "local_root_resident_mediator");
+        assert_eq!(
+            evidence.host_dns_routing,
+            "direct_client_to_root_resident_mediator"
+        );
         assert_eq!(evidence.docker_dns_routing, "local_root_resident_mediator");
         assert!(!evidence.protection_available);
         assert!(
@@ -6804,23 +6809,25 @@ mod tests {
     fn resolver_layout_rejects_unreviewed_targets_owners_and_modes() {
         let accepted = Path::new("/run/systemd/resolve/stub-resolv.conf");
         assert!(resolver_layout_is_supported(
-            true, accepted, accepted, true, false, 0, 0o644,
+            true, accepted, accepted, true, false, 991, 991, 0o644,
         ));
         for unsupported in [
-            resolver_layout_is_supported(false, accepted, accepted, true, false, 0, 0o644),
+            resolver_layout_is_supported(false, accepted, accepted, true, false, 991, 991, 0o644),
             resolver_layout_is_supported(
                 true,
                 Path::new("/run/systemd/resolve/resolv.conf"),
                 accepted,
                 true,
                 false,
-                0,
+                991,
+                991,
                 0o644,
             ),
-            resolver_layout_is_supported(true, accepted, accepted, false, false, 0, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, true, 0, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, false, 1000, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, false, 0, 0o666),
+            resolver_layout_is_supported(true, accepted, accepted, false, false, 991, 991, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, true, 991, 991, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, false, 0, 991, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, false, 1000, 991, 0o644),
+            resolver_layout_is_supported(true, accepted, accepted, true, false, 991, 991, 0o666),
         ] {
             assert!(!unsupported);
         }
