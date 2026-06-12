@@ -236,7 +236,13 @@ if scenario == "audit":
     assert report["counters"]["total_violations"] >= 1, report
     assert report["counters"]["sampled_violations"] >= 1, report
     assert any(item["classification"] == "would_block" for item in report["findings"]), report
-    assert dns["excluded_unretained_query_count"] >= 1, dns
+    assert dns["excluded_unretained_query_count"] == 0, dns
+    assert any(
+        item["hostname"] == "www.google.com"
+        and item["policy_classification"] == "outside_policy"
+        and item["query_type"] in {"a", "aaaa"}
+        for item in dns["observations"]
+    ), dns
     assert any(
         item["classification"] == "would_block"
         and item["protocol"] == "tcp"
