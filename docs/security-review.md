@@ -7,6 +7,11 @@ native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted
 lockdown controls, bundled Action wrapper, release provenance workflow, and
 offline validation scripts as of June 2026.
 
+This document records focused review findings. The current trust assumptions,
+attacker capabilities, abuse paths, and residual-risk priorities are defined in
+the frozen [`threat-model.md`](threat-model.md); normative behavior and schemas
+remain in [`v0.md`](v0.md).
+
 Fence intentionally supports only GitHub-hosted `ubuntu-24.04` x64 host jobs.
 Standard block mode reduces arbitrary outbound egress, disables measured
 passwordless sudo and container-control paths, and keeps resident controls
