@@ -44,6 +44,83 @@ dns_report="$directory/dns-report.json"
 config_source="$RUNNER_TEMP/fence-protected-run-config.json"
 target_root="$RUNNER_TEMP/fence-protected-run-target-$scenario"
 
+report_failed_https_probe() {
+  local hostname="$1"
+  sleep 1
+  python3 - "$report" "$dns_report" "$hostname" <<'PY'
+import json
+import pathlib
+import sys
+
+report_path = pathlib.Path(sys.argv[1])
+dns_path = pathlib.Path(sys.argv[2])
+hostname = sys.argv[3]
+
+def read_document(path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+report = read_document(report_path)
+dns = read_document(dns_path)
+materializations = [
+    {
+        "address": item.get("address"),
+        "hostname": item.get("hostname"),
+        "port": item.get("port"),
+        "protocol": item.get("protocol"),
+        "source_hostname": item.get("source_hostname"),
+    }
+    for item in report.get("materialized_allowances", [])
+    if item.get("source_hostname") == hostname or item.get("hostname") == hostname
+][:32]
+findings = [
+    {
+        "classification": item.get("classification"),
+        "family": item.get("family"),
+        "protocol": item.get("protocol"),
+        "remote_address": item.get("remote_address"),
+        "remote_port": item.get("remote_port"),
+        "rule_class": item.get("rule_class"),
+    }
+    for item in report.get("findings", [])
+    if item.get("protocol") == "tcp" and item.get("remote_port") == 443
+][:8]
+observations = [
+    {
+        "hostname": item.get("hostname"),
+        "occurrences": item.get("occurrences"),
+        "policy_classification": item.get("policy_classification"),
+        "query_type": item.get("query_type"),
+        "resolved_addresses": item.get("resolved_addresses", [])[:32],
+    }
+    for item in dns.get("observations", [])
+    if item.get("hostname") == hostname
+][:4]
+diagnostic = {
+    "critical_codes": [item.get("code") for item in report.get("critical_findings", [])][:8],
+    "dns_observations": observations,
+    "hostname": hostname,
+    "hostname_refresh_warnings": dns.get("hostname_refresh_warnings"),
+    "materialization_request_rejections": dns.get("materialization_request_rejections"),
+    "materialized_allowances": materializations,
+    "rejected_tcp_443_findings": findings,
+    "upstream_request_failures": dns.get("upstream_request_failures"),
+}
+print("bounded first-connect failure evidence: " + json.dumps(diagnostic, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+probe_https_once() {
+  local url="$1"
+  if curl --head --silent --show-error --max-time 10 --retry 0 --output /dev/null "$url"; then
+    return 0
+  fi
+  report_failed_https_probe "${url#https://}"
+  return 1
+}
+
 if sudo /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
   die "protected block proof requires absent host inet fence_v0 table"
 fi
@@ -283,7 +360,7 @@ case "$scenario" in
       https://github.com \
       https://api.github.com \
       https://release-assets.githubusercontent.com; do
-      curl --head --silent --show-error --max-time 10 --retry 0 --output /dev/null "$url"
+      probe_https_once "$url"
     done
     ;;
   standard-opt-out)

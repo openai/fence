@@ -42,6 +42,16 @@ ready="$directory/ready.json"
 production_ready="/run/fence/$invocation/ready.json"
 target_root="$RUNNER_TEMP/fence-selected-profile-runtime-target"
 
+report_selected_profile_failure() {
+  local status="$?"
+  if [[ -x /usr/bin/journalctl ]]; then
+    echo "bounded selected-profile service diagnostics:" >&2
+    /usr/bin/journalctl --no-pager --output=cat --lines=40 --unit "$unit" >&2 || true
+  fi
+  return "$status"
+}
+trap report_selected_profile_failure ERR
+
 mkdir -p "$target_root"
 export CARGO_TARGET_DIR="$target_root"
 cargo test --frozen --test selected_profile_runtime --no-run
