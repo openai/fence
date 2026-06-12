@@ -24,6 +24,7 @@ const {
   validateLauncherIntegrity,
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,
+  validateDnsEvidence,
   validateReady,
   validateReport,
   validateResidentHealth,
@@ -32,8 +33,26 @@ const {
 const actionLog = require("./log.cts");
 const { run } = require("./main.cts");
 
+function residentHealth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    status: "healthy",
+    resident_pid: 4242,
+    verification_sequence: 9,
+    last_successful_verification_unix_milliseconds: Date.now() - 1_000,
+    verification_interval_seconds: 5,
+    workers: [
+      { name: "docker_tcp_dns", status: "running" },
+      { name: "docker_udp_dns", status: "running" },
+      { name: "host_tcp_dns", status: "running" },
+      { name: "host_udp_dns", status: "running" },
+      { name: "process_attribution", status: "running" },
+    ],
+    ...overrides,
+  };
+}
+
 const report = {
-  runtime_evidence_schema_version: 1,
+  runtime_evidence_schema_version: 2,
   status: "protected_host_block",
   mode: "block",
   readiness_status: "ready",
@@ -44,12 +63,13 @@ const report = {
   protection_available: true,
   sudo_status: "disabled_verified",
   container_status: "disabled_verified",
-  policy_hash_schema_version: 3,
+  policy_hash_schema_version: 4,
   policy_hash: "a".repeat(64),
   base_ruleset_hash: "b".repeat(64),
   ruleset_hash: "c".repeat(64),
   critical_findings: [],
   critical_findings_truncated: false,
+  resident_health: residentHealth(),
 };
 
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
@@ -479,8 +499,19 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
 
 test("validates stable runtime evidence", () => {
   validateReport(report);
+  const dnsEvidence = {
+    runtime_evidence_schema_version: 2,
+    status: report.status,
+    mode: report.mode,
+    platform_profile_id: report.platform_profile_id,
+    profile_realization_id: report.profile_realization_id,
+    protection_available: report.protection_available,
+    routing_status: "active",
+    resident_health: report.resident_health,
+  };
+  validateDnsEvidence(dnsEvidence, report);
   validateReady({
-    runtime_evidence_schema_version: 1,
+    runtime_evidence_schema_version: 2,
     status: "ready",
     platform_profile_id: "github_hosted_workflow_bootstrap_v1",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
@@ -489,9 +520,10 @@ test("validates stable runtime evidence", () => {
     base_ruleset_hash: report.base_ruleset_hash,
     ruleset_hash: report.ruleset_hash,
     protection_available: true,
+    resident_health: report.resident_health,
   }, report);
   validateReady({
-    runtime_evidence_schema_version: 1,
+    runtime_evidence_schema_version: 2,
     status: "ready",
     platform_profile_id: "github_hosted_workflow_bootstrap_v1",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_mediation_v1",
@@ -500,6 +532,7 @@ test("validates stable runtime evidence", () => {
     base_ruleset_hash: report.base_ruleset_hash,
     ruleset_hash: "d".repeat(64),
     protection_available: true,
+    resident_health: report.resident_health,
   }, report);
   assert.throws(() => validateReport({ ...report, critical_findings: [{}] }), /critical resident findings/);
   assert.throws(
@@ -509,7 +542,19 @@ test("validates stable runtime evidence", () => {
   assert.throws(() => validateReport({ ...report, network_verification_status: "critical_drift" }), /verified network state/);
   assert.throws(() => validateReport({ ...report, critical_findings_truncated: true }), /bounded critical findings/);
   assert.throws(() => validateReport({ ...report, sudo_status: "preserved_verified" }), /inconsistent/);
-  assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 0 }), /profile/);
+  assert.throws(() => validateReport({ ...report, runtime_evidence_schema_version: 1 }), /profile/);
+  assert.throws(() => validateReport({ ...report, policy_hash_schema_version: 3 }), /profile/);
+  assert.throws(
+    () => validateDnsEvidence({ ...dnsEvidence, runtime_evidence_schema_version: 1 }, report),
+    /does not match/,
+  );
+  assert.throws(
+    () => validateDnsEvidence({
+      ...dnsEvidence,
+      resident_health: residentHealth({ resident_pid: 7 }),
+    }, report),
+    /resident process/,
+  );
   assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
 });
 
@@ -526,10 +571,20 @@ test("validates fresh resident worker and service identity evidence", () => {
       { name: "docker_udp_dns", status: "running" },
       { name: "host_tcp_dns", status: "running" },
       { name: "host_udp_dns", status: "running" },
+      { name: "process_attribution", status: "running" },
     ],
   };
   validateResidentHealth(health, now);
   validateResidentHealth({ ...health, status: "critical" }, now, true);
+  const failedWorkerHealth = {
+    ...health,
+    status: "critical",
+    workers: health.workers.map((worker) =>
+      worker.name === "process_attribution" ? { ...worker, status: "failed" } : worker
+    ),
+  };
+  validateResidentHealth(failedWorkerHealth, now, true);
+  assert.throws(() => validateResidentHealth(failedWorkerHealth, now), /invalid or unhealthy/);
   validateResidentUnitStatus("ActiveState=active\nSubState=running\nMainPID=4242\n", 4242);
   assert.throws(
     () => validateResidentHealth({ ...health, status: "critical" }, now),
@@ -557,6 +612,22 @@ test("validates fresh resident worker and service identity evidence", () => {
     /worker health/,
   );
   assert.throws(
+    () => validateResidentHealth({
+      ...health,
+      workers: health.workers.filter((worker) => worker.name !== "process_attribution"),
+    }, now),
+    /worker set/,
+  );
+  assert.throws(
+    () => validateResidentHealth({
+      ...health,
+      workers: health.workers.map((worker) =>
+        worker.name === "process_attribution" ? { ...worker, status: "failed" } : worker
+      ),
+    }, now),
+    /worker health/,
+  );
+  assert.throws(
     () => validateResidentUnitStatus("ActiveState=inactive\nSubState=dead\nMainPID=4242\n", 4242),
     /not active/,
   );
@@ -576,28 +647,28 @@ test("renders a concise healthy block results table without raw evidence fields"
       {
         hostname: "github.com",
         query_type: "a",
-        profile_classification: "matches_selected_profile_pattern",
+        policy_classification: "platform_profile",
         occurrences: 2,
         resolved_addresses: ["192.0.2.1"],
       },
       {
         hostname: "api.github.com",
         query_type: "aaaa",
-        profile_classification: "matches_selected_profile_pattern",
+        policy_classification: "platform_profile",
         occurrences: 1,
         resolved_addresses: ["2001:db8::1"],
       },
       {
         hostname: "codeload.github.com",
         query_type: "a",
-        profile_classification: "github_related_outside_profile",
+        policy_classification: "outside_policy",
         occurrences: 1,
         resolved_addresses: [],
       },
       {
         hostname: "github.com",
         query_type: "type_15",
-        profile_classification: "matches_selected_profile_pattern",
+        policy_classification: "platform_profile",
         occurrences: 1,
         resolved_addresses: [],
       },
@@ -646,6 +717,7 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   const critical = {
     ...report,
     network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
     critical_findings: [{
       timestamp: "unix-ms:1",
       code: "owned_nftables_state_missing",
@@ -710,15 +782,26 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
     findings_truncated: false,
   };
   const dnsEvidence = {
-    observations: [{
-      hostname: "www.google.com",
-      query_type: "a",
-      profile_classification: "audit_observed_without_authorization",
-      occurrences: 1,
-      resolved_addresses: ["203.0.113.10"],
-      minimum_observed_ttl_seconds: 60,
-      addresses_truncated: false,
-    }],
+    observations: [
+      {
+        hostname: "www.google.com",
+        query_type: "a",
+        policy_classification: "outside_policy",
+        occurrences: 1,
+        resolved_addresses: ["203.0.113.10"],
+        minimum_observed_ttl_seconds: 60,
+        addresses_truncated: false,
+      },
+      {
+        hostname: "api.github.com",
+        query_type: "a",
+        policy_classification: "platform_profile",
+        occurrences: 1,
+        resolved_addresses: ["203.0.113.10"],
+        minimum_observed_ttl_seconds: 60,
+        addresses_truncated: false,
+      },
+    ],
     observations_truncated: false,
   };
 
@@ -794,7 +877,7 @@ test("renders only bounded approved local attribution beside network findings", 
     observations: [{
       hostname: "example.com",
       query_type: "a",
-      profile_classification: "audit_observed_without_authorization",
+      policy_classification: "outside_policy",
       occurrences: 1,
       resolved_addresses: ["203.0.113.10"],
     }],
@@ -904,7 +987,7 @@ test("renders audit IP-only findings when DNS evidence excludes non-GitHub names
   const dnsEvidence = {
     observations: [],
     observations_truncated: false,
-    excluded_non_github_query_count: 2,
+    excluded_unretained_query_count: 2,
   };
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");

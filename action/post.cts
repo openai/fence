@@ -19,6 +19,7 @@ const {
   validateLauncherIntegrity,
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,
+  validateDnsEvidence,
   validateReport,
   validateResidentUnitStatus,
 } = require("./lib.cts");
@@ -113,13 +114,14 @@ function main(): void {
     readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
     false,
   );
-  if (report.runtime_evidence_schema_version === 2) {
-    validateResidentService(paths.unit, report.resident_health.resident_pid);
-  }
+  validateResidentService(paths.unit, report.resident_health.resident_pid);
   let dnsEvidence;
   const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
   if (fs.existsSync(effectiveDnsReportPath)) {
-    dnsEvidence = readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report");
+    dnsEvidence = validateDnsEvidence(
+      readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report"),
+      report,
+    );
   }
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
   const dnsMaterializationRequestRejections = materializationRequestRejections(dnsEvidence);
