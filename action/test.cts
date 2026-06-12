@@ -638,28 +638,28 @@ test("renders a concise healthy block results table without raw evidence fields"
       {
         hostname: "github.com",
         query_type: "a",
-        profile_classification: "matches_selected_profile_pattern",
+        policy_classification: "platform_profile",
         occurrences: 2,
         resolved_addresses: ["192.0.2.1"],
       },
       {
         hostname: "api.github.com",
         query_type: "aaaa",
-        profile_classification: "matches_selected_profile_pattern",
+        policy_classification: "platform_profile",
         occurrences: 1,
         resolved_addresses: ["2001:db8::1"],
       },
       {
         hostname: "codeload.github.com",
         query_type: "a",
-        profile_classification: "github_related_outside_profile",
+        policy_classification: "outside_policy",
         occurrences: 1,
         resolved_addresses: [],
       },
       {
         hostname: "github.com",
         query_type: "type_15",
-        profile_classification: "matches_selected_profile_pattern",
+        policy_classification: "platform_profile",
         occurrences: 1,
         resolved_addresses: [],
       },
@@ -708,6 +708,7 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   const critical = {
     ...report,
     network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
     critical_findings: [{
       timestamp: "unix-ms:1",
       code: "owned_nftables_state_missing",
@@ -772,15 +773,26 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
     findings_truncated: false,
   };
   const dnsEvidence = {
-    observations: [{
-      hostname: "www.google.com",
-      query_type: "a",
-      profile_classification: "audit_observed_without_authorization",
-      occurrences: 1,
-      resolved_addresses: ["203.0.113.10"],
-      minimum_observed_ttl_seconds: 60,
-      addresses_truncated: false,
-    }],
+    observations: [
+      {
+        hostname: "www.google.com",
+        query_type: "a",
+        policy_classification: "outside_policy",
+        occurrences: 1,
+        resolved_addresses: ["203.0.113.10"],
+        minimum_observed_ttl_seconds: 60,
+        addresses_truncated: false,
+      },
+      {
+        hostname: "api.github.com",
+        query_type: "a",
+        policy_classification: "platform_profile",
+        occurrences: 1,
+        resolved_addresses: ["203.0.113.10"],
+        minimum_observed_ttl_seconds: 60,
+        addresses_truncated: false,
+      },
+    ],
     observations_truncated: false,
   };
 
@@ -856,7 +868,7 @@ test("renders only bounded approved local attribution beside network findings", 
     observations: [{
       hostname: "example.com",
       query_type: "a",
-      profile_classification: "audit_observed_without_authorization",
+      policy_classification: "outside_policy",
       occurrences: 1,
       resolved_addresses: ["203.0.113.10"],
     }],
@@ -966,7 +978,7 @@ test("renders audit IP-only findings when DNS evidence excludes non-GitHub names
   const dnsEvidence = {
     observations: [],
     observations_truncated: false,
-    excluded_non_github_query_count: 2,
+    excluded_unretained_query_count: 2,
   };
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");

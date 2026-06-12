@@ -236,7 +236,7 @@ if scenario == "audit":
     assert report["counters"]["total_violations"] >= 1, report
     assert report["counters"]["sampled_violations"] >= 1, report
     assert any(item["classification"] == "would_block" for item in report["findings"]), report
-    assert dns["excluded_non_github_query_count"] >= 1, dns
+    assert dns["excluded_unretained_query_count"] >= 1, dns
     assert any(
         item["classification"] == "would_block"
         and item["protocol"] == "tcp"

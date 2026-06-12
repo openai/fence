@@ -76,10 +76,14 @@ const MAX_AUDIT_HOSTNAME_ROWS = 10;
 const MAX_AUDIT_IP_ROWS = 10;
 const MAX_NETWORK_ACTIVITY_ROWS = 20;
 const ALLOWED_DNS_CLASSIFICATIONS = new Set([
-  "matches_selected_profile_pattern",
-  "matches_bounded_actions_suffix_authorization",
-  "matches_ttl_bounded_cname_descendant",
+  "dynamic_platform",
+  "platform_and_user_allowlist",
+  "platform_cname_derived",
+  "platform_profile",
+  "user_allowlist",
+  "user_cname_derived",
 ]);
+const OUTSIDE_POLICY_DNS_CLASSIFICATIONS = new Set(["outside_policy"]);
 const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -729,13 +733,13 @@ function validateReport(report: any, failOnCritical = true): any {
   if (!validIdentity) {
     fail("Fence report does not select the reviewed hosted-runner profile");
   }
-  validateResidentHealth(report.resident_health, Date.now(), !failOnCritical);
   if (!Array.isArray(report.critical_findings) || report.critical_findings_truncated !== false) {
     fail("Fence report does not contain bounded critical findings");
   }
   if (failOnCritical && report.critical_findings.length !== 0) {
     fail("Fence report contains critical resident findings");
   }
+  validateResidentHealth(report.resident_health, Date.now(), !failOnCritical);
   if (report.network_verification_status !== "verified") {
     if (failOnCritical || report.critical_findings.length === 0) {
       fail("Fence report does not contain verified network state");
@@ -977,7 +981,10 @@ function sortedRows(rows: Iterable<AuditFindingRow>): AuditFindingRow[] {
   );
 }
 
-function dnsAddressHostnameMap(dnsEvidence: any): Map<string, Set<string>> {
+function dnsAddressHostnameMap(
+  dnsEvidence: any,
+  classifications: Set<string> | undefined = undefined,
+): Map<string, Set<string>> {
   const addressMap = new Map<string, Set<string>>();
   if (dnsEvidence === undefined || dnsEvidence === null || !Array.isArray(dnsEvidence.observations)) {
     return addressMap;
@@ -987,6 +994,9 @@ function dnsAddressHostnameMap(dnsEvidence: any): Map<string, Set<string>> {
       continue;
     }
     if (observation.query_type !== "a" && observation.query_type !== "aaaa") {
+      continue;
+    }
+    if (classifications !== undefined && !classifications.has(observation.policy_classification)) {
       continue;
     }
     const hostname = observation.hostname;
@@ -1008,7 +1018,7 @@ function dnsAddressHostnameMap(dnsEvidence: any): Map<string, Set<string>> {
 function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): AuditSummary {
   const hostnameRows = new Map<string, AuditFindingRow>();
   const ipRows = new Map<string, AuditFindingRow>();
-  const addressMap = dnsAddressHostnameMap(dnsEvidence);
+  const addressMap = dnsAddressHostnameMap(dnsEvidence, OUTSIDE_POLICY_DNS_CLASSIFICATIONS);
   let unparsedCount = 0;
 
   for (const finding of Array.isArray(report.findings) ? report.findings : []) {
@@ -1367,7 +1377,7 @@ function networkActivityRows(
       const count = safePositiveInteger(observation.occurrences);
       const decision = networkDecision(
         report,
-        observation.profile_classification,
+        observation.policy_classification,
         observation.query_type,
       );
       addNetworkActivity(rows, observation.hostname, decision, dnsQueryActivity(observation.query_type), count);
@@ -1385,7 +1395,7 @@ function networkActivityRows(
       "Other DNS names",
       "would_block",
       "DNS query (names not retained)",
-      safePositiveInteger(dnsEvidence && dnsEvidence.excluded_non_github_query_count),
+      safePositiveInteger(dnsEvidence && dnsEvidence.excluded_unretained_query_count),
     );
   } else {
     const unnamedBlocked = Math.max(
