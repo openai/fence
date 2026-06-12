@@ -122,9 +122,23 @@ function main(): void {
       readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report"),
       report,
     );
+  } else if (report.mode === "block") {
+    throw new Error("Fence block-mode DNS evidence is missing");
   }
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
   const dnsMaterializationRequestRejections = materializationRequestRejections(dnsEvidence);
+  const resultsStorageAuthorizationCount = materializationEvidenceCounter(
+    dnsEvidence,
+    "results_storage_authorization_count",
+  );
+  const resultsStorageAttributionFailures = materializationEvidenceCounter(
+    dnsEvidence,
+    "results_storage_attribution_failures",
+  );
+  const resultsStorageRequestRejections = materializationEvidenceCounter(
+    dnsEvidence,
+    "results_storage_request_rejections",
+  );
   log.debugGroup("Fence debug: post-job evidence", [
     `report_path=${reportPath}`,
     `dns_report_path=${effectiveDnsReportPath}`,
@@ -145,6 +159,10 @@ function main(): void {
     `materialization_request_rejections=${dnsMaterializationRequestRejections}`,
     `materialization_update_max_milliseconds=${materializationEvidenceCounter(dnsEvidence, "materialization_update_max_milliseconds")}`,
     `upstream_request_failures=${materializationEvidenceCounter(dnsEvidence, "upstream_request_failures")}`,
+    `results_storage_authorizations=${resultsStorageAuthorizationCount}`,
+    `results_storage_attribution_failures=${resultsStorageAttributionFailures}`,
+    `results_storage_request_rejections=${resultsStorageRequestRejections}`,
+    `results_storage_authorizations_truncated=${dnsEvidence?.runner_authorized_results_storage_truncated === true}`,
     `resident_verification_sequence=${report.resident_health?.verification_sequence ?? "not_available"}`,
     `resident_last_verified_unix_milliseconds=${report.resident_health?.last_successful_verification_unix_milliseconds ?? "not_available"}`,
     ...findingAttributionDebugLines(report),
@@ -160,6 +178,11 @@ function main(): void {
   if (dnsMaterializationRequestRejections > 0) {
     log.warning(
       `Fence withheld ${dnsMaterializationRequestRejections} DNS answer(s) because firewall update work could not be accepted`,
+    );
+  }
+  if (resultsStorageAttributionFailures > 0 || resultsStorageRequestRejections > 0) {
+    log.warning(
+      `Fence rejected ${resultsStorageRequestRejections} GitHub results-storage request(s); ${resultsStorageAttributionFailures} could not be attributed`,
     );
   }
   validateReport(report, true);

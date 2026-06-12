@@ -14,7 +14,7 @@ inputs:
     description: Container handling for block mode, either disable or unsafe_preserve
     required: false
   platform_profile:
-    description: Optional platform profile; only github_hosted_workflow_bootstrap_v1 is supported
+    description: Optional platform profile; only github_hosted_workflow_bootstrap_v2 is supported
     required: false
   disable_broad_github_domains:
     description: Set true to remove github.com, api.github.com, and release-assets.githubusercontent.com from the default GitHub compatibility profile

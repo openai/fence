@@ -87,12 +87,14 @@ const OUTSIDE_POLICY_DNS_CLASSIFICATIONS = new Set(["outside_policy"]);
 const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v1";
+const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net$/;
+const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
+const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v2";
 const PROFILE_REALIZATIONS = new Map([
-  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_mediation_v1"],
+  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_provenance_v2"],
 ]);
-const POLICY_HASH_SCHEMA_VERSION = 4;
-const RUNTIME_EVIDENCE_SCHEMA_VERSION = 2;
+const POLICY_HASH_SCHEMA_VERSION = 5;
+const RUNTIME_EVIDENCE_SCHEMA_VERSION = 3;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
 const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
@@ -834,7 +836,52 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
   if (dnsHealth.resident_pid !== report.resident_health.resident_pid) {
     fail("Fence DNS evidence resident process does not match the report");
   }
+  validateDnsProvenanceEvidence(dnsEvidence);
   return dnsEvidence;
+}
+
+function validateDnsProvenanceEvidence(dnsEvidence: any): void {
+  const authorizations = dnsEvidence.runner_authorized_results_storage;
+  if (
+    dnsEvidence.host_dns_routing !== "direct_client_to_root_resident_mediator" ||
+    dnsEvidence.docker_dns_routing !== "local_root_resident_mediator" ||
+    dnsEvidence.answer_attribution_status !== "bounded_reportable_hostname_answers_only" ||
+    !Array.isArray(authorizations) ||
+    authorizations.length > MAX_RESULTS_STORAGE_AUTHORIZATIONS ||
+    typeof dnsEvidence.runner_authorized_results_storage_truncated !== "boolean" ||
+    !isNonnegativeSafeInteger(dnsEvidence.results_storage_authorization_count) ||
+    !isNonnegativeSafeInteger(dnsEvidence.results_storage_attribution_failures) ||
+    !isNonnegativeSafeInteger(dnsEvidence.results_storage_request_rejections) ||
+    dnsEvidence.results_storage_authorization_count !== authorizations.length
+  ) {
+    fail("Fence DNS evidence does not contain bounded runner provenance");
+  }
+  const expectedProxyPolicy = dnsEvidence.mode === "audit"
+    ? "audit_forwards_without_name_authorization"
+    : "block_forwards_exact_roots_bounded_actions_suffix_names_runner_authorized_results_storage_and_bounded_cname_descendants";
+  if (dnsEvidence.proxy_policy_status !== expectedProxyPolicy) {
+    fail("Fence DNS evidence does not contain the reviewed proxy policy");
+  }
+  const seen = new Set<string>();
+  for (const authorization of authorizations) {
+    if (
+      authorization === null ||
+      Array.isArray(authorization) ||
+      typeof authorization !== "object" ||
+      Object.keys(authorization).sort().join(",") !== "authorization_origin,hostname" ||
+      typeof authorization.hostname !== "string" ||
+      !RESULTS_STORAGE_HOSTNAME.test(authorization.hostname) ||
+      authorization.authorization_origin !== "pinned_runner_worker_dns" ||
+      seen.has(authorization.hostname)
+    ) {
+      fail("Fence DNS evidence contains invalid results-storage authorization");
+    }
+    seen.add(authorization.hostname);
+  }
+}
+
+function isNonnegativeSafeInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
 function validateResidentHealth(
@@ -1096,7 +1143,10 @@ function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence
     auditSummary.omittedHostnameRows > 0 ||
     auditSummary.omittedIpRows > 0 ||
     (report.mode === "audit" && auditSummary.dnsMissing) ||
-    materializationRequestRejections(dnsEvidence) > 0
+    materializationRequestRejections(dnsEvidence) > 0 ||
+    resultsStorageEvidenceCounter(dnsEvidence, "results_storage_attribution_failures") > 0 ||
+    resultsStorageEvidenceCounter(dnsEvidence, "results_storage_request_rejections") > 0 ||
+    Boolean(dnsEvidence && dnsEvidence.runner_authorized_results_storage_truncated === true)
   );
 }
 
@@ -1110,18 +1160,50 @@ function materializationRequestRejections(dnsEvidence: any): number {
 }
 
 function materializationWarningLines(dnsEvidence: any): string[] {
+  return warningTableLines(materializationWarningRows(dnsEvidence));
+}
+
+function materializationWarningRows(dnsEvidence: any): string[] {
   const count = materializationRequestRejections(dnsEvidence);
-  if (count === 0) {
-    return [];
-  }
-  return [
-    "",
-    "#### Warnings",
-    "",
-    "| Warning | Count |",
-    "| --- | ---: |",
+  return count === 0 ? [] : [
     `| ⚠️ DNS answers withheld while firewall updates were unavailable | ${markdownCode(count)} |`,
   ];
+}
+
+function resultsStorageEvidenceCounter(dnsEvidence: any, field: string): number {
+  const value = dnsEvidence && dnsEvidence[field];
+  return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function resultsStorageWarningRows(dnsEvidence: any): string[] {
+  const attributionFailures = resultsStorageEvidenceCounter(
+    dnsEvidence,
+    "results_storage_attribution_failures",
+  );
+  const requestRejections = resultsStorageEvidenceCounter(
+    dnsEvidence,
+    "results_storage_request_rejections",
+  );
+  const truncated = Boolean(
+    dnsEvidence && dnsEvidence.runner_authorized_results_storage_truncated === true,
+  );
+  const rows = [];
+  if (attributionFailures > 0) {
+    rows.push(`| ⚠️ GitHub results-storage requests could not be attributed | ${markdownCode(attributionFailures)} |`);
+  }
+  if (requestRejections > 0) {
+    rows.push(`| ⚠️ GitHub results-storage requests were rejected | ${markdownCode(requestRejections)} |`);
+  }
+  if (truncated) {
+    rows.push("| ⚠️ Additional results-storage accounts were denied after the authorization limit | `1+` |");
+  }
+  return rows;
+}
+
+function warningTableLines(rows: string[]): string[] {
+  return rows.length === 0
+    ? []
+    : ["", "#### Warnings", "", "| Warning | Count |", "| --- | ---: |", ...rows];
 }
 
 function criticalFindingLines(report: any): string[] {
@@ -1527,7 +1609,10 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
     "",
     ...controlsSummary(report),
     ...criticalFindingLines(report),
-    ...materializationWarningLines(dnsEvidence),
+    ...warningTableLines([
+      ...materializationWarningRows(dnsEvidence),
+      ...resultsStorageWarningRows(dnsEvidence),
+    ]),
     ...networkActivitySummary(report, dnsEvidence, auditSummary),
     "",
   ];
