@@ -13,6 +13,7 @@ const {
   allowlistYamlSnippet,
   correlateFindingsToDns,
   defaultInlineConfig,
+  findingAttributionDebugLines,
   launcherIntegrityDocument,
   materializationRequestRejections,
   materializationWarningLines,
@@ -756,6 +757,81 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.doesNotMatch(summary, /config: >-/);
   assert.doesNotMatch(summary, /@main/);
   assert.doesNotMatch(summary, /secret-payload-marker/);
+});
+
+test("renders only bounded approved local attribution beside network findings", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [{
+      timestamp: "unix-ms:1",
+      mode: "audit",
+      classification: "would_block",
+      family: "ipv4",
+      protocol: "tcp",
+      remote_address: "203.0.113.10",
+      remote_port: 443,
+      rule_class: "undeclared_new_egress",
+      local_attribution: {
+        status: "attributed",
+        actor_class: "runner",
+        pid: 4242,
+        executable_basename: "curl",
+        parent_executable_basenames: ["bash", "node"],
+        executable_path: "/private/operator/path",
+        command_line: "secret-payload-marker",
+      },
+    }],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [{
+      hostname: "example.com",
+      query_type: "a",
+      profile_classification: "audit_observed_without_authorization",
+      occurrences: 1,
+      resolved_addresses: ["203.0.113.10"],
+    }],
+    observations_truncated: false,
+  };
+
+  const summary = summaryLines(audit, dnsEvidence).join("\n");
+  assert.match(summary, /\| Destination \| Result \| Activity \| Actor \|/);
+  assert.match(
+    summary,
+    /\| `example.com` \| ⚠️ Would block \| 1 A query, 1 TCP\/443 attempt \| runner: curl \(PID 4242\) \|/,
+  );
+  assert.doesNotMatch(summary, /secret-payload-marker/);
+  assert.doesNotMatch(summary, /private\/operator/);
+  assert.doesNotMatch(summary, /\bbash\b/);
+  assert.doesNotMatch(summary, /\bnode\b/);
+
+  const debugLines = findingAttributionDebugLines(audit);
+  assert.deepEqual(debugLines, [
+    "finding_attribution_1=tcp/443 203.0.113.10 runner: curl (PID 4242)",
+  ]);
+  assert.doesNotMatch(debugLines.join("\n"), /secret-payload-marker/);
+  assert.doesNotMatch(debugLines.join("\n"), /private\/operator/);
+  assert.deepEqual(
+    findingAttributionDebugLines({
+      findings: [{
+        ...audit.findings[0],
+        local_attribution: {
+          status: "attributed",
+          actor_class: "runner",
+          pid: 4242,
+          executable_basename: "../../private-tool",
+        },
+      }],
+    }),
+    [],
+  );
 });
 
 test("renders audit IP-only and missing-DNS fallbacks safely", () => {

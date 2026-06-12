@@ -152,6 +152,7 @@ expected_workers = [
         "name": "host_udp_dns",
         "status": "failed" if scenario == "worker-failure" else "running",
     },
+    {"name": "process_attribution", "status": "running"},
 ]
 assert resident["workers"] == expected_workers, resident
 assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"

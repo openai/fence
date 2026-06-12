@@ -62,6 +62,7 @@ type NetworkActivityRow = {
   destination: string;
   decision: NetworkDecision;
   activities: Map<string, number>;
+  actors: Map<string, number>;
   totalCount: number;
 };
 type NetworkActivitySummary = {
@@ -1195,6 +1196,7 @@ function addNetworkActivity(
   decision: NetworkDecision,
   activity: string,
   count: number,
+  actor: string | undefined = undefined,
 ): void {
   if (count === 0) {
     return;
@@ -1204,17 +1206,127 @@ function addNetworkActivity(
     destination,
     decision,
     activities: new Map<string, number>(),
+    actors: new Map<string, number>(),
     totalCount: 0,
   };
   row.activities.set(activity, (row.activities.get(activity) || 0) + count);
+  if (actor !== undefined) {
+    row.actors.set(actor, (row.actors.get(actor) || 0) + count);
+  }
   row.totalCount += count;
   rows.set(key, row);
+}
+
+function safeExecutableBasename(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._+-]{1,128}$/.test(value);
+}
+
+function findingActorLabel(finding: any): string | undefined {
+  if (
+    finding === null ||
+    Array.isArray(finding) ||
+    typeof finding !== "object" ||
+    finding.local_attribution === null ||
+    Array.isArray(finding.local_attribution) ||
+    typeof finding.local_attribution !== "object"
+  ) {
+    return undefined;
+  }
+  const attribution = finding.local_attribution;
+  const fallbackLabels = new Map([
+    ["ambiguous", "Ambiguous owner"],
+    ["not_found", "Owner not found"],
+    ["scan_limit_exceeded", "Attribution scan limit reached"],
+    ["queue_full", "Attribution queue full"],
+    ["worker_unavailable", "Attribution worker unavailable"],
+  ]);
+  if (fallbackLabels.has(attribution.status)) {
+    return fallbackLabels.get(attribution.status);
+  }
+  if (
+    attribution.status !== "attributed" ||
+    !new Set(["runner", "root", "other", "unknown"]).has(attribution.actor_class) ||
+    !Number.isSafeInteger(attribution.pid) ||
+    attribution.pid < 1 ||
+    attribution.pid > 0xffff_ffff ||
+    !safeExecutableBasename(attribution.executable_basename)
+  ) {
+    return undefined;
+  }
+  return `${attribution.actor_class}: ${attribution.executable_basename} (PID ${attribution.pid})`;
+}
+
+function findingAttributionDebugLines(report: any): string[] {
+  const lines: string[] = [];
+  const findings = Array.isArray(report && report.findings) ? report.findings.slice(0, 1024) : [];
+  for (const finding of findings) {
+    const actor = findingActorLabel(finding);
+    if (
+      actor === undefined ||
+      typeof finding.remote_address !== "string" ||
+      net.isIP(finding.remote_address) === 0 ||
+      !isSupportedProtocol(finding.protocol) ||
+      !isValidPort(finding.remote_port)
+    ) {
+      continue;
+    }
+    if (lines.length === 10) {
+      lines.push("additional_finding_attribution=omitted");
+      break;
+    }
+    lines.push(
+      `finding_attribution_${lines.length + 1}=${finding.protocol}/${finding.remote_port} ${finding.remote_address} ${actor}`,
+    );
+  }
+  return lines;
+}
+
+function addConnectionFindingActivity(
+  rows: Map<string, NetworkActivityRow>,
+  report: any,
+  dnsEvidence: any,
+): void {
+  const addressMap = dnsAddressHostnameMap(dnsEvidence);
+  const findings = Array.isArray(report.findings) ? report.findings.slice(0, 1024) : [];
+  for (const finding of findings) {
+    if (
+      finding === null ||
+      Array.isArray(finding) ||
+      typeof finding !== "object" ||
+      typeof finding.remote_address !== "string" ||
+      net.isIP(finding.remote_address) === 0 ||
+      !isSupportedProtocol(finding.protocol) ||
+      !isValidPort(finding.remote_port)
+    ) {
+      continue;
+    }
+    const decision = finding.classification === "rejected"
+      ? "blocked"
+      : finding.classification === "would_block"
+        ? "would_block"
+        : undefined;
+    if (decision === undefined) {
+      continue;
+    }
+    const hostnames = Array.from(addressMap.get(finding.remote_address) || []).sort();
+    const destinations = hostnames.length > 0 ? hostnames : [finding.remote_address];
+    const actor = findingActorLabel(finding);
+    for (const destination of destinations) {
+      addNetworkActivity(
+        rows,
+        destination,
+        decision,
+        `${finding.protocol.toUpperCase()}/${finding.remote_port} attempt`,
+        1,
+        actor,
+      );
+    }
+  }
 }
 
 function networkActivityRows(
   report: any,
   dnsEvidence: any,
-  auditSummary: AuditSummary,
 ): NetworkActivitySummary {
   const rows = new Map<string, NetworkActivityRow>();
   let namedBlockedDnsQueries = 0;
@@ -1242,16 +1354,9 @@ function networkActivityRows(
     }
   }
 
+  addConnectionFindingActivity(rows, report, dnsEvidence);
+
   if (report.mode === "audit") {
-    for (const row of [...auditSummary.hostnameRows, ...auditSummary.ipRows]) {
-      addNetworkActivity(
-        rows,
-        row.destination,
-        "would_block",
-        `${row.protocol.toUpperCase()}/${row.port} attempt`,
-        row.count,
-      );
-    }
     addNetworkActivity(
       rows,
       "Other DNS names",
@@ -1317,25 +1422,40 @@ function activityLabel(row: NetworkActivityRow): string {
     .join(", ");
 }
 
+function actorLabel(row: NetworkActivityRow): string {
+  return Array.from(row.actors.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([actor, count]) => `${actor}${count === 1 ? "" : ` ×${count}`}`)
+    .join(", ");
+}
+
 function networkActivitySummary(
   report: any,
   dnsEvidence: any = undefined,
   auditSummary: AuditSummary = correlateFindingsToDns(report, dnsEvidence),
 ): string[] {
-  const activity = networkActivityRows(report, dnsEvidence, auditSummary);
+  const activity = networkActivityRows(report, dnsEvidence);
   const lines = ["", "#### Network activity", ""];
   if (activity.rows.length === 0) {
     lines.push("_No reportable network activity was observed._");
     return lines;
   }
 
-  lines.push("| Destination | Result | Activity |");
-  lines.push("| --- | --- | ---: |");
+  const hasAttribution = activity.rows.some((row) => row.actors.size > 0);
+  lines.push(hasAttribution
+    ? "| Destination | Result | Activity | Actor |"
+    : "| Destination | Result | Activity |");
+  lines.push(hasAttribution ? "| --- | --- | ---: | --- |" : "| --- | --- | ---: |");
   for (const row of activity.rows) {
-    lines.push(`| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} |`);
+    const actor = row.actors.size > 0 ? boundedText(actorLabel(row)) : "➖";
+    lines.push(hasAttribution
+      ? `| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} | ${actor} |`
+      : `| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} |`);
   }
   if (activity.omittedRows > 0) {
-    lines.push(`| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) |`);
+    lines.push(hasAttribution
+      ? `| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) | ➖ |`
+      : `| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) |`);
   }
   lines.push("");
 
@@ -1383,6 +1503,7 @@ module.exports = {
   actionRuntimeFileDigests,
   allowlistYamlSnippet,
   correlateFindingsToDns,
+  findingAttributionDebugLines,
   controlsSummary,
   defaultInlineConfig,
   materializationRequestRejections,

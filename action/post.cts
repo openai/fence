@@ -7,6 +7,7 @@ const log = require("./log.cts");
 const {
   actionRuntimeFileDigests,
   correlateFindingsToDns,
+  findingAttributionDebugLines,
   materializationRequestRejections,
   materializationEvidenceCounter,
   MAX_REPORT_BYTES,
@@ -144,6 +145,7 @@ function main(): void {
     `upstream_request_failures=${materializationEvidenceCounter(dnsEvidence, "upstream_request_failures")}`,
     `resident_verification_sequence=${report.resident_health?.verification_sequence ?? "not_available"}`,
     `resident_last_verified_unix_milliseconds=${report.resident_health?.last_successful_verification_unix_milliseconds ?? "not_available"}`,
+    ...findingAttributionDebugLines(report),
   ]);
   if (process.env.GITHUB_STEP_SUMMARY) {
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {

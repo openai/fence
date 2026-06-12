@@ -1,5 +1,7 @@
 use crate::config::Mode;
-use crate::findings::{ConnectionFinding, bounded_timestamp_now, finding_from_prefix};
+use crate::findings::{
+    ConnectionEvent, ConnectionFinding, bounded_timestamp_now, connection_event_from_prefix,
+};
 use crate::nft::{NFLOG_GROUP, NFLOG_PACKET_PREFIX_BYTES, NFLOG_PREFIX_AUDIT, NFLOG_PREFIX_BLOCK};
 use netlink_sys::{Socket, SocketAddr, constants::NETLINK_NETFILTER};
 use std::io::ErrorKind;
@@ -89,12 +91,20 @@ impl NflogReader {
     }
 
     pub fn next_finding(&self, timeout: Duration) -> Result<Option<ConnectionFinding>, NflogError> {
+        self.next_event(timeout)
+            .map(|event| event.map(|event| event.finding))
+    }
+
+    pub(crate) fn next_event(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<ConnectionEvent>, NflogError> {
         let deadline = Instant::now() + timeout;
         loop {
             match receive_datagram(&self.socket) {
                 Ok(bytes) => {
                     let payload = extract_logged_prefix(&bytes, self.mode)?;
-                    return Ok(Some(finding_from_prefix(
+                    return Ok(Some(connection_event_from_prefix(
                         self.mode,
                         bounded_timestamp_now(),
                         payload,

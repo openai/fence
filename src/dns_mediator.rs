@@ -1,9 +1,14 @@
+use crate::attribution::{
+    ATTRIBUTION_WORKER_NAME, AttributionCoordinator, AttributionSubmission, attribution_channel,
+};
 use crate::config::{
     ContainerPolicy, DestinationType, MAX_EXPANDED_RULES, MAX_REPORT_BYTES, Mode, Protocol,
     parse_and_normalize,
 };
 use crate::error::ErrorDetail;
-use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
+use crate::findings::{
+    ConnectionEvent, ConnectionFinding, FindingCollection, bounded_timestamp_now,
+};
 use crate::hostname_policy::{
     ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
 };
@@ -106,11 +111,12 @@ const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
-const REQUIRED_DNS_WORKERS: [&str; 4] = [
+const REQUIRED_RESIDENT_WORKERS: [&str; 5] = [
     "docker_tcp_dns",
     "docker_udp_dns",
     "host_tcp_dns",
     "host_udp_dns",
+    ATTRIBUTION_WORKER_NAME,
 ];
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -159,7 +165,7 @@ fn initial_resident_health() -> ResidentHealth {
         verification_sequence: 0,
         last_successful_verification_unix_milliseconds: 0,
         verification_interval_seconds: RESIDENT_VERIFICATION_INTERVAL.as_secs(),
-        workers: REQUIRED_DNS_WORKERS
+        workers: REQUIRED_RESIDENT_WORKERS
             .into_iter()
             .map(|name| ResidentWorkerHealth {
                 name,
@@ -191,7 +197,7 @@ impl ResidentWorkerSupervisor {
     fn new(events: Receiver<ResidentWorkerEvent>) -> Self {
         Self {
             events,
-            statuses: REQUIRED_DNS_WORKERS
+            statuses: REQUIRED_RESIDENT_WORKERS
                 .into_iter()
                 .map(|worker| (worker, "starting"))
                 .collect(),
@@ -206,7 +212,7 @@ impl ResidentWorkerSupervisor {
             if remaining.is_zero() {
                 return Err(DnsMediationError::new(
                     "resident_worker_start_timeout",
-                    "required resident DNS workers did not all report startup",
+                    "required resident workers did not all report startup",
                 ));
             }
             match self.events.recv_timeout(remaining) {
@@ -218,7 +224,7 @@ impl ResidentWorkerSupervisor {
                 Err(_) => {
                     return Err(DnsMediationError::new(
                         "resident_worker_start_failed",
-                        "resident DNS worker supervision disconnected before readiness",
+                        "resident worker supervision disconnected before readiness",
                     ));
                 }
             }
@@ -1169,6 +1175,7 @@ pub struct DnsMediationSession {
     recorder: ObservationRecorder,
     resident_health: Arc<Mutex<ResidentHealth>>,
     supervisor: ResidentWorkerSupervisor,
+    attribution: AttributionCoordinator,
     stop_workers: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -1176,6 +1183,7 @@ pub struct DnsMediationSession {
 struct DnsProxyRuntime {
     threads: Vec<JoinHandle<()>>,
     supervisor: ResidentWorkerSupervisor,
+    attribution: AttributionCoordinator,
 }
 
 impl DnsMediationSession {
@@ -1221,6 +1229,7 @@ impl DnsMediationSession {
         let DnsProxyRuntime {
             mut threads,
             mut supervisor,
+            attribution,
         } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers))?;
         if let Err(error) = supervisor.wait_for_startup() {
             shutdown_dns_workers(&stop_workers, &mut threads);
@@ -1250,6 +1259,7 @@ impl DnsMediationSession {
             recorder,
             resident_health,
             supervisor,
+            attribution,
             stop_workers,
             threads,
         })
@@ -1262,6 +1272,18 @@ impl DnsMediationSession {
         }
         self.sync_worker_health();
         failures
+    }
+
+    fn submit_attribution(
+        &self,
+        finding_index: usize,
+        tuple: crate::attribution::SocketTuple,
+    ) -> AttributionSubmission {
+        self.attribution.submit(finding_index, tuple)
+    }
+
+    fn drain_attribution_results(&self) -> Vec<crate::attribution::AttributionResult> {
+        self.attribution.drain()
     }
 
     fn mark_verification_successful(&mut self) {
@@ -1320,6 +1342,35 @@ impl Drop for DnsMediationSession {
     fn drop(&mut self) {
         shutdown_dns_workers(&self.stop_workers, &mut self.threads);
     }
+}
+
+fn record_connection_event(
+    mediation: &DnsMediationSession,
+    findings: &mut FindingCollection,
+    event: ConnectionEvent,
+) {
+    let tuple = event.tuple;
+    let Some(index) = findings.record_finding(event.finding) else {
+        return;
+    };
+    if let Some(tuple) = tuple
+        && let AttributionSubmission::Rejected(attribution) =
+            mediation.submit_attribution(index, tuple)
+    {
+        findings.record_attribution(index, attribution);
+    }
+}
+
+fn apply_attribution_results(
+    mediation: &DnsMediationSession,
+    findings: &mut FindingCollection,
+) -> bool {
+    let results = mediation.drain_attribution_results();
+    let changed = !results.is_empty();
+    for result in results {
+        findings.record_attribution(result.finding_index, result.attribution);
+    }
+    changed
 }
 
 struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
@@ -1497,10 +1548,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             );
             changed = true;
         }
+        if apply_attribution_results(&self._mediation, &mut self.findings) {
+            changed = true;
+        }
         let mut finding_received = false;
-        match self.reader.next_finding(finding_timeout) {
-            Ok(Some(finding)) => {
-                self.findings.record_finding(finding);
+        match self.reader.next_event(finding_timeout) {
+            Ok(Some(event)) => {
+                record_connection_event(&self._mediation, &mut self.findings, event);
                 finding_received = true;
                 changed = true;
             }
@@ -1860,9 +1914,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             );
             changed = true;
         }
-        match self.reader.next_finding(finding_timeout) {
-            Ok(Some(finding)) => {
-                self.findings.record_finding(finding);
+        if apply_attribution_results(&self._mediation, &mut self.findings) {
+            changed = true;
+        }
+        match self.reader.next_event(finding_timeout) {
+            Ok(Some(event)) => {
+                record_connection_event(&self._mediation, &mut self.findings, event);
                 changed = true;
             }
             Ok(None) => {}
@@ -2401,6 +2458,9 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
+        "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
+        "process_arguments_full_paths_and_environment_are_not_retained",
+        "socket_ownership_races_may_produce_ambiguous_or_missing_attribution",
     ]
 }
 
@@ -2413,6 +2473,9 @@ fn protected_audit_limitations() -> Vec<&'static str> {
         "audit_preserves_passwordless_sudo_and_container_control",
         "later_workflow_code_retains_arbitrary_egress_in_audit_mode",
         "packet_prefixes_transiently_inspected_in_memory_not_serialized",
+        "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
+        "process_arguments_full_paths_and_environment_are_not_retained",
+        "socket_ownership_races_may_produce_ambiguous_or_missing_attribution",
         "remote_reporting_not_implemented",
     ]
 }
@@ -2446,6 +2509,9 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
         "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
         "dynamic_owned_table_replacement_resets_network_counters",
+        "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
+        "process_arguments_full_paths_and_environment_are_not_retained",
+        "socket_ownership_races_may_produce_ambiguous_or_missing_attribution",
     ]
 }
 
@@ -3041,6 +3107,8 @@ fn start_dns_proxy(
     }
 
     let (events, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+    let (attribution, attribution_worker) =
+        attribution_channel().map_err(|error| DnsMediationError::new(error.code, error.message))?;
     let mut threads = Vec::new();
     for (udp_worker, udp, tcp_worker, tcp) in listeners {
         let udp_recorder = recorder.clone();
@@ -3068,10 +3136,27 @@ fn start_dns_proxy(
             }
         }
     }
+    match spawn_supervised_worker(
+        ATTRIBUTION_WORKER_NAME,
+        Arc::clone(&stop),
+        events.clone(),
+        move |stop| {
+            attribution_worker
+                .run(stop)
+                .map_err(|error| DnsMediationError::new(error.code, error.message))
+        },
+    ) {
+        Ok(thread) => threads.push(thread),
+        Err(error) => {
+            shutdown_dns_workers(&stop, &mut threads);
+            return Err(error);
+        }
+    }
     drop(events);
     Ok(DnsProxyRuntime {
         threads,
         supervisor: ResidentWorkerSupervisor::new(receiver),
+        attribution,
     })
 }
 
@@ -3098,17 +3183,17 @@ where
                 Ok(Ok(())) => ResidentWorkerEvent::Fatal {
                     worker: name,
                     code: "resident_worker_exited",
-                    message: "required resident DNS worker exited unexpectedly",
+                    message: "required resident worker exited unexpectedly",
                 },
                 Ok(Err(error)) => ResidentWorkerEvent::Fatal {
                     worker: name,
                     code: error.code,
-                    message: "required resident DNS worker encountered a fatal listener failure",
+                    message: "required resident worker encountered a fatal failure",
                 },
                 Err(_) => ResidentWorkerEvent::Fatal {
                     worker: name,
                     code: "resident_worker_panicked",
-                    message: "required resident DNS worker panicked",
+                    message: "required resident worker panicked",
                 },
             };
             let _ = events.send(event);
@@ -3116,7 +3201,7 @@ where
         .map_err(|_| {
             DnsMediationError::new(
                 "resident_worker_spawn_failed",
-                "failed to start a required resident DNS worker",
+                "failed to start a required resident worker",
             )
         })
 }
@@ -5801,7 +5886,7 @@ mod tests {
     fn resident_worker_supervisor_requires_all_workers_and_reports_fatal_exit() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
         let mut supervisor = ResidentWorkerSupervisor::new(receiver);
-        for worker in REQUIRED_DNS_WORKERS {
+        for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
         supervisor.wait_for_startup().unwrap();
@@ -5831,7 +5916,7 @@ mod tests {
     fn resident_worker_supervisor_reports_channel_disconnect_once() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
         let mut supervisor = ResidentWorkerSupervisor::new(receiver);
-        for worker in REQUIRED_DNS_WORKERS {
+        for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
         supervisor.wait_for_startup().unwrap();
@@ -5848,8 +5933,13 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
             let mut supervisor = ResidentWorkerSupervisor::new(receiver);
+            let worker = if panic_worker {
+                ATTRIBUTION_WORKER_NAME
+            } else {
+                "host_udp_dns"
+            };
             let handle = spawn_supervised_worker(
-                "host_udp_dns",
+                worker,
                 Arc::clone(&stop),
                 sender,
                 move |_| -> Result<(), DnsMediationError> {
