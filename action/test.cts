@@ -576,6 +576,15 @@ test("validates fresh resident worker and service identity evidence", () => {
   };
   validateResidentHealth(health, now);
   validateResidentHealth({ ...health, status: "critical" }, now, true);
+  const failedWorkerHealth = {
+    ...health,
+    status: "critical",
+    workers: health.workers.map((worker) =>
+      worker.name === "process_attribution" ? { ...worker, status: "failed" } : worker
+    ),
+  };
+  validateResidentHealth(failedWorkerHealth, now, true);
+  assert.throws(() => validateResidentHealth(failedWorkerHealth, now), /invalid or unhealthy/);
   validateResidentUnitStatus("ActiveState=active\nSubState=running\nMainPID=4242\n", 4242);
   assert.throws(
     () => validateResidentHealth({ ...health, status: "critical" }, now),

@@ -871,12 +871,16 @@ function validateResidentHealth(
     fail("Fence resident worker health is missing");
   }
   const workers = health.workers.map((worker: any) => {
+    const validStatus = worker && (
+      worker.status === "running" ||
+      (allowCritical && health.status === "critical" && worker.status === "failed")
+    );
     if (
       worker === null ||
       Array.isArray(worker) ||
       typeof worker !== "object" ||
       typeof worker.name !== "string" ||
-      worker.status !== "running" ||
+      !validStatus ||
       Object.keys(worker).sort().join(",") !== "name,status"
     ) {
       fail("Fence resident worker health is invalid");
