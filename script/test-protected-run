@@ -226,6 +226,7 @@ assert resident["workers"] == [
     {"name": "docker_udp_dns", "status": "running"},
     {"name": "host_tcp_dns", "status": "running"},
     {"name": "host_udp_dns", "status": "running"},
+    {"name": "process_attribution", "status": "running"},
 ], resident
 assert ready["status"] == expected["ready"], ready
 assert ready["runtime_evidence_schema_version"] == 2, ready
@@ -313,9 +314,12 @@ esac
 if [[ "$scenario" == "audit" ]]; then
   python3 <<'PY'
 import socket
+import time
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.sendto(b"fence-audit-probe", ("192.0.2.10", 443))
+sock.connect(("192.0.2.10", 443))
+sock.send(b"fence-audit-probe")
+time.sleep(2)
 PY
 fi
 
@@ -381,6 +385,26 @@ if scenario == "audit":
     assert report["counters"]["total_violations"] >= 1, report
     assert report["counters"]["sampled_violations"] >= 1, report
     assert any(item["classification"] == "would_block" for item in report["findings"]), report
+    attributed = [
+        item for item in report["findings"]
+        if item.get("remote_address") == "192.0.2.10"
+        and item.get("remote_port") == 443
+        and item.get("protocol") == "udp"
+        and item.get("local_attribution", {}).get("status") == "attributed"
+    ]
+    assert attributed, report
+    attribution = attributed[0]["local_attribution"]
+    assert attribution["actor_class"] == "runner", attribution
+    assert isinstance(attribution["pid"], int) and attribution["pid"] > 0, attribution
+    assert attribution["executable_basename"].startswith("python3"), attribution
+    assert len(attribution["parent_executable_basenames"]) <= 4, attribution
+    assert set(attribution) == {
+        "status",
+        "actor_class",
+        "pid",
+        "executable_basename",
+        "parent_executable_basenames",
+    }, attribution
     assert "fence-audit-probe" not in json.dumps(report, sort_keys=True), report
     assert "fence-audit-probe" not in json.dumps(dns, sort_keys=True), dns
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))

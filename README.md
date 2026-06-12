@@ -129,6 +129,7 @@ to `tcp` port `443`. IPv6 or non-hostname entries should use the explicit
    `allowlist`, blocks other outbound network access, turns off passwordless
    sudo, and disables Docker/container access.
 7. Fence keeps running until the runner is destroyed and records local evidence.
+   Network findings may include bounded, best-effort local process attribution.
 8. The protected post-job hook prints a compact **Fence Summary** with control
    results and observed network activity, then fails the job if Fence sees
    critical drift.
@@ -185,6 +186,13 @@ allowlist.
 Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support
 claim. Pin Fence to a full immutable commit SHA, not `@main`.
+
+Fence does not upload telemetry. When it records a blocked or would-block
+connection, it may add the local process ID, executable basename, actor class,
+and up to four parent executable basenames. Process races or shared sockets can
+produce `not_found` or `ambiguous` attribution. Fence never records command
+arguments, full executable paths, environments, working directories, or packet
+payloads.
 
 ## Troubleshooting 🧯
 

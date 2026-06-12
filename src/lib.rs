@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[doc(hidden)]
+pub mod attribution;
 pub mod cli;
 pub mod config;
 #[cfg(target_os = "linux")]

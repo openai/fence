@@ -76,6 +76,16 @@ The NFLOG parser previously accepted duplicate payload or prefix attributes and
 could ignore trailing bytes outside aligned attributes. It now rejects those
 ambiguous event shapes before approved metadata extraction.
 
+### Bounded local incident attribution
+
+Retained NFLOG findings can now be correlated with a unique local Linux socket
+owner through bounded `/proc` snapshots. Fence records only attribution status,
+actor class, PID, executable basename, and at most four parent executable
+basenames. The worker has fixed queue, socket, process, and file-descriptor
+limits and is supervised with the other resident workers. Local socket tuples
+remain internal, and Fence does not record command arguments, full paths,
+environments, working directories, payloads, or telemetry.
+
 ### Sudo policy source file type
 
 The hosted-runner fingerprint path previously bounded sudo policy bytes and
@@ -134,6 +144,9 @@ compile TypeScript at workflow runtime. See Node's
 - Untrusted workflow code can intentionally deny service to its own job. Fence
   bounds individual mediator and subprocess waits but does not claim local
   availability against malicious later steps.
+- Process attribution is best effort. Short-lived processes, shared sockets,
+  namespace boundaries, and bounded scan limits can produce missing or
+  ambiguous ownership instead of a guessed actor.
 - GitHub-hosted runner image drift intentionally fails closed until the pinned
   fingerprint is reviewed and updated.
 - macOS, Windows, ARM, self-hosted runners, and job-container protection remain
