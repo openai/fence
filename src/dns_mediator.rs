@@ -10,7 +10,7 @@ use crate::error::ErrorDetail;
 use crate::findings::{
     ConnectionEvent, ConnectionFinding, FindingCollection, bounded_timestamp_now,
 };
-use crate::hosted_runner::hosted_runner_fingerprint_requirement;
+use crate::hosted_runner::{AcceptedResolverV1, hosted_runner_fingerprint_requirement};
 use crate::hostname_policy::{
     ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
 };
@@ -1459,11 +1459,10 @@ impl DnsRouting {
         if !resolver_layout_is_supported(
             metadata.file_type().is_symlink(),
             &canonical,
-            Path::new(accepted.canonical_target),
+            &accepted,
             target_metadata.file_type().is_file(),
             target_metadata.file_type().is_symlink(),
             target_metadata.uid(),
-            accepted.target_uid,
             target_metadata.permissions().mode() & 0o777,
         ) {
             return Err(DnsMediationError::new(
@@ -1521,18 +1520,17 @@ impl DnsRouting {
 fn resolver_layout_is_supported(
     resolv_conf_is_symlink: bool,
     canonical_target: &Path,
-    expected_target: &Path,
+    accepted: &AcceptedResolverV1,
     target_is_file: bool,
     target_is_symlink: bool,
     target_uid: u32,
-    expected_target_uid: u32,
     target_mode: u32,
 ) -> bool {
     resolv_conf_is_symlink
-        && canonical_target == expected_target
+        && canonical_target == Path::new(accepted.canonical_target)
         && target_is_file
         && !target_is_symlink
-        && target_uid == expected_target_uid
+        && target_uid == accepted.target_uid
         && target_mode == 0o644
 }
 
@@ -6807,27 +6805,57 @@ mod tests {
 
     #[test]
     fn resolver_layout_rejects_unreviewed_targets_owners_and_modes() {
-        let accepted = Path::new("/run/systemd/resolve/stub-resolv.conf");
+        let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
+        let accepted_target = Path::new(accepted.canonical_target);
         assert!(resolver_layout_is_supported(
-            true, accepted, accepted, true, false, 991, 991, 0o644,
+            true,
+            accepted_target,
+            &accepted,
+            true,
+            false,
+            991,
+            0o644,
         ));
         for unsupported in [
-            resolver_layout_is_supported(false, accepted, accepted, true, false, 991, 991, 0o644),
             resolver_layout_is_supported(
-                true,
-                Path::new("/run/systemd/resolve/resolv.conf"),
-                accepted,
+                false,
+                accepted_target,
+                &accepted,
                 true,
                 false,
                 991,
+                0o644,
+            ),
+            resolver_layout_is_supported(
+                true,
+                Path::new("/run/systemd/resolve/resolv.conf"),
+                &accepted,
+                true,
+                false,
                 991,
                 0o644,
             ),
-            resolver_layout_is_supported(true, accepted, accepted, false, false, 991, 991, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, true, 991, 991, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, false, 0, 991, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, false, 1000, 991, 0o644),
-            resolver_layout_is_supported(true, accepted, accepted, true, false, 991, 991, 0o666),
+            resolver_layout_is_supported(
+                true,
+                accepted_target,
+                &accepted,
+                false,
+                false,
+                991,
+                0o644,
+            ),
+            resolver_layout_is_supported(true, accepted_target, &accepted, true, true, 991, 0o644),
+            resolver_layout_is_supported(true, accepted_target, &accepted, true, false, 0, 0o644),
+            resolver_layout_is_supported(
+                true,
+                accepted_target,
+                &accepted,
+                true,
+                false,
+                1000,
+                0o644,
+            ),
+            resolver_layout_is_supported(true, accepted_target, &accepted, true, false, 991, 0o666),
         ] {
             assert!(!unsupported);
         }

@@ -670,11 +670,12 @@ fn dns_socket_inodes(
     family: SocketFamily,
 ) -> Option<BTreeSet<u64>> {
     let local = proc_endpoint(&client.peer.ip(), client.peer.port(), family);
-    let remote = proc_endpoint(&client.listener.ip(), client.listener.port(), family);
     let unspecified = match family {
         SocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         SocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
+    let wildcard_local = proc_endpoint(&unspecified, client.peer.port(), family);
+    let remote = proc_endpoint(&client.listener.ip(), client.listener.port(), family);
     let wildcard_remote = proc_endpoint(&unspecified, 0, family);
     let mut inodes = BTreeSet::new();
     for (index, line) in contents.lines().skip(1).enumerate() {
@@ -682,7 +683,11 @@ fn dns_socket_inodes(
             return None;
         }
         let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() <= 9 || !fields[1].eq_ignore_ascii_case(&local) {
+        let local_matches = fields.len() > 9
+            && (fields[1].eq_ignore_ascii_case(&local)
+                || (client.protocol == SocketProtocol::Udp
+                    && fields[1].eq_ignore_ascii_case(&wildcard_local)));
+        if !local_matches {
             continue;
         }
         let remote_matches = fields[2].eq_ignore_ascii_case(&remote)
@@ -861,15 +866,19 @@ mod tests {
         root: &Path,
         client: DnsClientSocket,
         inode: u64,
-        wildcard_udp_remote: bool,
+        wildcard_udp_endpoints: bool,
     ) {
         let (family, table) = dns_socket_table(client).unwrap();
-        let local = proc_endpoint(&client.peer.ip(), client.peer.port(), family);
-        let remote = if wildcard_udp_remote {
-            let unspecified = match family {
-                SocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                SocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-            };
+        let unspecified = match family {
+            SocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let local = if wildcard_udp_endpoints {
+            proc_endpoint(&unspecified, client.peer.port(), family)
+        } else {
+            proc_endpoint(&client.peer.ip(), client.peer.port(), family)
+        };
+        let remote = if wildcard_udp_endpoints {
             proc_endpoint(&unspecified, 0, family)
         } else {
             proc_endpoint(&client.listener.ip(), client.listener.port(), family)
@@ -1175,6 +1184,12 @@ mod tests {
         );
 
         fs::remove_file(root.join("200/fd/3")).unwrap();
+        write_trusted_process(&root, 250, 1001, 100, "workflow", 25, Some(501));
+        assert_eq!(
+            worker.classify_dns_client(udp).unwrap(),
+            DnsCallerProvenance::Untrusted
+        );
+        fs::remove_file(root.join("250/fd/3")).unwrap();
         let tcp = DnsClientSocket {
             protocol: SocketProtocol::Tcp,
             peer: "127.0.0.1:40001".parse().unwrap(),
