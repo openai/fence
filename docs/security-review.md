@@ -23,7 +23,10 @@ channels that later workflow code may use. The exact `github.com`,
 `hosted-compute-watchdog-prod-eus-01.githubapp.com` HTTPS channels are
 intentional compatibility exceptions by default. Workflows may set
 `disable_broad_github_domains: true` to remove those four broad GitHub roots
-while keeping core Actions status and finalization endpoints available.
+while keeping core Actions status and finalization endpoints available. The
+watchdog endpoint is optional: a transient empty lookup does not block Fence
+readiness, but any later approved answer is still withheld until its TCP `443`
+rule is applied and verified.
 GitHub results-storage accounts are authorized separately: Fence accepts only a
 bounded exact hostname requested by the pinned `Runner.Worker` process and then
 materializes HTTPS access after verified firewall application.

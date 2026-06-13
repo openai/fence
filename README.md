@@ -26,8 +26,9 @@ By default, Fence allows the GitHub domains needed for Actions job reporting.
 It also allows `github.com`, `api.github.com`,
 `release-assets.githubusercontent.com`, and the exact GitHub-hosted runner
 watchdog endpoint so Fence can run before checkout and common setup steps
-without suppressing runner health traffic. Those allowed GitHub domains are
-still places later workflow code can send data.
+without suppressing runner health traffic. Fence does not make readiness depend
+on that optional endpoint resolving before startup. Those allowed GitHub
+domains are still places later workflow code can send data.
 
 GitHub uploads job logs and summaries to a per-run Azure storage account.
 Fence authorizes at most four exact results-storage hostnames, and only when

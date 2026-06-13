@@ -40,6 +40,7 @@ use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
+    is_optional_github_hosted_workflow_bootstrap_hostname,
     reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
 use crate::runtime::{
@@ -2098,7 +2099,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = mediation.routing.rollback();
             return Err(DnsMediationError::new(
                 "dns_block_prehydration_failed",
-                "DNS-mediated block lifecycle did not materialize every fixed bootstrap name",
+                "DNS-mediated block lifecycle did not materialize every required exact hostname",
             ));
         }
         let allowances =
@@ -2846,7 +2847,7 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-        "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
+        "required_bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
         "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
@@ -2937,8 +2938,11 @@ fn prehydrate_exact_hostnames(
 ) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
     let mut materializations = Vec::new();
     for entry in &hostname_policy.exact {
-        let hostname_materializations = prehydrate_exact_hostname(entry, hostname_policy)?;
-        materializations.extend(hostname_materializations);
+        match prehydrate_exact_hostname(entry, hostname_policy) {
+            Ok(hostname_materializations) => materializations.extend(hostname_materializations),
+            Err(PrehydrationError::Transient(_)) if is_optional_platform_hostname_entry(entry) => {}
+            Err(error) => return Err(error),
+        }
         if materializations.len() > MAX_ACTIVE_MATERIALIZATIONS {
             return Err(PrehydrationError::Fatal(DnsMediationError::new(
                 "dns_block_prehydration_failed",
@@ -2947,6 +2951,11 @@ fn prehydrate_exact_hostnames(
         }
     }
     Ok(materializations)
+}
+
+fn is_optional_platform_hostname_entry(entry: &ExactHostnamePolicy) -> bool {
+    is_optional_github_hosted_workflow_bootstrap_hostname(&entry.hostname)
+        && entry.origins.as_slice() == [HostnamePolicyOrigin::Platform]
 }
 
 fn prehydrate_exact_hostname(
@@ -3400,6 +3409,9 @@ fn active_covers_exact_hostname_policy(
         })
         .collect::<BTreeSet<_>>();
     hostname_policy.exact.iter().all(|entry| {
+        if is_optional_platform_hostname_entry(entry) {
+            return true;
+        }
         entry
             .transports
             .iter()
@@ -4754,7 +4766,7 @@ fn evidence_from_state_and_authorizations(
                 "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-                "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
+                "required_bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
                 "bootstrap_roots_refresh_every_5_seconds",
                 "https_materialization_expiry_includes_30_second_refresh_overlap",
                 "dns_answers_materialize_only_bounded_profile_or_cname_descendant_https_addresses",
@@ -4780,7 +4792,7 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
         "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
         "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
-        "bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
+        "required_bootstrap_roots_prehydrated_before_ready_with_fixed_max_ttl",
         "bootstrap_roots_refresh_every_5_seconds",
         "https_materialization_expiry_includes_30_second_refresh_overlap",
         "dns_answers_materialize_only_bounded_workflow_bootstrap_or_cname_descendant_https_addresses",
@@ -6448,6 +6460,22 @@ mod tests {
             &policy,
         ));
         assert!(!active_covers_exact_hostname_policy(&active, &policy));
+        let mut required_only = active_with_all_bootstrap_roots(now);
+        required_only
+            .retain(|key, _| !is_optional_github_hosted_workflow_bootstrap_hostname(&key.0));
+        assert!(active_covers_exact_hostname_policy(&required_only, &policy));
+        let mut user_required_policy = policy.clone();
+        user_required_policy
+            .exact
+            .iter_mut()
+            .find(|entry| is_optional_github_hosted_workflow_bootstrap_hostname(&entry.hostname))
+            .unwrap()
+            .origins
+            .push(HostnamePolicyOrigin::User);
+        assert!(!active_covers_exact_hostname_policy(
+            &required_only,
+            &user_required_policy,
+        ));
 
         assert_eq!(
             pending_materializations_from_bootstrap_response(
@@ -6593,6 +6621,40 @@ mod tests {
         let now = Instant::now();
         let policy = test_hostname_policy(false);
         let active = active_with_all_bootstrap_roots(now);
+        let mut required_only = active.clone();
+        required_only
+            .retain(|key, _| !is_optional_github_hosted_workflow_bootstrap_hostname(&key.0));
+        assert_eq!(
+            root_refresh_critical_finding(
+                Some(&PrehydrationError::Transient(DnsMediationError::new(
+                    "dns_block_prehydration_failed",
+                    "optional refresh miss"
+                ))),
+                &required_only,
+                &policy,
+            ),
+            None
+        );
+        let mut user_required_policy = policy.clone();
+        user_required_policy
+            .exact
+            .iter_mut()
+            .find(|entry| is_optional_github_hosted_workflow_bootstrap_hostname(&entry.hostname))
+            .unwrap()
+            .origins
+            .push(HostnamePolicyOrigin::User);
+        assert_eq!(
+            root_refresh_critical_finding(
+                Some(&PrehydrationError::Transient(DnsMediationError::new(
+                    "dns_block_prehydration_failed",
+                    "user-required refresh miss"
+                ))),
+                &required_only,
+                &user_required_policy,
+            )
+            .map(|(code, _)| code),
+            Some("dns_block_root_refresh_failed")
+        );
         assert_eq!(
             root_refresh_critical_finding(
                 Some(&PrehydrationError::Transient(DnsMediationError::new(
