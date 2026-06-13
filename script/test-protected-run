@@ -194,6 +194,7 @@ expected_by_scenario = {
             "github.com",
             "api.github.com",
             "release-assets.githubusercontent.com",
+            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
             "vstoken.actions.githubusercontent.com",
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
@@ -229,6 +230,7 @@ expected_by_scenario = {
             "github.com",
             "api.github.com",
             "release-assets.githubusercontent.com",
+            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
             "vstoken.actions.githubusercontent.com",
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
@@ -248,6 +250,7 @@ expected_by_scenario = {
             "github.com",
             "api.github.com",
             "release-assets.githubusercontent.com",
+            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
             "vstoken.actions.githubusercontent.com",
             "pipelines.actions.githubusercontent.com",
             "payload.pipelines.actions.githubusercontent.com",
@@ -359,7 +362,8 @@ case "$scenario" in
     for url in \
       https://github.com \
       https://api.github.com \
-      https://release-assets.githubusercontent.com; do
+      https://release-assets.githubusercontent.com \
+      https://hosted-compute-watchdog-prod-eus-01.githubapp.com; do
       probe_https_once "$url"
     done
     ;;
@@ -367,7 +371,8 @@ case "$scenario" in
     for url in \
       https://github.com \
       https://api.github.com \
-      https://release-assets.githubusercontent.com; do
+      https://release-assets.githubusercontent.com \
+      https://hosted-compute-watchdog-prod-eus-01.githubapp.com; do
       if curl --head --silent --show-error --max-time 3 --retry 0 --output /dev/null "$url" 2>/dev/null; then
         die "protected broad-domain opt-out unexpectedly allowed $url"
       fi
