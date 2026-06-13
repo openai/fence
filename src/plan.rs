@@ -369,11 +369,9 @@ fn platform_plan(
                 "runner_authorized_results_storage_accounts_remain_egress_channels",
             ];
             if disable_broad_github_domains {
-                limitations.push("broad_github_web_api_and_release_asset_destinations_disabled");
+                limitations.push("broad_github_compatibility_destinations_disabled");
             } else {
-                limitations.push(
-                    "broad_github_web_api_and_release_asset_destinations_remain_egress_channels",
-                );
+                limitations.push("broad_github_compatibility_destinations_remain_egress_channels");
             }
             PlatformProfilePlan {
                 id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
@@ -638,6 +636,7 @@ mod tests {
                 "github.com",
                 "api.github.com",
                 "release-assets.githubusercontent.com",
+                "hosted-compute-watchdog-prod-eus-01.githubapp.com",
                 "vstoken.actions.githubusercontent.com",
                 "pipelines.actions.githubusercontent.com",
                 "payload.pipelines.actions.githubusercontent.com",
@@ -667,14 +666,17 @@ mod tests {
         );
         assert_ne!(default.policy_hash, opt_out.policy_hash);
         assert_eq!(default.ruleset_hash, opt_out.ruleset_hash);
-        assert!(default.platform_profile.limitations.contains(
-            &"broad_github_web_api_and_release_asset_destinations_remain_egress_channels"
-        ));
+        assert!(
+            default
+                .platform_profile
+                .limitations
+                .contains(&"broad_github_compatibility_destinations_remain_egress_channels")
+        );
         assert!(
             opt_out
                 .platform_profile
                 .limitations
-                .contains(&"broad_github_web_api_and_release_asset_destinations_disabled")
+                .contains(&"broad_github_compatibility_destinations_disabled")
         );
     }
 

@@ -5742,6 +5742,10 @@ mod tests {
             "release-assets.githubusercontent.com",
             &policy
         ));
+        assert!(matches_exact_platform_hostname(
+            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
+            &policy
+        ));
         assert!(!matches_exact_platform_hostname(
             "uploads.github.com",
             &policy
@@ -5762,6 +5766,10 @@ mod tests {
         assert!(!matches_exact_platform_hostname("api.github.com", &opt_out));
         assert!(!matches_exact_platform_hostname(
             "release-assets.githubusercontent.com",
+            &opt_out
+        ));
+        assert!(!matches_exact_platform_hostname(
+            "hosted-compute-watchdog-prod-eus-01.githubapp.com",
             &opt_out
         ));
         assert!(matches_exact_platform_hostname(
@@ -6032,6 +6040,10 @@ mod tests {
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("release-assets.githubusercontent.com", 1)
+        );
+        assert!(
+            DnsEvidenceScope::SelectedProfileRuntimeTest
+                .forward_query("hosted-compute-watchdog-prod-eus-01.githubapp.com", 1)
         );
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest

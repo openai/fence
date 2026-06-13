@@ -19,9 +19,10 @@ active until ephemeral runner teardown. It does not claim sandboxing, kernel
 isolation, or elimination of every exfiltration channel. The selected GitHub
 workflow-bootstrap profile and its bounded DNS mediation remain disclosed
 channels that later workflow code may use. The exact `github.com`,
-`api.github.com`, and `release-assets.githubusercontent.com` HTTPS bootstrap
-channels are intentional compatibility exceptions by default. Workflows may set
-`disable_broad_github_domains: true` to remove those three broad GitHub roots
+`api.github.com`, `release-assets.githubusercontent.com`, and
+`hosted-compute-watchdog-prod-eus-01.githubapp.com` HTTPS channels are
+intentional compatibility exceptions by default. Workflows may set
+`disable_broad_github_domains: true` to remove those four broad GitHub roots
 while keeping core Actions status and finalization endpoints available.
 GitHub results-storage accounts are authorized separately: Fence accepts only a
 bounded exact hostname requested by the pinned `Runner.Worker` process and then
@@ -155,10 +156,10 @@ compile TypeScript at workflow runtime. See Node's
 
 - Approved GitHub workflow-bootstrap DNS and HTTPS channels remain available to
   later workflow code and therefore remain possible exfiltration channels. By
-  default this includes `github.com`, `api.github.com`, and
-  `release-assets.githubusercontent.com`; `disable_broad_github_domains: true`
-  removes those three broad roots but retains core Actions status/finalization
-  channels.
+  default this includes `github.com`, `api.github.com`,
+  `release-assets.githubusercontent.com`, and the exact hosted-runner watchdog
+  endpoint; `disable_broad_github_domains: true` removes those four broad roots
+  but retains core Actions status/finalization channels.
 - An exact GitHub results-storage account authorized for the pinned runner is
   also reachable by later workflow code at its resolved HTTPS addresses. Fence
   does not inspect signed URLs, credentials, or encrypted request content.

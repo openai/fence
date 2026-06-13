@@ -7,10 +7,11 @@ pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN: &str =
     "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES: [&str; 1] =
     ["actions-results-receiver-production.githubapp.com"];
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 3] = [
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 4] = [
     "github.com",
     "api.github.com",
     "release-assets.githubusercontent.com",
+    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
 ];
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_CORE_ACTIONS_HOSTNAMES: [&str; 4] = [
     "vstoken.actions.githubusercontent.com",
@@ -18,10 +19,11 @@ pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_CORE_ACTIONS_HOSTNAMES: [&str; 4] = [
     "payload.pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ];
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES: [&str; 7] = [
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES: [&str; 8] = [
     "github.com",
     "api.github.com",
     "release-assets.githubusercontent.com",
+    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
@@ -134,6 +136,7 @@ mod tests {
                 "github.com",
                 "api.github.com",
                 "release-assets.githubusercontent.com",
+                "hosted-compute-watchdog-prod-eus-01.githubapp.com",
                 "vstoken.actions.githubusercontent.com",
                 "pipelines.actions.githubusercontent.com",
                 "payload.pipelines.actions.githubusercontent.com",
