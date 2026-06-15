@@ -126,11 +126,14 @@ owned `nftables` ruleset but returned the upstream answer before the verified
 firewall update was active. Block mode now submits bounded materialization
 requests to the single resident firewall owner and releases an approved address
 answer only after that owner applies and structurally verifies the matching
-rules. Queue rejection, service disconnection, or an explicit failed result
-returns a minimal retryable `SERVFAIL` response. The response contains the
-original DNS question but no answer, authority, additional, or raw upstream
-data. Queue rejections increment bounded warning evidence; backend apply and
-verification failures remain critical findings.
+rules. Address-bearing responses are all-or-nothing: every returned address
+must be materializable before any answer is released. An approved zero-TTL
+address receives a one-second materialization lifetime before the existing
+refresh overlap. Partial coverage, queue rejection, service disconnection, or
+an explicit failed result returns a minimal retryable `SERVFAIL` response. The
+response contains the original DNS question but no answer, authority,
+additional, or raw upstream data. Rejections increment bounded warning
+evidence; backend apply and verification failures remain critical findings.
 
 ### Runner-bound results-storage authorization
 
