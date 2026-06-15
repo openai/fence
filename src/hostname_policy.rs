@@ -29,6 +29,7 @@ pub struct ExactHostnamePolicy {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RuntimeHostnamePolicy {
     pub exact: Vec<ExactHostnamePolicy>,
+    pub allow_dynamic_githubapp_suffix: bool,
 }
 
 impl RuntimeHostnamePolicy {
@@ -93,6 +94,7 @@ pub fn build_runtime_hostname_policy(config: &NormalizedConfig) -> RuntimeHostna
                 transports: transports.into_iter().collect(),
             })
             .collect(),
+        allow_dynamic_githubapp_suffix: !config.disable_broad_github_domains,
     }
 }
 
@@ -150,8 +152,10 @@ mod tests {
                 "payload.pipelines.actions.githubusercontent.com",
                 "results-receiver.actions.githubusercontent.com",
                 "actions-results-receiver-production.githubapp.com",
+                "productionresultssa19.blob.core.windows.net",
             ]
         );
+        assert!(policy.allow_dynamic_githubapp_suffix);
     }
 
     #[test]
@@ -184,7 +188,9 @@ mod tests {
                 "payload.pipelines.actions.githubusercontent.com",
                 "results-receiver.actions.githubusercontent.com",
                 "actions-results-receiver-production.githubapp.com",
+                "productionresultssa19.blob.core.windows.net",
             ]
         );
+        assert!(!policy.allow_dynamic_githubapp_suffix);
     }
 }

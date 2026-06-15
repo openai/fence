@@ -29,16 +29,20 @@ use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_activatio
 use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_GITHUBAPP_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_GITHUBAPP_SUFFIX_PREFIX_LABELS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_TTL_SECONDS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_REFRESH_INTERVAL_SECONDS,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
     is_optional_github_hosted_workflow_bootstrap_hostname,
     reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
@@ -66,8 +70,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
-    "github_hosted_workflow_bootstrap_dns_provenance_v2";
-pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 3;
+    "github_hosted_workflow_bootstrap_dns_provenance_v3";
+pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 4;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
     "selected_profile_runtime_ready_no_public_activation";
@@ -77,11 +81,24 @@ pub const PROTECTED_DEGRADED_BLOCK_STATUS: &str = "protected_host_block_degraded
 pub const PROTECTED_DEGRADED_BLOCK_READY_STATUS: &str = "ready_degraded";
 pub const PROTECTED_AUDIT_STATUS: &str = "protected_host_audit_observation";
 pub const PROTECTED_AUDIT_READY_STATUS: &str = "ready_observation_only";
-pub const DNS_MEDIATED_COMPATIBILITY_PATTERNS: [&str; 3] = [
+pub const DNS_MEDIATED_COMPATIBILITY_PATTERNS: [&str; 4] = [
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_GITHUBAPP_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES[0],
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
 ];
+
+fn authorized_domain_patterns(hostname_policy: &RuntimeHostnamePolicy) -> Vec<&'static str> {
+    if hostname_policy.allow_dynamic_githubapp_suffix {
+        DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec()
+    } else {
+        vec![
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES[0],
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
+        ]
+    }
+}
 const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_MATERIALIZATIONS_PER_UPDATE: usize = 128;
@@ -90,6 +107,10 @@ const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS;
+const MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS: usize =
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS;
+const MAX_DYNAMIC_GITHUBAPP_SUFFIX_PREFIX_LABELS: usize =
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_GITHUBAPP_SUFFIX_PREFIX_LABELS;
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS;
 const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize =
@@ -424,11 +445,15 @@ impl DnsBlockRuntimeScope {
         }
     }
 
-    fn limitations(self) -> Vec<&'static str> {
+    fn limitations(self, allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
         match self {
-            Self::TestEvidence => dns_block_test_limitations(),
-            Self::ProductionStandardBlock => protected_block_limitations(),
-            Self::ProductionUnsafePreserve => protected_degraded_block_limitations(),
+            Self::TestEvidence => dns_block_test_limitations(allow_dynamic_githubapp_suffix),
+            Self::ProductionStandardBlock => {
+                protected_block_limitations(allow_dynamic_githubapp_suffix)
+            }
+            Self::ProductionUnsafePreserve => {
+                protected_degraded_block_limitations(allow_dynamic_githubapp_suffix)
+            }
         }
     }
 
@@ -487,6 +512,8 @@ pub struct DnsMediationEvidence {
     pub observations_truncated: bool,
     pub bounded_actions_suffix_authorizations: Vec<String>,
     pub bounded_actions_suffix_authorizations_truncated: bool,
+    pub bounded_githubapp_suffix_authorizations: Vec<String>,
+    pub bounded_githubapp_suffix_authorizations_truncated: bool,
     pub runner_authorized_results_storage: Vec<DnsResultsStorageAuthorization>,
     pub runner_authorized_results_storage_truncated: bool,
     pub results_storage_authorization_count: u64,
@@ -788,6 +815,8 @@ type ActiveMaterializationKey = (String, String, IpAddr, Protocol, u16);
 struct CnameAuthorizationState {
     bounded_actions_suffix: BTreeSet<String>,
     bounded_actions_suffix_truncated: bool,
+    bounded_githubapp_suffix: BTreeSet<String>,
+    bounded_githubapp_suffix_truncated: bool,
     runner_authorized_results_storage: BTreeSet<String>,
     runner_authorized_results_storage_truncated: bool,
     active: BTreeMap<String, ActiveCnameAuthorization>,
@@ -834,7 +863,11 @@ impl ObservationRecorder {
                         .lock()
                         .expect("DNS CNAME authorization lock poisoned");
                     remove_expired_cname_authorizations(&mut authorizations, Instant::now());
-                    requires_runner_results_storage_provenance(hostname, &authorizations)
+                    requires_runner_results_storage_provenance(
+                        hostname,
+                        &authorizations,
+                        &self.hostname_policy,
+                    )
                 };
                 if !requires_runner_provenance {
                     return Ok(DnsQueryAuthorization::Forward(None));
@@ -873,7 +906,11 @@ impl ObservationRecorder {
                         .lock()
                         .expect("DNS CNAME authorization lock poisoned");
                     remove_expired_cname_authorizations(&mut authorizations, Instant::now());
-                    requires_runner_results_storage_provenance(hostname, &authorizations)
+                    requires_runner_results_storage_provenance(
+                        hostname,
+                        &authorizations,
+                        &self.hostname_policy,
+                    )
                 };
                 let provenance = if requires_runner_provenance {
                     self.results_storage_provenance(client)?
@@ -1005,6 +1042,7 @@ impl ObservationRecorder {
             .expect("DNS CNAME authorization lock poisoned");
         remove_expired_cname_authorizations(&mut authorizations, now);
         if authorizations.bounded_actions_suffix.contains(hostname)
+            || authorizations.bounded_githubapp_suffix.contains(hostname)
             || authorizations
                 .runner_authorized_results_storage
                 .contains(hostname)
@@ -2253,7 +2291,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             ruleset_hash: &ruleset_hash,
             resident_health: &evidence.resident_health,
             protection_available: scope.protection_available(),
-            limitations: scope.limitations(),
+            limitations: scope
+                .limitations(plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix),
         }) {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status =
@@ -2795,7 +2834,7 @@ fn initial_dns_block_evidence(
         critical_findings_truncated: false,
         resident_health,
         protection_available: scope.protection_available(),
-        limitations: scope.limitations(),
+        limitations: scope.limitations(plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix),
     }
 }
 
@@ -2835,8 +2874,19 @@ fn initial_dns_audit_evidence(
     }
 }
 
-fn dns_block_test_limitations() -> Vec<&'static str> {
-    vec![
+fn githubapp_profile_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
+    if allow_dynamic_githubapp_suffix {
+        vec![
+            "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation",
+            "githubapp_suffix_authorizations_are_limited_to_8_unique_single_label_names",
+        ]
+    } else {
+        vec!["dynamic_githubapp_suffix_authorization_disabled"]
+    }
+}
+
+fn dns_block_test_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
+    let mut limitations = vec![
         "selected_profile_runtime_test_only_no_public_activation",
         "test_only_evidence_path_does_not_activate_default_planning_descriptor",
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
@@ -2845,6 +2895,7 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
         "runner_authorized_results_storage_accounts_remain_egress_channels",
+        "static_results_storage_compatibility_account_remains_an_egress_channel",
         "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
         "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -2859,7 +2910,11 @@ fn dns_block_test_limitations() -> Vec<&'static str> {
         "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
         "process_arguments_full_paths_and_environment_are_not_retained",
         "socket_ownership_races_may_produce_ambiguous_or_missing_attribution",
-    ]
+    ];
+    limitations.extend(githubapp_profile_limitations(
+        allow_dynamic_githubapp_suffix,
+    ));
+    limitations
 }
 
 fn protected_audit_limitations() -> Vec<&'static str> {
@@ -2878,12 +2933,12 @@ fn protected_audit_limitations() -> Vec<&'static str> {
     ]
 }
 
-fn protected_block_limitations() -> Vec<&'static str> {
-    protected_block_shared_limitations()
+fn protected_block_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
+    protected_block_shared_limitations(allow_dynamic_githubapp_suffix)
 }
 
-fn protected_degraded_block_limitations() -> Vec<&'static str> {
-    let mut limitations = protected_block_shared_limitations();
+fn protected_degraded_block_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
+    let mut limitations = protected_block_shared_limitations(allow_dynamic_githubapp_suffix);
     limitations.extend([
         "container_control_preserved_invalidates_containment",
         "container_control_remains_available_to_later_workflow_code",
@@ -2891,14 +2946,15 @@ fn protected_degraded_block_limitations() -> Vec<&'static str> {
     limitations
 }
 
-fn protected_block_shared_limitations() -> Vec<&'static str> {
-    vec![
+fn protected_block_shared_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
+    let mut limitations = vec![
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
         "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
         "block_dns_queries_are_canonicalized_before_upstream_forwarding",
         "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
         "runner_authorized_results_storage_accounts_remain_egress_channels",
+        "static_results_storage_compatibility_account_remains_an_egress_channel",
         "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
         "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -2912,7 +2968,11 @@ fn protected_block_shared_limitations() -> Vec<&'static str> {
         "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
         "process_arguments_full_paths_and_environment_are_not_retained",
         "socket_ownership_races_may_produce_ambiguous_or_missing_attribution",
-    ]
+    ];
+    limitations.extend(githubapp_profile_limitations(
+        allow_dynamic_githubapp_suffix,
+    ));
+    limitations
 }
 
 #[derive(Debug)]
@@ -4337,6 +4397,9 @@ fn hostname_policy_for_authorized_name(
     if state.bounded_actions_suffix.contains(hostname) {
         return Some(platform_transport_policy());
     }
+    if state.bounded_githubapp_suffix.contains(hostname) {
+        return Some(platform_transport_policy());
+    }
     if state.runner_authorized_results_storage.contains(hostname) {
         return Some(platform_transport_policy());
     }
@@ -4348,6 +4411,9 @@ fn hostname_policy_for_authorized_name(
             return Some((entry.origins.clone(), entry.transports.clone()));
         }
         if state.bounded_actions_suffix.contains(current) {
+            return Some(platform_transport_policy());
+        }
+        if state.bounded_githubapp_suffix.contains(current) {
             return Some(platform_transport_policy());
         }
         if state.runner_authorized_results_storage.contains(current) {
@@ -4365,7 +4431,7 @@ fn authorized_hostname(
     provenance: DnsQueryProvenance,
 ) -> bool {
     remove_expired_cname_authorizations(state, now);
-    if requires_runner_results_storage_provenance(hostname, state)
+    if requires_runner_results_storage_provenance(hostname, state, hostname_policy)
         && provenance != DnsQueryProvenance::TrustedRunnerWorker
     {
         return false;
@@ -4381,6 +4447,14 @@ fn authorized_hostname(
         state
             .runner_authorized_results_storage
             .insert(hostname.to_owned());
+        return true;
+    }
+    if matches_constrained_dynamic_githubapp_suffix_hostname(hostname, hostname_policy) {
+        if state.bounded_githubapp_suffix.len() >= MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS {
+            state.bounded_githubapp_suffix_truncated = true;
+            return false;
+        }
+        state.bounded_githubapp_suffix.insert(hostname.to_owned());
         return true;
     }
     if !matches_constrained_dynamic_actions_suffix_hostname(hostname, hostname_policy) {
@@ -4407,6 +4481,7 @@ fn retain_cname_authorizations(
         pending.retain(|alias| {
             let source_depth = if hostname_policy.exact_entry(&alias.owner).is_some()
                 || state.bounded_actions_suffix.contains(&alias.owner)
+                || state.bounded_githubapp_suffix.contains(&alias.owner)
                 || state
                     .runner_authorized_results_storage
                     .contains(&alias.owner)
@@ -4455,7 +4530,13 @@ fn retain_cname_authorizations(
 fn requires_runner_results_storage_provenance(
     hostname: &str,
     state: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
+    if hostname == GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME
+        && matches_exact_platform_hostname(hostname, hostname_policy)
+    {
+        return false;
+    }
     if matches_results_storage_hostname(hostname)
         || state.runner_authorized_results_storage.contains(hostname)
     {
@@ -4536,6 +4617,7 @@ fn matches_selected_profile_pattern(
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> bool {
     matches_actions_suffix_hostname(hostname)
+        || matches_constrained_dynamic_githubapp_suffix_hostname(hostname, hostname_policy)
         || hostname_policy
             .exact_entry(hostname)
             .is_some_and(|entry| entry.origins.contains(&HostnamePolicyOrigin::Platform))
@@ -4579,6 +4661,31 @@ fn matches_constrained_dynamic_actions_suffix_hostname(
         })
 }
 
+fn matches_constrained_dynamic_githubapp_suffix_hostname(
+    hostname: &str,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> bool {
+    if !hostname_policy.allow_dynamic_githubapp_suffix {
+        return false;
+    }
+    let Some(prefix) = hostname.strip_suffix(".githubapp.com") else {
+        return false;
+    };
+    let labels: Vec<&str> = prefix.split('.').collect();
+    !matches_exact_platform_hostname(hostname, hostname_policy)
+        && !labels.is_empty()
+        && labels.len() <= MAX_DYNAMIC_GITHUBAPP_SUFFIX_PREFIX_LABELS
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+}
+
 fn matches_supported_block_query_type(query_type: u16) -> bool {
     matches!(query_type, 1 | 28)
 }
@@ -4602,6 +4709,9 @@ fn policy_classification(
     if authorizations.bounded_actions_suffix.contains(hostname) {
         return "dynamic_platform";
     }
+    if authorizations.bounded_githubapp_suffix.contains(hostname) {
+        return "dynamic_platform";
+    }
     if authorizations
         .runner_authorized_results_storage
         .contains(hostname)
@@ -4609,7 +4719,7 @@ fn policy_classification(
         return "runner_authorized_results_storage";
     }
     if let Some(authorization) = authorizations.active.get(hostname) {
-        if requires_runner_results_storage_provenance(hostname, authorizations) {
+        if requires_runner_results_storage_provenance(hostname, authorizations, hostname_policy) {
             return "runner_authorized_results_storage_cname_derived";
         }
         return if hostname_policy_for_authorized_name(
@@ -4669,7 +4779,7 @@ fn evidence_from_state_and_authorizations(
         status: scope.status(),
         profile_realization_id: scope.profile_realization_id(),
         platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
-        authorized_domain_patterns: DNS_MEDIATED_COMPATIBILITY_PATTERNS.to_vec(),
+        authorized_domain_patterns: authorized_domain_patterns(hostname_policy),
         bootstrap_hostnames: hostname_policy.platform_hostnames(),
         hostname_policy: hostname_policy.clone(),
         mode: scope.mode(),
@@ -4696,7 +4806,7 @@ fn evidence_from_state_and_authorizations(
             DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded => {
-                "block_forwards_exact_roots_bounded_actions_suffix_names_runner_authorized_results_storage_and_bounded_cname_descendants"
+                "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
             }
         },
         observations: state
@@ -4726,6 +4836,13 @@ fn evidence_from_state_and_authorizations(
             .collect(),
         bounded_actions_suffix_authorizations_truncated: cname_authorizations
             .bounded_actions_suffix_truncated,
+        bounded_githubapp_suffix_authorizations: cname_authorizations
+            .bounded_githubapp_suffix
+            .iter()
+            .cloned()
+            .collect(),
+        bounded_githubapp_suffix_authorizations_truncated: cname_authorizations
+            .bounded_githubapp_suffix_truncated,
         runner_authorized_results_storage: cname_authorizations
             .runner_authorized_results_storage
             .iter()
@@ -4764,10 +4881,13 @@ fn evidence_from_state_and_authorizations(
                 "test_only_evidence_path_does_not_activate_default_planning_descriptor",
                 "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
                 "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
+                "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation",
+                "githubapp_suffix_authorizations_are_limited_to_8_unique_single_label_names",
                 "block_dns_queries_are_canonicalized_before_upstream_forwarding",
                 "dns_query_timing_and_count_remain_egress_limitations",
                 "post_ready_codeload_traffic_is_not_authorized",
                 "runner_authorized_results_storage_accounts_remain_egress_channels",
+                "static_results_storage_compatibility_account_remains_an_egress_channel",
                 "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
                 "cname_descendants_are_bounded_ttl_derived_authorizations",
                 "dns_cname_descendants_may_delegate_to_external_dns_operator_names",
@@ -4779,13 +4899,22 @@ fn evidence_from_state_and_authorizations(
                 "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
             ],
-            DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(false),
-            DnsEvidenceScope::ProtectedHostBlockDegraded => protected_dns_scope_limitations(true),
+            DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(
+                false,
+                hostname_policy.allow_dynamic_githubapp_suffix,
+            ),
+            DnsEvidenceScope::ProtectedHostBlockDegraded => protected_dns_scope_limitations(
+                true,
+                hostname_policy.allow_dynamic_githubapp_suffix,
+            ),
         },
     }
 }
 
-fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
+fn protected_dns_scope_limitations(
+    degraded: bool,
+    allow_dynamic_githubapp_suffix: bool,
+) -> Vec<&'static str> {
     let mut limitations = vec![
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
         "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels",
@@ -4793,6 +4922,7 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
         "dns_query_timing_and_count_remain_egress_limitations",
         "post_ready_codeload_traffic_is_not_authorized",
         "runner_authorized_results_storage_accounts_remain_egress_channels",
+        "static_results_storage_compatibility_account_remains_an_egress_channel",
         "results_storage_authorization_is_limited_to_four_runner_requested_accounts",
         "later_workflow_code_can_reach_authorized_results_storage_addresses",
         "cname_descendants_are_bounded_ttl_derived_authorizations",
@@ -4805,6 +4935,9 @@ fn protected_dns_scope_limitations(degraded: bool) -> Vec<&'static str> {
         "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
     ];
+    limitations.extend(githubapp_profile_limitations(
+        allow_dynamic_githubapp_suffix,
+    ));
     if degraded {
         limitations.push("container_control_preserved_invalidates_containment");
     }
@@ -5847,6 +5980,18 @@ mod tests {
             "actions-results-receiver-production.githubapp.com",
             &policy
         ));
+        assert!(matches_selected_profile_pattern(
+            "hosted-compute-request-orchestrator-prod-eus-02.githubapp.com",
+            &policy
+        ));
+        assert!(!matches_selected_profile_pattern(
+            "hosted-compute-request-orchestrator-prod-eus-02.githubapp.com",
+            &opt_out
+        ));
+        assert!(matches_selected_profile_pattern(
+            "productionresultssa19.blob.core.windows.net",
+            &policy
+        ));
         assert!(!matches_selected_profile_pattern(
             "productionresultssa17.blob.core.windows.net",
             &policy
@@ -5924,6 +6069,14 @@ mod tests {
         let policy = test_hostname_policy(false);
         let now = Instant::now();
         let mut authorizations = CnameAuthorizationState::default();
+        assert!(authorized_hostname(
+            "productionresultssa19.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(authorizations.runner_authorized_results_storage.is_empty());
         assert!(!authorized_hostname(
             "productionresultssa1.blob.core.windows.net",
             &mut authorizations,
@@ -6052,6 +6205,12 @@ mod tests {
             query_for_upstream(&recorder, &request, parsed.as_ref(), None).unwrap(),
             DnsQueryDispatch::RetryableFailure(Some("outside_policy"))
         );
+        let trusted_static = query("productionresultssa19.blob.core.windows.net", 28);
+        let parsed_static = parse_dns_question(&trusted_static);
+        assert_eq!(
+            query_for_upstream(&recorder, &trusted_static, parsed_static.as_ref(), None).unwrap(),
+            DnsQueryDispatch::Forward(trusted_static, None)
+        );
         let state = recorder.state.lock().unwrap();
         assert_eq!(state.results_storage_authorization_count, 0);
         assert_eq!(state.results_storage_attribution_failures, 1);
@@ -6165,6 +6324,14 @@ mod tests {
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("hosted-compute-watchdog-prod-eus-01.githubapp.com", 1)
         );
+        assert!(DnsEvidenceScope::SelectedProfileRuntimeTest.forward_query(
+            "hosted-compute-request-orchestrator-prod-eus-02.githubapp.com",
+            1,
+        ));
+        assert!(
+            DnsEvidenceScope::SelectedProfileRuntimeTest
+                .forward_query("productionresultssa19.blob.core.windows.net", 1)
+        );
         assert!(
             DnsEvidenceScope::SelectedProfileRuntimeTest
                 .forward_query("bounded-dynamic.pipelines.actions.githubusercontent.com", 1,),
@@ -6246,6 +6413,90 @@ mod tests {
             &mut CnameAuthorizationState::default(),
             now,
             &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+    }
+
+    #[test]
+    fn bounds_dynamic_githubapp_names_and_honors_broad_domain_opt_out() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut authorizations = CnameAuthorizationState::default();
+        for index in 0..MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS {
+            assert!(authorized_hostname(
+                &format!("hosted-compute-{index}.githubapp.com"),
+                &mut authorizations,
+                now,
+                &policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+        assert_eq!(
+            authorizations.bounded_githubapp_suffix.len(),
+            MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS
+        );
+        assert!(!authorized_hostname(
+            "hosted-compute-overflow.githubapp.com",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(authorizations.bounded_githubapp_suffix_truncated);
+        let evidence = evidence_from_state_and_authorizations(
+            &ObservationState::default(),
+            "active",
+            DnsEvidenceScope::ProtectedHostBlock,
+            &authorizations,
+            &policy,
+            &initial_resident_health(),
+        );
+        assert_eq!(
+            evidence.bounded_githubapp_suffix_authorizations.len(),
+            MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS
+        );
+        assert!(evidence.bounded_githubapp_suffix_authorizations_truncated);
+        assert!(!authorized_hostname(
+            "nested.hosted-compute.githubapp.com",
+            &mut CnameAuthorizationState::default(),
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(!authorized_hostname(
+            "hosted-compute.githubapp.com",
+            &mut CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(true),
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(
+            !authorized_domain_patterns(&test_hostname_policy(true)).contains(&"*.githubapp.com")
+        );
+        let opt_out_policy = test_hostname_policy(true);
+        let opt_out_evidence = evidence_from_state_and_authorizations(
+            &ObservationState::default(),
+            "active",
+            DnsEvidenceScope::ProtectedHostBlock,
+            &CnameAuthorizationState::default(),
+            &opt_out_policy,
+            &initial_resident_health(),
+        );
+        assert!(
+            opt_out_evidence
+                .limitations
+                .contains(&"dynamic_githubapp_suffix_authorization_disabled")
+        );
+        assert!(
+            !opt_out_evidence.limitations.contains(
+                &"bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation"
+            )
+        );
+        assert!(authorized_hostname(
+            "actions-results-receiver-production.githubapp.com",
+            &mut CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(true),
             DnsQueryProvenance::Untrusted,
         ));
     }
@@ -6862,7 +7113,7 @@ mod tests {
         );
         assert!(
             scope
-                .limitations()
+                .limitations(true)
                 .contains(&"container_control_remains_available_to_later_workflow_code")
         );
     }

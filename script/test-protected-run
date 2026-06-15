@@ -200,6 +200,7 @@ expected_by_scenario = {
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
             "actions-results-receiver-production.githubapp.com",
+            "productionresultssa19.blob.core.windows.net",
         ],
     },
     "standard-opt-out": {
@@ -216,6 +217,7 @@ expected_by_scenario = {
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
             "actions-results-receiver-production.githubapp.com",
+            "productionresultssa19.blob.core.windows.net",
         ],
     },
     "unsafe-preserve": {
@@ -236,6 +238,7 @@ expected_by_scenario = {
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
             "actions-results-receiver-production.githubapp.com",
+            "productionresultssa19.blob.core.windows.net",
         ],
     },
     "audit": {
@@ -256,6 +259,7 @@ expected_by_scenario = {
             "payload.pipelines.actions.githubusercontent.com",
             "results-receiver.actions.githubusercontent.com",
             "actions-results-receiver-production.githubapp.com",
+            "productionresultssa19.blob.core.windows.net",
         ],
     },
 }
@@ -278,14 +282,14 @@ assert report is not None, "protected report was not emitted"
 assert dns is not None, "protected DNS report was not emitted"
 assert ready is not None, "protected readiness was not emitted"
 assert report["status"] == expected["status"], report
-assert report["runtime_evidence_schema_version"] == 3, report
+assert report["runtime_evidence_schema_version"] == 4, report
 assert report["mode"] == expected["mode"], report
 assert report["setup_status"] == expected["resident"], report
 assert report["readiness_status"] == expected["ready"], report
 assert report["protection_available"] is expected["protection_available"], report
-assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", report
-assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", report
-assert report["policy_hash_schema_version"] == 5, report
+assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", report
+assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3", report
+assert report["policy_hash_schema_version"] == 6, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
@@ -311,20 +315,20 @@ assert resident["workers"] == [
     {"name": "process_attribution", "status": "running"},
 ], resident
 assert ready["status"] == expected["ready"], ready
-assert ready["runtime_evidence_schema_version"] == 3, ready
+assert ready["runtime_evidence_schema_version"] == 4, ready
 assert ready["mode"] == expected["mode"], ready
 assert ready["protection_available"] is expected["protection_available"], ready
-assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", ready
-assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", ready
+assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", ready
+assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3", ready
 assert ready["policy_hash"] == report["policy_hash"], (ready, report)
 assert ready["base_ruleset_hash"] == report["base_ruleset_hash"], (ready, report)
 assert ready["resident_health"]["resident_pid"] == resident["resident_pid"], ready
 assert dns["status"] == expected["status"], dns
-assert dns["runtime_evidence_schema_version"] == 3, dns
+assert dns["runtime_evidence_schema_version"] == 4, dns
 assert dns["mode"] == expected["mode"], dns
 assert dns["protection_available"] is expected["protection_available"], dns
-assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", dns
-assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", dns
+assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", dns
+assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3", dns
 assert dns["routing_status"] == "active", dns
 assert dns["host_dns_routing"] == "direct_client_to_root_resident_mediator", dns
 assert dns["docker_dns_routing"] == "local_root_resident_mediator", dns
@@ -337,6 +341,7 @@ assert dns["results_storage_authorization_count"] >= 0, dns
 assert dns["results_storage_attribution_failures"] == 0, dns
 assert dns["results_storage_request_rejections"] == 0, dns
 assert isinstance(dns["runner_authorized_results_storage"], list), dns
+assert isinstance(dns["bounded_githubapp_suffix_authorizations"], list), dns
 assert dns["hostname_refresh_warnings"] == 0, dns
 assert isinstance(dns["upstream_request_failures"], int), dns
 assert dns["upstream_request_failures"] >= 0, dns
@@ -351,7 +356,12 @@ else:
     assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
     assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in report["limitations"]
     assert "runner_authorized_results_storage_accounts_remain_egress_channels" in report["limitations"]
+    assert "static_results_storage_compatibility_account_remains_an_egress_channel" in report["limitations"]
     assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
+    if scenario == "standard-opt-out":
+        assert "dynamic_githubapp_suffix_authorization_disabled" in report["limitations"]
+    else:
+        assert "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
 if scenario == "unsafe-preserve":
     assert "container_control_preserved_invalidates_containment" in report["limitations"]
     assert "container_control_remains_available_to_later_workflow_code" in report["limitations"]
@@ -363,7 +373,8 @@ case "$scenario" in
       https://github.com \
       https://api.github.com \
       https://release-assets.githubusercontent.com \
-      https://hosted-compute-watchdog-prod-eus-01.githubapp.com; do
+      https://hosted-compute-watchdog-prod-eus-01.githubapp.com \
+      https://productionresultssa19.blob.core.windows.net; do
       probe_https_once "$url"
     done
     ;;
@@ -377,6 +388,7 @@ case "$scenario" in
         die "protected broad-domain opt-out unexpectedly allowed $url"
       fi
     done
+    probe_https_once https://productionresultssa19.blob.core.windows.net
     ;;
 esac
 

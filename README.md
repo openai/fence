@@ -24,16 +24,16 @@ Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs.
 
 By default, Fence allows the GitHub domains needed for Actions job reporting.
 It also allows `github.com`, `api.github.com`,
-`release-assets.githubusercontent.com`, and the exact GitHub-hosted runner
-watchdog endpoint so Fence can run before checkout and common setup steps
-without suppressing runner health traffic. Fence does not make readiness depend
-on that optional endpoint resolving before startup. Those allowed GitHub
-domains are still places later workflow code can send data.
+`release-assets.githubusercontent.com`, and up to eight single-label
+`*.githubapp.com` names so Fence can run before checkout and common setup steps
+without suppressing runner health traffic. Those allowed GitHub domains are
+still places later workflow code can send data.
 
 GitHub uploads job logs and summaries to a per-run Azure storage account.
-Fence authorizes at most four exact results-storage hostnames, and only when
-the DNS request comes from the pinned GitHub runner process. It does not allow
-the general `*.blob.core.windows.net` domain.
+Fence includes the exact `productionresultssa19.blob.core.windows.net`
+compatibility root and may authorize at most four other exact results-storage
+hostnames when the DNS request comes from the pinned GitHub runner process. It
+does not allow the general `*.blob.core.windows.net` domain.
 
 ## Examples 🧪
 
@@ -83,8 +83,8 @@ passwordless sudo:
     container_policy: unsafe_preserve
 ```
 
-Disable the broad GitHub web/API/release-asset allowlist entries while keeping
-the core GitHub Actions reporting path alive:
+Disable the broad GitHub web/API/release-asset and dynamic `githubapp.com`
+allowlist entries while keeping the core GitHub Actions reporting path alive:
 
 ```yaml
 - uses: GrantBirki/fence@<commit-sha>
@@ -191,11 +191,13 @@ The default GitHub allowlist is a usability tradeoff. It keeps normal GitHub
 Actions reporting, checkout, API, and release-asset flows working, but later
 workflow code can also send data to those allowed GitHub destinations. Set
 `disable_broad_github_domains: true` if you want to remove `github.com`,
-`api.github.com`, `release-assets.githubusercontent.com`, and the exact hosted
-runner watchdog endpoint from the default allowlist. GitHub's exact
-runner-authorized results-storage account also becomes a reachable destination
-for the rest of the job; Fence records that authorization locally and limits it
-to TCP port `443`.
+`api.github.com`, `release-assets.githubusercontent.com`, the optional exact
+watchdog root, and new `*.githubapp.com` authorizations from the default
+allowlist. Core Actions reporting and the exact
+`productionresultssa19.blob.core.windows.net` compatibility root remain
+enabled. Any exact runner-authorized results-storage account also becomes a
+reachable destination for the rest of the job; Fence records dynamic
+authorizations locally and limits all results-storage access to TCP port `443`.
 
 Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support
