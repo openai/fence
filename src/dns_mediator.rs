@@ -1004,7 +1004,11 @@ impl ObservationRecorder {
             .lock()
             .expect("DNS CNAME authorization lock poisoned");
         remove_expired_cname_authorizations(&mut authorizations, now);
-        if authorizations.bounded_actions_suffix.contains(hostname) {
+        if authorizations.bounded_actions_suffix.contains(hostname)
+            || authorizations
+                .runner_authorized_results_storage
+                .contains(hostname)
+        {
             return bound_materialization_ttl(ttl_seconds, None);
         }
         let remaining_seconds = authorizations
@@ -5355,6 +5359,48 @@ mod tests {
             request.materializations.iter().next().unwrap().ttl_seconds,
             1
         );
+        assert!(!caller.is_finished());
+        request
+            .completion
+            .send(MaterializationCompletion::AppliedAndVerified)
+            .unwrap();
+        assert_eq!(
+            caller.join().unwrap(),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn gates_direct_results_storage_answers_on_verified_materialization() {
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) =
+            test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
+        let hostname = "productionresultssa17.blob.core.windows.net";
+        {
+            let mut authorizations = recorder.cname_authorizations.lock().unwrap();
+            assert!(authorized_hostname(
+                hostname,
+                &mut authorizations,
+                Instant::now(),
+                &recorder.hostname_policy,
+                DnsQueryProvenance::TrustedRunnerWorker,
+            ));
+        }
+        let caller = thread::spawn(move || {
+            recorder.record_response(
+                hostname,
+                1,
+                &response_with_address(hostname, 1, 60, &[192, 0, 2, 17]),
+                None,
+            )
+        });
+        let request = requests.recv().unwrap();
+        let materialization = request.materializations.iter().next().unwrap();
+        assert_eq!(request.materializations.len(), 1);
+        assert_eq!(materialization.hostname, hostname);
+        assert_eq!(materialization.protocol, Protocol::Tcp);
+        assert_eq!(materialization.port, 443);
         assert!(!caller.is_finished());
         request
             .completion
