@@ -1124,41 +1124,39 @@ impl ObservationRecorder {
         if let Some(observation) = state.retained.get_mut(&key) {
             retain_address_answers(observation, answers.clone());
         }
-        let materializations = if forwardable_block_response {
-            let Some((origins, transports)) = policy else {
-                drop(state);
-                self.record_materialization_rejection();
-                return DnsResponseDisposition::RetryableFailure;
-            };
-            answers
-                .into_iter()
-                .filter_map(|answer| {
-                    let ttl_seconds =
-                        self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)?;
-                    Some((answer, ttl_seconds))
-                })
-                .flat_map(|(answer, ttl_seconds)| {
-                    let source_hostname = hostname.clone();
-                    let origins = origins.clone();
-                    transports
-                        .iter()
-                        .map(move |transport| PendingMaterialization {
-                            source_hostname: source_hostname.clone(),
+        let mut block_response_is_fully_materializable = true;
+        let mut materializations = Vec::new();
+        if forwardable_block_response {
+            if let Some((origins, transports)) = policy {
+                for answer in answers {
+                    let Some(ttl_seconds) =
+                        self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)
+                    else {
+                        block_response_is_fully_materializable = false;
+                        continue;
+                    };
+                    materializations.extend(transports.iter().map(|transport| {
+                        PendingMaterialization {
+                            source_hostname: hostname.clone(),
                             hostname: answer.hostname.clone(),
                             address: answer.address,
                             protocol: transport.protocol,
                             port: transport.port,
                             origins: origins.clone(),
                             ttl_seconds,
-                        })
-                })
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+                        }
+                    }));
+                }
+            } else {
+                block_response_is_fully_materializable = false;
+            }
+        }
         drop(state);
 
-        let disposition = if materializations.is_empty() {
+        let disposition = if !block_response_is_fully_materializable {
+            self.record_materialization_rejection();
+            DnsResponseDisposition::RetryableFailure
+        } else if materializations.is_empty() {
             DnsResponseDisposition::ForwardOriginal
         } else if let Some(submitter) = &self.materializations {
             let materializations = materializations.into_iter().collect::<BTreeSet<_>>();
@@ -4303,12 +4301,15 @@ fn bound_materialization_ttl(
     ttl_seconds: u32,
     authorization_remaining: Option<Duration>,
 ) -> Option<u32> {
-    let mut bounded_ttl = ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS);
+    let mut bounded_ttl = ttl_seconds.clamp(1, MAX_DYNAMIC_TTL_SECONDS);
     if let Some(remaining) = authorization_remaining {
         let remaining_seconds = u32::try_from(remaining.as_secs()).unwrap_or(u32::MAX);
+        if remaining_seconds == 0 {
+            return None;
+        }
         bounded_ttl = bounded_ttl.min(remaining_seconds);
     }
-    (bounded_ttl > 0).then_some(bounded_ttl)
+    Some(bounded_ttl)
 }
 
 fn platform_transport_policy() -> (Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>) {
@@ -5336,6 +5337,67 @@ mod tests {
     }
 
     #[test]
+    fn gates_zero_ttl_answers_with_a_bounded_minimum_materialization() {
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) =
+            test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
+        let caller = thread::spawn(move || {
+            recorder.record_response(
+                "api.github.com",
+                1,
+                &response_with_address("api.github.com", 1, 0, &[192, 0, 2, 10]),
+                None,
+            )
+        });
+        let request = requests.recv().unwrap();
+        assert_eq!(request.materializations.len(), 1);
+        assert_eq!(
+            request.materializations.iter().next().unwrap().ttl_seconds,
+            1
+        );
+        assert!(!caller.is_finished());
+        request
+            .completion
+            .send(MaterializationCompletion::AppliedAndVerified)
+            .unwrap();
+        assert_eq!(
+            caller.join().unwrap(),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn rejects_an_address_response_unless_every_address_is_materializable() {
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) =
+            test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
+        let mut response = response_with_address("github.com", 1, 60, &[192, 0, 2, 10]);
+        response[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        append_dns_name(&mut response, "unrelated.example.net");
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&60_u32.to_be_bytes());
+        response.extend_from_slice(&4_u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 11]);
+
+        assert_eq!(
+            recorder.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::RetryableFailure
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            recorder
+                .state
+                .lock()
+                .unwrap()
+                .materialization_request_rejections,
+            1
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
     fn user_hostname_answers_materialize_every_transport_and_cname_descendant() {
         let config = parse_and_normalize(
             br#"{"schema_version":1,"mode":"block","invocation_id":"user-host","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"example.com","protocol":"udp","port":53}]}"#,
@@ -6181,6 +6243,11 @@ mod tests {
         let now = Instant::now();
         let policy = test_hostname_policy(false);
         let mut authorizations = CnameAuthorizationState::default();
+        assert_eq!(bound_materialization_ttl(0, None), Some(1));
+        assert_eq!(
+            bound_materialization_ttl(0, Some(Duration::from_secs(20))),
+            Some(1)
+        );
         assert_eq!(bound_materialization_ttl(600, None), Some(300));
         assert_eq!(
             bound_materialization_ttl(300, Some(Duration::from_secs(20))),
