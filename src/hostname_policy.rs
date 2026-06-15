@@ -144,6 +144,7 @@ mod tests {
                 "github.com",
                 "api.github.com",
                 "release-assets.githubusercontent.com",
+                "hosted-compute-watchdog-prod-eus-01.githubapp.com",
                 "vstoken.actions.githubusercontent.com",
                 "pipelines.actions.githubusercontent.com",
                 "payload.pipelines.actions.githubusercontent.com",
@@ -160,6 +161,11 @@ mod tests {
         ));
 
         assert!(policy.exact_entry("github.com").is_none());
+        assert!(
+            policy
+                .exact_entry("hosted-compute-watchdog-prod-eus-01.githubapp.com")
+                .is_none()
+        );
         assert!(
             policy
                 .exact_entry("results-receiver.actions.githubusercontent.com")

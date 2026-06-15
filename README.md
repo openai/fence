@@ -23,10 +23,12 @@ That one line starts Fence in `block` mode with an empty user `allowlist`.
 Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs.
 
 By default, Fence allows the GitHub domains needed for Actions job reporting.
-It also allows `github.com`, `api.github.com`, and
-`release-assets.githubusercontent.com` so Fence can run before checkout and
-common setup steps. Those allowed GitHub domains are still places later
-workflow code can send data.
+It also allows `github.com`, `api.github.com`,
+`release-assets.githubusercontent.com`, and the exact GitHub-hosted runner
+watchdog endpoint so Fence can run before checkout and common setup steps
+without suppressing runner health traffic. Fence does not make readiness depend
+on that optional endpoint resolving before startup. Those allowed GitHub
+domains are still places later workflow code can send data.
 
 GitHub uploads job logs and summaries to a per-run Azure storage account.
 Fence authorizes at most four exact results-storage hostnames, and only when
@@ -189,10 +191,11 @@ The default GitHub allowlist is a usability tradeoff. It keeps normal GitHub
 Actions reporting, checkout, API, and release-asset flows working, but later
 workflow code can also send data to those allowed GitHub destinations. Set
 `disable_broad_github_domains: true` if you want to remove `github.com`,
-`api.github.com`, and `release-assets.githubusercontent.com` from the default
-allowlist. GitHub's exact runner-authorized results-storage account also
-becomes a reachable destination for the rest of the job; Fence records that
-authorization locally and limits it to TCP port `443`.
+`api.github.com`, `release-assets.githubusercontent.com`, and the exact hosted
+runner watchdog endpoint from the default allowlist. GitHub's exact
+runner-authorized results-storage account also becomes a reachable destination
+for the rest of the job; Fence records that authorization locally and limits it
+to TCP port `443`.
 
 Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support

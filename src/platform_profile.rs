@@ -7,21 +7,25 @@ pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN: &str =
     "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES: [&str; 1] =
     ["actions-results-receiver-production.githubapp.com"];
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 3] = [
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_BROAD_GITHUB_HOSTNAMES: [&str; 4] = [
     "github.com",
     "api.github.com",
     "release-assets.githubusercontent.com",
+    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
 ];
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_OPTIONAL_HOSTNAMES: [&str; 1] =
+    ["hosted-compute-watchdog-prod-eus-01.githubapp.com"];
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_CORE_ACTIONS_HOSTNAMES: [&str; 4] = [
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
     "results-receiver.actions.githubusercontent.com",
 ];
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES: [&str; 7] = [
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES: [&str; 8] = [
     "github.com",
     "api.github.com",
     "release-assets.githubusercontent.com",
+    "hosted-compute-watchdog-prod-eus-01.githubapp.com",
     "vstoken.actions.githubusercontent.com",
     "pipelines.actions.githubusercontent.com",
     "payload.pipelines.actions.githubusercontent.com",
@@ -69,6 +73,10 @@ pub fn github_hosted_workflow_bootstrap_hostnames(
     } else {
         GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES.to_vec()
     }
+}
+
+pub fn is_optional_github_hosted_workflow_bootstrap_hostname(hostname: &str) -> bool {
+    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_OPTIONAL_HOSTNAMES.contains(&hostname)
 }
 
 pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
@@ -134,6 +142,7 @@ mod tests {
                 "github.com",
                 "api.github.com",
                 "release-assets.githubusercontent.com",
+                "hosted-compute-watchdog-prod-eus-01.githubapp.com",
                 "vstoken.actions.githubusercontent.com",
                 "pipelines.actions.githubusercontent.com",
                 "payload.pipelines.actions.githubusercontent.com",
@@ -151,6 +160,12 @@ mod tests {
         assert_eq!(profile.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(profile.https_materialization_protocol, "tcp");
         assert_eq!(profile.https_materialization_port, 443);
+        assert!(is_optional_github_hosted_workflow_bootstrap_hostname(
+            "hosted-compute-watchdog-prod-eus-01.githubapp.com"
+        ));
+        assert!(!is_optional_github_hosted_workflow_bootstrap_hostname(
+            "github.com"
+        ));
         assert_eq!(
             opt_out.bootstrap_hostnames,
             [
