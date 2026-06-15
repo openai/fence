@@ -19,17 +19,16 @@ active until ephemeral runner teardown. It does not claim sandboxing, kernel
 isolation, or elimination of every exfiltration channel. The selected GitHub
 workflow-bootstrap profile and its bounded DNS mediation remain disclosed
 channels that later workflow code may use. The exact `github.com`,
-`api.github.com`, `release-assets.githubusercontent.com`, and
-`hosted-compute-watchdog-prod-eus-01.githubapp.com` HTTPS channels are
+`api.github.com`, `release-assets.githubusercontent.com`, the optional exact
+watchdog root, and up to eight single-label `*.githubapp.com` names are
 intentional compatibility exceptions by default. Workflows may set
-`disable_broad_github_domains: true` to remove those four broad GitHub roots
-while keeping core Actions status and finalization endpoints available. The
-watchdog endpoint is optional: a transient empty lookup does not block Fence
-readiness, but any later approved answer is still withheld until its TCP `443`
-rule is applied and verified.
-GitHub results-storage accounts are authorized separately: Fence accepts only a
-bounded exact hostname requested by the pinned `Runner.Worker` process and then
-materializes HTTPS access after verified firewall application.
+`disable_broad_github_domains: true` to remove those broad GitHub channels while
+keeping core Actions status and finalization endpoints available. GitHub
+results storage has one exact static compatibility root,
+`productionresultssa19.blob.core.windows.net`; Fence may additionally authorize
+at most four exact matching accounts requested by the pinned `Runner.Worker`
+process. Every approved answer remains withheld until its TCP `443` rule is
+applied and verified.
 
 ## Release Provenance
 
@@ -148,6 +147,13 @@ replacement, ambiguous ownership, Docker-originated requests, and ordinary
 workflow-process requests fail closed. The DNS answer remains withheld until
 TCP `443` access is atomically applied and structurally verified.
 
+The exact `productionresultssa19.blob.core.windows.net` account is a deliberate
+compatibility exception published in [GitHub's Actions domain
+inventory](https://api.github.com/meta). It is
+available without process attribution, while every other matching account
+continues to require the runner-bound authorization above. Fence does not allow
+the general Azure Blob suffix.
+
 ### Action child-process deadlines and dependency surface
 
 The Action launcher previously had no timeout for fixed privileged subprocess
@@ -163,15 +169,24 @@ compile TypeScript at workflow runtime. See Node's
 - Approved GitHub workflow-bootstrap DNS and HTTPS channels remain available to
   later workflow code and therefore remain possible exfiltration channels. By
   default this includes `github.com`, `api.github.com`,
-  `release-assets.githubusercontent.com`, and the exact hosted-runner watchdog
-  endpoint; `disable_broad_github_domains: true` removes those four broad roots
-  but retains core Actions status/finalization channels.
+  `release-assets.githubusercontent.com`, the optional exact watchdog root, and
+  up to eight single-label `*.githubapp.com` names;
+  `disable_broad_github_domains: true` removes those broad channels but retains
+  core Actions status/finalization channels.
+- The exact `productionresultssa19.blob.core.windows.net` account is always a
+  reachable TCP `443` compatibility channel. Other matching results-storage
+  accounts remain runner-authorized and bounded.
 - An exact GitHub results-storage account authorized for the pinned runner is
   also reachable by later workflow code at its resolved HTTPS addresses. Fence
   does not inspect signed URLs, credentials, or encrypted request content.
 - The fixed upstream DNS resolver remains a trusted platform dependency. Fence
   bounds, canonicalizes, and filters requests and validates response source and
   transaction identity, but does not add DNSSEC validation.
+- [Azure documents `168.63.129.16`](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
+  as its fixed platform virtual address for DNS, VM-agent, and health
+  communication. Fence permits only its root-resident DNS mediator to reach UDP
+  `53`; it does not grant later workflow code general access to Azure WireServer
+  TCP `80` or `32526`.
 - Untrusted workflow code can intentionally deny service to its own job. Fence
   bounds individual mediator and subprocess waits but does not claim local
   availability against malicious later steps.

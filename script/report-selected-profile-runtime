@@ -38,16 +38,16 @@ report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.arg
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 assert report["status"] == "selected_profile_runtime_test_only", report
-assert report["runtime_evidence_schema_version"] == 3, report
+assert report["runtime_evidence_schema_version"] == 4, report
 assert report["network_verification_status"] == "verified", report
 assert report["sudo_status"] == "disabled_verified", report
 assert report["container_status"] == "disabled_verified", report
 assert report["critical_findings"] == [], report
 assert dns["status"] == "selected_profile_runtime_test_only", dns
-assert dns["runtime_evidence_schema_version"] == 3, dns
-assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", report
-assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", dns
-assert report["policy_hash_schema_version"] == 5, report
+assert dns["runtime_evidence_schema_version"] == 4, dns
+assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", report
+assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", dns
+assert report["policy_hash_schema_version"] == 6, report
 assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
 assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report

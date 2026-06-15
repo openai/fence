@@ -54,13 +54,13 @@ pub enum ContainerPolicy {
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformProfile {
-    GithubHostedWorkflowBootstrapV2,
+    GithubHostedWorkflowBootstrapV3,
 }
 
 impl PlatformProfile {
     pub fn id(self) -> &'static str {
         match self {
-            Self::GithubHostedWorkflowBootstrapV2 => "github_hosted_workflow_bootstrap_v2",
+            Self::GithubHostedWorkflowBootstrapV3 => "github_hosted_workflow_bootstrap_v3",
         }
     }
 }
@@ -159,13 +159,13 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
     let platform_profile = match input
         .platform_profile
         .as_deref()
-        .unwrap_or("github_hosted_workflow_bootstrap_v2")
+        .unwrap_or("github_hosted_workflow_bootstrap_v3")
     {
-        "github_hosted_workflow_bootstrap_v2" => PlatformProfile::GithubHostedWorkflowBootstrapV2,
+        "github_hosted_workflow_bootstrap_v3" => PlatformProfile::GithubHostedWorkflowBootstrapV3,
         _ => {
             return Err(ErrorDetail::new(
                 "invalid_platform_profile",
-                "platform_profile must be github_hosted_workflow_bootstrap_v2",
+                "platform_profile must be github_hosted_workflow_bootstrap_v3",
             )
             .field("platform_profile"));
         }
@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(parsed.container_policy, Some(ContainerPolicy::Disable));
         assert_eq!(
             parsed.platform_profile,
-            PlatformProfile::GithubHostedWorkflowBootstrapV2
+            PlatformProfile::GithubHostedWorkflowBootstrapV3
         );
         assert!(!parsed.disable_broad_github_domains);
         assert!(parsed.requested_allowances.is_empty());
@@ -443,18 +443,18 @@ mod tests {
     #[test]
     fn accepts_explicit_selected_profile_audit_without_lockdown_degraded_block_and_broad_opt_out() {
         let audit = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_workflow_bootstrap_v2","disable_broad_github_domains":true,"allowlist":[]}"#,
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-1","platform_profile":"github_hosted_workflow_bootstrap_v3","disable_broad_github_domains":true,"allowlist":[]}"#,
         )
         .unwrap();
         let degraded = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_workflow_bootstrap_v2","container_policy":"unsafe_preserve","disable_broad_github_domains":false,"allowlist":[]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"block-1","platform_profile":"github_hosted_workflow_bootstrap_v3","container_policy":"unsafe_preserve","disable_broad_github_domains":false,"allowlist":[]}"#,
         )
         .unwrap();
 
         assert_eq!(audit.container_policy, None);
         assert_eq!(
             audit.platform_profile,
-            PlatformProfile::GithubHostedWorkflowBootstrapV2
+            PlatformProfile::GithubHostedWorkflowBootstrapV3
         );
         assert!(audit.disable_broad_github_domains);
         assert_eq!(
@@ -463,7 +463,7 @@ mod tests {
         );
         assert_eq!(
             degraded.platform_profile,
-            PlatformProfile::GithubHostedWorkflowBootstrapV2
+            PlatformProfile::GithubHostedWorkflowBootstrapV3
         );
         assert!(!degraded.disable_broad_github_domains);
     }
@@ -493,6 +493,11 @@ mod tests {
             ),
             (
                 br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"github_hosted_workflow_bootstrap_v1","allowlist":[]}"#
+                    .as_slice(),
+                "invalid_platform_profile",
+            ),
+            (
+                br#"{"schema_version":1,"mode":"block","invocation_id":"x","platform_profile":"github_hosted_workflow_bootstrap_v2","allowlist":[]}"#
                     .as_slice(),
                 "invalid_platform_profile",
             ),

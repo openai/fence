@@ -21,7 +21,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 5;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,7 +315,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV2 => Vec::new(),
+        PlatformProfile::GithubHostedWorkflowBootstrapV3 => Vec::new(),
     }
 }
 
@@ -355,7 +355,7 @@ fn platform_plan(
     frozen_resolution_results: Vec<ResolutionResult>,
 ) -> PlatformProfilePlan {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV2 => {
+        PlatformProfile::GithubHostedWorkflowBootstrapV3 => {
             let mut limitations = vec![
                 "dns_mediated_runtime_materialization_requires_trusted_launcher",
                 "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
@@ -370,8 +370,12 @@ fn platform_plan(
             ];
             if disable_broad_github_domains {
                 limitations.push("broad_github_compatibility_destinations_disabled");
+                limitations.push("dynamic_githubapp_suffix_authorization_disabled");
             } else {
                 limitations.push("broad_github_compatibility_destinations_remain_egress_channels");
+                limitations.push(
+                    "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation",
+                );
             }
             PlatformProfilePlan {
                 id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
@@ -600,7 +604,7 @@ mod tests {
         )
         .unwrap();
         let explicit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v2","allowlist":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v3","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
@@ -614,7 +618,7 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
-        assert_eq!(default.policy_hash_schema_version, 5);
+        assert_eq!(default.policy_hash_schema_version, 6);
         assert_eq!(
             default.platform_profile.id,
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
@@ -645,6 +649,16 @@ mod tests {
         );
         assert_eq!(dns.max_dynamic_actions_suffix_authorizations, 8);
         assert_eq!(dns.max_dynamic_actions_suffix_prefix_labels, 2);
+        assert_eq!(
+            dns.bounded_githubapp_suffix_pattern,
+            Some("*.githubapp.com")
+        );
+        assert_eq!(dns.max_dynamic_githubapp_suffix_authorizations, 8);
+        assert_eq!(dns.max_dynamic_githubapp_suffix_prefix_labels, 1);
+        assert!(
+            dns.exact_compatibility_hostnames
+                .contains(&"productionresultssa19.blob.core.windows.net")
+        );
         assert_eq!(dns.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(dns.https_materialization_port, 443);
         assert_eq!(default.policy_hash, explicit.policy_hash);
@@ -664,6 +678,7 @@ mod tests {
                 "results-receiver.actions.githubusercontent.com",
             ]
         );
+        assert_eq!(opt_out_dns.bounded_githubapp_suffix_pattern, None);
         assert_ne!(default.policy_hash, opt_out.policy_hash);
         assert_eq!(default.ruleset_hash, opt_out.ruleset_hash);
         assert!(
@@ -677,6 +692,17 @@ mod tests {
                 .platform_profile
                 .limitations
                 .contains(&"broad_github_compatibility_destinations_disabled")
+        );
+        assert!(
+            opt_out
+                .platform_profile
+                .limitations
+                .contains(&"dynamic_githubapp_suffix_authorization_disabled")
+        );
+        assert!(
+            !opt_out.platform_profile.limitations.contains(
+                &"bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation"
+            )
         );
     }
 

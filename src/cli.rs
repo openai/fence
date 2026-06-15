@@ -284,6 +284,10 @@ mod tests {
                 "broad-compatibility-profile.json",
                 "github_hosted_https_udp_dns_candidate_v1",
             ),
+            (
+                "retired-workflow-bootstrap-v2.json",
+                "github_hosted_workflow_bootstrap_v2",
+            ),
         ] {
             let config = root.join(name);
             std::fs::write(
@@ -336,7 +340,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_workflow_bootstrap_v2\"")
+                .contains("\"id\":\"github_hosted_workflow_bootstrap_v3\"")
         );
         assert!(
             output
