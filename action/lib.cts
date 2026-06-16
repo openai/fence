@@ -752,25 +752,29 @@ function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void
     Array.isArray(document) ||
     typeof document !== "object" ||
     !Array.isArray(document.filesystems) ||
-    document.filesystems.length !== 1
+    document.filesystems.length === 0 ||
+    document.filesystems.length > MAX_ACTION_PATH_GUARDS
   ) {
     fail("Fence protected Action mount evidence is incomplete");
   }
-  const mount = document.filesystems[0];
   if (
-    mount === null ||
-    Array.isArray(mount) ||
-    typeof mount !== "object" ||
-    mount.target !== expectedTarget ||
-    typeof mount.options !== "string"
+    document.filesystems.some((mount: any) =>
+      mount === null ||
+      Array.isArray(mount) ||
+      typeof mount !== "object" ||
+      mount.target !== expectedTarget ||
+      typeof mount.options !== "string"
+    )
   ) {
     fail("Fence protected Action mount does not match the registered runtime");
   }
-  const options = new Set(mount.options.split(","));
-  for (const required of ["ro", "nodev", "nosuid"]) {
-    if (!options.has(required)) {
-      fail(`Fence protected Action mount is missing ${required}`);
-    }
+  const requiredOptions = ["ro", "nodev", "nosuid"];
+  const hasProtectedMount = document.filesystems.some((mount: any) => {
+    const options = new Set(mount.options.split(","));
+    return requiredOptions.every((required) => options.has(required));
+  });
+  if (!hasProtectedMount) {
+    fail("Fence protected Action mount is missing required options");
   }
 }
 

@@ -568,6 +568,12 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
   validateReadOnlyActionMount(JSON.stringify({
     filesystems: [{ target, options: "ro,nosuid,nodev,relatime" }],
   }), target);
+  validateReadOnlyActionMount(JSON.stringify({
+    filesystems: [
+      { target, options: "rw,nosuid,nodev,relatime" },
+      { target, options: "ro,nosuid,nodev,relatime" },
+    ],
+  }), target);
   for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
     assert.throws(
       () => validateReadOnlyActionMount(JSON.stringify({
@@ -579,6 +585,15 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
   assert.throws(
     () => validateReadOnlyActionMount(JSON.stringify({
       filesystems: [{ target: "/different", options: "ro,nosuid,nodev" }],
+    }), target),
+    /does not match/,
+  );
+  assert.throws(
+    () => validateReadOnlyActionMount(JSON.stringify({
+      filesystems: [
+        { target, options: "ro,nosuid,nodev" },
+        { target: "/different", options: "ro,nosuid,nodev" },
+      ],
     }), target),
     /does not match/,
   );
