@@ -566,30 +566,60 @@ test("guards every renameable ancestor of the registered Action path", () => {
 test("requires the effective registered Action runtime mount to be read-only, nodev, and nosuid", () => {
   const target = "/opt/actions/fence/action";
   validateReadOnlyActionMount(JSON.stringify({
-    filesystems: [{ target, options: "ro,nosuid,nodev,relatime" }],
+    filesystems: [{ target, options: "ro,nosuid,nodev,relatime", id: 10, parent: 1 }],
   }), target);
-  for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
+  const stacked = Array.from({ length: 24 }, (_, index) => ({
+    target,
+    options: index === 23 ? "ro,nosuid,nodev,relatime" : "rw,relatime",
+    id: String(100 + index),
+    parent: String(index === 0 ? 1 : 99 + index),
+  }));
+  validateReadOnlyActionMount(JSON.stringify({ filesystems: stacked }), target);
+
+  for (const options of ["rw,nosuid,nodev", "ro,rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
     assert.throws(
       () => validateReadOnlyActionMount(JSON.stringify({
-        filesystems: [{ target, options }],
+        filesystems: [{ target, options, id: 10, parent: 1 }],
       }), target),
       /missing/,
     );
   }
   assert.throws(
     () => validateReadOnlyActionMount(JSON.stringify({
-      filesystems: [{ target: "/different", options: "ro,nosuid,nodev" }],
+      filesystems: [{
+        target: "/different",
+        options: "ro,nosuid,nodev",
+        id: 10,
+        parent: 1,
+      }],
     }), target),
     /does not match/,
   );
+  for (const filesystems of [
+    [
+      { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
+      { target, options: "ro,nosuid,nodev", id: 11, parent: 1 },
+    ],
+    [
+      { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
+      { target, options: "ro,nosuid,nodev", id: 10, parent: 10 },
+    ],
+    [{ target, options: "ro,nosuid,nodev", id: 10 }],
+    [],
+  ]) {
+    assert.throws(
+      () => validateReadOnlyActionMount(JSON.stringify({ filesystems }), target),
+      /incomplete/,
+    );
+  }
   assert.throws(
     () => validateReadOnlyActionMount(JSON.stringify({
       filesystems: [
-        { target, options: "ro,nosuid,nodev" },
-        { target, options: "ro,nosuid,nodev" },
+        { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
+        { target, options: "rw,nosuid,nodev", id: 11, parent: 10 },
       ],
     }), target),
-    /incomplete/,
+    /missing/,
   );
   assert.throws(() => validateReadOnlyActionMount("not-json", target), /malformed/);
 });
@@ -597,17 +627,38 @@ test("requires the effective registered Action runtime mount to be read-only, no
 test("requires effective registered Action path guards to remain exact writable mountpoints", () => {
   const target = "/srv/runner/work/project";
   validateActionPathGuardMount(JSON.stringify({
-    filesystems: [{ target, options: "rw,nosuid,nodev,relatime" }],
+    filesystems: [{ target, options: "rw,nosuid,nodev,relatime", id: 10, parent: 1 }],
+  }), target);
+  validateActionPathGuardMount(JSON.stringify({
+    filesystems: [
+      { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
+      { target, options: "rw,nosuid,nodev,relatime", id: 11, parent: 10 },
+    ],
   }), target);
   for (const evidence of [
-    { filesystems: [{ target, options: "ro,nosuid,nodev" }] },
-    { filesystems: [{ target: "/different", options: "rw,nosuid,nodev" }] },
+    { filesystems: [{ target, options: "ro,nosuid,nodev", id: 10, parent: 1 }] },
+    { filesystems: [{ target, options: "rw,ro,nosuid,nodev", id: 10, parent: 1 }] },
+    {
+      filesystems: [{
+        target: "/different",
+        options: "rw,nosuid,nodev",
+        id: 10,
+        parent: 1,
+      }],
+    },
     {
       filesystems: [
-        { target, options: "rw,nosuid,nodev" },
-        { target, options: "rw,nosuid,nodev" },
+        { target, options: "rw,nosuid,nodev", id: 10, parent: 1 },
+        { target, options: "rw,nosuid,nodev", id: 11, parent: 1 },
       ],
     },
+    {
+      filesystems: [
+        { target, options: "rw,nosuid,nodev", id: 10, parent: 1 },
+        { target, options: "ro,nosuid,nodev", id: 11, parent: 10 },
+      ],
+    },
+    { filesystems: [{ target, options: "rw,nosuid,nodev", id: 10 }] },
     { filesystems: [] },
   ]) {
     assert.throws(

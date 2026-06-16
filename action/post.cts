@@ -76,13 +76,11 @@ function captureMountEvidence(target: string, failureMessage: string): string {
     "/usr/bin/findmnt",
     [
       "--json",
-      "--direction",
-      "backward",
-      "--first-only",
+      "--list",
       "--mountpoint",
       target,
       "--output",
-      "TARGET,OPTIONS",
+      "TARGET,OPTIONS,ID,PARENT",
     ],
     {
       encoding: "utf8",

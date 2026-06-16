@@ -738,74 +738,92 @@ function validateProtectedActionRuntime(actionRoot: string): void {
 }
 
 function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void {
+  const mount = effectiveActionMount(raw, expectedTarget, "protected Action");
+  const options = new Set(mount.options.split(","));
+  if (
+    !options.has("ro") ||
+    options.has("rw") ||
+    !options.has("nodev") ||
+    !options.has("nosuid")
+  ) {
+    fail("Fence protected Action mount is missing required options");
+  }
+}
+
+function mountIdentifier(value: unknown, allowZero: boolean): string | undefined {
+  const identifier = typeof value === "number" && Number.isSafeInteger(value)
+    ? String(value)
+    : value;
+  if (
+    typeof identifier !== "string" ||
+    !/^(0|[1-9][0-9]*)$/.test(identifier) ||
+    (!allowZero && identifier === "0")
+  ) {
+    return undefined;
+  }
+  return identifier;
+}
+
+function effectiveActionMount(
+  raw: unknown,
+  expectedTarget: string,
+  description: string,
+): { options: string } {
   if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
-    fail("Fence protected Action mount evidence is unavailable");
+    fail(`Fence ${description} mount evidence is unavailable`);
   }
   let document: any;
   try {
     document = JSON.parse(raw);
   } catch {
-    fail("Fence protected Action mount evidence is malformed");
+    fail(`Fence ${description} mount evidence is malformed`);
   }
   if (
     document === null ||
     Array.isArray(document) ||
     typeof document !== "object" ||
     !Array.isArray(document.filesystems) ||
-    document.filesystems.length !== 1
+    document.filesystems.length === 0
   ) {
-    fail("Fence protected Action mount evidence is incomplete");
+    fail(`Fence ${description} mount evidence is incomplete`);
   }
-  if (
-    document.filesystems.some((mount: any) =>
+  const mounts = document.filesystems.map((mount: any) => {
+    const id = mountIdentifier(mount?.id, false);
+    const parent = mountIdentifier(mount?.parent, true);
+    if (
       mount === null ||
       Array.isArray(mount) ||
       typeof mount !== "object" ||
-      mount.target !== expectedTarget ||
-      typeof mount.options !== "string"
-    )
-  ) {
-    fail("Fence protected Action mount does not match the registered runtime");
-  }
-  const requiredOptions = ["ro", "nodev", "nosuid"];
-  const hasProtectedMount = document.filesystems.some((mount: any) => {
-    const options = new Set(mount.options.split(","));
-    return requiredOptions.every((required) => options.has(required));
+      Object.keys(mount).sort().join(",") !== "id,options,parent,target" ||
+      typeof mount.options !== "string" ||
+      id === undefined ||
+      parent === undefined
+    ) {
+      fail(`Fence ${description} mount evidence is incomplete`);
+    }
+    if (mount.target !== expectedTarget) {
+      fail(`Fence ${description} mount does not match the registered runtime`);
+    }
+    return { id, parent, options: mount.options };
   });
-  if (!hasProtectedMount) {
-    fail("Fence protected Action mount is missing required options");
+
+  const mountIds = new Set(mounts.map((mount) => mount.id));
+  if (mountIds.size !== mounts.length) {
+    fail(`Fence ${description} mount evidence is incomplete`);
   }
+  // In a same-target mount stack, every hidden layer is the parent of a newer layer.
+  const parentIds = new Set(mounts.map((mount) => mount.parent));
+  const effective = mounts.filter((mount) => !parentIds.has(mount.id));
+  if (effective.length !== 1) {
+    fail(`Fence ${description} mount evidence is incomplete`);
+  }
+  return effective[0];
 }
 
 function validateActionPathGuardMount(raw: unknown, expectedTarget: string): void {
-  if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
-    fail("Fence registered Action path guard mount evidence is unavailable");
-  }
-  let document: any;
-  try {
-    document = JSON.parse(raw);
-  } catch {
-    fail("Fence registered Action path guard mount evidence is malformed");
-  }
-  const mounts = document?.filesystems;
-  if (
-    !Array.isArray(mounts) ||
-    mounts.length !== 1 ||
-    mounts.some((mount) =>
-      mount === null ||
-      Array.isArray(mount) ||
-      typeof mount !== "object" ||
-      mount.target !== expectedTarget ||
-      typeof mount.options !== "string"
-    )
-  ) {
-    fail("Fence registered Action path guard mount does not match the protected runtime");
-  }
-  const hasWritableMount = mounts.some((mount) => {
-    const options = new Set(mount.options.split(","));
-    return options.has("rw") && !options.has("ro");
-  });
-  if (!hasWritableMount) {
+  const mount = effectiveActionMount(raw, expectedTarget, "registered Action path guard");
+  const options = new Set(mount.options.split(","));
+  if (!options.has("rw") || options.has("ro")) {
     fail("Fence registered Action path guard mount must remain writable");
   }
 }
