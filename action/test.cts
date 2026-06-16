@@ -590,9 +590,21 @@ test("requires registered Action path guards to remain exact writable mountpoint
   validateActionPathGuardMount(JSON.stringify({
     filesystems: [{ target, options: "rw,nosuid,nodev,relatime" }],
   }), target);
+  validateActionPathGuardMount(JSON.stringify({
+    filesystems: [
+      { target, options: "ro,nosuid,nodev,relatime" },
+      { target, options: "rw,nosuid,nodev,relatime" },
+    ],
+  }), target);
   for (const evidence of [
     { filesystems: [{ target, options: "ro,nosuid,nodev" }] },
     { filesystems: [{ target: "/different", options: "rw,nosuid,nodev" }] },
+    {
+      filesystems: [
+        { target, options: "rw,nosuid,nodev" },
+        { target: "/different", options: "rw,nosuid,nodev" },
+      ],
+    },
     { filesystems: [] },
   ]) {
     assert.throws(

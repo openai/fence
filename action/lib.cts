@@ -784,18 +784,26 @@ function validateActionPathGuardMount(raw: unknown, expectedTarget: string): voi
   } catch {
     fail("Fence registered Action path guard mount evidence is malformed");
   }
-  const mount = document?.filesystems?.length === 1 ? document.filesystems[0] : undefined;
+  const mounts = document?.filesystems;
   if (
-    mount === null ||
-    Array.isArray(mount) ||
-    typeof mount !== "object" ||
-    mount.target !== expectedTarget ||
-    typeof mount.options !== "string"
+    !Array.isArray(mounts) ||
+    mounts.length === 0 ||
+    mounts.length > MAX_ACTION_PATH_GUARDS ||
+    mounts.some((mount) =>
+      mount === null ||
+      Array.isArray(mount) ||
+      typeof mount !== "object" ||
+      mount.target !== expectedTarget ||
+      typeof mount.options !== "string"
+    )
   ) {
     fail("Fence registered Action path guard mount does not match the protected runtime");
   }
-  const options = new Set(mount.options.split(","));
-  if (!options.has("rw") || options.has("ro")) {
+  const hasWritableMount = mounts.some((mount) => {
+    const options = new Set(mount.options.split(","));
+    return options.has("rw") && !options.has("ro");
+  });
+  if (!hasWritableMount) {
     fail("Fence registered Action path guard mount must remain writable");
   }
 }
