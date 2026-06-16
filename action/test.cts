@@ -8,6 +8,7 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   ACTION_RUNTIME_FILES,
+  actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
@@ -574,6 +575,28 @@ test("parses only one bounded active mount identity", () => {
     "x".repeat(4097),
   ]) {
     assert.throws(() => mountIdFromFdInfo(fdInfo), /active mount identity/);
+  }
+});
+
+test("parses only the bounded active mount record", () => {
+  const target = "/opt/actions/fence action";
+  const mountInfo = "42 7 0:1 / /opt/actions/fence\\040action ro,nosuid,nodev shared:1 - ext4 /dev/root rw";
+  assert.deepEqual(
+    actionMountRecordFromMountInfo(mountInfo, target, "42"),
+    { target, options: "ro,nosuid,nodev", id: "42" },
+  );
+  for (const invalid of [
+    [mountInfo, target, "41"],
+    [mountInfo, "/different", "42"],
+    [mountInfo.replace("\\040", "\\777"), target, "42"],
+    [mountInfo.replace(" - ", " "), target, "42"],
+    [`${mountInfo}\n${mountInfo}`, target, "42"],
+    ["x".repeat(16 * 1024 + 1), target, "42"],
+  ]) {
+    assert.throws(
+      () => actionMountRecordFromMountInfo(invalid[0], invalid[1], invalid[2]),
+      /active mount record/,
+    );
   }
 });
 

@@ -7,11 +7,11 @@ const log = require("./log.cts");
 const {
   ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  activeActionMountEvidence,
   actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
   launcherIntegrityDocument,
-  mountIdFromFdInfo,
   nativeInputsFromEnvironment,
   readJsonBounded,
   readLauncherIntegrity,
@@ -97,14 +97,6 @@ function capture(
     stderr: String(result.stderr || ""),
     error: result.error ? result.error.message : undefined,
   };
-}
-
-function captureRequired(executable: string, args: string[]): string {
-  const result = capture(executable, args);
-  if (result.error || result.status !== 0) {
-    throw new Error(`${path.basename(executable)} could not verify protected Action state`);
-  }
-  return result.stdout;
 }
 
 function compactServiceStatus(output: string): string {
@@ -200,41 +192,6 @@ function createOrValidateRootDirectory(directory: string): void {
   assertRootDirectory(directory);
 }
 
-function mountEvidence(actionRoot: string): { raw: string; mountId: string } {
-  let descriptor: number;
-  try {
-    descriptor = fs.openSync(
-      actionRoot,
-      fs.constants.O_RDONLY |
-        fs.constants.O_DIRECTORY |
-        fs.constants.O_NOFOLLOW,
-    );
-  } catch {
-    throw new Error("Fence active Action mount could not be opened");
-  }
-  try {
-    let mountId: string;
-    try {
-      mountId = mountIdFromFdInfo(
-        fs.readFileSync(`/proc/self/fdinfo/${descriptor}`, "utf8"),
-      );
-    } catch {
-      throw new Error("Fence active Action mount could not be identified");
-    }
-    const raw = captureRequired("/usr/bin/findmnt", [
-      "--json",
-      "--list",
-      "--mountpoint",
-      actionRoot,
-      "--output",
-      "TARGET,OPTIONS,ID",
-    ]);
-    return { raw, mountId };
-  } finally {
-    fs.closeSync(descriptor);
-  }
-}
-
 function installProtectedActionRuntime(
   invocationId: string,
   paths: ReturnType<typeof runtimePaths>,
@@ -321,7 +278,7 @@ function installProtectedActionRuntime(
       guard.path,
     ]);
     protectedActionPathGuards.push(guard.path);
-    const evidence = mountEvidence(guard.path);
+    const evidence = activeActionMountEvidence(guard.path);
     validateActionPathGuardMount(evidence.raw, guard.path, evidence.mountId);
   }
 
@@ -339,7 +296,7 @@ function installProtectedActionRuntime(
     paths.launcherActionDirectory,
     ACTION_ROOT,
   ]);
-  const actionMount = mountEvidence(ACTION_ROOT);
+  const actionMount = activeActionMountEvidence(ACTION_ROOT);
   validateReadOnlyActionMount(actionMount.raw, ACTION_ROOT, actionMount.mountId);
   validateProtectedActionRuntime(ACTION_ROOT);
   const mountedFiles = actionRuntimeFileDigests(ACTION_ROOT);
@@ -353,7 +310,7 @@ function installProtectedActionRuntime(
     mountedPathGuards,
   );
   for (const guard of mountedPathGuards) {
-    const evidence = mountEvidence(guard.path);
+    const evidence = activeActionMountEvidence(guard.path);
     validateActionPathGuardMount(evidence.raw, guard.path, evidence.mountId);
   }
   validateBundle(MANIFEST, BINARY);

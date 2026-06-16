@@ -127,6 +127,8 @@ const ACTION_RUNTIME_FILES = [
 const MAX_ACTION_RUNTIME_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_ACTION_PATH_GUARDS = 16;
 const MAX_ACTION_PATH_ANCESTORS = 64;
+const MAX_ACTION_MOUNTINFO_BYTES = 4 * 1024 * 1024;
+const MAX_ACTION_MOUNTINFO_RECORD_BYTES = 16 * 1024;
 const REPORT_STATUSES = new Set([
   "protected_host_block",
   "protected_host_block_degraded",
@@ -783,6 +785,120 @@ function mountIdFromFdInfo(raw: unknown): string {
     fail("Fence active mount identity is unavailable");
   }
   return mountIds[0];
+}
+
+function mountInfoRecordForId(mountId: string): string {
+  const descriptor = fs.openSync(
+    "/proc/self/mountinfo",
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+  );
+  try {
+    const chunks: Buffer[] = [];
+    const chunk = Buffer.alloc(16 * 1024);
+    let totalBytes = 0;
+    while (true) {
+      const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      totalBytes += bytesRead;
+      if (totalBytes > MAX_ACTION_MOUNTINFO_BYTES) {
+        fail("Fence active mount table is unavailable");
+      }
+      chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
+    }
+    const matching = Buffer.concat(chunks, totalBytes)
+      .toString("utf8")
+      .split("\n")
+      .filter((line) => line.startsWith(`${mountId} `));
+    if (matching.length !== 1) {
+      fail("Fence active mount table is unavailable");
+    }
+    return matching[0];
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function decodeMountInfoPath(encoded: string): string {
+  if (encoded.replace(/\\(?:011|012|040|134)/g, "").includes("\\")) {
+    fail("Fence active mount record is malformed");
+  }
+  return encoded.replace(
+    /\\(011|012|040|134)/g,
+    (_escape, octal) => String.fromCharCode(Number.parseInt(octal, 8)),
+  );
+}
+
+function actionMountRecordFromMountInfo(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+): { target: string; options: string; id: string } {
+  if (
+    typeof raw !== "string" ||
+    Buffer.byteLength(raw, "utf8") > MAX_ACTION_MOUNTINFO_RECORD_BYTES ||
+    raw.length === 0 ||
+    raw.includes("\n") ||
+    raw.includes("\r")
+  ) {
+    fail("Fence active mount record is unavailable");
+  }
+  const fields = raw.split(" ");
+  const separator = fields.indexOf("-", 6);
+  const mountId = mountIdentifier(fields[0]);
+  if (
+    mountId === undefined ||
+    mountId !== expectedMountId ||
+    !/^[0-9]+:[0-9]+$/.test(fields[2] || "") ||
+    separator < 6 ||
+    fields.length < separator + 4 ||
+    !fields[5]
+  ) {
+    fail("Fence active mount record is malformed");
+  }
+  const target = decodeMountInfoPath(fields[4]);
+  if (target !== expectedTarget) {
+    fail("Fence active mount record does not match the registered runtime");
+  }
+  return { target, options: fields[5], id: mountId };
+}
+
+function activeActionMountEvidence(
+  target: string,
+): { raw: string; mountId: string } {
+  if (!path.isAbsolute(target) || path.normalize(target) !== target) {
+    fail("Fence active Action mount target is invalid");
+  }
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(
+      target,
+      fs.constants.O_RDONLY |
+        fs.constants.O_DIRECTORY |
+        fs.constants.O_NOFOLLOW,
+    );
+  } catch {
+    fail("Fence active Action mount evidence is unavailable");
+  }
+  try {
+    const mountId = mountIdFromFdInfo(
+      fs.readFileSync(`/proc/self/fdinfo/${descriptor}`, "utf8"),
+    );
+    const record = actionMountRecordFromMountInfo(
+      mountInfoRecordForId(mountId),
+      target,
+      mountId,
+    );
+    return {
+      raw: JSON.stringify({ filesystems: [record] }),
+      mountId,
+    };
+  } catch {
+    fail("Fence active Action mount evidence is unavailable");
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 function effectiveActionMount(
@@ -1820,6 +1936,8 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 module.exports = {
   ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  activeActionMountEvidence,
+  actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
