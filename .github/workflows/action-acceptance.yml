@@ -126,7 +126,7 @@ jobs:
         run: script/test-action-setup-failure
 
   tamper:
-    name: action post-ready tamper evidence
+    name: action registered-path and post-ready tamper evidence
     timeout-minutes: 5
     runs-on: ubuntu-24.04
 
@@ -145,7 +145,7 @@ jobs:
       - name: test Action wrapper
         run: script/test-action-wrapper
 
-      - name: fail the post hook on post-ready drift
+      - name: deny registered-path replacement and fail the post hook on drift
         run: script/test-action-tamper
 
   action-finalization:
@@ -200,8 +200,27 @@ jobs:
   acceptance:
     name: action acceptance
     needs: [action, zero-input, setup-failure, tamper, verify-action-finalization]
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-24.04
 
     steps:
       - name: confirm bundled Action acceptance
-        run: echo "bundled Action acceptance passed"
+        env:
+          ACTION_RESULT: ${{ needs.action.result }}
+          ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}
+          SETUP_FAILURE_RESULT: ${{ needs.setup-failure.result }}
+          TAMPER_RESULT: ${{ needs.tamper.result }}
+          FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}
+        run: |
+          for result in \
+            "$ACTION_RESULT" \
+            "$ZERO_INPUT_RESULT" \
+            "$SETUP_FAILURE_RESULT" \
+            "$TAMPER_RESULT" \
+            "$FINALIZATION_RESULT"
+          do
+            if [[ "$result" != "success" ]]; then
+              exit 1
+            fi
+          done
+          echo "bundled Action acceptance passed"

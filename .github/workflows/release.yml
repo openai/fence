@@ -300,10 +300,37 @@ jobs:
           REPO: ${{ github.event.repository.name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
 
           tag="$RELEASE_TAG"
+          release_metadata="$(gh release view "$tag" --repo "${OWNER}/${REPO}" --json tagName,targetCommitish,isPrerelease,isDraft,isImmutable)"
+          python3 - "$tag" "$SOURCE_COMMIT" "$release_metadata" <<'PY'
+          import json
+          import re
+          import sys
+
+          tag, source_commit, raw_release = sys.argv[1:]
+          release = json.loads(raw_release)
+          if release["tagName"] != tag:
+              raise SystemExit("published release tag mismatch")
+          if release["targetCommitish"] != source_commit or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+              raise SystemExit("published release source commit mismatch")
+          if release["isDraft"] is not False:
+              raise SystemExit("published release must not be a draft")
+          if release["isImmutable"] is not True:
+              raise SystemExit("published release must be immutable")
+          if release["isPrerelease"] is not ("-" in tag):
+              raise SystemExit("published release channel mismatch")
+          PY
+
+          tag_commit="$(gh api "repos/${OWNER}/${REPO}/commits/${tag}" --jq '.sha')"
+          if [[ "$tag_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "published release tag does not resolve to the source commit" >&2
+            exit 1
+          fi
+
           rm -rf release-download
           mkdir -p release-download
           gh release download "$tag" --repo "${OWNER}/${REPO}" --dir release-download
@@ -319,7 +346,14 @@ jobs:
 
           find release-download -type f ! -name checksums.txt -print0 | while IFS= read -r -d '' file; do
             echo "Verifying file: $file"
-            gh attestation verify "$file" --repo "${OWNER}/${REPO}" --signer-workflow "${OWNER}/${REPO}/.github/workflows/release.yml"
+            gh attestation verify \
+              "$file" \
+              --repo "${OWNER}/${REPO}" \
+              --signer-workflow "${OWNER}/${REPO}/.github/workflows/release.yml" \
+              --signer-digest "$SOURCE_COMMIT" \
+              --source-digest "$SOURCE_COMMIT" \
+              --source-ref refs/heads/main \
+              --deny-self-hosted-runners >/dev/null
           done
 
   release-summary:

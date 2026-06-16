@@ -67,7 +67,16 @@ assert_action_runtime_immutable() {
     fi
   done
   rm -f "$replacement"
-  python3 - "$launcher_integrity" <<'PY'
+  python3 -E - "$launcher_integrity" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import stat
@@ -75,15 +84,29 @@ import sys
 
 integrity_path = pathlib.Path(sys.argv[1])
 metadata = integrity_path.stat()
-assert stat.S_IMODE(metadata.st_mode) == 0o444, oct(stat.S_IMODE(metadata.st_mode))
-assert metadata.st_uid == 0, metadata.st_uid
+require(stat.S_IMODE(metadata.st_mode) == 0o444)
+require(metadata.st_uid == 0)
 integrity = json.loads(integrity_path.read_text(encoding="utf-8"))
-assert integrity["schema_version"] == 1, integrity
-assert len(integrity["files"]) == 6, integrity
+require(integrity["schema_version"] == 2)
+require(len(integrity["files"]) == 6)
+require(1 <= len(integrity["path_guards"]) <= 16)
+for guard in integrity["path_guards"]:
+    require(set(guard) == {"path", "device", "inode"})
+    require(guard["device"].isdigit())
+    require(guard["inode"].isdigit())
 PY
 }
 
-python3 - "$scenario" "$report" "$dns_report" "$ready" "action/bundle-manifest.json" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" "$ready" "action/bundle-manifest.json" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import sys
@@ -100,16 +123,16 @@ expected_workers = [
 
 def assert_resident_health(document, expected_pid=None, minimum_sequence=1):
     health = document["resident_health"]
-    assert health["status"] == "healthy", health
-    assert isinstance(health["resident_pid"], int) and health["resident_pid"] > 0, health
+    require(health["status"] == "healthy")
+    require(isinstance(health["resident_pid"], int) and health["resident_pid"] > 0)
     if expected_pid is not None:
-        assert health["resident_pid"] == expected_pid, health
-    assert health["verification_sequence"] >= minimum_sequence, health
-    assert health["verification_interval_seconds"] == 5, health
+        require(health["resident_pid"] == expected_pid)
+    require(health["verification_sequence"] >= minimum_sequence)
+    require(health["verification_interval_seconds"] == 5)
     verified_at = health["last_successful_verification_unix_milliseconds"]
     now = int(time.time() * 1000)
-    assert now - 20_000 <= verified_at <= now + 5_000, health
-    assert health["workers"] == expected_workers, health
+    require(now - 20_000 <= verified_at <= now + 5_000)
+    require(health["workers"] == expected_workers)
     return health["resident_pid"]
 
 scenario = sys.argv[1]
@@ -125,50 +148,55 @@ report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-assert manifest["schema_version"] == 2, manifest
-assert manifest["release_channel"] == "stable", manifest
-assert report["mode"] == mode, report
-assert report["status"] == status, report
-assert report["setup_status"] == resident, report
-assert report["readiness_status"] == readiness, report
-assert report["protection_available"] is protection, report
-assert report["sudo_status"] == sudo_status, report
-assert report["container_status"] == container_status, report
-assert report["network_verification_status"] == "verified", report
-assert report["critical_findings"] == [], report
-assert ready["status"] == readiness, ready
-assert dns["routing_status"] == "active", dns
-assert report["runtime_evidence_schema_version"] == 3, report
-assert report["policy_hash_schema_version"] == 5, report
-assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", report
-assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", report
-assert ready["runtime_evidence_schema_version"] == 3, ready
-assert ready["policy_hash_schema_version"] == 5, ready
-assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", ready
-assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", ready
-assert dns["runtime_evidence_schema_version"] == 3, dns
-assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2", dns
-assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2", dns
-assert dns["host_dns_routing"] == "direct_client_to_root_resident_mediator", dns
-assert dns["docker_dns_routing"] == "local_root_resident_mediator", dns
-assert len(dns["runner_authorized_results_storage"]) <= 4, dns
-assert dns["results_storage_authorization_count"] == len(dns["runner_authorized_results_storage"]), dns
-assert dns["results_storage_attribution_failures"] == 0, dns
-assert dns["results_storage_request_rejections"] == 0, dns
-assert dns["runner_authorized_results_storage_truncated"] is False, dns
-assert all(
+require(manifest["schema_version"] == 3)
+require(manifest["release_is_draft"] is False)
+require(manifest["release_is_immutable"] is True)
+require(manifest["release_tag_commit"] == manifest["source_commit"])
+require(manifest["source_ref"] == "refs/heads/main")
+require(manifest["signer_digest"] == manifest["source_commit"])
+require(manifest["release_channel"] == "stable")
+require(report["mode"] == mode)
+require(report["status"] == status)
+require(report["setup_status"] == resident)
+require(report["readiness_status"] == readiness)
+require(report["protection_available"] is protection)
+require(report["sudo_status"] == sudo_status)
+require(report["container_status"] == container_status)
+require(report["network_verification_status"] == "verified")
+require(report["critical_findings"] == [])
+require(ready["status"] == readiness)
+require(dns["routing_status"] == "active")
+require(report["runtime_evidence_schema_version"] == 3)
+require(report["policy_hash_schema_version"] == 5)
+require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2")
+require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2")
+require(ready["runtime_evidence_schema_version"] == 3)
+require(ready["policy_hash_schema_version"] == 5)
+require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2")
+require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2")
+require(dns["runtime_evidence_schema_version"] == 3)
+require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v2")
+require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v2")
+require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
+require(dns["docker_dns_routing"] == "local_root_resident_mediator")
+require(len(dns["runner_authorized_results_storage"]) <= 4)
+require(dns["results_storage_authorization_count"] == len(dns["runner_authorized_results_storage"]))
+require(dns["results_storage_attribution_failures"] == 0)
+require(dns["results_storage_request_rejections"] == 0)
+require(dns["runner_authorized_results_storage_truncated"] is False)
+require(all(
     item["authorization_origin"] == "pinned_runner_worker_dns"
     for item in dns["runner_authorized_results_storage"]
-), dns
+))
 resident_pid = assert_resident_health(report)
 assert_resident_health(ready, resident_pid)
 assert_resident_health(dns, resident_pid)
 broad_roots = {"github.com", "api.github.com", "release-assets.githubusercontent.com"}
 bootstrap_roots = set(dns["bootstrap_hostnames"])
 if scenario == "standard-opt-out":
-    assert broad_roots.isdisjoint(bootstrap_roots), dns
+    require(broad_roots.isdisjoint(bootstrap_roots))
 else:
-    assert broad_roots.issubset(bootstrap_roots), dns
+    require(broad_roots.issubset(bootstrap_roots))
 PY
 
 case "$scenario" in
@@ -193,7 +221,7 @@ case "$scenario" in
 esac
 
 if [[ "$scenario" == "audit" ]]; then
-  python3 <<'PY'
+  python3 -E <<'PY'
 import socket
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -207,7 +235,16 @@ if [[ "$scenario" == "standard" ]]; then
 fi
 
 sleep 6
-python3 - "$scenario" "$report" "$dns_report" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import sys
@@ -225,41 +262,41 @@ scenario = sys.argv[1]
 report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-assert report["runtime_evidence_schema_version"] == 3, report
-assert report["policy_hash_schema_version"] == 5, report
-assert report["network_verification_status"] == "verified", report
-assert report["critical_findings"] == [], report
+require(report["runtime_evidence_schema_version"] == 3)
+require(report["policy_hash_schema_version"] == 5)
+require(report["network_verification_status"] == "verified")
+require(report["critical_findings"] == [])
 resident = report["resident_health"]
-assert resident["status"] == "healthy", resident
-assert resident["verification_sequence"] >= 2, resident
-assert resident["verification_interval_seconds"] == 5, resident
-assert resident["workers"] == expected_workers, resident
+require(resident["status"] == "healthy")
+require(resident["verification_sequence"] >= 2)
+require(resident["verification_interval_seconds"] == 5)
+require(resident["workers"] == expected_workers)
 verified_at = resident["last_successful_verification_unix_milliseconds"]
 now = int(time.time() * 1000)
-assert now - 20_000 <= verified_at <= now + 5_000, resident
-assert dns["runtime_evidence_schema_version"] == 3, dns
-assert dns["resident_health"]["resident_pid"] == resident["resident_pid"], dns
-assert dns["resident_health"]["workers"] == expected_workers, dns
-assert dns["resident_health"]["verification_sequence"] >= 2, dns
-assert "fence-action-audit-probe" not in json.dumps(report, sort_keys=True), report
-assert "fence-action-audit-probe" not in json.dumps(dns, sort_keys=True), dns
+require(now - 20_000 <= verified_at <= now + 5_000)
+require(dns["runtime_evidence_schema_version"] == 3)
+require(dns["resident_health"]["resident_pid"] == resident["resident_pid"])
+require(dns["resident_health"]["workers"] == expected_workers)
+require(dns["resident_health"]["verification_sequence"] >= 2)
+require("fence-action-audit-probe" not in json.dumps(report, sort_keys=True))
+require("fence-action-audit-probe" not in json.dumps(dns, sort_keys=True))
 if scenario == "audit":
-    assert report["counters"]["total_violations"] >= 1, report
-    assert report["counters"]["sampled_violations"] >= 1, report
-    assert any(item["classification"] == "would_block" for item in report["findings"]), report
-    assert dns["excluded_unretained_query_count"] == 0, dns
-    assert any(
+    require(report["counters"]["total_violations"] >= 1)
+    require(report["counters"]["sampled_violations"] >= 1)
+    require(any(item["classification"] == "would_block" for item in report["findings"]))
+    require(dns["excluded_unretained_query_count"] == 0)
+    require(any(
         item["hostname"] == "www.google.com"
         and item["policy_classification"] == "outside_policy"
         and item["query_type"] in {"a", "aaaa"}
         for item in dns["observations"]
-    ), dns
-    assert any(
+    ))
+    require(any(
         item["classification"] == "would_block"
         and item["protocol"] == "tcp"
         and item["remote_port"] == 443
         for item in report["findings"]
-    ), report
+    ))
 PY
 
 echo -e "${GREEN}Action acceptance verified:${OFF} $scenario"

@@ -1,0 +1,135 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/rust-dist.bash"
+
+require_cmd python3
+
+tmpdir="$(make_temp_dir fence-rust-preparation-test)"
+cleanup() {
+  remove_generated_path "$tmpdir" "Rust preparation test directory"
+}
+trap cleanup EXIT
+
+fixture_root="$tmpdir/source"
+mirror_root="$tmpdir/mirror"
+lockfile="$tmpdir/rust-toolchain.lock.toml"
+mkdir -p "$fixture_root"
+
+write_fixture() {
+  local name="$1"
+  printf 'fixture:%s\n' "$name" > "$fixture_root/$name"
+}
+
+write_entry() {
+  local kind="$1"
+  local component="$2"
+  local target="$3"
+  local name="$4"
+  local checksum
+  checksum="$(sha256_file "$fixture_root/$name")"
+  {
+    echo
+    echo '[[artifacts]]'
+    echo "kind = \"$kind\""
+    echo "component = \"$component\""
+    echo "target = \"$target\""
+    echo "url = \"https://static.rust-lang.org/dist/2099-01-01/$name\""
+    echo "sha256 = \"$checksum\""
+  } >> "$lockfile"
+}
+
+host="x86_64-unknown-linux-gnu"
+extra_target="aarch64-unknown-linux-gnu"
+manifest_name="channel-rust-1.0.0.toml"
+write_fixture "$manifest_name"
+for component in "${RUST_DIST_HOST_COMPONENTS[@]}"; do
+  write_fixture "${component}-${host}.tar.xz"
+done
+write_fixture "rust-std-${host}.tar.xz"
+write_fixture "rust-std-${extra_target}.tar.xz"
+
+manifest_checksum="$(sha256_file "$fixture_root/$manifest_name")"
+{
+  echo '[rust]'
+  echo 'version = "1.0.0"'
+  echo "manifest_url = \"https://static.rust-lang.org/dist/$manifest_name\""
+  echo "manifest_sha256 = \"$manifest_checksum\""
+} > "$lockfile"
+
+for component in "${RUST_DIST_HOST_COMPONENTS[@]}"; do
+  write_entry host "$component" "$host" "${component}-${host}.tar.xz"
+done
+write_entry target rust-std "$host" "rust-std-${host}.tar.xz"
+write_entry target rust-std "$extra_target" "rust-std-${extra_target}.tar.xz"
+
+fetch() {
+  local url="$1"
+  local destination="$2"
+  if [[ -n "${FETCH_MARKER:-}" ]]; then
+    : > "$FETCH_MARKER"
+  fi
+  mkdir -p "$(dirname "$destination")"
+  cp "$fixture_root/${url##*/}" "$destination"
+}
+
+rust_dist_prepare_verified_mirror "$lockfile" "$host" "$extra_target" "$mirror_root"
+[[ -f "$mirror_root/dist/$manifest_name" ]] || die "verified mirror omitted the channel manifest"
+[[ -f "$mirror_root/dist/${manifest_name}.sha256" ]] || die "verified mirror omitted the channel checksum"
+for component in "${RUST_DIST_HOST_COMPONENTS[@]}"; do
+  [[ -f "$mirror_root/dist/2099-01-01/${component}-${host}.tar.xz" ]] || die "verified mirror omitted a host component"
+done
+[[ -f "$mirror_root/dist/2099-01-01/rust-std-${host}.tar.xz" ]] || die "verified mirror omitted the host standard library"
+[[ -f "$mirror_root/dist/2099-01-01/rust-std-${extra_target}.tar.xz" ]] || die "verified mirror omitted a requested target"
+
+fetch_marker="$tmpdir/unexpected-fetch"
+if (FETCH_MARKER="$fetch_marker" rust_dist_prepare_verified_mirror "$lockfile" "$host" "unlisted-target" "$tmpdir/rejected-mirror") >/dev/null 2>&1; then
+  die "unlisted Rust target unexpectedly prepared"
+fi
+[[ ! -e "$fetch_marker" ]] || die "unlisted Rust target was rejected after network access"
+
+printf 'tampered\n' > "$fixture_root/rustc-${host}.tar.xz"
+if (rust_dist_prepare_verified_mirror "$lockfile" "$host" "" "$tmpdir/tampered-mirror") >/dev/null 2>&1; then
+  die "modified Rust artifact unexpectedly prepared"
+fi
+
+capture="$tmpdir/rustup-environment"
+fake_bin="$tmpdir/bin"
+mkdir -p "$fake_bin"
+{
+  echo '#! /usr/bin/env bash'
+  echo 'set -euo pipefail'
+  echo '{'
+  echo '  echo "args=$*"'
+  echo '  echo "dist=${RUSTUP_DIST_SERVER:-missing}"'
+  echo '  echo "update=${RUSTUP_UPDATE_ROOT:-missing}"'
+  echo '  echo "legacy=${RUSTUP_DIST_ROOT-unset}"'
+  echo '  echo "toolchain=${RUSTUP_TOOLCHAIN-unset}"'
+  echo '  echo "offline=${RUSTUP_OFFLINE-unset}"'
+  echo '  echo "proxy=${HTTPS_PROXY-unset}"'
+  echo '} >> "$RUSTUP_TEST_CAPTURE"'
+} > "$fake_bin/rustup"
+chmod +x "$fake_bin/rustup"
+RUSTUP_DIST_SERVER="https://example.com/untrusted" \
+RUSTUP_UPDATE_ROOT="https://example.com/untrusted" \
+RUSTUP_DIST_ROOT="https://example.com/untrusted" \
+RUSTUP_TOOLCHAIN="untrusted" \
+RUSTUP_OFFLINE=1 \
+HTTPS_PROXY="https://example.com/untrusted" \
+RUSTUP_TEST_CAPTURE="$capture" \
+PATH="$fake_bin:$PATH" \
+  rust_dist_install_from_verified_mirror "$mirror_root" "1.0.0-${host}" toolchain install "1.0.0-${host}" --no-self-update
+
+[[ "$(grep -c '^args=' "$capture")" -eq 2 ]] || die "rustup preparation did not perform exactly one replacement and installation"
+grep -Fxq "args=toolchain uninstall 1.0.0-${host}" "$capture" || die "rustup did not remove the existing host toolchain before installation"
+grep -Fxq "args=toolchain install 1.0.0-${host} --no-self-update" "$capture" || die "rustup installation did not pin the host or disable self-update"
+[[ "$(grep -Ec '^dist=http://127[.]0[.]0[.]1:[0-9]+$' "$capture")" -eq 2 ]] || die "rustup did not use the verified loopback mirror"
+[[ "$(grep -Ec '^update=http://127[.]0[.]0[.]1:[0-9]+/rustup$' "$capture")" -eq 2 ]] || die "rustup update root was not isolated"
+[[ "$(grep -c '^legacy=unset$' "$capture")" -eq 2 ]] || die "legacy Rust distribution override was preserved"
+[[ "$(grep -c '^toolchain=unset$' "$capture")" -eq 2 ]] || die "Rust toolchain override was preserved"
+[[ "$(grep -c '^offline=unset$' "$capture")" -eq 2 ]] || die "Rust offline override was preserved"
+[[ "$(grep -c '^proxy=unset$' "$capture")" -eq 2 ]] || die "proxy override was preserved for loopback installation"
+
+echo -e "${GREEN}Rust preparation checks passed${OFF}"

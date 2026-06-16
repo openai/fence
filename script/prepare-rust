@@ -3,6 +3,7 @@
 set -euo pipefail
 
 source script/env "$@"
+source "$DIR/script/lib/rust-dist.bash"
 
 expected="$(rust_toolchain_version)"
 if [[ -z "$expected" ]]; then
@@ -10,15 +11,19 @@ if [[ -z "$expected" ]]; then
 fi
 
 require_cmd rustup
+require_cmd python3
 
+toolchain="${expected}-${RUST_HOST_TRIPLE}"
+export RUSTUP_TOOLCHAIN="$toolchain"
+targets_csv="${PREPARE_RUST_TARGETS:-${VERIFY_RUST_TARGETS:-}}"
+rust_dist_require_install_selection "$RUST_TOOLCHAIN_LOCK" "$RUST_HOST_TRIPLE" "$targets_csv"
 script/validate-rust-toolchain --ci
 
 # This script is the intentional online Rust preparation path.
 unset CARGO_NET_OFFLINE
 unset RUSTUP_OFFLINE
 
-install_args=(toolchain install "$expected" --profile minimal --component rustfmt --component clippy --component llvm-tools-preview)
-targets_csv="${PREPARE_RUST_TARGETS:-${VERIFY_RUST_TARGETS:-}}"
+install_args=(toolchain install "$toolchain" --no-self-update --profile minimal --component rustfmt --component clippy --component llvm-tools-preview)
 if [[ -n "$targets_csv" ]]; then
   IFS=',' read -r -a targets <<< "$targets_csv"
   for target in "${targets[@]}"; do
@@ -28,7 +33,20 @@ if [[ -n "$targets_csv" ]]; then
 fi
 
 echo -e "${BLUE}Preparing Rust toolchain:${OFF} ${PURPLE}${expected}${OFF}"
-rustup "${install_args[@]}"
+mirror_tmp="$(make_temp_dir fence-rust-mirror)"
+cleanup() {
+  remove_generated_path "$mirror_tmp" "verified Rust distribution mirror"
+  if [[ -e "${mirror_tmp}.port" ]]; then
+    remove_generated_path "${mirror_tmp}.port" "verified Rust distribution mirror port file"
+  fi
+  if [[ -e "${mirror_tmp}.server.log" ]]; then
+    remove_generated_path "${mirror_tmp}.server.log" "verified Rust distribution mirror server log"
+  fi
+}
+trap cleanup EXIT
+
+rust_dist_prepare_verified_mirror "$RUST_TOOLCHAIN_LOCK" "$RUST_HOST_TRIPLE" "$targets_csv" "$mirror_tmp"
+rust_dist_install_from_verified_mirror "$mirror_tmp" "$toolchain" "${install_args[@]}"
 
 refresh_rust_version
 ensure_rust_toolchain

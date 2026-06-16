@@ -8,3 +8,4 @@ require_cmd node
 
 node -e 'require("./action/lib.cts"); require("./action/main.cts"); require("./action/post.cts")'
 node --test action/test.cts
+script/test-action-bundle-provenance

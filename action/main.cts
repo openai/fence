@@ -7,6 +7,7 @@ const log = require("./log.cts");
 const {
   ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
   launcherIntegrityDocument,
@@ -15,6 +16,7 @@ const {
   readLauncherIntegrity,
   runtimePaths,
   validateBundle,
+  validateActionPathGuardMount,
   validateInlineConfig,
   validateLauncherIntegrity,
   validateProtectedActionRuntime,
@@ -39,6 +41,7 @@ let diagnosticPaths: { unit: string } | undefined;
 let serviceLaunchAttempted = false;
 let serviceLaunchSucceeded = false;
 let launcherPaths: ReturnType<typeof runtimePaths> | undefined;
+let protectedActionPathGuards: string[] = [];
 let protectedActionMounted = false;
 let readinessObserved = false;
 let runtimeDirectoryCreated = false;
@@ -254,11 +257,13 @@ function installProtectedActionRuntime(
   if (actionRuntimeDigest(sourceFiles) !== actionRuntimeDigest(protectedFiles)) {
     throw new Error("Fence protected Action copy does not match the registered runtime");
   }
+  const pathGuards = actionPathGuardIdentities(ACTION_ROOT);
   const integrity = launcherIntegrityDocument(
     invocationId,
     ACTION_ROOT,
     paths.launcherActionDirectory,
     protectedFiles,
+    pathGuards,
   );
   run("/usr/bin/sudo", [
     "/usr/bin/install",
@@ -279,7 +284,19 @@ function installProtectedActionRuntime(
     ACTION_ROOT,
     paths.launcherActionDirectory,
     protectedFiles,
+    pathGuards,
   );
+
+  for (const guard of pathGuards) {
+    run("/usr/bin/sudo", [
+      "/usr/bin/mount",
+      "--bind",
+      guard.path,
+      guard.path,
+    ]);
+    protectedActionPathGuards.push(guard.path);
+    validateActionPathGuardMount(mountEvidence(guard.path), guard.path);
+  }
 
   run("/usr/bin/sudo", [
     "/usr/bin/mount",
@@ -298,18 +315,23 @@ function installProtectedActionRuntime(
   validateReadOnlyActionMount(mountEvidence(ACTION_ROOT), ACTION_ROOT);
   validateProtectedActionRuntime(ACTION_ROOT);
   const mountedFiles = actionRuntimeFileDigests(ACTION_ROOT);
+  const mountedPathGuards = actionPathGuardIdentities(ACTION_ROOT);
   validateLauncherIntegrity(
     readLauncherIntegrity(paths.launcherIntegrity),
     invocationId,
     ACTION_ROOT,
     paths.launcherActionDirectory,
     mountedFiles,
+    mountedPathGuards,
   );
+  for (const guard of mountedPathGuards) {
+    validateActionPathGuardMount(mountEvidence(guard.path), guard.path);
+  }
   validateBundle(MANIFEST, BINARY);
   log.debugGroup("Fence debug: protected Action runtime", [
-    `action_runtime_path=${ACTION_ROOT}`,
-    `protected_copy_path=${paths.launcherActionDirectory}`,
-    `integrity_path=${paths.launcherIntegrity}`,
+    `registered_runtime=verified`,
+    `protected_copy=verified`,
+    `path_guard_count=${mountedPathGuards.length}`,
     `runtime_digest=${actionRuntimeDigest(mountedFiles)}`,
     `mount_options=ro,nodev,nosuid`,
   ]);
@@ -345,6 +367,10 @@ function cleanupLauncherBeforeReadiness(): void {
       run("/usr/bin/sudo", ["/usr/bin/umount", ACTION_ROOT]);
       protectedActionMounted = false;
     }
+    for (const guard of [...protectedActionPathGuards].reverse()) {
+      run("/usr/bin/sudo", ["/usr/bin/umount", guard]);
+    }
+    protectedActionPathGuards = [];
     if (runtimeDirectoryCreated && pathEntryExists(launcherPaths.directory)) {
       run("/usr/bin/sudo", [
         "/usr/bin/rm",

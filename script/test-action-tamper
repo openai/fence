@@ -27,6 +27,7 @@ invocation="action-tamper"
 directory="/run/fence/$invocation"
 report="$directory/report.json"
 launcher_integrity="/run/fence-launcher/$invocation/integrity.json"
+path_guard_record="$temporary_directory/path-guard"
 state="$temporary_directory/state"
 summary="$temporary_directory/summary"
 post_stdout="$temporary_directory/post-stdout"
@@ -65,20 +66,83 @@ if rm -f action/post.cts 2>/dev/null; then
   die "Action tamper evidence unlinked the registered post hook"
 fi
 
+python3 -E - "$launcher_integrity" >"$path_guard_record" <<'PY'
+import json
+import os
+import pathlib
+import stat
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+integrity = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+require(integrity.get("schema_version") == 2, "launcher integrity schema mismatch")
+guards = integrity.get("path_guards")
+require(isinstance(guards, list) and guards, "registered Action path guard evidence is missing")
+guard = guards[-1]
+require(set(guard) == {"path", "device", "inode"}, "registered Action path guard evidence is malformed")
+require(
+    pathlib.Path(integrity["action_runtime_path"]).parent == pathlib.Path(guard["path"]),
+    "registered Action path guard does not protect the closest ancestor",
+)
+metadata = os.lstat(guard["path"])
+require(stat.S_ISDIR(metadata.st_mode), "registered Action path guard is not a directory")
+require(str(metadata.st_dev) == guard["device"], "registered Action path guard device changed")
+require(str(metadata.st_ino) == guard["inode"], "registered Action path guard inode changed")
+print(f'{guard["path"]}\t{guard["device"]}\t{guard["inode"]}')
+PY
+
+IFS=$'\t' read -r path_guard path_guard_device path_guard_inode <"$path_guard_record"
+[[ "$path_guard_device" =~ ^[0-9]+$ ]] || die "Action path guard device evidence is invalid"
+[[ "$path_guard_inode" =~ ^[0-9]+$ ]] || die "Action path guard inode evidence is invalid"
+guard_target="$(findmnt --noheadings --mountpoint "$path_guard" --output TARGET)"
+guard_options="$(findmnt --noheadings --mountpoint "$path_guard" --output OPTIONS)"
+[[ "$guard_target" == "$path_guard" ]] || die "Action path guard mount target changed"
+if [[ ",$guard_options," != *,rw,* || ",$guard_options," == *,ro,* ]]; then
+  die "Action path guard mount is not writable"
+fi
+
+guard_parent="${path_guard%/*}"
+moved_guard="$guard_parent/.fence-action-path-tamper"
+if [[ -e "$moved_guard" || -L "$moved_guard" ]]; then
+  die "Action path guard tamper destination already exists"
+fi
+if /usr/bin/mv -- "$path_guard" "$moved_guard" 2>/dev/null; then
+  /usr/bin/mkdir -p "$DIR/action"
+  printf '%s\n' '// synthetic replacement marker' >"$DIR/action/post.cts"
+  echo "registered_action_path_rename=unexpectedly_permitted"
+  die "Action path guard allowed registered runtime replacement"
+fi
+echo "registered_action_path_rename=denied"
+
 sudo --non-interactive /usr/sbin/nft delete table inet fence_v0
 sleep 7
 
-python3 - "$report" <<'PY'
+python3 -E - "$report" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import sys
 
 report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-assert report["status"] == "protected_host_audit_observation", report
-assert report["readiness_status"] == "ready_observation_only", report
-assert report["network_verification_status"] == "critical_drift", report
-assert report["critical_findings_truncated"] is False, report
-assert any(item["code"] == "dns_audit_network_drift" for item in report["critical_findings"]), report
+require(report["status"] == "protected_host_audit_observation")
+require(report["readiness_status"] == "ready_observation_only")
+require(report["network_verification_status"] == "critical_drift")
+require(report["critical_findings_truncated"] is False)
+require(any(item["code"] == "dns_audit_network_drift" for item in report["critical_findings"]))
 PY
 
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
@@ -100,4 +164,4 @@ if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1
 fi
 sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
 
-echo -e "${GREEN}Action tamper evidence verified:${OFF} post hook failed without restoring access"
+echo -e "${GREEN}Action tamper evidence verified:${OFF} registered path remained stable and post hook failed without restoring access"

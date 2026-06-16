@@ -21,6 +21,11 @@ type ActionRuntimeFileDigest = {
   path: string;
   sha256: string;
 };
+type ActionPathGuard = {
+  path: string;
+  device: string;
+  inode: string;
+};
 type InlineConfig = {
   invocationId: string;
   raw: string;
@@ -120,6 +125,8 @@ const ACTION_RUNTIME_FILES = [
   "post.cts",
 ] as const;
 const MAX_ACTION_RUNTIME_FILE_BYTES = 64 * 1024 * 1024;
+const MAX_ACTION_PATH_GUARDS = 16;
+const MAX_ACTION_PATH_ANCESTORS = 64;
 const REPORT_STATUSES = new Set([
   "protected_host_block",
   "protected_host_block_degraded",
@@ -541,20 +548,114 @@ function actionRuntimeDigest(files: ActionRuntimeFileDigest[]): string {
   return crypto.createHash("sha256").update(JSON.stringify(files)).digest("hex");
 }
 
+function runnerCanRenamePath(candidate: string, parent: string): boolean {
+  try {
+    fs.accessSync(parent, fs.constants.W_OK | fs.constants.X_OK);
+  } catch {
+    return false;
+  }
+  const parentStat = fs.lstatSync(parent);
+  const candidateStat = fs.lstatSync(candidate);
+  const effectiveUser = typeof process.geteuid === "function"
+    ? process.geteuid()
+    : process.getuid();
+  const sticky = (parentStat.mode & 0o1000) !== 0;
+  return !sticky ||
+    effectiveUser === 0 ||
+    effectiveUser === parentStat.uid ||
+    effectiveUser === candidateStat.uid;
+}
+
+function registeredActionPathGuardPaths(
+  actionRoot: string,
+  canRename: (candidate: string, parent: string) => boolean = runnerCanRenamePath,
+): string[] {
+  if (!path.isAbsolute(actionRoot) || path.normalize(actionRoot) !== actionRoot) {
+    fail("Fence registered Action path must be normalized and absolute");
+  }
+  const deepestFirst: string[] = [];
+  let candidate = path.dirname(actionRoot);
+  let inspected = 0;
+  while (candidate !== path.dirname(candidate)) {
+    const parent = path.dirname(candidate);
+    inspected += 1;
+    if (inspected > MAX_ACTION_PATH_ANCESTORS) {
+      fail("Fence registered Action path has too many ancestors");
+    }
+    if (canRename(candidate, parent)) {
+      deepestFirst.push(candidate);
+      if (deepestFirst.length > MAX_ACTION_PATH_GUARDS) {
+        fail("Fence registered Action path has too many writable ancestors");
+      }
+    }
+    candidate = parent;
+  }
+  return deepestFirst.reverse();
+}
+
+function validateActionPathGuardSet(guards: ActionPathGuard[], actionRoot: string): void {
+  if (!Array.isArray(guards) || guards.length > MAX_ACTION_PATH_GUARDS) {
+    fail("Fence registered Action path guard set is invalid");
+  }
+  let previous: string | undefined;
+  for (const guard of guards) {
+    if (
+      guard === null ||
+      typeof guard !== "object" ||
+      Object.keys(guard).sort().join(",") !== "device,inode,path" ||
+      !path.isAbsolute(guard.path) ||
+      path.normalize(guard.path) !== guard.path ||
+      !actionRoot.startsWith(`${guard.path}${path.sep}`) ||
+      !/^[0-9]+$/.test(guard.device) ||
+      !/^[0-9]+$/.test(guard.inode) ||
+      (previous !== undefined && !guard.path.startsWith(`${previous}${path.sep}`))
+    ) {
+      fail("Fence registered Action path guard set is invalid");
+    }
+    previous = guard.path;
+  }
+}
+
+function actionPathGuardIdentities(
+  actionRoot: string,
+  canRename: (candidate: string, parent: string) => boolean = runnerCanRenamePath,
+): ActionPathGuard[] {
+  const guards = registeredActionPathGuardPaths(actionRoot, canRename).map((guardPath) => {
+    const stat = fs.lstatSync(guardPath, { bigint: true });
+    if (
+      !stat.isDirectory() ||
+      stat.isSymbolicLink() ||
+      fs.realpathSync(guardPath) !== guardPath
+    ) {
+      fail("Fence registered Action path contains an unsafe ancestor");
+    }
+    return {
+      path: guardPath,
+      device: stat.dev.toString(),
+      inode: stat.ino.toString(),
+    };
+  });
+  validateActionPathGuardSet(guards, actionRoot);
+  return guards;
+}
+
 function launcherIntegrityDocument(
   invocationId: string,
   actionRuntimePath: string,
   protectedCopyPath: string,
   files: ActionRuntimeFileDigest[],
+  pathGuards: ActionPathGuard[],
 ): Record<string, unknown> {
   runtimePaths(invocationId);
   if (!path.isAbsolute(actionRuntimePath) || !path.isAbsolute(protectedCopyPath)) {
     fail("Fence Action integrity paths must be absolute");
   }
+  validateActionPathGuardSet(pathGuards, actionRuntimePath);
   return {
-    schema_version: 1,
+    schema_version: 2,
     invocation_id: invocationId,
     action_runtime_path: actionRuntimePath,
+    path_guards: pathGuards,
     protected_copy_path: protectedCopyPath,
     runtime_digest: actionRuntimeDigest(files),
     files,
@@ -567,6 +668,7 @@ function validateLauncherIntegrity(
   actionRuntimePath: string,
   protectedCopyPath: string,
   files: ActionRuntimeFileDigest[],
+  pathGuards: ActionPathGuard[],
 ): void {
   if (integrity === null || Array.isArray(integrity) || typeof integrity !== "object") {
     fail("Fence Action launcher integrity evidence is invalid");
@@ -575,21 +677,24 @@ function validateLauncherIntegrity(
     "action_runtime_path",
     "files",
     "invocation_id",
+    "path_guards",
     "protected_copy_path",
     "runtime_digest",
     "schema_version",
   ];
   if (
     JSON.stringify(Object.keys(integrity).sort()) !== JSON.stringify(expectedKeys) ||
-    integrity.schema_version !== 1 ||
+    integrity.schema_version !== 2 ||
     integrity.invocation_id !== invocationId ||
     integrity.action_runtime_path !== actionRuntimePath ||
     integrity.protected_copy_path !== protectedCopyPath ||
+    JSON.stringify(integrity.path_guards) !== JSON.stringify(pathGuards) ||
     integrity.runtime_digest !== actionRuntimeDigest(files) ||
     JSON.stringify(integrity.files) !== JSON.stringify(files)
   ) {
     fail("Fence Action launcher integrity evidence does not match the protected runtime");
   }
+  validateActionPathGuardSet(pathGuards, actionRuntimePath);
 }
 
 function readLauncherIntegrity(file: string): any {
@@ -669,6 +774,32 @@ function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void
   }
 }
 
+function validateActionPathGuardMount(raw: unknown, expectedTarget: string): void {
+  if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
+    fail("Fence registered Action path guard mount evidence is unavailable");
+  }
+  let document: any;
+  try {
+    document = JSON.parse(raw);
+  } catch {
+    fail("Fence registered Action path guard mount evidence is malformed");
+  }
+  const mount = document?.filesystems?.length === 1 ? document.filesystems[0] : undefined;
+  if (
+    mount === null ||
+    Array.isArray(mount) ||
+    typeof mount !== "object" ||
+    mount.target !== expectedTarget ||
+    typeof mount.options !== "string"
+  ) {
+    fail("Fence registered Action path guard mount does not match the protected runtime");
+  }
+  const options = new Set(mount.options.split(","));
+  if (!options.has("rw") || options.has("ro")) {
+    fail("Fence registered Action path guard mount must remain writable");
+  }
+}
+
 function validateBundle(manifestPath: string, binaryPath: string): any {
   const manifest = readJsonBounded(manifestPath, 16 * 1024, "bundle manifest");
   const binaryStat = fs.lstatSync(binaryPath);
@@ -687,23 +818,33 @@ function validateBundle(manifestPath: string, binaryPath: string): any {
     "attestation_verified",
     "bundle_path",
     "release_channel",
+    "release_is_draft",
+    "release_is_immutable",
     "release_tag",
+    "release_tag_commit",
     "release_url",
     "repository",
     "schema_version",
+    "signer_digest",
     "signer_workflow",
     "source_commit",
+    "source_ref",
   ];
   if (
     JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(expectedKeys) ||
-    manifest.schema_version !== 2 ||
+    manifest.schema_version !== 3 ||
     manifest.repository !== "GrantBirki/fence" ||
     !RELEASE_TAG.test(manifest.release_tag) ||
     manifest.release_channel !== expectedReleaseChannel ||
+    manifest.release_is_draft !== false ||
+    manifest.release_is_immutable !== true ||
     manifest.release_url !== `https://github.com/GrantBirki/fence/releases/tag/${manifest.release_tag}` ||
     !/^[0-9a-f]{40}$/.test(manifest.source_commit) ||
+    manifest.release_tag_commit !== manifest.source_commit ||
+    manifest.source_ref !== "refs/heads/main" ||
     manifest.artifact_name !== `fence_${manifest.release_tag}_linux-amd64` ||
     !SHA256.test(manifest.artifact_sha256) ||
+    manifest.signer_digest !== manifest.source_commit ||
     manifest.signer_workflow !== "GrantBirki/fence/.github/workflows/release.yml" ||
     manifest.bundle_path !== "action/bin/fence" ||
     manifest.attestation_verified !== true
@@ -1623,6 +1764,7 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 module.exports = {
   ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
   allowlistYamlSnippet,
@@ -1638,12 +1780,14 @@ module.exports = {
   readJsonBounded,
   readLauncherIntegrity,
   launcherIntegrityDocument,
+  registeredActionPathGuardPaths,
   runtimePaths,
   summaryHeading,
   summaryLines,
   validateBundle,
   validateInlineConfig,
   validateLauncherIntegrity,
+  validateActionPathGuardMount,
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,
   validateDnsEvidence,

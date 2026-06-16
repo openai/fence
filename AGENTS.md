@@ -107,9 +107,16 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/prepare-rust`
   - Explicit online Rust preparation path for local developers and hosted validation.
   - Runs `script/validate-rust-toolchain --ci` before installing anything.
+  - Downloads the locked manifest and selected component archives, verifies every SHA-256, and exposes only that verified set to rustup through a temporary loopback mirror.
+  - Ignores caller-provided Rust distribution, update-root, toolchain, and proxy overrides while rustup installs from the verified loopback mirror.
+  - Replaces the fully qualified version-and-host toolchain only after the complete selected artifact set is locally verified, and disables rustup self-update during installation.
   - Installs the exact Rust toolchain from `rust-toolchain.toml` with the minimal profile plus `rustfmt` and `clippy`.
   - Installs extra target standard libraries only when `PREPARE_RUST_TARGETS` or `VERIFY_RUST_TARGETS` is set.
   - Does not run from offline project scripts.
+
+- `script/test-rust-toolchain-preparation`
+  - Offline-only regression coverage for the verified Rust distribution mirror.
+  - Proves unlisted targets fail before fetch, modified archives fail checksum verification, and rustup replaces the selected toolchain from only the loopback mirror with source overrides removed and self-update disabled.
 
 - `script/bootstrap`
   - Validates Rust and Cargo availability.
@@ -174,10 +181,11 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Accepts only bounded HTTPS redirects to reviewed GitHub Actions, GitHub content, or Azure Blob host suffixes. It must not print signed URLs, query strings, tokens, archive contents, or unrelated job metadata.
 
 - `script/observe-hosted-runner`
-  - Linux x64-only, read-only hosted-runner fingerprint candidate collector for the `integration` workflow.
-  - Emits bounded JSON describing only the runner principal/group names, fixed security-relevant paths, reviewed resolver symlink target/type/mode/owner, fixed systemd unit state, fixed runtime socket state, aggregate Docker workload count, and sudo-policy source digests plus reduced principal/group `NOPASSWD` marker classification for review.
+  - Linux x64-only, GitHub-Actions-only hosted-runner fingerprint candidate collector for the `integration` workflow.
+  - Emits schema-`2` bounded JSON describing only the runner principal/group names; fixed command canonical targets, types, owner/group classifications, modes, device/inode identities, and runner writability; the same metadata for bounded sudo-policy sources; reviewed resolver symlink target/type/mode/owner; fixed systemd unit state; fixed runtime socket state; aggregate Docker workload count; and sudo-policy source digests plus reduced principal/group `NOPASSWD` marker classification for review.
+  - Tests replacement capability only in the fixed `/`, `/etc`, `/etc/sudoers.d`, `/usr`, `/usr/bin`, and `/usr/sbin` ancestor directories by attempting to create and immediately delete one exclusive empty synthetic file as the runner. Root cleanup is mandatory after any partial probe. It must not probe arbitrary directories or modify commands or sudo policy.
   - Must not emit sudo policy contents, environment values, process arguments, workload identifiers, credentials, or arbitrary host files.
-  - Must not establish support, mutate host state, enable public enforcement, or write readiness.
+  - Must not establish support, enable public enforcement, write readiness, or leave host state after its bounded synthetic probes. Schema-`2` permission observations remain evidence-only until reviewed hosted runs justify a separate production hardening change.
 
 - `script/test-package-smoke`
   - Linux x64-only offline packaged-artifact acceptance entrypoint; it accepts exactly one already-built Fence binary path.
@@ -187,17 +195,17 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/validate-action-bundle`
   - Offline-only validation for the committed Action binary and provenance manifest.
-  - Verifies manifest schema `2`, immutable stable or prerelease release identity, matching release channel, Linux x64 artifact name, source commit, signer workflow, executable mode, and SHA-256 match.
+  - Verifies manifest schema `3`, non-draft immutable stable or prerelease release identity, matching release channel, Linux x64 artifact name, source commit, resolved tag commit, `refs/heads/main` source ref, signer workflow and digest, executable mode, and SHA-256 match.
   - Runs from `script/validate-locks`; it must not fetch releases, attestations, agents, or policy.
 
 - `script/update-action-bundle`
   - Intentional online-only maintainer path for refreshing the Action binary from an already-published immutable stable or prerelease release tag.
-  - Downloads the selected Linux x64 release asset and `checksums.txt`, verifies the checksum, verifies GitHub provenance against `.github/workflows/release.yml`, installs the binary under `action/bin/fence`, and writes `action/bundle-manifest.json`.
-  - Requires the GitHub Release prerelease flag to match the selected semver tag channel.
+  - Downloads the selected Linux x64 release asset and `checksums.txt`, verifies the checksum, verifies GitHub provenance against `.github/workflows/release.yml` at the release source commit on `refs/heads/main`, installs the binary under `action/bin/fence`, and writes `action/bundle-manifest.json`.
+  - Requires a non-draft immutable GitHub Release, a tag resolving to the full release source commit, and a prerelease flag matching the selected semver tag channel.
   - Must never become an Action runtime step.
 
 - `script/test-action-wrapper`
-  - Offline-only dependency-free TypeScript and Node built-in `node:test` checks for the Action launcher, protected-runtime integrity records, read-only mount evidence, report validation, compact control and network-activity summary tables, bounded finding attribution, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and bundle checksum validation.
+  - Offline-only dependency-free TypeScript, Node built-in `node:test`, and synthetic `gh`-shim checks for the Action launcher, registered-path guard selection, protected-runtime integrity records, exact writable guard and read-only runtime mount evidence, report validation, compact control and network-activity summary tables, bounded finding attribution, audit allowlist guidance, critical-finding propagation, runtime-path derivation, and release/bundle provenance validation.
   - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
   - Action logs should stay concise by default and may use emoji plus ANSI colors for human readability. Debug logs are allowed only through GitHub Actions debug mode, must remain bounded and sanitized, and must not print raw config bodies, environment dumps, tokens, packet payloads, raw DNS packets, unrelated system logs, or arbitrary report JSON.
   - Job summaries should prefer bounded result tables over explanatory prose: show mode, network, sudo, and container outcomes plus reportable destinations and decisions; show sanitized local attribution only beside actual findings, keep detailed evidence in local JSON, and keep audit allowlist guidance collapsed.
@@ -207,7 +215,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-acceptance`
   - Linux x64-only, GitHub-Actions-only hosted acceptance entrypoint invoked after `uses: ./`.
-  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown. Standard block also proves the root-owned Action runtime is mounted read-only, `nodev`, and `nosuid`, and that runner-user overwrite, unlink, chmod, rename, and replacement attempts fail for every executable wrapper file and the bundled agent. Audit acceptance also exercises a non-profile public hostname so the Action summary has DNS-backed would-block evidence to turn into `allowlist` guidance.
+  - Proves standard block, degraded `unsafe_preserve`, and audit behavior from the bundled release binary while controls remain resident until ephemeral teardown. Standard block also proves the root-owned Action runtime is mounted read-only, `nodev`, and `nosuid`, and that runner-user overwrite, unlink, chmod, rename, and replacement attempts fail for every executable wrapper file and the bundled agent. The registered pathname is protected separately by writable self-bind guards on every runner-renameable ancestor. Audit acceptance also exercises a non-profile public hostname so the Action summary has DNS-backed would-block evidence to turn into `allowlist` guidance.
   - Must not stop the service, restore controls, download an agent, or fetch policy.
 
 - `script/test-action-setup-failure`
@@ -216,7 +224,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-tamper`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
-  - Launches the bundled audit lifecycle through the Action entrypoint, proves direct runner-user modification of the registered protected post hook fails, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the protected post hook fails without stopping the service or restoring network state.
+  - Launches the bundled audit lifecycle through the Action entrypoint, proves direct runner-user modification of the protected post hook fails, verifies the closest registered-path guard retains its mounted device/inode identity, proves the guarded ancestor cannot be renamed and recreated, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the protected post hook fails without stopping the service or restoring network state.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.
@@ -357,13 +365,13 @@ If any version file changes, update docs and verify the corresponding script beh
 
 - The `build` workflow is the PR-based native Linux x64 package smoke test. It should validate locks, prepare Rust, run `script/bootstrap`, and run `script/build --release --targets "x86_64-unknown-linux-gnu"` on `ubuntu-24.04`.
 - The `acceptance` workflow should run only on `ubuntu-24.04`, build its own Linux x64 package from the current commit, verify its checksum, and invoke `script/test-package-smoke` as the `acceptance` check.
-- The `action acceptance` workflow should run only on disposable `ubuntu-24.04` runners, validate the committed release-bound Action bundle, invoke the root wrapper through `uses: ./`, and prove standard block, degraded `unsafe_preserve`, and audit behavior while controls remain resident. Separate jobs under the same stable aggregate must prove setup rejection before mutation and post-ready critical-drift failure propagation without restore.
+- The `action acceptance` workflow should run only on disposable `ubuntu-24.04` runners, validate the committed release-bound Action bundle, invoke the root wrapper through `uses: ./`, and prove standard block, degraded `unsafe_preserve`, and audit behavior while controls remain resident. Separate jobs under the same stable aggregate must prove setup rejection before mutation, registered-path ancestor rename denial, and post-ready critical-drift failure propagation without restore.
 - The non-required `action acceptance ubuntu latest` workflow is an observational floating-label canary. It should exercise zero-input standard block through `uses: ./` on `ubuntu-latest`, but a pass must not expand the supported protected target beyond fixed `ubuntu-24.04` x64.
 - The `build` workflow should exercise retained Zig/`cargo-zigbuild` artifacts in a distinct offline install/verify smoke job. That job is not a protected release artifact claim.
 - Hosted lint/test workflows may remain portable on fixed Ubuntu and macOS labels while their behavior is platform-neutral. Protected integration, package, and release jobs target fixed `ubuntu-24.04` x64 only.
 - Hosted lint/test/build workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/bootstrap`, then their offline validation command or native package-smoke path.
 - Hosted coverage workflows should run `script/validate-locks --ci`, then `script/prepare-rust`, then `script/install-test-tools`, then `script/bootstrap`, then `script/test --coverage`.
-- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, invoke `script/observe-hosted-runner` for bounded read-only runner-shape evidence, invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` and `resident_lifecycle_test_only` evidence, isolate `script/test-lockdown` audit, rollback, degraded, and standard host-lockdown scenarios on disposable runners, run one disposable-host selected-profile runtime scenario through `script/test-selected-profile-runtime`, and run packaged production-shaped standard block, broad-domain opt-out block, degraded block, and audit observation services through `script/test-protected-run` while preserving the stable aggregate `integration` context. Keep integration concurrency commit-scoped because a stranded host-block job may be unable to receive cancellation.
+- The `integration` workflow should run only on `ubuntu-24.04`, prepare the pinned Rust toolchain through repository scripts, invoke `script/observe-hosted-runner` for bounded runner-shape and fixed-ancestor permission evidence, invoke `script/test-privileged` for namespace-isolated `network_enforcement_test_only` and `resident_lifecycle_test_only` evidence, isolate `script/test-lockdown` audit, rollback, degraded, and standard host-lockdown scenarios on disposable runners, run one disposable-host selected-profile runtime scenario through `script/test-selected-profile-runtime`, and run packaged production-shaped standard block, broad-domain opt-out block, degraded block, and audit observation services through `script/test-protected-run` while preserving the stable aggregate `integration` context. Keep integration concurrency commit-scoped because a stranded host-block job may be unable to receive cancellation.
 - `acceptance` and `integration` must remain separate evidence boundaries: the former exercises the packaged direct-invocation trusted-launcher boundary without mutation, while the latter observes the hosted shape, proves privileged kernel/network and transient-service behavior, and launches disposable production-shaped standard block, degraded block, and audit observation services.
 - Hosted validation should rely on offline defaults from `script/env` after explicit preparation completes.
 - Do not add Rust toolchain setup actions to hosted lint/test/build workflows; use `script/prepare-rust` so the preparation path stays explicit, checksum-gated, and repo-owned.

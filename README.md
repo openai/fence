@@ -149,7 +149,7 @@ and port you configured as DNS answers change.
 flowchart TD
     start["GitHub-hosted Linux job starts"] --> action["Fence Action runs first"]
     action --> input["Read native Action inputs<br/>default: block mode + empty allowlist"]
-    input --> protect["Protect Action runtime<br/>root-owned + read-only"]
+    input --> protect["Protect registered Action path<br/>stable ancestors + read-only runtime"]
     protect --> config["Write root-owned config<br/>under /run/fence/"]
     config --> launch["Launch bundled agent<br/>with sudo + systemd"]
 
@@ -232,6 +232,13 @@ script/test
 script/lint
 script/build
 ```
+
+Preparation downloads only the manifest, host components, and requested target
+libraries named in the checked-in Rust distribution lock. Each download is
+checksum-verified before rustup installs it from a temporary loopback-only
+mirror. The fully qualified version-and-host toolchain is replaced only after
+the complete selected artifact set verifies; caller-provided distribution and
+update sources are not used, and rustup self-update is disabled.
 
 ## CLI 🧰
 

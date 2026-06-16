@@ -28,7 +28,16 @@ for sample in 1 2 3 4; do
   sleep 5
   echo "collecting bounded late DNS-mediated selected-profile evidence ($sample/4)"
 done
-python3 - "$report" "$dns_report" "$production_ready" <<'PY'
+python3 -E - "$report" "$dns_report" "$production_ready" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import re
@@ -37,21 +46,21 @@ import sys
 report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-assert report["status"] == "selected_profile_runtime_test_only", report
-assert report["runtime_evidence_schema_version"] == 4, report
-assert report["network_verification_status"] == "verified", report
-assert report["sudo_status"] == "disabled_verified", report
-assert report["container_status"] == "disabled_verified", report
-assert report["critical_findings"] == [], report
-assert dns["status"] == "selected_profile_runtime_test_only", dns
-assert dns["runtime_evidence_schema_version"] == 4, dns
-assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", report
-assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3", dns
-assert report["policy_hash_schema_version"] == 6, report
-assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]), report
-assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]), report
-assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]), report
-assert not production_path.exists()
+require(report["status"] == "selected_profile_runtime_test_only")
+require(report["runtime_evidence_schema_version"] == 4)
+require(report["network_verification_status"] == "verified")
+require(report["sudo_status"] == "disabled_verified")
+require(report["container_status"] == "disabled_verified")
+require(report["critical_findings"] == [])
+require(dns["status"] == "selected_profile_runtime_test_only")
+require(dns["runtime_evidence_schema_version"] == 4)
+require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
+require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
+require(report["policy_hash_schema_version"] == 6)
+require(re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]))
+require(re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]))
+require(re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]))
+require(not production_path.exists())
 
 observations = dns["observations"]
 derived_cname_authorizations = dns["derived_cname_authorizations"]
@@ -103,7 +112,7 @@ summary = {
     ],
 }
 encoded = json.dumps(summary, sort_keys=True, separators=(",", ":"))
-assert len(encoded.encode("utf-8")) <= 256 * 1024
+require(len(encoded.encode("utf-8")) <= 256 * 1024)
 print(encoded)
 PY
 

@@ -5,7 +5,7 @@ use crate::nft::{
     NetworkEvidence, OwnedChain, OwnedNftState, OwnedRule, VerificationFailure, verify_owned_state,
 };
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -477,17 +477,13 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
         BackendError::new("unexpected_nft_state", "nft rule has no expression array")
     })?;
     match comment {
-        "fence:loopback" if has_accept(expressions) && has_scalar(expressions, "lo") => {
+        "fence:loopback" if is_exact_loopback_rule(expressions) => {
             Ok(OwnedRule::Loopback { chain })
         }
-        "fence:established"
-            if has_accept(expressions) && has_established_related_state(expressions) =>
-        {
+        "fence:established" if is_exact_established_related_rule(expressions) => {
             Ok(OwnedRule::EstablishedRelated { chain })
         }
-        "fence:implicit_ipv6_control"
-            if has_accept(expressions) && has_implicit_ipv6_control(expressions) =>
-        {
+        "fence:implicit_ipv6_control" if is_exact_implicit_ipv6_control_rule(expressions) => {
             Ok(OwnedRule::ImplicitIpv6Control {
                 chain,
                 icmpv6_types: vec![
@@ -498,39 +494,17 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
                 required_hop_limit: 255,
             })
         }
-        "fence:classify" if has_jump(expressions, NFT_CLASSIFY_CHAIN) => {
+        "fence:classify" if is_exact_jump_rule(expressions, NFT_CLASSIFY_CHAIN) => {
             Ok(OwnedRule::ClassifyDispatch { chain })
         }
-        "fence:allowance" if has_accept(expressions) => parse_allowance_rule(chain, expressions),
-        "fence:dns_mediator_upstream" if has_accept(expressions) => {
-            parse_dns_mediator_upstream_rule(chain, expressions)
-        }
-        "fence:violation" if has_jump(expressions, NFT_VIOLATION_CHAIN) => {
+        "fence:allowance" => parse_allowance_rule(chain, expressions),
+        "fence:dns_mediator_upstream" => parse_dns_mediator_upstream_rule(chain, expressions),
+        "fence:violation" if is_exact_jump_rule(expressions, NFT_VIOLATION_CHAIN) => {
             Ok(OwnedRule::ViolationDispatch { chain })
         }
-        "fence:sample_violation"
-            if has_named_counter(expressions, NFT_SAMPLED_VIOLATIONS_COUNTER) =>
-        {
-            parse_sampled_rule(chain, expressions)
-        }
-        "fence:reject_violation"
-            if has_named_counter(expressions, NFT_TOTAL_VIOLATIONS_COUNTER)
-                && has_key(expressions, "reject") =>
-        {
-            Ok(OwnedRule::TerminalViolation {
-                chain,
-                verdict: "reject".to_owned(),
-            })
-        }
-        "fence:accept_violation"
-            if has_named_counter(expressions, NFT_TOTAL_VIOLATIONS_COUNTER)
-                && has_accept(expressions) =>
-        {
-            Ok(OwnedRule::TerminalViolation {
-                chain,
-                verdict: "accept".to_owned(),
-            })
-        }
+        "fence:sample_violation" => parse_sampled_rule(chain, expressions),
+        "fence:reject_violation" => parse_terminal_rule(chain, expressions, "reject"),
+        "fence:accept_violation" => parse_terminal_rule(chain, expressions, "accept"),
         _ => Err(BackendError::new(
             "unexpected_nft_state",
             format!("owned nftables table contains malformed rule class {comment}"),
@@ -539,7 +513,7 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
 }
 
 fn parse_allowance_rule(chain: String, expressions: &[Value]) -> Result<OwnedRule, BackendError> {
-    if expressions.len() != 3 || expressions[2].get("accept").is_none() {
+    if expressions.len() != 3 || !is_exact_verdict(&expressions[2], "accept") {
         return Err(BackendError::new(
             "unexpected_nft_state",
             "allowance rule does not have the exact expected expression shape",
@@ -562,7 +536,7 @@ fn parse_dns_mediator_upstream_rule(
 ) -> Result<OwnedRule, BackendError> {
     if expressions.len() != 4
         || !has_meta_uid(expressions.first(), 0)
-        || expressions[3].get("accept").is_none()
+        || !is_exact_verdict(&expressions[3], "accept")
     {
         return Err(BackendError::new(
             "unexpected_nft_state",
@@ -592,51 +566,12 @@ fn parse_dns_mediator_upstream_rule(
 }
 
 fn parse_sampled_rule(chain: String, expressions: &[Value]) -> Result<OwnedRule, BackendError> {
-    let log = find_expression(expressions, "log").ok_or_else(|| {
+    let prefix = exact_sampled_rule_prefix(expressions).ok_or_else(|| {
         BackendError::new(
             "unexpected_nft_state",
-            "owned logging rule omits its log expression",
+            "owned logging rule does not have the exact expected expression shape",
         )
     })?;
-    let prefix = log.get("prefix").and_then(Value::as_str).ok_or_else(|| {
-        BackendError::new(
-            "unexpected_nft_state",
-            "owned logging rule omits its prefix",
-        )
-    })?;
-    if !matches!(prefix, "fence-v0-block" | "fence-v0-audit") {
-        return Err(BackendError::new(
-            "unexpected_nft_state",
-            "owned logging rule has an unexpected prefix",
-        ));
-    }
-    let group = log.get("group").and_then(Value::as_u64);
-    let snaplen = log.get("snaplen").and_then(Value::as_u64);
-    let queue_threshold = log
-        .get("qthreshold")
-        .or_else(|| log.get("queue-threshold"))
-        .and_then(Value::as_u64);
-    let limit = find_expression(expressions, "limit").ok_or_else(|| {
-        BackendError::new(
-            "unexpected_nft_state",
-            "owned logging rule omits its rate limit",
-        )
-    })?;
-    let rate = limit.get("rate").and_then(Value::as_u64);
-    let per = limit.get("per").and_then(Value::as_str);
-    let burst = limit.get("burst").and_then(Value::as_u64);
-    if group != Some(4242)
-        || snaplen != Some(64)
-        || queue_threshold != Some(1)
-        || rate != Some(100)
-        || per != Some("second")
-        || burst != Some(100)
-    {
-        return Err(BackendError::new(
-            "unexpected_nft_state",
-            "owned logging rule does not match fixed NFLOG values",
-        ));
-    }
     Ok(OwnedRule::SampledViolation {
         chain,
         nflog_group: 4242,
@@ -647,21 +582,24 @@ fn parse_sampled_rule(chain: String, expressions: &[Value]) -> Result<OwnedRule,
     })
 }
 
-fn find_expression<'a>(expressions: &'a [Value], key: &str) -> Option<&'a Value> {
-    expressions
-        .iter()
-        .find_map(|expression| expression.get(key))
-}
-
-fn has_named_counter(expressions: &[Value], name: &str) -> bool {
-    let Some(counter) = find_expression(expressions, "counter") else {
-        return false;
-    };
-    match counter {
-        Value::String(value) => value == name,
-        Value::Object(value) => value.get("name").and_then(Value::as_str) == Some(name),
-        _ => false,
+fn parse_terminal_rule(
+    chain: String,
+    expressions: &[Value],
+    verdict: &'static str,
+) -> Result<OwnedRule, BackendError> {
+    if expressions.len() != 2
+        || !is_exact_named_counter(&expressions[0], NFT_TOTAL_VIOLATIONS_COUNTER)
+        || !is_exact_verdict(&expressions[1], verdict)
+    {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "terminal violation rule does not have the exact expected expression shape",
+        ));
     }
+    Ok(OwnedRule::TerminalViolation {
+        chain,
+        verdict: verdict.to_owned(),
+    })
 }
 
 fn extract_destination(expressions: &[Value]) -> Result<(String, String), BackendError> {
@@ -745,121 +683,104 @@ fn extract_transport(expressions: &[Value]) -> Result<(String, u16), BackendErro
     ))
 }
 
-fn has_accept(expressions: &[Value]) -> bool {
-    has_key(expressions, "accept")
+fn single_expression<'a>(expression: &'a Value, key: &str) -> Option<&'a Value> {
+    let object = expression.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object.get(key)
+}
+
+fn expressions_equal(expressions: &[Value], expected: Value) -> bool {
+    expected
+        .as_array()
+        .is_some_and(|expected| expressions == expected)
+}
+
+fn is_exact_verdict(expression: &Value, verdict: &str) -> bool {
+    single_expression(expression, verdict).is_some_and(Value::is_null)
+}
+
+fn is_exact_loopback_rule(expressions: &[Value]) -> bool {
+    expressions_equal(
+        expressions,
+        json!([{"match": {"left": {"meta": {"key": "oifname"}}, "op": "==", "right": "lo"}}, {"accept": null}]),
+    )
+}
+
+fn is_exact_established_related_rule(expressions: &[Value]) -> bool {
+    expressions_equal(
+        expressions,
+        json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": [2, 4]}}, {"accept": null}]),
+    )
+}
+
+fn is_exact_implicit_ipv6_control_rule(expressions: &[Value]) -> bool {
+    expressions_equal(
+        expressions,
+        json!([{"match": {"left": {"payload": {"protocol": "ip6", "field": "hoplimit"}}, "op": "==", "right": 255}}, {"match": {"left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "op": "==", "right": {"set": [133, 135, 136]}}}, {"accept": null}]),
+    )
+}
+
+fn is_exact_jump_rule(expressions: &[Value], target: &str) -> bool {
+    expressions_equal(expressions, json!([{"jump": {"target": target}}]))
+}
+
+fn is_exact_named_counter(expression: &Value, name: &str) -> bool {
+    let Some(counter) = single_expression(expression, "counter") else {
+        return false;
+    };
+    if counter.as_str() == Some(name) {
+        return true;
+    }
+    let Some(counter) = counter.as_object() else {
+        return false;
+    };
+    counter.get("name").and_then(Value::as_str) == Some(name)
+        && counter
+            .keys()
+            .all(|key| matches!(key.as_str(), "name" | "packets" | "bytes"))
+        && counter
+            .get("packets")
+            .is_none_or(|value| value.as_u64().is_some())
+        && counter
+            .get("bytes")
+            .is_none_or(|value| value.as_u64().is_some())
+}
+
+fn is_exact_sample_limit(expression: &Value) -> bool {
+    expression == &json!({"limit": {"rate": 100, "per": "second", "burst": 100}})
+}
+
+fn exact_sample_log_prefix(expression: &Value) -> Option<&str> {
+    let prefix = single_expression(expression, "log")?
+        .get("prefix")
+        .and_then(Value::as_str)?;
+    if !matches!(prefix, "fence-v0-block" | "fence-v0-audit") {
+        return None;
+    }
+    let qthreshold =
+        json!({"log": {"group": 4242, "prefix": prefix, "snaplen": 64, "qthreshold": 1}});
+    let queue_threshold =
+        json!({"log": {"group": 4242, "prefix": prefix, "snaplen": 64, "queue-threshold": 1}});
+    (expression == &qthreshold || expression == &queue_threshold).then_some(prefix)
+}
+
+fn exact_sampled_rule_prefix(expressions: &[Value]) -> Option<&str> {
+    if expressions.len() != 3
+        || !is_exact_sample_limit(&expressions[0])
+        || !is_exact_named_counter(&expressions[1], NFT_SAMPLED_VIOLATIONS_COUNTER)
+    {
+        return None;
+    }
+    exact_sample_log_prefix(&expressions[2])
 }
 
 fn has_meta_uid(expression: Option<&Value>, expected: u64) -> bool {
-    let Some(matcher) = expression.and_then(|expression| expression.get("match")) else {
-        return false;
-    };
-    matcher
-        .get("left")
-        .and_then(|left| left.get("meta"))
-        .and_then(|meta| meta.get("key"))
-        .and_then(Value::as_str)
-        == Some("skuid")
-        && matcher.get("op").and_then(Value::as_str) == Some("==")
-        && matcher.get("right").and_then(Value::as_u64) == Some(expected)
-}
-
-fn has_established_related_state(expressions: &[Value]) -> bool {
-    expressions.iter().any(|expression| {
-        let Some(matcher) = expression.get("match") else {
-            return false;
-        };
-        let is_ct_state = matcher
-            .get("left")
-            .and_then(|left| left.get("ct"))
-            .and_then(|ct| ct.get("key"))
-            .and_then(Value::as_str)
-            == Some("state");
-        let values = matcher
-            .get("right")
-            .and_then(Value::as_array)
-            .map(|values| values.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
-        is_ct_state && values.as_deref() == Some(&[2, 4])
-    })
-}
-
-fn has_implicit_ipv6_control(expressions: &[Value]) -> bool {
-    let hop_limit = expressions.iter().any(|expression| {
-        let Some(matcher) = expression.get("match") else {
-            return false;
-        };
-        matcher
-            .get("left")
-            .and_then(|left| left.get("payload"))
-            .and_then(|payload| payload.get("protocol"))
-            .and_then(Value::as_str)
-            == Some("ip6")
-            && matcher
-                .get("left")
-                .and_then(|left| left.get("payload"))
-                .and_then(|payload| payload.get("field"))
-                .and_then(Value::as_str)
-                == Some("hoplimit")
-            && matcher.get("right").and_then(Value::as_u64) == Some(255)
-    });
-    let control_types = expressions.iter().any(|expression| {
-        let Some(matcher) = expression.get("match") else {
-            return false;
-        };
-        let is_icmp_type = matcher
-            .get("left")
-            .and_then(|left| left.get("payload"))
-            .and_then(|payload| payload.get("protocol"))
-            .and_then(Value::as_str)
-            == Some("icmpv6")
-            && matcher
-                .get("left")
-                .and_then(|left| left.get("payload"))
-                .and_then(|payload| payload.get("field"))
-                .and_then(Value::as_str)
-                == Some("type");
-        let types = matcher
-            .get("right")
-            .and_then(|right| right.get("set"))
-            .and_then(Value::as_array)
-            .map(|types| types.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
-        is_icmp_type && types.as_deref() == Some(&[133, 135, 136])
-    });
-    hop_limit && control_types
-}
-
-fn has_jump(expressions: &[Value], target: &str) -> bool {
-    expressions.iter().any(|expression| {
-        expression
-            .get("jump")
-            .and_then(|jump| jump.get("target"))
-            .and_then(Value::as_str)
-            == Some(target)
-    })
-}
-
-fn has_key(expressions: &[Value], key: &str) -> bool {
-    expressions
-        .iter()
-        .any(|expression| expression.get(key).is_some())
-}
-
-fn has_scalar(expressions: &[Value], expected: &str) -> bool {
-    expressions
-        .iter()
-        .any(|expression| value_contains_scalar(expression, expected))
-}
-
-fn value_contains_scalar(value: &Value, expected: &str) -> bool {
-    match value {
-        Value::String(value) => value == expected,
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value_contains_scalar(value, expected)),
-        Value::Object(values) => values
-            .values()
-            .any(|value| value_contains_scalar(value, expected)),
-        _ => false,
-    }
+    expression
+        == Some(
+            &json!({"match": {"left": {"meta": {"key": "skuid"}}, "op": "==", "right": expected}}),
+        )
 }
 
 fn require_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, BackendError> {
@@ -1040,6 +961,24 @@ mod tests {
                 "expr": expressions
             }),
         )
+    }
+
+    fn parse_test_rule(
+        chain: &str,
+        comment: &str,
+        expressions: Value,
+    ) -> Result<OwnedRule, BackendError> {
+        let item = rule(chain, comment, expressions);
+        parse_rule(item.get("rule").unwrap())
+    }
+
+    fn assert_malformed_rule(chain: &str, comment: &str, expressions: Value) {
+        assert_eq!(
+            parse_test_rule(chain, comment, expressions)
+                .unwrap_err()
+                .code,
+            "unexpected_nft_state"
+        );
     }
 
     fn active_state_json(mode: Mode) -> Vec<u8> {
@@ -1316,6 +1255,202 @@ mod tests {
             .unwrap_err()
             .code,
             "unexpected_nft_state"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_exact_builtin_rule_shapes() {
+        let rules = vec![
+            (
+                NFT_OUTPUT_CHAIN,
+                "fence:loopback",
+                json!([{"match": {"left": {"meta": {"key": "oifname"}}, "op": "==", "right": "lo"}}, {"accept": null}]),
+            ),
+            (
+                NFT_OUTPUT_CHAIN,
+                "fence:established",
+                json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": [2, 4]}}, {"accept": null}]),
+            ),
+            (
+                NFT_OUTPUT_CHAIN,
+                "fence:implicit_ipv6_control",
+                json!([{"match": {"left": {"payload": {"protocol": "ip6", "field": "hoplimit"}}, "op": "==", "right": 255}}, {"match": {"left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "op": "==", "right": {"set": [133, 135, 136]}}}, {"accept": null}]),
+            ),
+            (
+                NFT_OUTPUT_CHAIN,
+                "fence:classify",
+                json!([{"jump": {"target": NFT_CLASSIFY_CHAIN}}]),
+            ),
+            (
+                NFT_CLASSIFY_CHAIN,
+                "fence:violation",
+                json!([{"jump": {"target": NFT_VIOLATION_CHAIN}}]),
+            ),
+            (
+                NFT_VIOLATION_CHAIN,
+                "fence:sample_violation",
+                json!([{"limit": {"rate": 100, "per": "second", "burst": 100}}, {"counter": {"name": NFT_SAMPLED_VIOLATIONS_COUNTER}}, {"log": {"group": 4242, "prefix": "fence-v0-block", "snaplen": 64, "qthreshold": 1}}]),
+            ),
+            (
+                NFT_VIOLATION_CHAIN,
+                "fence:sample_violation",
+                json!([{"limit": {"rate": 100, "per": "second", "burst": 100}}, {"counter": {"name": NFT_SAMPLED_VIOLATIONS_COUNTER, "packets": 7, "bytes": 512}}, {"log": {"group": 4242, "prefix": "fence-v0-audit", "snaplen": 64, "queue-threshold": 1}}]),
+            ),
+            (
+                NFT_VIOLATION_CHAIN,
+                "fence:reject_violation",
+                json!([{"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}}, {"reject": null}]),
+            ),
+            (
+                NFT_VIOLATION_CHAIN,
+                "fence:accept_violation",
+                json!([{"counter": NFT_TOTAL_VIOLATIONS_COUNTER}, {"accept": null}]),
+            ),
+        ];
+
+        for (chain, comment, expressions) in rules {
+            parse_test_rule(chain, comment, expressions).unwrap();
+        }
+    }
+
+    #[test]
+    fn parser_rejects_modified_classification_dispatch() {
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:classify",
+            json!([
+                {"match": {"left": {"meta": {"key": "oifname"}}, "op": "==", "right": "lo"}},
+                {"jump": {"target": NFT_CLASSIFY_CHAIN}}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:classify",
+            json!([
+                {"jump": {"target": NFT_CLASSIFY_CHAIN}},
+                {"jump": {"target": NFT_VIOLATION_CHAIN}}
+            ]),
+        );
+    }
+
+    #[test]
+    fn parser_rejects_modified_violation_dispatch() {
+        assert_malformed_rule(
+            NFT_CLASSIFY_CHAIN,
+            "fence:violation",
+            json!([
+                {"jump": {"target": NFT_VIOLATION_CHAIN}},
+                {"accept": null}
+            ]),
+        );
+    }
+
+    #[test]
+    fn parser_rejects_modified_terminal_rule() {
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:reject_violation",
+            json!([
+                {"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}},
+                {"accept": null},
+                {"reject": null}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:accept_violation",
+            json!([
+                {"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}},
+                {"accept": null},
+                {"drop": null}
+            ]),
+        );
+    }
+
+    #[test]
+    fn parser_rejects_modified_loopback_rule() {
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:loopback",
+            json!([{"match": {"left": {"meta": {"key": "oifname"}}, "op": "!=", "right": "lo"}}, {"accept": null}]),
+        );
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:loopback",
+            json!([
+                {"match": {"left": {"meta": {"key": "oifname"}}, "op": "==", "right": "lo"}},
+                {"match": {"left": {"meta": {"key": "mark"}}, "op": "==", "right": 1}},
+                {"accept": null}
+            ]),
+        );
+    }
+
+    #[test]
+    fn parser_rejects_modified_connection_state_rule() {
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:established",
+            json!([{"match": {"left": {"ct": {"key": "state"}}, "op": "not in", "right": [2, 4]}}, {"accept": null}]),
+        );
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:established",
+            json!([
+                {"match": {"left": {"ct": {"key": "state"}}, "op": "in", "right": [2, 4]}},
+                {"match": {"left": {"meta": {"key": "mark"}}, "op": "==", "right": 1}},
+                {"accept": null}
+            ]),
+        );
+    }
+
+    #[test]
+    fn parser_rejects_modified_sampled_violation_rule() {
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:sample_violation",
+            json!([
+                {"counter": {"name": NFT_SAMPLED_VIOLATIONS_COUNTER}},
+                {"log": {"group": 4242, "prefix": "fence-v0-block", "snaplen": 64, "qthreshold": 1}},
+                {"limit": {"rate": 100, "per": "second", "burst": 100}}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:sample_violation",
+            json!([
+                {"limit": {"rate": 100, "per": "second", "burst": 100}},
+                {"counter": {"name": NFT_SAMPLED_VIOLATIONS_COUNTER}},
+                {"log": {"group": 4242, "prefix": "fence-v0-block", "snaplen": 64, "qthreshold": 1}},
+                {"accept": null}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:sample_violation",
+            json!([
+                {"limit": {"rate": 100, "per": "second", "burst": 100}},
+                {"counter": {"name": NFT_SAMPLED_VIOLATIONS_COUNTER, "unexpected": true}},
+                {"log": {"group": 4242, "prefix": "fence-v0-block", "snaplen": 64, "qthreshold": 1}}
+            ]),
+        );
+    }
+
+    #[test]
+    fn parser_rejects_modified_ipv6_control_rule() {
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:implicit_ipv6_control",
+            json!([{"match": {"left": {"payload": {"protocol": "ip6", "field": "hoplimit"}}, "op": "!=", "right": 255}}, {"match": {"left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "op": "==", "right": {"set": [133, 135, 136]}}}, {"accept": null}]),
+        );
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:implicit_ipv6_control",
+            json!([
+                {"match": {"left": {"payload": {"protocol": "ip6", "field": "hoplimit"}}, "op": "==", "right": 255}},
+                {"match": {"left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "op": "==", "right": {"set": [133, 135, 136]}}},
+                {"match": {"left": {"meta": {"key": "mark"}}, "op": "==", "right": 1}},
+                {"accept": null}
+            ]),
         );
     }
 
