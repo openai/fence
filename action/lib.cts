@@ -127,6 +127,8 @@ const ACTION_RUNTIME_FILES = [
 const MAX_ACTION_RUNTIME_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_ACTION_PATH_GUARDS = 16;
 const MAX_ACTION_PATH_ANCESTORS = 64;
+const MAX_ACTION_MOUNTINFO_BYTES = 4 * 1024 * 1024;
+const MAX_ACTION_MOUNTINFO_RECORD_BYTES = 16 * 1024;
 const REPORT_STATUSES = new Set([
   "protected_host_block",
   "protected_host_block_degraded",
@@ -737,77 +739,235 @@ function validateProtectedActionRuntime(actionRoot: string): void {
   }
 }
 
-function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void {
+function validateReadOnlyActionMount(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+): void {
+  const mount = effectiveActionMount(
+    raw,
+    expectedTarget,
+    expectedMountId,
+    "protected Action",
+  );
+  const options = new Set(mount.options.split(","));
+  if (
+    !options.has("ro") ||
+    !options.has("nodev") ||
+    !options.has("nosuid")
+  ) {
+    fail("Fence protected Action mount is missing required options");
+  }
+}
+
+function mountIdentifier(value: unknown): string | undefined {
+  const identifier = typeof value === "number" && Number.isSafeInteger(value)
+    ? String(value)
+    : value;
+  if (
+    typeof identifier !== "string" ||
+    !/^[1-9][0-9]*$/.test(identifier)
+  ) {
+    return undefined;
+  }
+  return identifier;
+}
+
+function mountIdFromFdInfo(raw: unknown): string {
+  if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 4 * 1024) {
+    fail("Fence active mount identity is unavailable");
+  }
+  const mountIds = raw
+    .split("\n")
+    .map((line) => /^mnt_id:\s+([1-9][0-9]*)\s*$/.exec(line)?.[1])
+    .filter((mountId): mountId is string => mountId !== undefined);
+  if (mountIds.length !== 1) {
+    fail("Fence active mount identity is unavailable");
+  }
+  return mountIds[0];
+}
+
+function mountInfoRecordForId(mountId: string): string {
+  const descriptor = fs.openSync(
+    "/proc/self/mountinfo",
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+  );
+  try {
+    const chunks: Buffer[] = [];
+    const chunk = Buffer.alloc(16 * 1024);
+    let totalBytes = 0;
+    while (true) {
+      const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      totalBytes += bytesRead;
+      if (totalBytes > MAX_ACTION_MOUNTINFO_BYTES) {
+        fail("Fence active mount table is unavailable");
+      }
+      chunks.push(Buffer.from(chunk.subarray(0, bytesRead)));
+    }
+    const matching = Buffer.concat(chunks, totalBytes)
+      .toString("utf8")
+      .split("\n")
+      .filter((line) => line.startsWith(`${mountId} `));
+    if (matching.length !== 1) {
+      fail("Fence active mount table is unavailable");
+    }
+    return matching[0];
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function decodeMountInfoPath(encoded: string): string {
+  if (encoded.replace(/\\(?:011|012|040|134)/g, "").includes("\\")) {
+    fail("Fence active mount record is malformed");
+  }
+  return encoded.replace(
+    /\\(011|012|040|134)/g,
+    (_escape, octal) => String.fromCharCode(Number.parseInt(octal, 8)),
+  );
+}
+
+function actionMountRecordFromMountInfo(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+): { target: string; options: string; id: string } {
+  if (
+    typeof raw !== "string" ||
+    Buffer.byteLength(raw, "utf8") > MAX_ACTION_MOUNTINFO_RECORD_BYTES ||
+    raw.length === 0 ||
+    raw.includes("\n") ||
+    raw.includes("\r")
+  ) {
+    fail("Fence active mount record is unavailable");
+  }
+  const fields = raw.split(" ");
+  const separator = fields.indexOf("-", 6);
+  const mountId = mountIdentifier(fields[0]);
+  if (
+    mountId === undefined ||
+    mountId !== expectedMountId ||
+    !/^[0-9]+:[0-9]+$/.test(fields[2] || "") ||
+    separator < 6 ||
+    fields.length < separator + 4 ||
+    !fields[5]
+  ) {
+    fail("Fence active mount record is malformed");
+  }
+  const target = decodeMountInfoPath(fields[4]);
+  if (target !== expectedTarget) {
+    fail("Fence active mount record does not match the registered runtime");
+  }
+  return { target, options: fields[5], id: mountId };
+}
+
+function activeActionMountEvidence(
+  target: string,
+): { raw: string; mountId: string } {
+  if (!path.isAbsolute(target) || path.normalize(target) !== target) {
+    fail("Fence active Action mount target is invalid");
+  }
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(
+      target,
+      fs.constants.O_RDONLY |
+        fs.constants.O_DIRECTORY |
+        fs.constants.O_NOFOLLOW,
+    );
+  } catch {
+    fail("Fence active Action mount evidence is unavailable");
+  }
+  try {
+    const mountId = mountIdFromFdInfo(
+      fs.readFileSync(`/proc/self/fdinfo/${descriptor}`, "utf8"),
+    );
+    const record = actionMountRecordFromMountInfo(
+      mountInfoRecordForId(mountId),
+      target,
+      mountId,
+    );
+    return {
+      raw: JSON.stringify({ filesystems: [record] }),
+      mountId,
+    };
+  } catch {
+    fail("Fence active Action mount evidence is unavailable");
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function effectiveActionMount(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+  description: string,
+): { options: string } {
+  if (mountIdentifier(expectedMountId) !== expectedMountId) {
+    fail(`Fence ${description} mount evidence is incomplete`);
+  }
   if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
-    fail("Fence protected Action mount evidence is unavailable");
+    fail(`Fence ${description} mount evidence is unavailable`);
   }
   let document: any;
   try {
     document = JSON.parse(raw);
   } catch {
-    fail("Fence protected Action mount evidence is malformed");
+    fail(`Fence ${description} mount evidence is malformed`);
   }
   if (
     document === null ||
     Array.isArray(document) ||
     typeof document !== "object" ||
     !Array.isArray(document.filesystems) ||
-    document.filesystems.length === 0 ||
-    document.filesystems.length > MAX_ACTION_PATH_GUARDS
+    document.filesystems.length === 0
   ) {
-    fail("Fence protected Action mount evidence is incomplete");
+    fail(`Fence ${description} mount evidence is incomplete`);
   }
-  if (
-    document.filesystems.some((mount: any) =>
+  const mounts = document.filesystems.map((mount: any) => {
+    const mountId = mountIdentifier(mount?.id);
+    if (
       mount === null ||
       Array.isArray(mount) ||
       typeof mount !== "object" ||
-      mount.target !== expectedTarget ||
-      typeof mount.options !== "string"
-    )
-  ) {
-    fail("Fence protected Action mount does not match the registered runtime");
-  }
-  const requiredOptions = ["ro", "nodev", "nosuid"];
-  const hasProtectedMount = document.filesystems.some((mount: any) => {
-    const options = new Set(mount.options.split(","));
-    return requiredOptions.every((required) => options.has(required));
+      Object.keys(mount).sort().join(",") !== "id,options,target" ||
+      typeof mount.options !== "string" ||
+      mountId === undefined
+    ) {
+      fail(`Fence ${description} mount evidence is incomplete`);
+    }
+    if (mount.target !== expectedTarget) {
+      fail(`Fence ${description} mount does not match the registered runtime`);
+    }
+    return { id: mountId, options: mount.options };
   });
-  if (!hasProtectedMount) {
-    fail("Fence protected Action mount is missing required options");
+  if (new Set(mounts.map((mount) => mount.id)).size !== mounts.length) {
+    fail(`Fence ${description} mount evidence is incomplete`);
   }
+  const activeMounts = mounts.filter((mount) => mount.id === expectedMountId);
+  if (activeMounts.length !== 1) {
+    fail(`Fence ${description} mount does not match the active runtime`);
+  }
+  return activeMounts[0];
 }
 
-function validateActionPathGuardMount(raw: unknown, expectedTarget: string): void {
-  if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
-    fail("Fence registered Action path guard mount evidence is unavailable");
-  }
-  let document: any;
-  try {
-    document = JSON.parse(raw);
-  } catch {
-    fail("Fence registered Action path guard mount evidence is malformed");
-  }
-  const mounts = document?.filesystems;
-  if (
-    !Array.isArray(mounts) ||
-    mounts.length === 0 ||
-    mounts.length > MAX_ACTION_PATH_GUARDS ||
-    mounts.some((mount) =>
-      mount === null ||
-      Array.isArray(mount) ||
-      typeof mount !== "object" ||
-      mount.target !== expectedTarget ||
-      typeof mount.options !== "string"
-    )
-  ) {
-    fail("Fence registered Action path guard mount does not match the protected runtime");
-  }
-  const hasWritableMount = mounts.some((mount) => {
-    const options = new Set(mount.options.split(","));
-    return options.has("rw") && !options.has("ro");
-  });
-  if (!hasWritableMount) {
+function validateActionPathGuardMount(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+): void {
+  const mount = effectiveActionMount(
+    raw,
+    expectedTarget,
+    expectedMountId,
+    "registered Action path guard",
+  );
+  const options = new Set(mount.options.split(","));
+  if (!options.has("rw") || options.has("ro")) {
     fail("Fence registered Action path guard mount must remain writable");
   }
 }
@@ -1776,6 +1936,8 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 module.exports = {
   ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  activeActionMountEvidence,
+  actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
@@ -1787,6 +1949,7 @@ module.exports = {
   materializationRequestRejections,
   materializationEvidenceCounter,
   materializationWarningLines,
+  mountIdFromFdInfo,
   networkActivitySummary,
   nativeInputsFromEnvironment,
   readJsonBounded,

@@ -5,6 +5,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const log = require("./log.cts");
 const {
+  activeActionMountEvidence,
   actionPathGuardIdentities,
   actionRuntimeFileDigests,
   correlateFindingsToDns,
@@ -67,37 +68,15 @@ function validateResidentService(unit: string, expectedPid: unknown): void {
 }
 
 function validateProtectedActionMount(actionRoot: string): void {
-  const raw = captureMountEvidence(actionRoot, "Fence protected Action mount could not be verified");
-  validateReadOnlyActionMount(raw, actionRoot);
-}
-
-function captureMountEvidence(target: string, failureMessage: string): string {
-  const result = spawnSync(
-    "/usr/bin/findmnt",
-    ["--json", "--mountpoint", target, "--output", "TARGET,OPTIONS"],
-    {
-      encoding: "utf8",
-      env: CHILD_ENV,
-      killSignal: "SIGKILL",
-      maxBuffer: 16 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: 2 * 1000,
-    },
-  );
-  if (result.error || result.status !== 0 || String(result.stderr || "").length !== 0) {
-    throw new Error(failureMessage);
-  }
-  return String(result.stdout || "");
+  const evidence = activeActionMountEvidence(actionRoot);
+  validateReadOnlyActionMount(evidence.raw, actionRoot, evidence.mountId);
 }
 
 function validateRegisteredActionPathGuards(actionRoot: string): ReturnType<typeof actionPathGuardIdentities> {
   const guards = actionPathGuardIdentities(actionRoot);
   for (const guard of guards) {
-    const raw = captureMountEvidence(
-      guard.path,
-      "Fence registered Action path guard could not be verified",
-    );
-    validateActionPathGuardMount(raw, guard.path);
+    const evidence = activeActionMountEvidence(guard.path);
+    validateActionPathGuardMount(evidence.raw, guard.path, evidence.mountId);
   }
   return guards;
 }

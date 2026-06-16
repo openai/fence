@@ -180,10 +180,11 @@ marker = "\n  acceptance:\n"
 require(workflow.count(marker) == 1, "Action acceptance aggregate must be unique")
 aggregate = workflow.split(marker, 1)[1]
 required_fragments = [
-    "needs: [action, zero-input, setup-failure, tamper, verify-action-finalization]",
+    "needs: [action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]",
     "if: ${{ always() && !cancelled() }}",
     "ACTION_RESULT: ${{ needs.action.result }}",
     "ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}",
+    "NESTED_LAYOUT_RESULT: ${{ needs.nested-layout.result }}",
     "SETUP_FAILURE_RESULT: ${{ needs.setup-failure.result }}",
     "TAMPER_RESULT: ${{ needs.tamper.result }}",
     "FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}",

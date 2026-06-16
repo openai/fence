@@ -102,6 +102,40 @@ jobs:
       - name: verify zero-input Action lifecycle
         run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
+  nested-layout:
+    name: action nested registered path
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout into nested Action path
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          path: target/action-layout/owner/project/revision
+          persist-credentials: false
+
+      - name: validate locks
+        working-directory: target/action-layout/owner/project/revision
+        run: script/validate-locks --ci
+
+      - name: observe hosted runner fingerprint candidate
+        working-directory: target/action-layout/owner/project/revision
+        run: script/observe-hosted-runner
+
+      - name: test Action wrapper
+        working-directory: target/action-layout/owner/project/revision
+        run: script/test-action-wrapper
+
+      - name: activate bundled Fence agent from nested path
+        uses: ./target/action-layout/owner/project/revision
+        with:
+          mode: audit
+          invocation_id: action-nested-layout
+
+      - name: verify nested Action lifecycle
+        working-directory: target/action-layout/owner/project/revision
+        run: script/test-action-acceptance audit action-nested-layout
+
   setup-failure:
     name: action setup failure evidence
     timeout-minutes: 5
@@ -199,7 +233,7 @@ jobs:
 
   acceptance:
     name: action acceptance
-    needs: [action, zero-input, setup-failure, tamper, verify-action-finalization]
+    needs: [action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-24.04
 
@@ -208,6 +242,7 @@ jobs:
         env:
           ACTION_RESULT: ${{ needs.action.result }}
           ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}
+          NESTED_LAYOUT_RESULT: ${{ needs.nested-layout.result }}
           SETUP_FAILURE_RESULT: ${{ needs.setup-failure.result }}
           TAMPER_RESULT: ${{ needs.tamper.result }}
           FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}
@@ -215,6 +250,7 @@ jobs:
           for result in \
             "$ACTION_RESULT" \
             "$ZERO_INPUT_RESULT" \
+            "$NESTED_LAYOUT_RESULT" \
             "$SETUP_FAILURE_RESULT" \
             "$TAMPER_RESULT" \
             "$FINALIZATION_RESULT"
