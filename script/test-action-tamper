@@ -100,12 +100,22 @@ PY
 IFS=$'\t' read -r path_guard path_guard_device path_guard_inode <"$path_guard_record"
 [[ "$path_guard_device" =~ ^[0-9]+$ ]] || die "Action path guard device evidence is invalid"
 [[ "$path_guard_inode" =~ ^[0-9]+$ ]] || die "Action path guard inode evidence is invalid"
-guard_target="$(findmnt --noheadings --mountpoint "$path_guard" --output TARGET)"
-guard_options="$(findmnt --noheadings --mountpoint "$path_guard" --output OPTIONS)"
-[[ "$guard_target" == "$path_guard" ]] || die "Action path guard mount target changed"
-if [[ ",$guard_options," != *,rw,* || ",$guard_options," == *,ro,* ]]; then
-  die "Action path guard mount is not writable"
-fi
+mapfile -t guard_mounts < <(
+  findmnt --raw --noheadings --mountpoint "$path_guard" --output TARGET,OPTIONS
+)
+guard_mount_count="${#guard_mounts[@]}"
+(( guard_mount_count > 0 && guard_mount_count <= 16 )) ||
+  die "Action path guard mount evidence is incomplete"
+guard_mount_writable=false
+for guard_mount in "${guard_mounts[@]}"; do
+  read -r guard_target guard_options <<<"$guard_mount"
+  [[ "$guard_target" == "$path_guard" && -n "$guard_options" ]] ||
+    die "Action path guard mount target changed"
+  if [[ ",$guard_options," == *,rw,* && ",$guard_options," != *,ro,* ]]; then
+    guard_mount_writable=true
+  fi
+done
+[[ "$guard_mount_writable" == "true" ]] || die "Action path guard mount is not writable"
 
 guard_parent="${path_guard%/*}"
 moved_guard="$guard_parent/.fence-action-path-tamper"
