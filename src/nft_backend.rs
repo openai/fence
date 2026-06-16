@@ -698,7 +698,11 @@ fn expressions_equal(expressions: &[Value], expected: Value) -> bool {
 }
 
 fn is_exact_verdict(expression: &Value, verdict: &str) -> bool {
-    single_expression(expression, verdict).is_some_and(Value::is_null)
+    let Some(value) = single_expression(expression, verdict) else {
+        return false;
+    };
+    value.is_null()
+        || (verdict == "reject" && value == &json!({"type": "icmpx", "expr": "port-unreachable"}))
 }
 
 fn is_exact_loopback_rule(expressions: &[Value]) -> bool {
@@ -986,7 +990,7 @@ mod tests {
             Mode::Block => (
                 "fence-v0-block",
                 "fence:reject_violation",
-                json!({"reject": null}),
+                json!({"reject": {"type": "icmpx", "expr": "port-unreachable"}}),
             ),
             Mode::Audit => (
                 "fence-v0-audit",
@@ -1303,6 +1307,11 @@ mod tests {
             ),
             (
                 NFT_VIOLATION_CHAIN,
+                "fence:reject_violation",
+                json!([{"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}}, {"reject": {"type": "icmpx", "expr": "port-unreachable"}}]),
+            ),
+            (
+                NFT_VIOLATION_CHAIN,
                 "fence:accept_violation",
                 json!([{"counter": NFT_TOTAL_VIOLATIONS_COUNTER}, {"accept": null}]),
             ),
@@ -1363,6 +1372,30 @@ mod tests {
                 {"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}},
                 {"accept": null},
                 {"drop": null}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:reject_violation",
+            json!([
+                {"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}},
+                {"reject": {"type": "tcp reset", "expr": "port-unreachable"}}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:reject_violation",
+            json!([
+                {"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}},
+                {"reject": {"type": "icmpx", "expr": "admin-prohibited"}}
+            ]),
+        );
+        assert_malformed_rule(
+            NFT_VIOLATION_CHAIN,
+            "fence:reject_violation",
+            json!([
+                {"counter": {"name": NFT_TOTAL_VIOLATIONS_COUNTER}},
+                {"reject": {"type": "icmpx", "expr": "port-unreachable", "extra": true}}
             ]),
         );
     }
