@@ -18,6 +18,7 @@ const {
   launcherIntegrityDocument,
   materializationRequestRejections,
   materializationWarningLines,
+  mountIdFromFdInfo,
   registeredActionPathGuardPaths,
   runtimePaths,
   summaryLines,
@@ -563,110 +564,96 @@ test("guards every renameable ancestor of the registered Action path", () => {
   }
 });
 
-test("requires the effective registered Action runtime mount to be read-only, nodev, and nosuid", () => {
-  const target = "/opt/actions/fence/action";
-  validateReadOnlyActionMount(JSON.stringify({
-    filesystems: [{ target, options: "ro,nosuid,nodev,relatime", id: 10, parent: 1 }],
-  }), target);
-  const stacked = Array.from({ length: 24 }, (_, index) => ({
-    target,
-    options: index === 23 ? "ro,nosuid,nodev,relatime" : "rw,relatime",
-    id: String(100 + index),
-    parent: String(index === 0 ? 1 : 99 + index),
-  }));
-  validateReadOnlyActionMount(JSON.stringify({ filesystems: stacked }), target);
+test("parses only one bounded active mount identity", () => {
+  assert.equal(mountIdFromFdInfo("pos:\t0\nflags:\t0100000\nmnt_id:\t42\n"), "42");
+  for (const fdInfo of [
+    "",
+    "mnt_id:\t0\n",
+    "mnt_id:\t01\n",
+    "mnt_id:\t1\nmnt_id:\t2\n",
+    "x".repeat(4097),
+  ]) {
+    assert.throws(() => mountIdFromFdInfo(fdInfo), /active mount identity/);
+  }
+});
 
-  for (const options of ["rw,nosuid,nodev", "ro,rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
+test("requires the active registered Action runtime mount to be read-only, nodev, and nosuid", () => {
+  const target = "/opt/actions/fence/action";
+  const mountId = "10";
+  validateReadOnlyActionMount(JSON.stringify({
+    filesystems: [{ target, options: "ro,nosuid,nodev,relatime", id: 10 }],
+  }), target, mountId);
+
+  for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
     assert.throws(
       () => validateReadOnlyActionMount(JSON.stringify({
-        filesystems: [{ target, options, id: 10, parent: 1 }],
-      }), target),
+        filesystems: [{ target, options, id: 10 }],
+      }), target, mountId),
       /missing/,
     );
   }
-  assert.throws(
-    () => validateReadOnlyActionMount(JSON.stringify({
-      filesystems: [{
-        target: "/different",
-        options: "ro,nosuid,nodev",
-        id: 10,
-        parent: 1,
-      }],
-    }), target),
-    /does not match/,
-  );
+  for (const evidence of [
+    { filesystems: [{ target: "/different", options: "ro,nosuid,nodev", id: 10 }] },
+    { filesystems: [{ target, options: "ro,nosuid,nodev", id: 11 }] },
+  ]) {
+    assert.throws(
+      () => validateReadOnlyActionMount(JSON.stringify(evidence), target, mountId),
+      /does not match/,
+    );
+  }
   for (const filesystems of [
     [
-      { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
-      { target, options: "ro,nosuid,nodev", id: 11, parent: 1 },
+      { target, options: "ro,nosuid,nodev", id: 10 },
+      { target, options: "ro,nosuid,nodev", id: 11 },
     ],
-    [
-      { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
-      { target, options: "ro,nosuid,nodev", id: 10, parent: 10 },
-    ],
-    [{ target, options: "ro,nosuid,nodev", id: 10 }],
+    [{ target, options: "ro,nosuid,nodev", id: 10, parent: 1 }],
+    [{ target, options: "ro,nosuid,nodev" }],
     [],
   ]) {
     assert.throws(
-      () => validateReadOnlyActionMount(JSON.stringify({ filesystems }), target),
+      () => validateReadOnlyActionMount(JSON.stringify({ filesystems }), target, mountId),
       /incomplete/,
     );
   }
   assert.throws(
     () => validateReadOnlyActionMount(JSON.stringify({
-      filesystems: [
-        { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
-        { target, options: "rw,nosuid,nodev", id: 11, parent: 10 },
-      ],
-    }), target),
-    /missing/,
+      filesystems: [{ target, options: "ro,nosuid,nodev", id: 10 }],
+    }), target, "01"),
+    /incomplete/,
   );
-  assert.throws(() => validateReadOnlyActionMount("not-json", target), /malformed/);
+  assert.throws(() => validateReadOnlyActionMount("not-json", target, mountId), /malformed/);
 });
 
-test("requires effective registered Action path guards to remain exact writable mountpoints", () => {
+test("requires active registered Action path guards to remain exact writable mountpoints", () => {
   const target = "/srv/runner/work/project";
+  const mountId = "10";
   validateActionPathGuardMount(JSON.stringify({
-    filesystems: [{ target, options: "rw,nosuid,nodev,relatime", id: 10, parent: 1 }],
-  }), target);
-  validateActionPathGuardMount(JSON.stringify({
-    filesystems: [
-      { target, options: "ro,nosuid,nodev", id: 10, parent: 1 },
-      { target, options: "rw,nosuid,nodev,relatime", id: 11, parent: 10 },
-    ],
-  }), target);
+    filesystems: [{ target, options: "rw,nosuid,nodev,relatime", id: mountId }],
+  }), target, mountId);
   for (const evidence of [
-    { filesystems: [{ target, options: "ro,nosuid,nodev", id: 10, parent: 1 }] },
-    { filesystems: [{ target, options: "rw,ro,nosuid,nodev", id: 10, parent: 1 }] },
-    {
-      filesystems: [{
-        target: "/different",
-        options: "rw,nosuid,nodev",
-        id: 10,
-        parent: 1,
-      }],
-    },
+    { filesystems: [{ target, options: "ro,nosuid,nodev", id: 10 }] },
+    { filesystems: [{ target, options: "rw,ro,nosuid,nodev", id: 10 }] },
+    { filesystems: [{ target: "/different", options: "rw,nosuid,nodev", id: 10 }] },
+    { filesystems: [{ target, options: "rw,nosuid,nodev", id: 11 }] },
     {
       filesystems: [
-        { target, options: "rw,nosuid,nodev", id: 10, parent: 1 },
-        { target, options: "rw,nosuid,nodev", id: 11, parent: 1 },
+        { target, options: "rw,nosuid,nodev", id: 10 },
+        { target, options: "rw,nosuid,nodev", id: 11 },
       ],
     },
-    {
-      filesystems: [
-        { target, options: "rw,nosuid,nodev", id: 10, parent: 1 },
-        { target, options: "ro,nosuid,nodev", id: 11, parent: 10 },
-      ],
-    },
-    { filesystems: [{ target, options: "rw,nosuid,nodev", id: 10 }] },
+    { filesystems: [{ target, options: "rw,nosuid,nodev", id: 10, parent: 1 }] },
+    { filesystems: [{ target, options: "rw,nosuid,nodev" }] },
     { filesystems: [] },
   ]) {
     assert.throws(
-      () => validateActionPathGuardMount(JSON.stringify(evidence), target),
+      () => validateActionPathGuardMount(JSON.stringify(evidence), target, mountId),
       /guard mount/,
     );
   }
-  assert.throws(() => validateActionPathGuardMount("not-json", target), /malformed/);
+  assert.throws(
+    () => validateActionPathGuardMount("not-json", target, mountId),
+    /malformed/,
+  );
 });
 
 test("validates stable runtime evidence", () => {

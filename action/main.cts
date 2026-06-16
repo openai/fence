@@ -11,6 +11,7 @@ const {
   actionRuntimeDigest,
   actionRuntimeFileDigests,
   launcherIntegrityDocument,
+  mountIdFromFdInfo,
   nativeInputsFromEnvironment,
   readJsonBounded,
   readLauncherIntegrity,
@@ -199,15 +200,39 @@ function createOrValidateRootDirectory(directory: string): void {
   assertRootDirectory(directory);
 }
 
-function mountEvidence(actionRoot: string): string {
-  return captureRequired("/usr/bin/findmnt", [
-    "--json",
-    "--list",
-    "--mountpoint",
-    actionRoot,
-    "--output",
-    "TARGET,OPTIONS,ID,PARENT",
-  ]);
+function mountEvidence(actionRoot: string): { raw: string; mountId: string } {
+  let descriptor: number;
+  try {
+    descriptor = fs.openSync(
+      actionRoot,
+      fs.constants.O_RDONLY |
+        fs.constants.O_DIRECTORY |
+        fs.constants.O_NOFOLLOW,
+    );
+  } catch {
+    throw new Error("Fence active Action mount could not be opened");
+  }
+  try {
+    let mountId: string;
+    try {
+      mountId = mountIdFromFdInfo(
+        fs.readFileSync(`/proc/self/fdinfo/${descriptor}`, "utf8"),
+      );
+    } catch {
+      throw new Error("Fence active Action mount could not be identified");
+    }
+    const raw = captureRequired("/usr/bin/findmnt", [
+      "--json",
+      "--list",
+      "--id",
+      mountId,
+      "--output",
+      "TARGET,OPTIONS,ID",
+    ]);
+    return { raw, mountId };
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
 function installProtectedActionRuntime(
@@ -296,7 +321,8 @@ function installProtectedActionRuntime(
       guard.path,
     ]);
     protectedActionPathGuards.push(guard.path);
-    validateActionPathGuardMount(mountEvidence(guard.path), guard.path);
+    const evidence = mountEvidence(guard.path);
+    validateActionPathGuardMount(evidence.raw, guard.path, evidence.mountId);
   }
 
   run("/usr/bin/sudo", [
@@ -313,7 +339,8 @@ function installProtectedActionRuntime(
     paths.launcherActionDirectory,
     ACTION_ROOT,
   ]);
-  validateReadOnlyActionMount(mountEvidence(ACTION_ROOT), ACTION_ROOT);
+  const actionMount = mountEvidence(ACTION_ROOT);
+  validateReadOnlyActionMount(actionMount.raw, ACTION_ROOT, actionMount.mountId);
   validateProtectedActionRuntime(ACTION_ROOT);
   const mountedFiles = actionRuntimeFileDigests(ACTION_ROOT);
   const mountedPathGuards = actionPathGuardIdentities(ACTION_ROOT);
@@ -326,7 +353,8 @@ function installProtectedActionRuntime(
     mountedPathGuards,
   );
   for (const guard of mountedPathGuards) {
-    validateActionPathGuardMount(mountEvidence(guard.path), guard.path);
+    const evidence = mountEvidence(guard.path);
+    validateActionPathGuardMount(evidence.raw, guard.path, evidence.mountId);
   }
   validateBundle(MANIFEST, BINARY);
   log.debugGroup("Fence debug: protected Action runtime", [

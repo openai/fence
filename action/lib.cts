@@ -737,12 +737,20 @@ function validateProtectedActionRuntime(actionRoot: string): void {
   }
 }
 
-function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void {
-  const mount = effectiveActionMount(raw, expectedTarget, "protected Action");
+function validateReadOnlyActionMount(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+): void {
+  const mount = effectiveActionMount(
+    raw,
+    expectedTarget,
+    expectedMountId,
+    "protected Action",
+  );
   const options = new Set(mount.options.split(","));
   if (
     !options.has("ro") ||
-    options.has("rw") ||
     !options.has("nodev") ||
     !options.has("nosuid")
   ) {
@@ -750,23 +758,37 @@ function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void
   }
 }
 
-function mountIdentifier(value: unknown, allowZero: boolean): string | undefined {
+function mountIdentifier(value: unknown): string | undefined {
   const identifier = typeof value === "number" && Number.isSafeInteger(value)
     ? String(value)
     : value;
   if (
     typeof identifier !== "string" ||
-    !/^(0|[1-9][0-9]*)$/.test(identifier) ||
-    (!allowZero && identifier === "0")
+    !/^[1-9][0-9]*$/.test(identifier)
   ) {
     return undefined;
   }
   return identifier;
 }
 
+function mountIdFromFdInfo(raw: unknown): string {
+  if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 4 * 1024) {
+    fail("Fence active mount identity is unavailable");
+  }
+  const mountIds = raw
+    .split("\n")
+    .map((line) => /^mnt_id:\s+([1-9][0-9]*)\s*$/.exec(line)?.[1])
+    .filter((mountId): mountId is string => mountId !== undefined);
+  if (mountIds.length !== 1) {
+    fail("Fence active mount identity is unavailable");
+  }
+  return mountIds[0];
+}
+
 function effectiveActionMount(
   raw: unknown,
   expectedTarget: string,
+  expectedMountId: string,
   description: string,
 ): { options: string } {
   if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
@@ -783,45 +805,40 @@ function effectiveActionMount(
     Array.isArray(document) ||
     typeof document !== "object" ||
     !Array.isArray(document.filesystems) ||
-    document.filesystems.length === 0
+    document.filesystems.length !== 1
   ) {
     fail(`Fence ${description} mount evidence is incomplete`);
   }
-  const mounts = document.filesystems.map((mount: any) => {
-    const id = mountIdentifier(mount?.id, false);
-    const parent = mountIdentifier(mount?.parent, true);
-    if (
-      mount === null ||
-      Array.isArray(mount) ||
-      typeof mount !== "object" ||
-      Object.keys(mount).sort().join(",") !== "id,options,parent,target" ||
-      typeof mount.options !== "string" ||
-      id === undefined ||
-      parent === undefined
-    ) {
-      fail(`Fence ${description} mount evidence is incomplete`);
-    }
-    if (mount.target !== expectedTarget) {
-      fail(`Fence ${description} mount does not match the registered runtime`);
-    }
-    return { id, parent, options: mount.options };
-  });
-
-  const mountIds = new Set(mounts.map((mount) => mount.id));
-  if (mountIds.size !== mounts.length) {
+  const mount = document.filesystems[0];
+  const mountId = mountIdentifier(mount?.id);
+  if (
+    mount === null ||
+    Array.isArray(mount) ||
+    typeof mount !== "object" ||
+    Object.keys(mount).sort().join(",") !== "id,options,target" ||
+    typeof mount.options !== "string" ||
+    mountId === undefined ||
+    mountIdentifier(expectedMountId) !== expectedMountId
+  ) {
     fail(`Fence ${description} mount evidence is incomplete`);
   }
-  // In a same-target mount stack, every hidden layer is the parent of a newer layer.
-  const parentIds = new Set(mounts.map((mount) => mount.parent));
-  const effective = mounts.filter((mount) => !parentIds.has(mount.id));
-  if (effective.length !== 1) {
-    fail(`Fence ${description} mount evidence is incomplete`);
+  if (mount.target !== expectedTarget || mountId !== expectedMountId) {
+    fail(`Fence ${description} mount does not match the active runtime`);
   }
-  return effective[0];
+  return mount;
 }
 
-function validateActionPathGuardMount(raw: unknown, expectedTarget: string): void {
-  const mount = effectiveActionMount(raw, expectedTarget, "registered Action path guard");
+function validateActionPathGuardMount(
+  raw: unknown,
+  expectedTarget: string,
+  expectedMountId: string,
+): void {
+  const mount = effectiveActionMount(
+    raw,
+    expectedTarget,
+    expectedMountId,
+    "registered Action path guard",
+  );
   const options = new Set(mount.options.split(","));
   if (!options.has("rw") || options.has("ro")) {
     fail("Fence registered Action path guard mount must remain writable");
@@ -1803,6 +1820,7 @@ module.exports = {
   materializationRequestRejections,
   materializationEvidenceCounter,
   materializationWarningLines,
+  mountIdFromFdInfo,
   networkActivitySummary,
   nativeInputsFromEnvironment,
   readJsonBounded,
