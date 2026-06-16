@@ -224,8 +224,8 @@ function mountEvidence(actionRoot: string): { raw: string; mountId: string } {
     const raw = captureRequired("/usr/bin/findmnt", [
       "--json",
       "--list",
-      "--id",
-      mountId,
+      "--mountpoint",
+      actionRoot,
       "--output",
       "TARGET,OPTIONS,ID",
     ]);

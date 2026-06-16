@@ -791,6 +791,9 @@ function effectiveActionMount(
   expectedMountId: string,
   description: string,
 ): { options: string } {
+  if (mountIdentifier(expectedMountId) !== expectedMountId) {
+    fail(`Fence ${description} mount evidence is incomplete`);
+  }
   if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 16 * 1024) {
     fail(`Fence ${description} mount evidence is unavailable`);
   }
@@ -805,27 +808,35 @@ function effectiveActionMount(
     Array.isArray(document) ||
     typeof document !== "object" ||
     !Array.isArray(document.filesystems) ||
-    document.filesystems.length !== 1
+    document.filesystems.length === 0
   ) {
     fail(`Fence ${description} mount evidence is incomplete`);
   }
-  const mount = document.filesystems[0];
-  const mountId = mountIdentifier(mount?.id);
-  if (
-    mount === null ||
-    Array.isArray(mount) ||
-    typeof mount !== "object" ||
-    Object.keys(mount).sort().join(",") !== "id,options,target" ||
-    typeof mount.options !== "string" ||
-    mountId === undefined ||
-    mountIdentifier(expectedMountId) !== expectedMountId
-  ) {
+  const mounts = document.filesystems.map((mount: any) => {
+    const mountId = mountIdentifier(mount?.id);
+    if (
+      mount === null ||
+      Array.isArray(mount) ||
+      typeof mount !== "object" ||
+      Object.keys(mount).sort().join(",") !== "id,options,target" ||
+      typeof mount.options !== "string" ||
+      mountId === undefined
+    ) {
+      fail(`Fence ${description} mount evidence is incomplete`);
+    }
+    if (mount.target !== expectedTarget) {
+      fail(`Fence ${description} mount does not match the registered runtime`);
+    }
+    return { id: mountId, options: mount.options };
+  });
+  if (new Set(mounts.map((mount) => mount.id)).size !== mounts.length) {
     fail(`Fence ${description} mount evidence is incomplete`);
   }
-  if (mount.target !== expectedTarget || mountId !== expectedMountId) {
+  const activeMounts = mounts.filter((mount) => mount.id === expectedMountId);
+  if (activeMounts.length !== 1) {
     fail(`Fence ${description} mount does not match the active runtime`);
   }
-  return mount;
+  return activeMounts[0];
 }
 
 function validateActionPathGuardMount(

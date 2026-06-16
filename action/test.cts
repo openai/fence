@@ -583,6 +583,12 @@ test("requires the active registered Action runtime mount to be read-only, nodev
   validateReadOnlyActionMount(JSON.stringify({
     filesystems: [{ target, options: "ro,nosuid,nodev,relatime", id: 10 }],
   }), target, mountId);
+  const stacked = Array.from({ length: 24 }, (_, index) => ({
+    target,
+    options: index === 23 ? "ro,nosuid,nodev,relatime" : "rw,relatime",
+    id: 10 + index,
+  }));
+  validateReadOnlyActionMount(JSON.stringify({ filesystems: stacked }), target, "33");
 
   for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
     assert.throws(
@@ -604,7 +610,7 @@ test("requires the active registered Action runtime mount to be read-only, nodev
   for (const filesystems of [
     [
       { target, options: "ro,nosuid,nodev", id: 10 },
-      { target, options: "ro,nosuid,nodev", id: 11 },
+      { target, options: "ro,nosuid,nodev", id: 10 },
     ],
     [{ target, options: "ro,nosuid,nodev", id: 10, parent: 1 }],
     [{ target, options: "ro,nosuid,nodev" }],
@@ -615,6 +621,15 @@ test("requires the active registered Action runtime mount to be read-only, nodev
       /incomplete/,
     );
   }
+  assert.throws(
+    () => validateReadOnlyActionMount(JSON.stringify({
+      filesystems: [
+        { target, options: "ro,nosuid,nodev", id: 10 },
+        { target, options: "rw,nosuid,nodev", id: 11 },
+      ],
+    }), target, "11"),
+    /missing/,
+  );
   assert.throws(
     () => validateReadOnlyActionMount(JSON.stringify({
       filesystems: [{ target, options: "ro,nosuid,nodev", id: 10 }],
@@ -630,6 +645,12 @@ test("requires active registered Action path guards to remain exact writable mou
   validateActionPathGuardMount(JSON.stringify({
     filesystems: [{ target, options: "rw,nosuid,nodev,relatime", id: mountId }],
   }), target, mountId);
+  validateActionPathGuardMount(JSON.stringify({
+    filesystems: [
+      { target, options: "ro,nosuid,nodev", id: 9 },
+      { target, options: "rw,nosuid,nodev,relatime", id: 10 },
+    ],
+  }), target, mountId);
   for (const evidence of [
     { filesystems: [{ target, options: "ro,nosuid,nodev", id: 10 }] },
     { filesystems: [{ target, options: "rw,ro,nosuid,nodev", id: 10 }] },
@@ -638,7 +659,13 @@ test("requires active registered Action path guards to remain exact writable mou
     {
       filesystems: [
         { target, options: "rw,nosuid,nodev", id: 10 },
-        { target, options: "rw,nosuid,nodev", id: 11 },
+        { target, options: "rw,nosuid,nodev", id: 10 },
+      ],
+    },
+    {
+      filesystems: [
+        { target, options: "rw,nosuid,nodev", id: 9 },
+        { target, options: "ro,nosuid,nodev", id: 10 },
       ],
     },
     { filesystems: [{ target, options: "rw,nosuid,nodev", id: 10, parent: 1 }] },

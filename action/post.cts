@@ -101,7 +101,7 @@ function captureMountEvidence(
     }
     const result = spawnSync(
       "/usr/bin/findmnt",
-      ["--json", "--list", "--id", mountId, "--output", "TARGET,OPTIONS,ID"],
+      ["--json", "--list", "--mountpoint", target, "--output", "TARGET,OPTIONS,ID"],
       {
         encoding: "utf8",
         env: CHILD_ENV,
