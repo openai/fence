@@ -752,8 +752,7 @@ function validateReadOnlyActionMount(raw: unknown, expectedTarget: string): void
     Array.isArray(document) ||
     typeof document !== "object" ||
     !Array.isArray(document.filesystems) ||
-    document.filesystems.length === 0 ||
-    document.filesystems.length > MAX_ACTION_PATH_GUARDS
+    document.filesystems.length !== 1
   ) {
     fail("Fence protected Action mount evidence is incomplete");
   }
@@ -791,8 +790,7 @@ function validateActionPathGuardMount(raw: unknown, expectedTarget: string): voi
   const mounts = document?.filesystems;
   if (
     !Array.isArray(mounts) ||
-    mounts.length === 0 ||
-    mounts.length > MAX_ACTION_PATH_GUARDS ||
+    mounts.length !== 1 ||
     mounts.some((mount) =>
       mount === null ||
       Array.isArray(mount) ||

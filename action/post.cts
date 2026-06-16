@@ -74,7 +74,7 @@ function validateProtectedActionMount(actionRoot: string): void {
 function captureMountEvidence(target: string, failureMessage: string): string {
   const result = spawnSync(
     "/usr/bin/findmnt",
-    ["--json", "--mountpoint", target, "--output", "TARGET,OPTIONS"],
+    ["--json", "--uniq", "--mountpoint", target, "--output", "TARGET,OPTIONS"],
     {
       encoding: "utf8",
       env: CHILD_ENV,

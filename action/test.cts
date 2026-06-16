@@ -563,16 +563,10 @@ test("guards every renameable ancestor of the registered Action path", () => {
   }
 });
 
-test("requires the registered Action runtime mount to be read-only, nodev, and nosuid", () => {
+test("requires the effective registered Action runtime mount to be read-only, nodev, and nosuid", () => {
   const target = "/opt/actions/fence/action";
   validateReadOnlyActionMount(JSON.stringify({
     filesystems: [{ target, options: "ro,nosuid,nodev,relatime" }],
-  }), target);
-  validateReadOnlyActionMount(JSON.stringify({
-    filesystems: [
-      { target, options: "rw,nosuid,nodev,relatime" },
-      { target, options: "ro,nosuid,nodev,relatime" },
-    ],
   }), target);
   for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
     assert.throws(
@@ -592,24 +586,18 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
     () => validateReadOnlyActionMount(JSON.stringify({
       filesystems: [
         { target, options: "ro,nosuid,nodev" },
-        { target: "/different", options: "ro,nosuid,nodev" },
+        { target, options: "ro,nosuid,nodev" },
       ],
     }), target),
-    /does not match/,
+    /incomplete/,
   );
   assert.throws(() => validateReadOnlyActionMount("not-json", target), /malformed/);
 });
 
-test("requires registered Action path guards to remain exact writable mountpoints", () => {
+test("requires effective registered Action path guards to remain exact writable mountpoints", () => {
   const target = "/srv/runner/work/project";
   validateActionPathGuardMount(JSON.stringify({
     filesystems: [{ target, options: "rw,nosuid,nodev,relatime" }],
-  }), target);
-  validateActionPathGuardMount(JSON.stringify({
-    filesystems: [
-      { target, options: "ro,nosuid,nodev,relatime" },
-      { target, options: "rw,nosuid,nodev,relatime" },
-    ],
   }), target);
   for (const evidence of [
     { filesystems: [{ target, options: "ro,nosuid,nodev" }] },
@@ -617,7 +605,7 @@ test("requires registered Action path guards to remain exact writable mountpoint
     {
       filesystems: [
         { target, options: "rw,nosuid,nodev" },
-        { target: "/different", options: "rw,nosuid,nodev" },
+        { target, options: "rw,nosuid,nodev" },
       ],
     },
     { filesystems: [] },
