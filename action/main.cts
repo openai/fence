@@ -202,7 +202,9 @@ function createOrValidateRootDirectory(directory: string): void {
 function mountEvidence(actionRoot: string): string {
   return captureRequired("/usr/bin/findmnt", [
     "--json",
-    "--uniq",
+    "--direction",
+    "backward",
+    "--first-only",
     "--mountpoint",
     actionRoot,
     "--output",
