@@ -1,0 +1,178 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+require_cmd python3
+
+tmpdir="$(make_temp_dir fence-action-bundle-test)"
+cleanup() {
+  remove_generated_path "$tmpdir" "temporary Action bundle provenance test directory"
+}
+trap cleanup EXIT
+
+source_commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+tag="v1.2.3"
+
+make_fixture() {
+  local case_name="$1"
+  local fixture="$tmpdir/$case_name/repo"
+
+  mkdir -p \
+    "$fixture/action/bin" \
+    "$fixture/script/lib" \
+    "$fixture/target/tmp" \
+    "$tmpdir/$case_name/bin" \
+    "$tmpdir/$case_name/state"
+  cp script/env script/update-action-bundle script/validate-action-bundle "$fixture/script/"
+  cp script/lib/common.bash "$fixture/script/lib/"
+  cp rust-toolchain.toml "$fixture/"
+
+  cat > "$tmpdir/$case_name/bin/gh" <<'SH'
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+command_name="${1:-}"
+subcommand="${2:-}"
+shift 2
+
+case "$command_name:$subcommand" in
+  release:view)
+    is_draft=false
+    is_immutable=true
+    case "$FAKE_RELEASE_CASE" in
+      draft) is_draft=true ;;
+      mutable) is_immutable=false ;;
+      valid|tag-mismatch) ;;
+      *) exit 64 ;;
+    esac
+    printf '{"isDraft":%s,"isImmutable":%s,"isPrerelease":false,"tagName":"v1.2.3","targetCommitish":"%s","url":"https://github.com/GrantBirki/fence/releases/tag/v1.2.3"}\n' \
+      "$is_draft" "$is_immutable" "$FAKE_SOURCE_COMMIT"
+    ;;
+  api:repos/GrantBirki/fence/commits/v1.2.3)
+    if [[ "$FAKE_RELEASE_CASE" == "tag-mismatch" ]]; then
+      printf '%s\n' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    else
+      printf '%s\n' "$FAKE_SOURCE_COMMIT"
+    fi
+    ;;
+  release:download)
+    destination=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --dir)
+          destination="$2"
+          shift 2
+          ;;
+        *) shift ;;
+      esac
+    done
+    [[ -n "$destination" ]] || exit 64
+    printf '%s' "synthetic-action-binary" > "$destination/fence_v1.2.3_linux-amd64"
+    if command -v shasum >/dev/null 2>&1; then
+      digest="$(shasum -a 256 "$destination/fence_v1.2.3_linux-amd64" | awk '{print $1}')"
+    else
+      digest="$(sha256sum "$destination/fence_v1.2.3_linux-amd64" | awk '{print $1}')"
+    fi
+    printf '%s  %s\n' "$digest" "fence_v1.2.3_linux-amd64" > "$destination/checksums.txt"
+    : > "$FAKE_GH_STATE/downloaded"
+    ;;
+  attestation:verify)
+    signer_digest=""
+    source_digest=""
+    source_ref=""
+    signer_workflow=""
+    deny_self_hosted="false"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --signer-digest) signer_digest="$2"; shift 2 ;;
+        --source-digest) source_digest="$2"; shift 2 ;;
+        --source-ref) source_ref="$2"; shift 2 ;;
+        --signer-workflow) signer_workflow="$2"; shift 2 ;;
+        --deny-self-hosted-runners) deny_self_hosted="true"; shift ;;
+        --repo) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    [[ "$signer_digest" == "$FAKE_SOURCE_COMMIT" ]] || exit 65
+    [[ "$source_digest" == "$FAKE_SOURCE_COMMIT" ]] || exit 65
+    [[ "$source_ref" == "refs/heads/main" ]] || exit 65
+    [[ "$signer_workflow" == "GrantBirki/fence/.github/workflows/release.yml" ]] || exit 65
+    [[ "$deny_self_hosted" == "true" ]] || exit 65
+    : > "$FAKE_GH_STATE/attestation-verified"
+    ;;
+  *) exit 64 ;;
+esac
+SH
+  chmod 0755 "$tmpdir/$case_name/bin/gh"
+  printf '%s\n' "$fixture"
+}
+
+run_rejected_case() {
+  local case_name="$1"
+  local fixture
+  fixture="$(make_fixture "$case_name")"
+
+  if (
+    cd "$fixture"
+    CI=true \
+      RUNNER_TEMP="$fixture/target/tmp" \
+      TMPDIR="$fixture/target/tmp" \
+      PATH="$tmpdir/$case_name/bin:$PATH" \
+      FAKE_GH_STATE="$tmpdir/$case_name/state" \
+      FAKE_RELEASE_CASE="$case_name" \
+      FAKE_SOURCE_COMMIT="$source_commit" \
+      script/update-action-bundle "$tag"
+  ) > "$tmpdir/$case_name/output" 2>&1; then
+    die "Action bundle updater accepted invalid release metadata"
+  fi
+  if [[ -e "$tmpdir/$case_name/state/downloaded" ]]; then
+    die "Action bundle updater downloaded an artifact before rejecting invalid release metadata"
+  fi
+}
+
+run_rejected_case draft
+run_rejected_case mutable
+run_rejected_case tag-mismatch
+
+fixture="$(make_fixture valid)"
+(
+  cd "$fixture"
+  CI=true \
+    RUNNER_TEMP="$fixture/target/tmp" \
+    TMPDIR="$fixture/target/tmp" \
+    PATH="$tmpdir/valid/bin:$PATH" \
+    FAKE_GH_STATE="$tmpdir/valid/state" \
+    FAKE_RELEASE_CASE="valid" \
+    FAKE_SOURCE_COMMIT="$source_commit" \
+    script/update-action-bundle "$tag"
+) > "$tmpdir/valid/output" 2>&1
+
+[[ -e "$tmpdir/valid/state/downloaded" ]] || die "Action bundle updater did not download the validated artifact"
+[[ -e "$tmpdir/valid/state/attestation-verified" ]] || die "Action bundle updater did not enforce attestation provenance"
+
+python3 - "$fixture/action/bundle-manifest.json" "$source_commit" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+source_commit = sys.argv[2]
+expected = {
+    "schema_version": 3,
+    "release_is_draft": False,
+    "release_is_immutable": True,
+    "release_tag_commit": source_commit,
+    "source_commit": source_commit,
+    "source_ref": "refs/heads/main",
+    "signer_digest": source_commit,
+    "attestation_verified": True,
+}
+for key, value in expected.items():
+    if manifest.get(key) != value:
+        raise SystemExit(f"generated Action bundle manifest has an invalid {key}")
+PY
+
+echo -e "${GREEN}Action bundle provenance verified${OFF}"

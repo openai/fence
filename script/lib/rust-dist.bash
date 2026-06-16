@@ -77,6 +77,234 @@ rust_dist_require_artifact() {
   fi
 }
 
+rust_dist_artifact_entry() {
+  local lockfile="$1"
+  local kind="$2"
+  local component="$3"
+  local target="$4"
+
+  rust_dist_artifact_entries "$lockfile" | awk -F'|' \
+    -v kind="$kind" -v component="$component" -v target="$target" '
+      !found && $1 == kind && $2 == component && $3 == target {
+        print $4 "|" $5
+        found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+rust_dist_relative_url_path() {
+  local url="$1"
+  local path
+
+  case "$url" in
+    https://static.rust-lang.org/dist/*)
+      path="${url#https://static.rust-lang.org/}"
+      ;;
+    *)
+      die "unexpected Rust distribution URL"
+      ;;
+  esac
+
+  case "$path" in
+    *\?*|*\#*)
+      die "Rust distribution URL must not contain a query or fragment"
+      ;;
+  esac
+  reject_unsafe_relative_path "$path" "Rust distribution URL path"
+  printf '%s\n' "$path"
+}
+
+rust_dist_fetch_verified() {
+  local url="$1"
+  local expected_sha256="$2"
+  local mirror_root="$3"
+  local relative_path
+  local destination
+  local actual_sha256
+
+  if ! [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+    die "invalid locked Rust distribution checksum"
+  fi
+
+  relative_path="$(rust_dist_relative_url_path "$url")"
+  destination="$mirror_root/$relative_path"
+  if [[ ! -f "$destination" ]]; then
+    fetch "$url" "$destination"
+  fi
+
+  actual_sha256="$(sha256_file "$destination")"
+  if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+    die "Rust distribution artifact checksum mismatch"
+  fi
+}
+
+rust_dist_require_install_selection() {
+  local lockfile="$1"
+  local host="$2"
+  local targets_csv="$3"
+  local component
+  local target
+  local requested_targets=()
+
+  if [[ -z "$host" || "$host" == "unknown" ]]; then
+    die "unsupported Rust host"
+  fi
+
+  for component in "${RUST_DIST_HOST_COMPONENTS[@]}"; do
+    rust_dist_require_artifact "$lockfile" host "$component" "$host"
+  done
+  rust_dist_require_artifact "$lockfile" target rust-std "$host"
+
+  if [[ -n "$targets_csv" ]]; then
+    IFS=',' read -r -a requested_targets <<< "$targets_csv"
+    for target in "${requested_targets[@]}"; do
+      [[ -n "$target" ]] || continue
+      if [[ "$target" =~ [[:space:]] ]]; then
+        die "Rust target contains whitespace"
+      fi
+      rust_dist_require_artifact "$lockfile" target rust-std "$target"
+    done
+  fi
+}
+
+rust_dist_prepare_verified_mirror() {
+  local lockfile="$1"
+  local host="$2"
+  local targets_csv="$3"
+  local mirror_root="$4"
+  local component
+  local target
+  local artifact_entry
+  local artifact_url
+  local artifact_sha256
+  local manifest_url
+  local manifest_sha256
+  local manifest_relative_path
+  local manifest_path
+  local seen_targets="|${host}|"
+  local targets=("$host")
+  local requested_targets=()
+
+  rust_dist_require_install_selection "$lockfile" "$host" "$targets_csv"
+
+  if [[ -n "$targets_csv" ]]; then
+    IFS=',' read -r -a requested_targets <<< "$targets_csv"
+    for target in "${requested_targets[@]}"; do
+      [[ -n "$target" ]] || continue
+      case "$seen_targets" in
+        *"|${target}|"*) ;;
+        *)
+          targets+=("$target")
+          seen_targets+="${target}|"
+          ;;
+      esac
+    done
+  fi
+
+  manifest_url="$(toml_value "$lockfile" manifest_url)"
+  manifest_sha256="$(toml_value "$lockfile" manifest_sha256)"
+  rust_dist_fetch_verified "$manifest_url" "$manifest_sha256" "$mirror_root"
+  manifest_relative_path="$(rust_dist_relative_url_path "$manifest_url")"
+  manifest_path="$mirror_root/$manifest_relative_path"
+  printf '%s  %s\n' "$manifest_sha256" "$(basename "$manifest_path")" > "${manifest_path}.sha256"
+
+  for component in "${RUST_DIST_HOST_COMPONENTS[@]}"; do
+    artifact_entry="$(rust_dist_artifact_entry "$lockfile" host "$component" "$host")"
+    IFS='|' read -r artifact_url artifact_sha256 <<< "$artifact_entry"
+    rust_dist_fetch_verified "$artifact_url" "$artifact_sha256" "$mirror_root"
+  done
+
+  for target in "${targets[@]}"; do
+    artifact_entry="$(rust_dist_artifact_entry "$lockfile" target rust-std "$target")"
+    IFS='|' read -r artifact_url artifact_sha256 <<< "$artifact_entry"
+    rust_dist_fetch_verified "$artifact_url" "$artifact_sha256" "$mirror_root"
+  done
+}
+
+rust_dist_install_from_verified_mirror() {
+  local mirror_root="$1"
+  local toolchain="$2"
+  shift 2
+  local port_file="${mirror_root}.port"
+  local server_log="${mirror_root}.server.log"
+
+  require_cmd python3
+
+  if [[ -e "$port_file" ]]; then
+    remove_generated_path "$port_file" "verified Rust distribution mirror port file"
+  fi
+
+  (
+    python3 -I - "$mirror_root" "$port_file" >"$server_log" 2>&1 <<'PY' &
+import functools
+import http.server
+import os
+import sys
+
+root, port_path = sys.argv[1:3]
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, _format, *_args):
+        pass
+
+
+handler = functools.partial(QuietHandler, directory=root)
+server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+descriptor = os.open(port_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    handle.write(f"{server.server_port}\n")
+server.serve_forever()
+PY
+    local server_pid=$!
+    cleanup_server() {
+      kill "$server_pid" >/dev/null 2>&1 || true
+      wait "$server_pid" >/dev/null 2>&1 || true
+    }
+    trap cleanup_server EXIT INT TERM
+
+    local attempt
+    for ((attempt = 0; attempt < 100; attempt++)); do
+      if [[ -s "$port_file" ]]; then
+        break
+      fi
+      if ! kill -0 "$server_pid" >/dev/null 2>&1; then
+        die "verified Rust distribution mirror failed to start"
+      fi
+      sleep 0.05
+    done
+    if [[ ! -s "$port_file" ]]; then
+      die "verified Rust distribution mirror did not become ready"
+    fi
+
+    local mirror_url="http://127.0.0.1:$(head -n1 "$port_file")"
+    local rustup_environment=(
+      env
+      -u RUSTUP_DIST_ROOT
+      -u RUSTUP_TOOLCHAIN
+      -u RUSTUP_OFFLINE
+      -u RUSTUP_LOG
+      -u RUSTUP_TRACE_DIR
+      -u RUSTUP_TOOLCHAIN_SOURCE
+      -u RUSTUP_PERMIT_COPY_RENAME
+      -u ALL_PROXY
+      -u HTTPS_PROXY
+      -u HTTP_PROXY
+      -u all_proxy
+      -u https_proxy
+      -u http_proxy
+      NO_PROXY="127.0.0.1,localhost"
+      no_proxy="127.0.0.1,localhost"
+      RUSTUP_DIST_SERVER="$mirror_url"
+      RUSTUP_UPDATE_ROOT="$mirror_url/rustup"
+      RUSTUP_AUTO_INSTALL=0
+    )
+    "${rustup_environment[@]}" rustup toolchain uninstall "$toolchain"
+    "${rustup_environment[@]}" rustup "$@"
+  )
+}
+
 rust_dist_generate_artifact_entries_from_manifest() {
   local manifest="$1"
   local version="$2"

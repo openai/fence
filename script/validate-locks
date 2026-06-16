@@ -117,6 +117,110 @@ validate_cargo_vendor_surface() {
   fi
 }
 
+validate_ci_evidence() {
+  python3 -E - "$DIR" <<'PY'
+import ast
+import pathlib
+import re
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+root = pathlib.Path(sys.argv[1])
+validator_paths = [
+    "script/test-action-acceptance",
+    "script/test-action-tamper",
+    "script/test-lockdown",
+    "script/test-protected-run",
+    "script/test-selected-profile-runtime",
+    "script/report-selected-profile-runtime",
+]
+
+for relative in validator_paths:
+    source = (root / relative).read_text(encoding="utf-8")
+    invocations = [
+        line
+        for line in source.splitlines()
+        if re.match(r"^\s*python3(?:\s|$)", line)
+    ]
+    require(invocations, f"{relative}: missing Python evidence validator")
+    require(
+        all(re.match(r"^\s*python3 -E(?:\s|$)", line) for line in invocations),
+        f"{relative}: Python evidence validators must ignore environment options",
+    )
+
+    blocks = re.findall(r"<<'PY'\n(.*?)\nPY(?:\n|$)", source, re.DOTALL)
+    require(blocks, f"{relative}: missing inline Python evidence validator")
+    for block in blocks:
+        tree = ast.parse(block, filename=relative)
+        require(
+            not any(isinstance(node, ast.Assert) for node in ast.walk(tree)),
+            f"{relative}: evidence validation must not use Python assert",
+        )
+        uses_require = any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "require"
+            for node in ast.walk(tree)
+        )
+        if uses_require:
+            require(
+                "sys.flags.optimize != 0" in block
+                and 'raise SystemExit("Python optimization must be disabled")' in block,
+                f"{relative}: evidence validator must reject optimized Python",
+            )
+
+workflow = (root / ".github/workflows/action-acceptance.yml").read_text(encoding="utf-8")
+marker = "\n  acceptance:\n"
+require(workflow.count(marker) == 1, "Action acceptance aggregate must be unique")
+aggregate = workflow.split(marker, 1)[1]
+required_fragments = [
+    "needs: [action, zero-input, setup-failure, tamper, verify-action-finalization]",
+    "if: ${{ always() && !cancelled() }}",
+    "ACTION_RESULT: ${{ needs.action.result }}",
+    "ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}",
+    "SETUP_FAILURE_RESULT: ${{ needs.setup-failure.result }}",
+    "TAMPER_RESULT: ${{ needs.tamper.result }}",
+    "FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}",
+    'if [[ "$result" != "success" ]]; then',
+]
+for fragment in required_fragments:
+    require(fragment in aggregate, "Action acceptance aggregate must fail closed")
+require(aggregate.count("exit 1") == 1, "Action acceptance aggregate must reject unsuccessful jobs")
+PY
+
+  if PYTHONOPTIMIZE=1 python3 -E - <<'PY' >/dev/null 2>&1
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+require(False, "synthetic malformed evidence")
+PY
+  then
+    die "environment optimization bypassed unconditional evidence validation"
+  fi
+
+  if python3 -O - <<'PY' >/dev/null 2>&1
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+PY
+  then
+    die "optimized Python bypassed the evidence validation guard"
+  fi
+}
+
 validate_tooling_layout() {
   local required=(
     "$RUST_TOOLCHAIN_LOCK"
@@ -170,5 +274,6 @@ script/validate-test-tools
 script/validate-action-bundle
 validate_cargo_vendor_surface
 validate_workflow_uses_pinned
+validate_ci_evidence
 
 echo -e "${GREEN}lock surfaces verified${OFF}"

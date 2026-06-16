@@ -34,10 +34,11 @@ applied and verified.
 
 Release builds upload Linux x64 artifacts, generate GitHub artifact
 attestations in a dedicated least-privilege job, re-download immutable release
-assets, verify checksums, and verify each attestation against the repository
-release workflow. The committed Action binary is installed only through the
-online maintainer refresh script, which verifies its checksum and attestation
-before writing the reviewed offline manifest. See GitHub's
+assets, verify checksums, and bind each attestation to the repository release
+workflow at the release source commit on `refs/heads/main`. The committed
+Action binary is installed only through the online maintainer refresh script,
+which also requires a non-draft immutable release and a tag resolving to that
+source commit before writing the reviewed offline manifest. See GitHub's
 [artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
 
 ## Findings Addressed

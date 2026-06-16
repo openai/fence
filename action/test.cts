@@ -8,6 +8,7 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   ACTION_RUNTIME_FILES,
+  actionPathGuardIdentities,
   actionRuntimeDigest,
   actionRuntimeFileDigests,
   allowlistYamlSnippet,
@@ -17,9 +18,11 @@ const {
   launcherIntegrityDocument,
   materializationRequestRejections,
   materializationWarningLines,
+  registeredActionPathGuardPaths,
   runtimePaths,
   summaryLines,
   validateBundle,
+  validateActionPathGuardMount,
   validateInlineConfig,
   validateLauncherIntegrity,
   validateProtectedActionRuntime,
@@ -75,13 +78,18 @@ const report = {
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
   const digest = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
   return {
-    schema_version: 2,
+    schema_version: 3,
     repository: "GrantBirki/fence",
     release_tag: "v0.1.0-alpha.3",
     release_channel: "prerelease",
+    release_is_draft: false,
+    release_is_immutable: true,
+    release_tag_commit: "a".repeat(40),
     release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0-alpha.3",
     source_commit: "a".repeat(40),
+    source_ref: "refs/heads/main",
     artifact_name: "fence_v0.1.0-alpha.3_linux-amd64",
+    signer_digest: "a".repeat(40),
     signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
     bundle_path: "action/bin/fence",
     artifact_sha256: digest,
@@ -430,11 +438,17 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
     const files = actionRuntimeFileDigests(temporary);
     assert.equal(files.length, ACTION_RUNTIME_FILES.length);
     assert.match(actionRuntimeDigest(files), /^[0-9a-f]{64}$/);
+    const pathGuards = [{
+      path: "/opt/actions/fence",
+      device: "1",
+      inode: "2",
+    }];
     const integrity = launcherIntegrityDocument(
       "action-test",
       "/opt/actions/fence/action",
       "/run/fence-launcher/action-test/action",
       files,
+      pathGuards,
     );
     validateLauncherIntegrity(
       integrity,
@@ -442,6 +456,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
       "/opt/actions/fence/action",
       "/run/fence-launcher/action-test/action",
       files,
+      pathGuards,
     );
     assert.throws(
       () => validateLauncherIntegrity(
@@ -450,6 +465,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
         "/opt/actions/fence/action",
         "/run/fence-launcher/action-test/action",
         files,
+        pathGuards,
       ),
       /does not match/,
     );
@@ -463,6 +479,18 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
         "/opt/actions/fence/action",
         "/run/fence-launcher/action-test/action",
         modified,
+        pathGuards,
+      ),
+      /does not match/,
+    );
+    assert.throws(
+      () => validateLauncherIntegrity(
+        integrity,
+        "action-test",
+        "/opt/actions/fence/action",
+        "/run/fence-launcher/action-test/action",
+        files,
+        [{ ...pathGuards[0], inode: "3" }],
       ),
       /does not match/,
     );
@@ -475,10 +503,76 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
   }
 });
 
+test("guards every renameable ancestor of the registered Action path", () => {
+  const actionRoot = "/srv/runner/work/project/action";
+  const renameable = new Set([
+    "/srv/runner/work",
+    "/srv/runner/work/project",
+  ]);
+  const guards = registeredActionPathGuardPaths(
+    actionRoot,
+    (candidate) => renameable.has(candidate),
+  );
+  assert.deepEqual(guards, [
+    "/srv/runner/work",
+    "/srv/runner/work/project",
+  ]);
+  assert.deepEqual(
+    registeredActionPathGuardPaths(actionRoot, () => false),
+    [],
+  );
+  assert.throws(
+    () => registeredActionPathGuardPaths("relative/action", () => false),
+    /normalized and absolute/,
+  );
+  const separatedRenameable = new Set([
+    "/srv/runner/outer",
+    "/srv/runner/outer/locked/project",
+  ]);
+  assert.deepEqual(
+    registeredActionPathGuardPaths(
+      "/srv/runner/outer/locked/project/action",
+      (candidate) => separatedRenameable.has(candidate),
+    ),
+    [
+      "/srv/runner/outer",
+      "/srv/runner/outer/locked/project",
+    ],
+  );
+
+  const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-path-")));
+  try {
+    const stable = path.join(temporary, "stable");
+    const outer = path.join(stable, "outer");
+    const locked = path.join(outer, "locked");
+    const project = path.join(locked, "project");
+    const runtime = path.join(project, "action");
+    fs.mkdirSync(runtime, { recursive: true });
+    const identities = actionPathGuardIdentities(
+      runtime,
+      (candidate) => candidate === outer || candidate === project,
+    );
+    assert.deepEqual(identities.map((identity) => identity.path), [outer, project]);
+    for (const identity of identities) {
+      const metadata = fs.lstatSync(identity.path, { bigint: true });
+      assert.equal(identity.device, metadata.dev.toString());
+      assert.equal(identity.inode, metadata.ino.toString());
+    }
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
 test("requires the registered Action runtime mount to be read-only, nodev, and nosuid", () => {
   const target = "/opt/actions/fence/action";
   validateReadOnlyActionMount(JSON.stringify({
     filesystems: [{ target, options: "ro,nosuid,nodev,relatime" }],
+  }), target);
+  validateReadOnlyActionMount(JSON.stringify({
+    filesystems: [
+      { target, options: "rw,nosuid,nodev,relatime" },
+      { target, options: "ro,nosuid,nodev,relatime" },
+    ],
   }), target);
   for (const options of ["rw,nosuid,nodev", "ro,nodev", "ro,nosuid"]) {
     assert.throws(
@@ -494,7 +588,46 @@ test("requires the registered Action runtime mount to be read-only, nodev, and n
     }), target),
     /does not match/,
   );
+  assert.throws(
+    () => validateReadOnlyActionMount(JSON.stringify({
+      filesystems: [
+        { target, options: "ro,nosuid,nodev" },
+        { target: "/different", options: "ro,nosuid,nodev" },
+      ],
+    }), target),
+    /does not match/,
+  );
   assert.throws(() => validateReadOnlyActionMount("not-json", target), /malformed/);
+});
+
+test("requires registered Action path guards to remain exact writable mountpoints", () => {
+  const target = "/srv/runner/work/project";
+  validateActionPathGuardMount(JSON.stringify({
+    filesystems: [{ target, options: "rw,nosuid,nodev,relatime" }],
+  }), target);
+  validateActionPathGuardMount(JSON.stringify({
+    filesystems: [
+      { target, options: "ro,nosuid,nodev,relatime" },
+      { target, options: "rw,nosuid,nodev,relatime" },
+    ],
+  }), target);
+  for (const evidence of [
+    { filesystems: [{ target, options: "ro,nosuid,nodev" }] },
+    { filesystems: [{ target: "/different", options: "rw,nosuid,nodev" }] },
+    {
+      filesystems: [
+        { target, options: "rw,nosuid,nodev" },
+        { target: "/different", options: "rw,nosuid,nodev" },
+      ],
+    },
+    { filesystems: [] },
+  ]) {
+    assert.throws(
+      () => validateActionPathGuardMount(JSON.stringify(evidence), target),
+      /guard mount/,
+    );
+  }
+  assert.throws(() => validateActionPathGuardMount("not-json", target), /malformed/);
 });
 
 test("validates stable runtime evidence", () => {
@@ -1188,6 +1321,8 @@ test("validates immutable attested bundle metadata and binary identity", () => {
       release_channel: "stable",
       release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
       source_commit: "b".repeat(40),
+      release_tag_commit: "b".repeat(40),
+      signer_digest: "b".repeat(40),
       artifact_name: "fence_v0.1.0_linux-amd64",
     })), "utf8");
     validateBundle(manifest, binary);
@@ -1196,6 +1331,8 @@ test("validates immutable attested bundle metadata and binary identity", () => {
       release_channel: "prerelease",
       release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
       source_commit: "b".repeat(40),
+      release_tag_commit: "b".repeat(40),
+      signer_digest: "b".repeat(40),
       artifact_name: "fence_v0.1.0_linux-amd64",
     })), "utf8");
     assert.throws(() => validateBundle(manifest, binary), /contract/);
@@ -1204,6 +1341,27 @@ test("validates immutable attested bundle metadata and binary identity", () => {
       release_channel: "stable",
       release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
       source_commit: "b".repeat(40),
+      release_tag_commit: "b".repeat(40),
+      signer_digest: "b".repeat(40),
+      artifact_name: "fence_v0.1.0_linux-amd64",
+    })), "utf8");
+    for (const invalidProvenance of [
+      { release_is_draft: true },
+      { release_is_immutable: false },
+      { source_ref: "refs/heads/topic" },
+      { signer_digest: "c".repeat(40) },
+      { release_tag_commit: "d".repeat(40) },
+    ]) {
+      fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, invalidProvenance)), "utf8");
+      assert.throws(() => validateBundle(manifest, binary), /contract/);
+    }
+    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, {
+      release_tag: "v0.1.0",
+      release_channel: "stable",
+      release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
+      source_commit: "b".repeat(40),
+      release_tag_commit: "b".repeat(40),
+      signer_digest: "b".repeat(40),
       artifact_name: "fence_v0.1.0_linux-amd64",
     })), "utf8");
     fs.symlinkSync(binary, binaryLink);

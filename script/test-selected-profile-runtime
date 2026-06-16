@@ -93,7 +93,16 @@ sudo /usr/bin/systemd-run \
   "${worker_failure_environment[@]}" \
   "${test_binaries[0]}" --ignored --exact selected_profile_runtime_worker --nocapture
 
-python3 - "$report" "$dns_report" "$ready" "$production_ready" "$scenario" <<'PY'
+python3 -E - "$report" "$dns_report" "$ready" "$production_ready" "$scenario" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import re
@@ -118,19 +127,19 @@ while time.monotonic() < deadline:
         ):
             break
     time.sleep(0.1)
-assert report is not None, "DNS-mediated block report was not emitted"
-assert dns is not None, "DNS-mediated block DNS report was not emitted"
-assert ready is not None, "DNS-mediated block test readiness was not emitted"
-assert report["status"] == "selected_profile_runtime_test_only"
-assert report["runtime_evidence_schema_version"] == 4
-assert report["mode"] == "block"
-assert report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3"
-assert report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3"
-assert report["policy_hash_schema_version"] == 6
-assert re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"])
-assert re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"])
-assert re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"])
-assert report["bootstrap_hostnames"] == [
+require(report is not None)
+require(dns is not None)
+require(ready is not None)
+require(report["status"] == "selected_profile_runtime_test_only")
+require(report["runtime_evidence_schema_version"] == 4)
+require(report["mode"] == "block")
+require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
+require(report["policy_hash_schema_version"] == 6)
+require(re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]))
+require(re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]))
+require(re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]))
+require(report["bootstrap_hostnames"] == [
     "github.com",
     "api.github.com",
     "release-assets.githubusercontent.com",
@@ -141,21 +150,21 @@ assert report["bootstrap_hostnames"] == [
     "results-receiver.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa19.blob.core.windows.net",
-]
-assert report["network_application_status"] == "applied"
-assert report["network_verification_status"] == "verified"
-assert report["sudo_status"] == "disabled_verified"
-assert report["container_status"] == "disabled_verified"
-assert report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53"
-assert report["materialization_status"] == "bounded_ttl_exact_host_and_cname_transport_policy"
-assert len(report["materialized_allowances"]) >= 1
-assert all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_allowances"])
+])
+require(report["network_application_status"] == "applied")
+require(report["network_verification_status"] == "verified")
+require(report["sudo_status"] == "disabled_verified")
+require(report["container_status"] == "disabled_verified")
+require(report["dns_upstream_policy"] == "root_resident_mediator_only_udp_53")
+require(report["materialization_status"] == "bounded_ttl_exact_host_and_cname_transport_policy")
+require(len(report["materialized_allowances"]) >= 1)
+require(all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_allowances"]))
 resident = report["resident_health"]
-assert resident["status"] == ("critical" if scenario == "worker-failure" else "healthy"), resident
-assert resident["resident_pid"] > 0, resident
-assert resident["verification_sequence"] >= 1, resident
-assert resident["last_successful_verification_unix_milliseconds"] > 0, resident
-assert resident["verification_interval_seconds"] == 5, resident
+require(resident["status"] == ("critical" if scenario == "worker-failure" else "healthy"))
+require(resident["resident_pid"] > 0)
+require(resident["verification_sequence"] >= 1)
+require(resident["last_successful_verification_unix_milliseconds"] > 0)
+require(resident["verification_interval_seconds"] == 5)
 expected_workers = [
     {"name": "docker_tcp_dns", "status": "running"},
     {"name": "docker_udp_dns", "status": "running"},
@@ -166,28 +175,28 @@ expected_workers = [
     },
     {"name": "process_attribution", "status": "running"},
 ]
-assert resident["workers"] == expected_workers, resident
-assert ready["status"] == "selected_profile_runtime_ready_no_public_activation"
-assert ready["runtime_evidence_schema_version"] == 4
-assert ready["protection_available"] is False
-assert ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3"
-assert ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3"
-assert ready["policy_hash_schema_version"] == 6
-assert ready["policy_hash"] == report["policy_hash"]
-assert ready["base_ruleset_hash"] == report["base_ruleset_hash"]
-assert ready["resident_health"]["resident_pid"] == resident["resident_pid"]
-assert ready["resident_health"]["status"] == "healthy", ready
-assert dns["status"] == "selected_profile_runtime_test_only"
-assert dns["runtime_evidence_schema_version"] == 4
-assert dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3"
-assert dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3"
-assert dns["authorized_domain_patterns"] == [
+require(resident["workers"] == expected_workers)
+require(ready["status"] == "selected_profile_runtime_ready_no_public_activation")
+require(ready["runtime_evidence_schema_version"] == 4)
+require(ready["protection_available"] is False)
+require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
+require(ready["policy_hash_schema_version"] == 6)
+require(ready["policy_hash"] == report["policy_hash"])
+require(ready["base_ruleset_hash"] == report["base_ruleset_hash"])
+require(ready["resident_health"]["resident_pid"] == resident["resident_pid"])
+require(ready["resident_health"]["status"] == "healthy")
+require(dns["status"] == "selected_profile_runtime_test_only")
+require(dns["runtime_evidence_schema_version"] == 4)
+require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
+require(dns["authorized_domain_patterns"] == [
     "*.actions.githubusercontent.com",
     "*.githubapp.com",
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net",
-]
-assert dns["bootstrap_hostnames"] == [
+])
+require(dns["bootstrap_hostnames"] == [
     "github.com",
     "api.github.com",
     "release-assets.githubusercontent.com",
@@ -198,73 +207,82 @@ assert dns["bootstrap_hostnames"] == [
     "results-receiver.actions.githubusercontent.com",
     "actions-results-receiver-production.githubapp.com",
     "productionresultssa19.blob.core.windows.net",
-]
-assert isinstance(dns["materialization_batch_count"], int)
-assert dns["materialization_batch_count"] >= 0
-assert dns["materialization_request_rejections"] == 0
-assert dns["results_storage_authorization_count"] >= 0
-assert dns["results_storage_attribution_failures"] == 0
-assert dns["results_storage_request_rejections"] == 0
-assert len(dns["runner_authorized_results_storage"]) <= 4
-assert isinstance(dns["upstream_request_failures"], int)
-assert dns["upstream_request_failures"] >= 0
-assert dns["resident_health"]["resident_pid"] == resident["resident_pid"]
-assert isinstance(dns["materialization_update_max_milliseconds"], int)
-assert dns["materialization_update_max_milliseconds"] >= 0
-assert dns["mode"] == "block"
-assert dns["proxy_policy_status"] == "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
-assert dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only"
-assert len(dns["bounded_actions_suffix_authorizations"]) <= 8
-assert dns["bounded_actions_suffix_authorizations_truncated"] is False
-assert len(dns["bounded_githubapp_suffix_authorizations"]) <= 8
-assert dns["bounded_githubapp_suffix_authorizations_truncated"] is False
-assert all(
+])
+require(isinstance(dns["materialization_batch_count"], int))
+require(dns["materialization_batch_count"] >= 0)
+require(dns["materialization_request_rejections"] == 0)
+require(dns["results_storage_authorization_count"] >= 0)
+require(dns["results_storage_attribution_failures"] == 0)
+require(dns["results_storage_request_rejections"] == 0)
+require(len(dns["runner_authorized_results_storage"]) <= 4)
+require(isinstance(dns["upstream_request_failures"], int))
+require(dns["upstream_request_failures"] >= 0)
+require(dns["resident_health"]["resident_pid"] == resident["resident_pid"])
+require(isinstance(dns["materialization_update_max_milliseconds"], int))
+require(dns["materialization_update_max_milliseconds"] >= 0)
+require(dns["mode"] == "block")
+require(dns["proxy_policy_status"] == "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants")
+require(dns["answer_attribution_status"] == "bounded_reportable_hostname_answers_only")
+require(len(dns["bounded_actions_suffix_authorizations"]) <= 8)
+require(dns["bounded_actions_suffix_authorizations_truncated"] is False)
+require(len(dns["bounded_githubapp_suffix_authorizations"]) <= 8)
+require(dns["bounded_githubapp_suffix_authorizations_truncated"] is False)
+require(all(
     1 <= len(hostname.removesuffix(".actions.githubusercontent.com").split(".")) <= 2
     for hostname in dns["bounded_actions_suffix_authorizations"]
-)
-assert "test_only_evidence_path_does_not_activate_default_planning_descriptor" in dns["limitations"]
-assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in dns["limitations"]
-assert "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in dns["limitations"]
-assert "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation" in dns["limitations"]
-assert "githubapp_suffix_authorizations_are_limited_to_8_unique_single_label_names" in dns["limitations"]
-assert "block_dns_queries_are_canonicalized_before_upstream_forwarding" in dns["limitations"]
-assert "dns_query_timing_and_count_remain_egress_limitations" in dns["limitations"]
-assert "post_ready_codeload_traffic_is_not_authorized" in dns["limitations"]
-assert "runner_authorized_results_storage_accounts_remain_egress_channels" in dns["limitations"]
-assert "static_results_storage_compatibility_account_remains_an_egress_channel" in dns["limitations"]
-assert "cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"]
-assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"]
-assert "bootstrap_roots_refresh_every_5_seconds" in dns["limitations"]
-assert "https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"]
-assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in dns["limitations"]
-assert "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in dns["limitations"]
-assert "test_only_evidence_path_does_not_activate_default_planning_descriptor" in report["limitations"]
-assert "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
-assert "actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in report["limitations"]
-assert "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"]
-assert "githubapp_suffix_authorizations_are_limited_to_8_unique_single_label_names" in report["limitations"]
-assert "block_dns_queries_are_canonicalized_before_upstream_forwarding" in report["limitations"]
-assert "dns_query_timing_and_count_remain_egress_limitations" in report["limitations"]
-assert "post_ready_codeload_traffic_is_not_authorized" in report["limitations"]
-assert "runner_authorized_results_storage_accounts_remain_egress_channels" in report["limitations"]
-assert "static_results_storage_compatibility_account_remains_an_egress_channel" in report["limitations"]
-assert "cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"]
-assert "bootstrap_roots_refresh_every_5_seconds" in report["limitations"]
-assert "https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"]
-assert "dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"]
-assert "approved_workflow_bootstrap_https_destinations_remain_egress_channels" in report["limitations"]
-assert "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in report["limitations"]
-assert "root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"]
+))
+require("test_only_evidence_path_does_not_activate_default_planning_descriptor" in dns["limitations"])
+require("bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in dns["limitations"])
+require("actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in dns["limitations"])
+require("bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation" in dns["limitations"])
+require("githubapp_suffix_authorizations_are_limited_to_8_unique_single_label_names" in dns["limitations"])
+require("block_dns_queries_are_canonicalized_before_upstream_forwarding" in dns["limitations"])
+require("dns_query_timing_and_count_remain_egress_limitations" in dns["limitations"])
+require("post_ready_codeload_traffic_is_not_authorized" in dns["limitations"])
+require("runner_authorized_results_storage_accounts_remain_egress_channels" in dns["limitations"])
+require("static_results_storage_compatibility_account_remains_an_egress_channel" in dns["limitations"])
+require("cname_descendants_are_bounded_ttl_derived_authorizations" in dns["limitations"])
+require("dns_cname_descendants_may_delegate_to_external_dns_operator_names" in dns["limitations"])
+require("bootstrap_roots_refresh_every_5_seconds" in dns["limitations"])
+require("https_materialization_expiry_includes_30_second_refresh_overlap" in dns["limitations"])
+require("approved_workflow_bootstrap_https_destinations_remain_egress_channels" in dns["limitations"])
+require("resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in dns["limitations"])
+require("test_only_evidence_path_does_not_activate_default_planning_descriptor" in report["limitations"])
+require("bounded_actions_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"])
+require("actions_suffix_authorizations_are_limited_to_8_unique_names_and_two_prefix_labels" in report["limitations"])
+require("bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation" in report["limitations"])
+require("githubapp_suffix_authorizations_are_limited_to_8_unique_single_label_names" in report["limitations"])
+require("block_dns_queries_are_canonicalized_before_upstream_forwarding" in report["limitations"])
+require("dns_query_timing_and_count_remain_egress_limitations" in report["limitations"])
+require("post_ready_codeload_traffic_is_not_authorized" in report["limitations"])
+require("runner_authorized_results_storage_accounts_remain_egress_channels" in report["limitations"])
+require("static_results_storage_compatibility_account_remains_an_egress_channel" in report["limitations"])
+require("cname_descendants_are_bounded_ttl_derived_authorizations" in report["limitations"])
+require("bootstrap_roots_refresh_every_5_seconds" in report["limitations"])
+require("https_materialization_expiry_includes_30_second_refresh_overlap" in report["limitations"])
+require("dns_cname_descendants_may_delegate_to_external_dns_operator_names" in report["limitations"])
+require("approved_workflow_bootstrap_https_destinations_remain_egress_channels" in report["limitations"])
+require("resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations" in report["limitations"])
+require("root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"])
 if scenario == "worker-failure":
-    assert any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]), report
+    require(any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]))
 else:
-    assert report["critical_findings"] == [], report
-assert not production_path.exists()
+    require(report["critical_findings"] == [])
+require(not production_path.exists())
 PY
 
 # Unrelated traffic and a syntactically valid results-storage request from the
 # workflow process must be refused locally.
-python3 <<'PY'
+python3 -E <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import random
 import socket
 import struct
@@ -282,8 +300,8 @@ for hostname in (
     sock.settimeout(2)
     sock.sendto(packet, ("127.0.0.1", 53))
     response, _ = sock.recvfrom(4096)
-    assert struct.unpack("!H", response[:2])[0] == identifier
-    assert struct.unpack("!H", response[2:4])[0] & 0x000F == 5
+    require(struct.unpack("!H", response[:2])[0] == identifier)
+    require(struct.unpack("!H", response[2:4])[0] & 0x000F == 5)
 PY
 
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
@@ -294,7 +312,16 @@ if docker ps --quiet >/dev/null 2>&1; then
 fi
 
 sleep 6
-python3 - "$report" "$dns_report" "$production_ready" "$scenario" <<'PY'
+python3 -E - "$report" "$dns_report" "$production_ready" "$scenario" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="evidence validation failed"):
+    if not condition:
+        raise SystemExit(message)
+
 import json
 import pathlib
 import sys
@@ -303,26 +330,26 @@ report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.arg
 scenario = sys.argv[4]
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-assert report["network_verification_status"] == "verified", report
-assert report["sudo_status"] == "disabled_verified", report
-assert report["container_status"] == "disabled_verified", report
+require(report["network_verification_status"] == "verified")
+require(report["sudo_status"] == "disabled_verified")
+require(report["container_status"] == "disabled_verified")
 if scenario == "worker-failure":
-    assert report["resident_health"]["status"] == "critical", report
-    assert report["resident_health"]["verification_sequence"] == 1, report
-    assert any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]), report
-    assert any(item["status"] == "failed" for item in report["resident_health"]["workers"]), report
+    require(report["resident_health"]["status"] == "critical")
+    require(report["resident_health"]["verification_sequence"] == 1)
+    require(any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]))
+    require(any(item["status"] == "failed" for item in report["resident_health"]["workers"]))
 else:
-    assert report["critical_findings"] == [], report
-    assert report["resident_health"]["status"] == "healthy", report
-    assert report["resident_health"]["verification_sequence"] >= 2, report
-assert dns["blocked_non_profile_query_count"] >= 4, dns
-assert dns["results_storage_request_rejections"] >= 1, dns
-assert dns["results_storage_attribution_failures"] == 0, dns
+    require(report["critical_findings"] == [])
+    require(report["resident_health"]["status"] == "healthy")
+    require(report["resident_health"]["verification_sequence"] >= 2)
+require(dns["blocked_non_profile_query_count"] >= 4)
+require(dns["results_storage_request_rejections"] >= 1)
+require(dns["results_storage_attribution_failures"] == 0)
 if scenario == "worker-failure":
-    assert dns["resident_health"]["status"] == "critical", dns
+    require(dns["resident_health"]["status"] == "critical")
 else:
-    assert dns["resident_health"]["verification_sequence"] >= 2, dns
-assert not production_path.exists()
+    require(dns["resident_health"]["verification_sequence"] >= 2)
+require(not production_path.exists())
 print(json.dumps(report, sort_keys=True, separators=(",", ":")))
 PY
 

@@ -14,6 +14,9 @@ require_cmd python3
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
   die "hosted-runner observation requires Linux x86_64"
 fi
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "hosted-runner observation runs only on disposable GitHub Actions runners"
+fi
 
 runner_principal="$(/usr/bin/id -un)"
 if ! [[ "$runner_principal" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
@@ -22,7 +25,9 @@ fi
 
 # Observe only fixed security-relevant surfaces. Do not emit file contents,
 # environment values, process arguments, workload identifiers, or socket data.
-sudo --non-interactive /usr/bin/python3 - "$runner_principal" <<'PY'
+# The only mutation is an exclusive empty-file create/delete probe in the
+# enumerated command and sudo-policy ancestor directories.
+sudo --non-interactive /usr/bin/python3 -E - "$runner_principal" <<'PY'
 import grp
 import hashlib
 import json
@@ -30,11 +35,15 @@ import os
 import pathlib
 import platform
 import pwd
+import re
+import secrets
 import stat
 import subprocess
 import sys
 
+MAX_OUTPUT_BYTES = 256 * 1024
 MAX_POLICY_SOURCE_BYTES = 256 * 1024
+MAX_POLICY_SOURCES = 64
 FIXED_PATHS = [
     "/usr/bin/docker",
     "/usr/bin/id",
@@ -48,6 +57,14 @@ FIXED_PATHS = [
     "/usr/sbin/visudo",
     "/usr/sbin/nft",
 ]
+FIXED_ANCESTOR_DIRECTORIES = [
+    "/",
+    "/etc",
+    "/etc/sudoers.d",
+    "/usr",
+    "/usr/bin",
+    "/usr/sbin",
+]
 FIXED_UNITS = [
     "docker.service",
     "docker.socket",
@@ -59,6 +76,22 @@ FIXED_SOCKETS = [
     "/run/docker.sock",
     "/run/containerd/containerd.sock",
 ]
+REPORTABLE_CANONICAL_ROOTS = [
+    pathlib.Path("/bin"),
+    pathlib.Path("/etc"),
+    pathlib.Path("/sbin"),
+    pathlib.Path("/usr"),
+]
+PROBE_RESULTS = {
+    "created_and_removed",
+    "created_and_root_removed",
+    "denied",
+    "unavailable",
+}
+
+
+def fail(message):
+    raise SystemExit(message)
 
 
 def command_output(args):
@@ -78,6 +111,210 @@ def command_output(args):
     return result.stdout[:4096]
 
 
+def metadata_type(mode):
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character_device"
+    if stat.S_ISBLK(mode):
+        return "block_device"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    return "other"
+
+
+def runner_identity(principal):
+    try:
+        account = pwd.getpwnam(principal)
+        group_ids = sorted(set(os.getgrouplist(principal, account.pw_gid)))
+    except KeyError:
+        fail("hosted-runner observation could not resolve the runner identity")
+    group_names = []
+    for identifier in group_ids:
+        try:
+            group_names.append(grp.getgrgid(identifier).gr_name[:64])
+        except KeyError:
+            group_names.append(str(identifier))
+    return {
+        "uid": account.pw_uid,
+        "gid": account.pw_gid,
+        "group_ids": group_ids,
+        "group_names": group_names[:64],
+    }
+
+
+def owner_class(identifier, identity):
+    if identifier == 0:
+        return "root"
+    if identifier == identity["uid"]:
+        return "runner"
+    return "other"
+
+
+def group_class(identifier, identity):
+    if identifier == 0:
+        return "root"
+    if identifier == identity["gid"]:
+        return "runner_primary"
+    if identifier in identity["group_ids"]:
+        return "runner_member"
+    return "other"
+
+
+def bounded_canonical_target(path):
+    candidate = pathlib.Path(path)
+    if candidate == pathlib.Path("/"):
+        return "/"
+    for root in REPORTABLE_CANONICAL_ROOTS:
+        if candidate == root or root in candidate.parents:
+            rendered = str(candidate)
+            if len(rendered) <= 256 and all(ord(character) >= 32 for character in rendered):
+                return rendered
+    return "outside_fixed_system_roots"
+
+
+def drop_to_runner(identity):
+    os.setgroups(identity["group_ids"])
+    os.setresgid(identity["gid"], identity["gid"], identity["gid"])
+    os.setresuid(identity["uid"], identity["uid"], identity["uid"])
+
+
+def runner_access(path, mode, identity):
+    pid = os.fork()
+    if pid == 0:
+        try:
+            drop_to_runner(identity)
+            allowed = os.access(path, mode)
+        except OSError:
+            os._exit(2)
+        os._exit(0 if allowed else 1)
+    _, status = os.waitpid(pid, 0)
+    if not os.WIFEXITED(status):
+        return None
+    code = os.WEXITSTATUS(status)
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
+def metadata_observation(path, identity):
+    candidate = pathlib.Path(path)
+    try:
+        path_metadata = candidate.lstat()
+        canonical = candidate.resolve(strict=True)
+        target_metadata = canonical.stat()
+    except (FileNotFoundError, OSError):
+        return {"path": path, "present": False}
+    return {
+        "path": path,
+        "present": True,
+        "path_type": metadata_type(path_metadata.st_mode),
+        "canonical_target": bounded_canonical_target(canonical),
+        "target_type": metadata_type(target_metadata.st_mode),
+        "owner_class": owner_class(target_metadata.st_uid, identity),
+        "group_class": group_class(target_metadata.st_gid, identity),
+        "mode": format(stat.S_IMODE(target_metadata.st_mode), "04o"),
+        "device": target_metadata.st_dev,
+        "inode": target_metadata.st_ino,
+        "runner_writable": runner_access(path, os.W_OK, identity),
+    }
+
+
+def command_path_observation(path, identity):
+    observation = metadata_observation(path, identity)
+    if not observation["present"]:
+        observation["executable"] = False
+        observation["runner_executable"] = False
+        return observation
+    observation["executable"] = (
+        observation["target_type"] == "regular"
+        and int(observation["mode"], 8) & 0o111 != 0
+    )
+    observation["runner_executable"] = runner_access(path, os.X_OK, identity)
+    return observation
+
+
+def synthetic_create_delete_probe(directory, identity):
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(directory, flags)
+    except OSError:
+        return "unavailable"
+
+    probe_name = f".fence-observer-{secrets.token_hex(16)}"
+    try:
+        try:
+            os.stat(probe_name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            return "unavailable"
+
+        pid = os.fork()
+        if pid == 0:
+            created = False
+            try:
+                drop_to_runner(identity)
+                probe_fd = os.open(
+                    probe_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                created = True
+                os.close(probe_fd)
+                os.unlink(probe_name, dir_fd=directory_fd)
+            except PermissionError:
+                os._exit(12 if created else 10)
+            except OSError:
+                os._exit(12 if created else 11)
+            os._exit(0)
+
+        _, status = os.waitpid(pid, 0)
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 11
+        root_removed = False
+        try:
+            os.unlink(probe_name, dir_fd=directory_fd)
+            root_removed = True
+        except FileNotFoundError:
+            pass
+        except OSError:
+            fail("hosted-runner observation could not remove its synthetic probe")
+
+        if root_removed:
+            return "created_and_root_removed"
+        if code == 0:
+            return "created_and_removed"
+        if code == 10:
+            return "denied"
+        return "unavailable"
+    finally:
+        os.close(directory_fd)
+
+
+def ancestor_directory_observation(path, identity):
+    observation = metadata_observation(path, identity)
+    if not observation["present"] or observation.get("target_type") != "directory":
+        observation["runner_searchable"] = False
+        observation["synthetic_create_delete_probe"] = "unavailable"
+        return observation
+    observation["runner_searchable"] = runner_access(path, os.X_OK, identity)
+    observation["synthetic_create_delete_probe"] = synthetic_create_delete_probe(path, identity)
+    return observation
+
+
 def runner_nopasswd_markers(contents, principal, groups):
     text = contents.decode("utf-8", errors="ignore").replace("\\\n", " ")
     accepted_subjects = {principal: "principal"}
@@ -94,20 +331,55 @@ def runner_nopasswd_markers(contents, principal, groups):
     return sorted(markers)
 
 
-def regular_file_observation(path, principal, groups):
+def bounded_policy_name(name):
+    if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", name):
+        return name
+    return "unreportable_name"
+
+
+def regular_file_observation(path, principal, identity):
     candidate = pathlib.Path(path)
-    if not candidate.is_file() or candidate.is_symlink():
+    try:
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError:
         return None
-    if candidate.stat().st_size > MAX_POLICY_SOURCE_BYTES:
-        return {"name": candidate.name, "status": "oversized"}
-    contents = candidate.read_bytes()
-    digest = hashlib.sha256(contents).hexdigest()
-    return {
-        "name": candidate.name,
-        "sha256": digest,
-        "contains_nopasswd_directive": b"NOPASSWD:" in contents,
-        "runner_nopasswd_markers": runner_nopasswd_markers(contents, principal, groups),
-    }
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            return None
+        canonical = candidate.resolve(strict=True)
+        common = {
+            "name": bounded_policy_name(candidate.name),
+            "canonical_target": bounded_canonical_target(canonical),
+            "target_type": "regular",
+            "owner_class": owner_class(metadata.st_uid, identity),
+            "group_class": group_class(metadata.st_gid, identity),
+            "mode": format(stat.S_IMODE(metadata.st_mode), "04o"),
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+            "runner_writable": runner_access(str(candidate), os.W_OK, identity),
+        }
+        if metadata.st_size > MAX_POLICY_SOURCE_BYTES:
+            return {**common, "status": "oversized"}
+        with os.fdopen(descriptor, "rb", closefd=False) as source:
+            contents = source.read(MAX_POLICY_SOURCE_BYTES + 1)
+        if len(contents) > MAX_POLICY_SOURCE_BYTES:
+            return {**common, "status": "oversized"}
+        return {
+            **common,
+            "sha256": hashlib.sha256(contents).hexdigest(),
+            "contains_nopasswd_directive": b"NOPASSWD:" in contents,
+            "runner_nopasswd_markers": runner_nopasswd_markers(
+                contents,
+                principal,
+                identity["group_names"],
+            ),
+        }
+    finally:
+        os.close(descriptor)
 
 
 def unit_state(unit):
@@ -167,21 +439,6 @@ def socket_state(path):
     }
 
 
-def principal_groups(principal):
-    try:
-        primary = pwd.getpwnam(principal).pw_gid
-        identifiers = os.getgrouplist(principal, primary)
-    except KeyError:
-        return []
-    values = []
-    for identifier in sorted(set(identifiers)):
-        try:
-            values.append(grp.getgrgid(identifier).gr_name[:64])
-        except KeyError:
-            values.append(str(identifier))
-    return values[:64]
-
-
 def resolver_layout():
     path = pathlib.Path("/etc/resolv.conf")
     try:
@@ -201,16 +458,95 @@ def resolver_layout():
     }
 
 
-runner_groups = principal_groups(sys.argv[1])
+def validate_metadata_fields(item):
+    required = {
+        "canonical_target",
+        "target_type",
+        "owner_class",
+        "group_class",
+        "mode",
+        "device",
+        "inode",
+        "runner_writable",
+    }
+    if not required.issubset(item):
+        fail("hosted-runner observation metadata is incomplete")
+    if item["owner_class"] not in {"root", "runner", "other"}:
+        fail("hosted-runner observation owner classification mismatch")
+    if item["group_class"] not in {
+        "root",
+        "runner_primary",
+        "runner_member",
+        "other",
+    }:
+        fail("hosted-runner observation group classification mismatch")
+    if not re.fullmatch(r"[0-7]{4}", item["mode"]):
+        fail("hosted-runner observation mode mismatch")
+    if not isinstance(item["device"], int) or isinstance(item["device"], bool):
+        fail("hosted-runner observation device identity mismatch")
+    if not isinstance(item["inode"], int) or isinstance(item["inode"], bool):
+        fail("hosted-runner observation inode identity mismatch")
+    if item["runner_writable"] not in {True, False, None}:
+        fail("hosted-runner observation writability mismatch")
+
+
+def validate_result(result):
+    if result.get("schema_version") != 2:
+        fail("hosted-runner observation schema mismatch")
+    required_paths = result.get("required_paths")
+    if not isinstance(required_paths, list) or [
+        item.get("path") for item in required_paths
+    ] != FIXED_PATHS:
+        fail("hosted-runner observation path set mismatch")
+    for item in required_paths:
+        if item.get("present") is True:
+            validate_metadata_fields(item)
+        if item.get("executable") not in {True, False}:
+            fail("hosted-runner observation executable state mismatch")
+        if item.get("runner_executable") not in {True, False, None}:
+            fail("hosted-runner observation runner executable state mismatch")
+    ancestors = result.get("permission_ancestor_directories")
+    if not isinstance(ancestors, list) or [
+        item.get("path") for item in ancestors
+    ] != FIXED_ANCESTOR_DIRECTORIES:
+        fail("hosted-runner observation ancestor set mismatch")
+    for item in ancestors:
+        if item.get("present") is True:
+            validate_metadata_fields(item)
+        if item.get("runner_searchable") not in {True, False, None}:
+            fail("hosted-runner observation directory search state mismatch")
+        if item.get("synthetic_create_delete_probe") not in PROBE_RESULTS:
+            fail("hosted-runner observation probe result mismatch")
+    policy_sources = result.get("sudo", {}).get("policy_source_hashes")
+    if not isinstance(policy_sources, list) or len(policy_sources) > MAX_POLICY_SOURCES:
+        fail("hosted-runner observation policy source bound mismatch")
+    for item in policy_sources:
+        validate_metadata_fields(item)
+    encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        fail("hosted-runner observation exceeds its output bound")
+    return encoded
+
+
+identity = runner_identity(sys.argv[1])
 sudo_sources = []
-main_sudoers = regular_file_observation("/etc/sudoers", sys.argv[1], runner_groups)
+main_sudoers = regular_file_observation("/etc/sudoers", sys.argv[1], identity)
 if main_sudoers is not None:
     main_sudoers["path_class"] = "main_policy"
     sudo_sources.append(main_sudoers)
+
+policy_sources_truncated = False
 drop_in_root = pathlib.Path("/etc/sudoers.d")
-if drop_in_root.is_dir():
+try:
+    drop_in_root_metadata = drop_in_root.lstat()
+except OSError:
+    drop_in_root_metadata = None
+if drop_in_root_metadata is not None and stat.S_ISDIR(drop_in_root_metadata.st_mode):
     for candidate in sorted(drop_in_root.iterdir()):
-        hashed = regular_file_observation(candidate, sys.argv[1], runner_groups)
+        if len(sudo_sources) >= MAX_POLICY_SOURCES:
+            policy_sources_truncated = True
+            break
+        hashed = regular_file_observation(candidate, sys.argv[1], identity)
         if hashed is not None:
             hashed["path_class"] = "drop_in"
             sudo_sources.append(hashed)
@@ -230,7 +566,7 @@ except (FileNotFoundError, UnicodeDecodeError):
     pass
 
 result = {
-    "schema_version": 1,
+    "schema_version": 2,
     "observation": "hosted_runner_fingerprint_candidate",
     "status": "observation_only_no_protection",
     "protected_target": "github_hosted_ubuntu_24_04_x86_64",
@@ -239,23 +575,28 @@ result = {
         "os_version_id": os_identity["version_id"],
         "architecture": platform.machine(),
         "runner_principal": sys.argv[1],
-        "runner_groups": runner_groups,
+        "runner_groups": identity["group_names"],
     },
     "required_paths": [
-        {"path": path, "executable": os.access(path, os.X_OK)} for path in FIXED_PATHS
+        command_path_observation(path, identity) for path in FIXED_PATHS
+    ],
+    "permission_ancestor_directories": [
+        ancestor_directory_observation(path, identity)
+        for path in FIXED_ANCESTOR_DIRECTORIES
     ],
     "resolver": resolver_layout(),
     "systemd": {"units": [unit_state(unit) for unit in FIXED_UNITS]},
     "sudo": {
         "noninteractive_root_observation_succeeded": True,
         "policy_source_hashes": sudo_sources,
+        "policy_sources_truncated": policy_sources_truncated,
         "grant_source_review_required": True,
     },
     "container_runtime": {
         "sockets": [socket_state(path) for path in FIXED_SOCKETS],
         "docker_running_workload_count": docker_workload_count,
     },
-    "next_step": "compare_to_accepted_fingerprint_before_test_only_lockdown_mutation",
+    "next_step": "review_permission_invariants_before_any_enforcement_change",
 }
-print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+print(validate_result(result))
 PY
