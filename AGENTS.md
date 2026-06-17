@@ -189,8 +189,8 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/observe-wireserver-agent`
   - Linux x64-only, GitHub-Actions-only evidence helper for the disposable hosted `audit` scenario; it must not run on developer machines or reusable runners.
-  - Observes natural sockets only within the fixed `/azure.slice/walinuxagent.service` control group for the exact Azure platform address and TCP ports `80` and `32526`, with bounded process, descriptor, socket-table, duration, and result limits.
-  - Retains only root-owned process PID, start time, executable basename/device/inode, and destination port. It must not generate traffic or inspect command lines, environment values, local tuples, HTTP paths, payloads, responses, VM identifiers, goal-state data, certificates, or arbitrary processes.
+  - Observes natural connect attempts only from the fixed root-owned Python PIDs already present in `/azure.slice/walinuxagent.service`, retains matches only for the exact Azure platform address and TCP ports `80` and `32526`, and bounds process count, transient trace bytes, duration, and results.
+  - Retains only root-owned process PID, start time, executable basename/device/inode, and destination port. It must not generate traffic, persist the syscall stream, or inspect command lines, environment values, local tuples, HTTP paths, payloads, responses, VM identifiers, goal-state data, certificates, or arbitrary processes.
   - Writes runner-readable observation-only evidence under the runner-provided temporary root. It must not mutate policy, establish support, write readiness, or make a protection claim.
 
 - `script/test-package-smoke`

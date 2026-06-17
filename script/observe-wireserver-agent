@@ -16,15 +16,18 @@ fi
 
 require_cmd python3
 require_cmd sudo
+if [[ ! -x /usr/bin/strace ]]; then
+  die "WireServer agent observation requires /usr/bin/strace"
+fi
 
 sudo --non-interactive /usr/bin/python3 -E - "$1" "$2" <<'PY'
 import json
 import os
 import pathlib
 import re
-import socket
+import selectors
 import stat
-import struct
+import subprocess
 import sys
 import time
 
@@ -32,10 +35,11 @@ AZURE_PLATFORM_ADDRESS = "168.63.129.16"
 AZURE_PLATFORM_PORTS = {80, 32526}
 CONTROL_GROUP = "/azure.slice/walinuxagent.service"
 MAX_CGROUP_PROCESSES = 16
-MAX_DESCRIPTORS_PER_PROCESS = 256
 MAX_OBSERVATIONS = 16
-MAX_PROC_NET_BYTES = 1024 * 1024
+MAX_TRACE_BYTES = 1024 * 1024
+MAX_TRACE_BUFFER_BYTES = 16 * 1024
 OBSERVATION_SECONDS = 15
+STRACE_PATH = "/usr/bin/strace"
 
 
 def fail(message):
@@ -76,37 +80,7 @@ def process_identity(pid):
     }
 
 
-def wireserver_socket_inodes():
-    try:
-        with open("/proc/net/tcp", "rb") as source:
-            contents = source.read(MAX_PROC_NET_BYTES + 1)
-    except OSError:
-        return {}
-    if len(contents) > MAX_PROC_NET_BYTES:
-        fail("WireServer agent observation exceeded the socket-table bound")
-    matches = {}
-    for raw_line in contents.decode("ascii", errors="ignore").splitlines()[1:]:
-        fields = raw_line.split()
-        if len(fields) < 10:
-            continue
-        remote_address, separator, remote_port = fields[2].partition(":")
-        if not separator or len(remote_address) != 8:
-            continue
-        try:
-            address = socket.inet_ntoa(struct.pack("<I", int(remote_address, 16)))
-            port = int(remote_port, 16)
-            inode = int(fields[9])
-        except (OSError, ValueError):
-            continue
-        if address == AZURE_PLATFORM_ADDRESS and port in AZURE_PLATFORM_PORTS:
-            matches[inode] = port
-    return matches
-
-
-observations = {}
-deadline = time.monotonic() + OBSERVATION_SECONDS
-while time.monotonic() < deadline:
-    sockets = wireserver_socket_inodes()
+def control_group_process_ids():
     try:
         process_ids = sorted({
             int(value)
@@ -115,35 +89,97 @@ while time.monotonic() < deadline:
         })
     except (FileNotFoundError, OSError, UnicodeDecodeError):
         fail("WireServer agent control group became unavailable")
-    if len(process_ids) > MAX_CGROUP_PROCESSES:
-        fail("WireServer agent control group exceeded its process bound")
-    for pid in process_ids:
-        identity = process_identity(pid)
-        if identity is None:
-            continue
-        descriptor_root = pathlib.Path(f"/proc/{pid}/fd")
+    if not process_ids or len(process_ids) > MAX_CGROUP_PROCESSES:
+        fail("WireServer agent control group violated its process bound")
+    return process_ids
+
+
+process_ids = control_group_process_ids()
+processes = {pid: process_identity(pid) for pid in process_ids}
+if any(identity is None for identity in processes.values()):
+    fail("WireServer agent control group identity was not root-owned Python")
+
+command = [
+    STRACE_PATH,
+    "-qq",
+    "-e",
+    "trace=connect",
+    "-e",
+    "signal=none",
+    "-s",
+    "32",
+]
+for pid in process_ids:
+    command.extend(["-p", str(pid)])
+trace = subprocess.Popen(
+    command,
+    env={"LC_ALL": "C"},
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    close_fds=True,
+)
+if trace.stderr is None:
+    fail("WireServer agent observation could not capture the bounded trace")
+os.set_blocking(trace.stderr.fileno(), False)
+selector = selectors.DefaultSelector()
+selector.register(trace.stderr, selectors.EVENT_READ)
+connect_pattern = re.compile(
+    rb'^(?:\[pid\s+([0-9]+)\]\s+)?connect\([^,]+,\s+'
+    rb'\{sa_family=AF_INET,\s+sin_port=htons\((80|32526)\),\s+'
+    rb'sin_addr=inet_addr\("168\.63\.129\.16"\)'
+)
+
+
+observations = {}
+buffer = b""
+bytes_seen = 0
+deadline = time.monotonic() + OBSERVATION_SECONDS
+try:
+    while time.monotonic() < deadline:
+        if trace.poll() is not None:
+            break
+        for key, _ in selector.select(timeout=0.1):
+            chunk = os.read(key.fileobj.fileno(), 4096)
+            if not chunk:
+                continue
+            bytes_seen += len(chunk)
+            if bytes_seen > MAX_TRACE_BYTES:
+                fail("WireServer agent observation exceeded its trace bound")
+            buffer += chunk
+            if len(buffer) > MAX_TRACE_BUFFER_BYTES:
+                fail("WireServer agent observation exceeded its line bound")
+            lines = buffer.split(b"\n")
+            buffer = lines.pop()
+            for line in lines:
+                match = connect_pattern.search(line)
+                if match is None:
+                    continue
+                if match.group(1) is None:
+                    if len(process_ids) != 1:
+                        continue
+                    pid = process_ids[0]
+                else:
+                    pid = int(match.group(1))
+                if pid not in control_group_process_ids():
+                    continue
+                identity = process_identity(pid)
+                if identity is None:
+                    continue
+                port = int(match.group(2))
+                key = (identity["pid"], identity["start_time_ticks"], port)
+                observations[key] = {**identity, "port": port}
+                if len(observations) > MAX_OBSERVATIONS:
+                    fail("WireServer agent observation exceeded its result bound")
+finally:
+    selector.close()
+    if trace.poll() is None:
+        trace.terminate()
         try:
-            descriptors = list(descriptor_root.iterdir())
-        except OSError:
-            continue
-        if len(descriptors) > MAX_DESCRIPTORS_PER_PROCESS:
-            fail("WireServer agent process exceeded its descriptor bound")
-        for descriptor in descriptors:
-            try:
-                target = os.readlink(descriptor)
-            except OSError:
-                continue
-            match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
-            if match is None:
-                continue
-            port = sockets.get(int(match.group(1)))
-            if port is None:
-                continue
-            key = (identity["pid"], identity["start_time_ticks"], port)
-            observations[key] = {**identity, "port": port}
-            if len(observations) > MAX_OBSERVATIONS:
-                fail("WireServer agent observation exceeded its result bound")
-    time.sleep(0.005)
+            trace.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            trace.kill()
+            trace.wait(timeout=2)
 
 document = {
     "schema_version": 1,
