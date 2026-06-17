@@ -28,7 +28,7 @@ require_cmd docker
 require_cmd python3
 require_cmd sudo
 
-for required in /usr/bin/install /usr/bin/mount /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/umount /usr/sbin/nft; do
+for required in /usr/bin/install /usr/bin/journalctl /usr/bin/mount /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/umount /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
     die "protected block proof requires executable $required"
   fi
@@ -174,7 +174,7 @@ sudo /usr/bin/systemd-run \
   --unit "$unit" \
   "$binary" run --config "$config"
 
-python3 -E - "$scenario" "$report" "$dns_report" "$ready" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" "$ready" "$unit" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -187,11 +187,13 @@ def require(condition, message="evidence validation failed"):
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
 scenario = sys.argv[1]
-report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:5])
+unit = sys.argv[5]
 expected_by_scenario = {
     "standard": {
         "mode": "block",
@@ -290,6 +292,51 @@ while time.monotonic() < deadline:
     time.sleep(0.1)
 
 if report is None or report.get("setup_status") != expected["resident"]:
+    properties = subprocess.run(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=Result",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unit_state = {}
+    for line in properties.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            unit_state[key] = value
+
+    journal = subprocess.run(
+        [
+            "/usr/bin/journalctl",
+            "--unit",
+            unit,
+            "--no-pager",
+            "--output=cat",
+            "--lines=20",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    service_error_codes = []
+    for line in journal.stdout.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        code = entry.get("error", {}).get("code")
+        if isinstance(code, str) and code not in service_error_codes:
+            service_error_codes.append(code)
+
     diagnostic = {
         "critical_codes": [
             item.get("code")
@@ -300,7 +347,9 @@ if report is None or report.get("setup_status") != expected["resident"]:
         "network_verification_status": (report or {}).get("network_verification_status"),
         "readiness_status": (report or {}).get("readiness_status"),
         "report_present": report is not None,
+        "service_error_codes": service_error_codes[:8],
         "setup_status": (report or {}).get("setup_status"),
+        "unit_state": unit_state,
     }
     print("bounded protected startup evidence: " + json.dumps(
         diagnostic,
