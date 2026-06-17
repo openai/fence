@@ -10,10 +10,9 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree defines the schema-`7` policy and schema-`4` runtime-evidence
-contract. The released Action continues using the contract identified by its
-manifest until a bundle update changes the attested agent and wrapper validators
-atomically. The bundle remains governed by
+The source tree and released Action define the schema-`7` policy and schema-`4`
+runtime-evidence contract. Future contract changes must update the attested
+agent and wrapper validators atomically. The bundle remains governed by
 `action/bundle-manifest.json` and the wrapper schema constants; the
 wrapper rejects older evidence, stale verification state, an incomplete worker
 set, or a resident PID that does not match the active systemd service. This

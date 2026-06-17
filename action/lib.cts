@@ -96,12 +96,12 @@ const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net$/;
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
-const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v2";
+const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v4";
 const PROFILE_REALIZATIONS = new Map([
-  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_provenance_v2"],
+  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_provenance_v4"],
 ]);
-const POLICY_HASH_SCHEMA_VERSION = 5;
-const RUNTIME_EVIDENCE_SCHEMA_VERSION = 3;
+const POLICY_HASH_SCHEMA_VERSION = 7;
+const RUNTIME_EVIDENCE_SCHEMA_VERSION = 4;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
 const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
