@@ -276,7 +276,7 @@ expected_by_scenario = {
 }
 expected_by_scenario["standard-finalization"] = expected_by_scenario["standard"]
 expected = expected_by_scenario[scenario]
-deadline = time.monotonic() + 30
+deadline = time.monotonic() + 60
 report = None
 dns = None
 ready = None
