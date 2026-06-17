@@ -454,7 +454,7 @@ def azure_platform_agent_observation(identity):
         configured_user_class = "other"
     else:
         configured_user_class = "root_or_default"
-    if not re.fullmatch(r"/[A-Za-z0-9_.@:/\\-]{1,255}", control_group):
+    if not re.fullmatch(r"/[A-Za-z0-9_.@:/-]{1,255}", control_group):
         control_group = "unreportable"
 
     observation = {
@@ -626,7 +626,7 @@ def validate_result(result):
         fail("hosted-runner observation Azure platform agent PID is invalid")
     if not isinstance(agent.get("process_start_time_ticks"), int) or agent["process_start_time_ticks"] <= 0:
         fail("hosted-runner observation Azure platform agent start time is invalid")
-    if not re.fullmatch(r"python3(?:\\.[0-9]+)?", agent.get("executable_basename", "")):
+    if not re.fullmatch(r"python3(?:\.[0-9]+)?", agent.get("executable_basename", "")):
         fail("hosted-runner observation Azure platform agent executable is unexpected")
     for field in ("executable_device", "executable_inode"):
         if not isinstance(agent.get(field), int) or isinstance(agent[field], bool):
