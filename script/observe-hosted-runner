@@ -49,6 +49,7 @@ import sys
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_POLICY_SOURCE_BYTES = 256 * 1024
 MAX_POLICY_SOURCES = 64
+MAX_AZURE_PLATFORM_AGENT_PROCESSES = 16
 FIXED_PATHS = [
     "/usr/bin/docker",
     "/usr/bin/id",
@@ -419,6 +420,30 @@ def unit_state(unit):
     return values
 
 
+def bounded_process_identity(pid, identity):
+    process_root = pathlib.Path(f"/proc/{pid}")
+    try:
+        process_metadata = process_root.stat()
+        executable = (process_root / "exe").resolve(strict=True)
+        executable_metadata = executable.stat()
+        stat_fields = (process_root / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        process_start_time = int(stat_fields[19])
+    except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError, ValueError):
+        return None
+
+    executable_basename = executable.name
+    if not re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", executable_basename):
+        executable_basename = "unreportable"
+    return {
+        "pid": pid,
+        "owner_class": owner_class(process_metadata.st_uid, identity),
+        "start_time_ticks": process_start_time,
+        "executable_basename": executable_basename,
+        "executable_device": executable_metadata.st_dev,
+        "executable_inode": executable_metadata.st_ino,
+    }
+
+
 def azure_platform_agent_observation(identity):
     unit = "walinuxagent.service"
     output = command_output(
@@ -468,31 +493,35 @@ def azure_platform_agent_observation(identity):
         "control_group": control_group,
         "main_pid": main_pid,
     }
-    if main_pid <= 0:
+    if main_pid <= 0 or control_group == "unreportable":
         return observation
 
-    process_root = pathlib.Path(f"/proc/{main_pid}")
+    cgroup_processes = pathlib.Path("/sys/fs/cgroup") / control_group.removeprefix("/") / "cgroup.procs"
     try:
-        process_metadata = process_root.stat()
-        executable = (process_root / "exe").resolve(strict=True)
-        executable_metadata = executable.stat()
-        stat_fields = (process_root / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
-        process_start_time = int(stat_fields[19])
-    except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError, ValueError):
+        raw_pids = cgroup_processes.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
         observation["process_status"] = "unavailable"
         return observation
-
-    executable_basename = executable.name
-    if not re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", executable_basename):
-        executable_basename = "unreportable"
+    process_ids = sorted({int(value) for value in raw_pids if value.isdecimal()})
+    observation["processes_truncated"] = len(process_ids) > MAX_AZURE_PLATFORM_AGENT_PROCESSES
+    processes = [
+        process
+        for pid in process_ids[:MAX_AZURE_PLATFORM_AGENT_PROCESSES]
+        if (process := bounded_process_identity(pid, identity)) is not None
+    ]
+    observation["processes"] = processes
+    main_process = next((process for process in processes if process["pid"] == main_pid), None)
+    if main_process is None:
+        observation["process_status"] = "unavailable"
+        return observation
     observation.update(
         {
             "process_status": "observed",
-            "process_owner_class": owner_class(process_metadata.st_uid, identity),
-            "process_start_time_ticks": process_start_time,
-            "executable_basename": executable_basename,
-            "executable_device": executable_metadata.st_dev,
-            "executable_inode": executable_metadata.st_ino,
+            "process_owner_class": main_process["owner_class"],
+            "process_start_time_ticks": main_process["start_time_ticks"],
+            "executable_basename": main_process["executable_basename"],
+            "executable_device": main_process["executable_device"],
+            "executable_inode": main_process["executable_inode"],
         }
     )
     return observation
@@ -618,6 +647,8 @@ def validate_result(result):
         fail("hosted-runner observation Azure platform agent is not running")
     if agent.get("configured_user_class") != "root_or_default":
         fail("hosted-runner observation Azure platform agent user is unexpected")
+    if agent.get("control_group") != "/azure.slice/walinuxagent.service":
+        fail("hosted-runner observation Azure platform agent control group is unexpected")
     if agent.get("process_status") != "observed":
         fail("hosted-runner observation Azure platform agent process is unavailable")
     if agent.get("process_owner_class") != "root":
@@ -631,6 +662,25 @@ def validate_result(result):
     for field in ("executable_device", "executable_inode"):
         if not isinstance(agent.get(field), int) or isinstance(agent[field], bool):
             fail("hosted-runner observation Azure platform agent executable identity is invalid")
+    processes = agent.get("processes")
+    if not isinstance(processes, list) or not processes or len(processes) > MAX_AZURE_PLATFORM_AGENT_PROCESSES:
+        fail("hosted-runner observation Azure platform agent process set is invalid")
+    if agent.get("processes_truncated") is not False:
+        fail("hosted-runner observation Azure platform agent process set is truncated")
+    if agent["main_pid"] not in {process.get("pid") for process in processes}:
+        fail("hosted-runner observation Azure platform agent MainPID is not in its control group")
+    for process in processes:
+        if process.get("owner_class") != "root":
+            fail("hosted-runner observation Azure platform agent child is not root-owned")
+        if not isinstance(process.get("pid"), int) or process["pid"] <= 0:
+            fail("hosted-runner observation Azure platform agent child PID is invalid")
+        if not isinstance(process.get("start_time_ticks"), int) or process["start_time_ticks"] <= 0:
+            fail("hosted-runner observation Azure platform agent child start time is invalid")
+        if not re.fullmatch(r"python3(?:\.[0-9]+)?", process.get("executable_basename", "")):
+            fail("hosted-runner observation Azure platform agent child executable is unexpected")
+        for field in ("executable_device", "executable_inode"):
+            if not isinstance(process.get(field), int) or isinstance(process[field], bool):
+                fail("hosted-runner observation Azure platform agent child identity is invalid")
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
         fail("hosted-runner observation exceeds its output bound")

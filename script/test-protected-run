@@ -573,20 +573,52 @@ if scenario == "audit":
         and item.get("protocol") == "tcp"
         and item.get("remote_port") in {80, 32526}
     ]
-    require({item["remote_port"] for item in wireserver_findings} == {80, 32526})
+    observed_ports = {item["remote_port"] for item in wireserver_findings}
+    agent_processes = {
+        (process["pid"], process["executable_basename"])
+        for process in azure_agent["processes"]
+    }
+    diagnostic = {
+        "agent_control_group": azure_agent["control_group"],
+        "agent_processes": [
+            {
+                "executable_basename": process["executable_basename"],
+                "pid": process["pid"],
+            }
+            for process in azure_agent["processes"]
+        ],
+        "observed_ports": sorted(observed_ports),
+        "wireserver_attribution": [
+            {
+                "actor_class": item.get("local_attribution", {}).get("actor_class"),
+                "executable_basename": item.get("local_attribution", {}).get("executable_basename"),
+                "pid": item.get("local_attribution", {}).get("pid"),
+                "port": item["remote_port"],
+                "status": item.get("local_attribution", {}).get("status"),
+            }
+            for item in wireserver_findings
+        ],
+    }
+    print("fence-wireserver-agent-correlation=" + json.dumps(
+        diagnostic,
+        sort_keys=True,
+        separators=(",", ":"),
+    ))
+    require(observed_ports == {80, 32526}, "both WireServer ports were not naturally observed")
     require(not any(
         item.get("local_attribution", {}).get("actor_class") == "runner"
         for item in wireserver_findings
-    ))
+    ), "WireServer traffic was attributed to the runner")
     agent_attributed = [
         item for item in wireserver_findings
         if item.get("local_attribution", {}).get("status") == "attributed"
         and item["local_attribution"].get("actor_class") == "root"
-        and item["local_attribution"].get("pid") == azure_agent["main_pid"]
-        and item["local_attribution"].get("executable_basename")
-            == azure_agent["executable_basename"]
+        and (
+            item["local_attribution"].get("pid"),
+            item["local_attribution"].get("executable_basename"),
+        ) in agent_processes
     ]
-    require(agent_attributed)
+    require(agent_attributed, "WireServer traffic was not attributed to the Azure agent control group")
     print("fence-wireserver-agent-attribution-observed")
     require("fence-audit-probe" not in json.dumps(report, sort_keys=True))
     require("fence-audit-probe" not in json.dumps(dns, sort_keys=True))
