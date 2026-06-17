@@ -91,7 +91,7 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     assert_eq!(first, second);
     assert_eq!(first["data"]["application_status"], "not_applied");
     assert_eq!(first["data"]["verification_status"], "not_verified");
-    assert_eq!(first["data"]["policy_hash_schema_version"], 6);
+    assert_eq!(first["data"]["policy_hash_schema_version"], 7);
     assert_eq!(
         first["data"]["network_enforcement_preview"]["owned_table"]["name"],
         "fence_v0"
@@ -124,8 +124,8 @@ fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
     let profile = &response["data"]["platform_profile"];
     let dns = &profile["dns_mediated_compatibility"];
 
-    assert_eq!(response["data"]["policy_hash_schema_version"], 6);
-    assert_eq!(profile["id"], "github_hosted_workflow_bootstrap_v3");
+    assert_eq!(response["data"]["policy_hash_schema_version"], 7);
+    assert_eq!(profile["id"], "github_hosted_workflow_bootstrap_v4");
     assert_eq!(profile["selection_status"], "default_bounded_dns_mediated");
     assert_eq!(
         dns["realization_status"],
@@ -138,6 +138,25 @@ fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
         serde_json::json!(["a", "aaaa"])
     );
     assert_eq!(dns["https_materialization_port"], 443);
+    assert_eq!(
+        dns["root_platform_service_permissions"],
+        serde_json::json!([
+            {
+                "subject": "root_uid",
+                "root_uid": 0,
+                "destination": "168.63.129.16",
+                "protocol": "tcp",
+                "port": 80
+            },
+            {
+                "subject": "root_uid",
+                "root_uid": 0,
+                "destination": "168.63.129.16",
+                "protocol": "tcp",
+                "port": 32526
+            }
+        ])
+    );
     assert_eq!(runtime_path.exists(), existed_before);
 }
 
@@ -192,6 +211,10 @@ fn retired_platform_profiles_are_structured_errors() {
         (
             "retired-workflow-bootstrap-v2.json",
             "github_hosted_workflow_bootstrap_v2",
+        ),
+        (
+            "retired-workflow-bootstrap-v3.json",
+            "github_hosted_workflow_bootstrap_v3",
         ),
     ] {
         let config = config_file(

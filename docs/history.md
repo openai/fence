@@ -78,5 +78,10 @@ See [`v0.md`](v0.md) for normative behavior and
 - Bounded local `/proc` correlation may add best-effort process attribution to
   actual findings without telemetry, command arguments, full paths,
   environments, or payload data.
+- Hosted evidence pinned the root-owned `walinuxagent.service` identity and
+  observed the same service process naturally connecting to both Azure
+  WireServer ports. The next profile version added exact UID `0` TCP `80` and
+  `32526` rules for `168.63.129.16` as a dedicated platform-service class while
+  leaving workflow traffic and Azure IMDS blocked.
 
 Future release details belong in GitHub Releases rather than this document.

@@ -317,9 +317,9 @@ require(report["mode"] == expected["mode"])
 require(report["setup_status"] == expected["resident"])
 require(report["readiness_status"] == expected["ready"])
 require(report["protection_available"] is expected["protection_available"])
-require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
-require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
-require(report["policy_hash_schema_version"] == 6)
+require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
+require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
+require(report["policy_hash_schema_version"] == 7)
 require(re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]))
@@ -348,8 +348,8 @@ require(ready["status"] == expected["ready"])
 require(ready["runtime_evidence_schema_version"] == 4)
 require(ready["mode"] == expected["mode"])
 require(ready["protection_available"] is expected["protection_available"])
-require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
-require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
+require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
 require(ready["policy_hash"] == report["policy_hash"])
 require(ready["base_ruleset_hash"] == report["base_ruleset_hash"])
 require(ready["resident_health"]["resident_pid"] == resident["resident_pid"])
@@ -357,8 +357,8 @@ require(dns["status"] == expected["status"])
 require(dns["runtime_evidence_schema_version"] == 4)
 require(dns["mode"] == expected["mode"])
 require(dns["protection_available"] is expected["protection_available"])
-require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
-require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
+require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
 require(dns["routing_status"] == "active")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
 require(dns["docker_dns_routing"] == "local_root_resident_mediator")
@@ -438,6 +438,22 @@ except socket.gaierror:
     pass
 else:
     raise SystemExit("workflow process unexpectedly authorized a results-storage hostname")
+
+for address, port in [
+    ("168.63.129.16", 80),
+    ("168.63.129.16", 32526),
+    ("169.254.169.254", 80),
+]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect((address, port))
+    except OSError:
+        pass
+    else:
+        raise SystemExit(f"workflow process unexpectedly connected to {address}:{port}")
+    finally:
+        sock.close()
 PY
 fi
 
@@ -644,7 +660,7 @@ if scenario == "audit":
         sort_keys=True,
         separators=(",", ":"),
     ))
-    require(observed_ports == {80, 32526}, "both WireServer ports were not naturally observed")
+    require(not observed_ports, "natural WireServer traffic was reported as blocked")
     require(not any(
         item.get("local_attribution", {}).get("actor_class") == "runner"
         for item in wireserver_findings

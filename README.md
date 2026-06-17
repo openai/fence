@@ -35,6 +35,14 @@ Fence authorizes at most four exact results-storage hostnames, and only when
 the DNS request comes from the pinned GitHub runner process. It does not allow
 the general `*.blob.core.windows.net` domain.
 
+The hosted VM also depends on Azure's fixed `168.63.129.16` platform address.
+The source-built v4 profile permits only UID `0` host traffic to its WireServer
+TCP ports `80` and `32526`, separately from the user `allowlist` and GitHub
+workflow destinations. Unprivileged workflow traffic and forwarded container
+traffic do not match those rules, and Azure IMDS at `169.254.169.254` remains
+blocked. The checked-in Action adopts that contract only through an atomic
+attested bundle refresh.
+
 ## Examples 🧪
 
 Run in audit mode first to see what would be blocked:

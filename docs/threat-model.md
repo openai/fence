@@ -10,7 +10,7 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree defines the schema-`6` policy and schema-`4` runtime-evidence
+The source tree defines the schema-`7` policy and schema-`4` runtime-evidence
 contract. The released Action continues using the contract identified by its
 manifest until a bundle update changes the attested agent and wrapper validators
 atomically. The bundle remains governed by
@@ -29,6 +29,14 @@ later bypass, and the local evidence consumed by the protected post hook. Fence
 reduces arbitrary outbound access; it does not eliminate exfiltration because
 approved GitHub destinations, DNS behavior, user allowlist entries, and shared
 destination IP addresses remain usable channels.
+
+The versioned platform contract separately permits UID `0` host traffic to
+Azure WireServer at exact destination `168.63.129.16` on TCP `80` and `32526`.
+This is not workflow-wide HTTP access: unprivileged and forwarded traffic does
+not match, and Azure IMDS at `169.254.169.254` remains outside policy. Any
+root-owned host process can use the two ports, so standard block depends on its
+verified sudo/container lockdown; degraded block and audit do not claim that
+containment boundary.
 
 ## Scope and assumptions
 

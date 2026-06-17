@@ -6,7 +6,7 @@ use crate::config::{
 };
 use crate::error::ErrorDetail;
 use crate::hostname_policy::{RuntimeHostnamePolicy, build_runtime_hostname_policy};
-use crate::nft::{NetworkEnforcementPreview, build_preview, implicit_ipv6_control};
+use crate::nft::{NetworkEnforcementPreview, build_dns_mediated_preview, implicit_ipv6_control};
 use crate::platform_profile::{
     DnsMediatedCompatibilityPlan, GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
     github_hosted_workflow_bootstrap_dns_mediation_plan,
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 6;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,7 +247,7 @@ fn build_plan_inner(
         platform_resolution_results,
     );
     let policy_hash = policy_hash(&config);
-    let network_enforcement_preview = build_preview(config.mode, &effective_policy);
+    let network_enforcement_preview = build_dns_mediated_preview(config.mode, &effective_policy);
     let ruleset_hash = sha256_hex(network_enforcement_preview.ruleset.as_bytes());
     let assurance_status = assurance_status(config.mode, config.container_policy);
     let limitations = limitations(assurance_status);
@@ -315,7 +315,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV3 => Vec::new(),
+        PlatformProfile::GithubHostedWorkflowBootstrapV4 => Vec::new(),
     }
 }
 
@@ -355,7 +355,7 @@ fn platform_plan(
     frozen_resolution_results: Vec<ResolutionResult>,
 ) -> PlatformProfilePlan {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV3 => {
+        PlatformProfile::GithubHostedWorkflowBootstrapV4 => {
             let mut limitations = vec![
                 "dns_mediated_runtime_materialization_requires_trusted_launcher",
                 "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
@@ -367,6 +367,7 @@ fn platform_plan(
                 "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "post_ready_codeload_traffic_is_not_authorized",
                 "runner_authorized_results_storage_accounts_remain_egress_channels",
+                "root_owned_azure_wireserver_tcp_ports_remain_egress_channels",
             ];
             if disable_broad_github_domains {
                 limitations.push("broad_github_compatibility_destinations_disabled");
@@ -604,7 +605,7 @@ mod tests {
         )
         .unwrap();
         let explicit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v3","allowlist":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v4","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
@@ -618,7 +619,7 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
-        assert_eq!(default.policy_hash_schema_version, 6);
+        assert_eq!(default.policy_hash_schema_version, 7);
         assert_eq!(
             default.platform_profile.id,
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
@@ -629,6 +630,9 @@ mod tests {
         );
         assert!(default.platform_profile.requested_allowances.is_empty());
         assert!(default.platform_profile.effective_allowances.is_empty());
+        assert_eq!(default.limits.declared_user_allowances, 0);
+        assert!(default.runtime_static_policy.is_empty());
+        assert!(default.effective_policy.is_empty());
         let dns = default
             .platform_profile
             .dns_mediated_compatibility
@@ -661,9 +665,53 @@ mod tests {
         );
         assert_eq!(dns.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(dns.https_materialization_port, 443);
+        assert_eq!(dns.root_platform_service_permissions.len(), 2);
+        assert_eq!(dns.root_platform_service_permissions[0].root_uid, 0);
+        assert_eq!(
+            dns.root_platform_service_permissions[0].destination,
+            "168.63.129.16"
+        );
+        assert_eq!(dns.root_platform_service_permissions[0].protocol, "tcp");
+        assert_eq!(dns.root_platform_service_permissions[0].port, 80);
+        assert_eq!(dns.root_platform_service_permissions[1].port, 32526);
+        assert_eq!(
+            dns.root_platform_service_permissions,
+            opt_out
+                .platform_profile
+                .dns_mediated_compatibility
+                .as_ref()
+                .unwrap()
+                .root_platform_service_permissions
+        );
         assert_eq!(default.policy_hash, explicit.policy_hash);
         assert_eq!(default.policy_hash, explicit_false.policy_hash);
         assert_eq!(default.ruleset_hash, explicit.ruleset_hash);
+        assert_eq!(
+            default
+                .network_enforcement_preview
+                .ruleset
+                .matches("comment \"fence:wireserver_platform\"")
+                .count(),
+            2
+        );
+        assert!(
+            default
+                .network_enforcement_preview
+                .ruleset
+                .contains("meta skuid 0 ip daddr 168.63.129.16 tcp dport 80 accept")
+        );
+        assert!(
+            default
+                .network_enforcement_preview
+                .ruleset
+                .contains("meta skuid 0 ip daddr 168.63.129.16 tcp dport 32526 accept")
+        );
+        assert!(
+            !default
+                .network_enforcement_preview
+                .ruleset
+                .contains("169.254.169.254")
+        );
         let opt_out_dns = opt_out
             .platform_profile
             .dns_mediated_compatibility

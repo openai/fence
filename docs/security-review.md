@@ -185,9 +185,15 @@ compile TypeScript at workflow runtime. See Node's
   transaction identity, but does not add DNSSEC validation.
 - [Azure documents `168.63.129.16`](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
   as its fixed platform virtual address for DNS, VM-agent, and health
-  communication. Fence permits only its root-resident DNS mediator to reach UDP
-  `53`; it does not grant later workflow code general access to Azure WireServer
-  TCP `80` or `32526`.
+  communication. Fence permits its root-resident DNS mediator to reach UDP `53`
+  and UID `0` host traffic to reach WireServer TCP `80` and `32526`. The latter
+  is a dedicated platform-service rule class, not a workflow or user allowance.
+  Unprivileged and forwarded traffic does not match it, and Azure IMDS at
+  `169.254.169.254` remains blocked.
+- Any root-owned host process can use the two WireServer ports. Standard block
+  relies on verified sudo and container lockdown to prevent later workflow code
+  from obtaining UID `0`; degraded block and audit already disclaim ordinary
+  containment.
 - Untrusted workflow code can intentionally deny service to its own job. Fence
   bounds individual mediator and subprocess waits but does not claim local
   availability against malicious later steps.
