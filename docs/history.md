@@ -35,6 +35,8 @@ See [`v0.md`](v0.md) for normative behavior and
   proved before public activation.
 - Later hosted evidence added a second exact reviewed digest for the fixed
   cloud-init sudo-policy source without broadening any other fingerprint fact.
+- A bounded Action-acceptance classifier removed the source-before-bundle
+  release deadlock while continuing to reject every unreviewed host drift.
 - Standard block added measured passwordless-sudo and Docker/containerd
   lockdown. `unsafe_preserve` retained container access with degraded
   assurance, while audit preserved sudo and containers and made no containment

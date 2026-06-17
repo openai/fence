@@ -116,6 +116,18 @@ new digest only as an additional exact value and retains the same source name,
 regular-file, ownership, mode, non-writability, marker, unit, socket, resolver,
 principal, and group checks.
 
+### Source-before-bundle host compatibility
+
+An immutable bundled agent can temporarily predate a newly reviewed hosted-runner
+sudo-policy digest even though source-built integration already accepts and
+tests that host shape. Action acceptance now compares the bounded live
+observation against the bundle's serialized `check-support` fingerprint before
+destructive activation. It skips activation only when every fixed executable,
+resolver, sudo source, principal, group, unit, socket, and workload fact matches
+and the sole mismatch is an exact source-reviewed digest in the checked-in
+transition file. Unknown drift fails. After the refreshed bundle includes the
+digest, the same classifier automatically requires normal bundled activation.
+
 ### Invocation slug consistency
 
 The Action wrapper rejected consecutive hyphens in invocation identifiers,
