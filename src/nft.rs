@@ -757,14 +757,18 @@ mod tests {
         assert!(verify_owned_state(&expected, &missing).is_err());
 
         let mut broadened = expected.clone();
-        let rule = broadened
+        let index = broadened
             .rules
-            .iter_mut()
-            .find(|rule| matches!(rule, OwnedRule::WireServerPlatform { port: 32526, .. }))
+            .iter()
+            .position(|rule| matches!(rule, OwnedRule::WireServerPlatform { port: 32526, .. }))
             .unwrap();
-        if let OwnedRule::WireServerPlatform { uid, .. } = rule {
-            *uid = 1001;
-        }
+        broadened.rules[index] = OwnedRule::WireServerPlatform {
+            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            uid: 1001,
+            destination: AZURE_WIRESERVER_ADDRESS.to_owned(),
+            protocol: "tcp".to_owned(),
+            port: 32526,
+        };
         assert!(verify_owned_state(&expected, &broadened).is_err());
 
         let mut duplicated = expected.clone();
