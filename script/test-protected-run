@@ -43,6 +43,7 @@ report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 config_source="$RUNNER_TEMP/fence-protected-run-config.json"
 target_root="$RUNNER_TEMP/fence-protected-run-target-$scenario"
+host_observation="$RUNNER_TEMP/fence-hosted-runner-observation.json"
 
 report_failed_https_probe() {
   local hostname="$1"
@@ -448,7 +449,7 @@ PY
 fi
 
 sleep 6
-python3 -E - "$scenario" "$report" "$dns_report" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" "$host_observation" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -463,7 +464,7 @@ import pathlib
 import sys
 
 scenario = sys.argv[1]
-report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path, host_observation_path = (pathlib.Path(item) for item in sys.argv[2:])
 expected_by_scenario = {
     "standard": {
         "mode": "block",
@@ -557,6 +558,36 @@ if scenario == "audit":
         "executable_basename",
         "parent_executable_basenames",
     })
+    observation = json.loads(host_observation_path.read_text(encoding="utf-8"))
+    require(observation["schema_version"] == 3)
+    azure_agent = observation["systemd"]["azure_platform_agent"]
+    require(azure_agent["name"] == "walinuxagent.service")
+    require(azure_agent["active_state"] == "active")
+    require(azure_agent["sub_state"] == "running")
+    require(azure_agent["configured_user_class"] == "root_or_default")
+    require(azure_agent["process_owner_class"] == "root")
+    require(azure_agent["process_status"] == "observed")
+    wireserver_findings = [
+        item for item in report["findings"]
+        if item.get("remote_address") == "168.63.129.16"
+        and item.get("protocol") == "tcp"
+        and item.get("remote_port") in {80, 32526}
+    ]
+    require({item["remote_port"] for item in wireserver_findings} == {80, 32526})
+    require(not any(
+        item.get("local_attribution", {}).get("actor_class") == "runner"
+        for item in wireserver_findings
+    ))
+    agent_attributed = [
+        item for item in wireserver_findings
+        if item.get("local_attribution", {}).get("status") == "attributed"
+        and item["local_attribution"].get("actor_class") == "root"
+        and item["local_attribution"].get("pid") == azure_agent["main_pid"]
+        and item["local_attribution"].get("executable_basename")
+            == azure_agent["executable_basename"]
+    ]
+    require(agent_attributed)
+    print("fence-wireserver-agent-attribution-observed")
     require("fence-audit-probe" not in json.dumps(report, sort_keys=True))
     require("fence-audit-probe" not in json.dumps(dns, sort_keys=True))
 if scenario != "standard-finalization":

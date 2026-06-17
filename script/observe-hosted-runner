@@ -25,9 +25,14 @@ fi
 
 # Observe only fixed security-relevant surfaces. Do not emit file contents,
 # environment values, process arguments, workload identifiers, or socket data.
-# The only mutation is an exclusive empty-file create/delete probe in the
-# enumerated command and sudo-policy ancestor directories.
-sudo --non-interactive /usr/bin/python3 -E - "$runner_principal" <<'PY'
+# The only mutations are an exclusive empty-file create/delete probe in the
+# enumerated command and sudo-policy ancestor directories plus one bounded
+# runner-readable evidence file under the runner-provided temporary root.
+observation_path="$RUNNER_TEMP/fence-hosted-runner-observation.json"
+if [[ -e "$observation_path" ]]; then
+  die "hosted-runner observation requires an absent evidence path"
+fi
+sudo --non-interactive /usr/bin/python3 -E - "$runner_principal" "$observation_path" <<'PY'
 import grp
 import hashlib
 import json
@@ -70,6 +75,7 @@ FIXED_UNITS = [
     "docker.socket",
     "containerd.service",
     "containerd.socket",
+    "walinuxagent.service",
 ]
 FIXED_SOCKETS = [
     "/var/run/docker.sock",
@@ -413,6 +419,85 @@ def unit_state(unit):
     return values
 
 
+def azure_platform_agent_observation(identity):
+    unit = "walinuxagent.service"
+    output = command_output(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            "--no-pager",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=UnitFileState",
+            "--property=MainPID",
+            "--property=User",
+            "--property=ControlGroup",
+            unit,
+        ]
+    )
+    if output is None:
+        return {"name": unit, "status": "unavailable"}
+
+    fields = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            fields[key] = value
+    try:
+        main_pid = int(fields.get("MainPID", "0"))
+    except ValueError:
+        main_pid = 0
+    configured_user = fields.get("User", "")
+    control_group = fields.get("ControlGroup", "")
+    if configured_user not in {"", "root"}:
+        configured_user_class = "other"
+    else:
+        configured_user_class = "root_or_default"
+    if not re.fullmatch(r"/[A-Za-z0-9_.@:/\\-]{1,255}", control_group):
+        control_group = "unreportable"
+
+    observation = {
+        "name": unit,
+        "status": "observed",
+        "load_state": fields.get("LoadState", "unobserved")[:64],
+        "active_state": fields.get("ActiveState", "unobserved")[:64],
+        "sub_state": fields.get("SubState", "unobserved")[:64],
+        "unit_file_state": fields.get("UnitFileState", "unobserved")[:64],
+        "configured_user_class": configured_user_class,
+        "control_group": control_group,
+        "main_pid": main_pid,
+    }
+    if main_pid <= 0:
+        return observation
+
+    process_root = pathlib.Path(f"/proc/{main_pid}")
+    try:
+        process_metadata = process_root.stat()
+        executable = (process_root / "exe").resolve(strict=True)
+        executable_metadata = executable.stat()
+        stat_fields = (process_root / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        process_start_time = int(stat_fields[19])
+    except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError, ValueError):
+        observation["process_status"] = "unavailable"
+        return observation
+
+    executable_basename = executable.name
+    if not re.fullmatch(r"[A-Za-z0-9._+-]{1,128}", executable_basename):
+        executable_basename = "unreportable"
+    observation.update(
+        {
+            "process_status": "observed",
+            "process_owner_class": owner_class(process_metadata.st_uid, identity),
+            "process_start_time_ticks": process_start_time,
+            "executable_basename": executable_basename,
+            "executable_device": executable_metadata.st_dev,
+            "executable_inode": executable_metadata.st_ino,
+        }
+    )
+    return observation
+
+
 def socket_state(path):
     candidate = pathlib.Path(path)
     try:
@@ -491,7 +576,7 @@ def validate_metadata_fields(item):
 
 
 def validate_result(result):
-    if result.get("schema_version") != 2:
+    if result.get("schema_version") != 3:
         fail("hosted-runner observation schema mismatch")
     required_paths = result.get("required_paths")
     if not isinstance(required_paths, list) or [
@@ -522,6 +607,30 @@ def validate_result(result):
         fail("hosted-runner observation policy source bound mismatch")
     for item in policy_sources:
         validate_metadata_fields(item)
+    agent = result.get("systemd", {}).get("azure_platform_agent")
+    if not isinstance(agent, dict) or agent.get("name") != "walinuxagent.service":
+        fail("hosted-runner observation Azure platform agent is missing")
+    if agent.get("status") != "observed":
+        fail("hosted-runner observation Azure platform agent is unavailable")
+    if agent.get("load_state") != "loaded" or agent.get("active_state") != "active":
+        fail("hosted-runner observation Azure platform agent is not active")
+    if agent.get("sub_state") != "running":
+        fail("hosted-runner observation Azure platform agent is not running")
+    if agent.get("configured_user_class") != "root_or_default":
+        fail("hosted-runner observation Azure platform agent user is unexpected")
+    if agent.get("process_status") != "observed":
+        fail("hosted-runner observation Azure platform agent process is unavailable")
+    if agent.get("process_owner_class") != "root":
+        fail("hosted-runner observation Azure platform agent process is not root-owned")
+    if not isinstance(agent.get("main_pid"), int) or agent["main_pid"] <= 0:
+        fail("hosted-runner observation Azure platform agent PID is invalid")
+    if not isinstance(agent.get("process_start_time_ticks"), int) or agent["process_start_time_ticks"] <= 0:
+        fail("hosted-runner observation Azure platform agent start time is invalid")
+    if not re.fullmatch(r"python3(?:\\.[0-9]+)?", agent.get("executable_basename", "")):
+        fail("hosted-runner observation Azure platform agent executable is unexpected")
+    for field in ("executable_device", "executable_inode"):
+        if not isinstance(agent.get(field), int) or isinstance(agent[field], bool):
+            fail("hosted-runner observation Azure platform agent executable identity is invalid")
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
         fail("hosted-runner observation exceeds its output bound")
@@ -566,7 +675,7 @@ except (FileNotFoundError, UnicodeDecodeError):
     pass
 
 result = {
-    "schema_version": 2,
+    "schema_version": 3,
     "observation": "hosted_runner_fingerprint_candidate",
     "status": "observation_only_no_protection",
     "protected_target": "github_hosted_ubuntu_24_04_x86_64",
@@ -585,7 +694,10 @@ result = {
         for path in FIXED_ANCESTOR_DIRECTORIES
     ],
     "resolver": resolver_layout(),
-    "systemd": {"units": [unit_state(unit) for unit in FIXED_UNITS]},
+    "systemd": {
+        "units": [unit_state(unit) for unit in FIXED_UNITS],
+        "azure_platform_agent": azure_platform_agent_observation(identity),
+    },
     "sudo": {
         "noninteractive_root_observation_succeeded": True,
         "policy_source_hashes": sudo_sources,
@@ -598,5 +710,17 @@ result = {
     },
     "next_step": "review_permission_invariants_before_any_enforcement_change",
 }
-print(validate_result(result))
+encoded = validate_result(result)
+output_path = pathlib.Path(sys.argv[2])
+try:
+    descriptor = os.open(
+        output_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o644,
+    )
+except OSError:
+    fail("hosted-runner observation could not create its bounded evidence file")
+with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+    destination.write(encoded)
+print(encoded)
 PY
