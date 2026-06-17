@@ -1,0 +1,165 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 2 ]]; then
+  die "usage: script/observe-wireserver-agent <host-observation-json> <output-json>"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "WireServer agent observation requires Linux x86_64"
+fi
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "WireServer agent observation runs only on disposable GitHub Actions runners"
+fi
+
+require_cmd python3
+require_cmd sudo
+
+sudo --non-interactive /usr/bin/python3 -E - "$1" "$2" <<'PY'
+import json
+import os
+import pathlib
+import re
+import socket
+import stat
+import struct
+import sys
+import time
+
+AZURE_PLATFORM_ADDRESS = "168.63.129.16"
+AZURE_PLATFORM_PORTS = {80, 32526}
+CONTROL_GROUP = "/azure.slice/walinuxagent.service"
+MAX_CGROUP_PROCESSES = 16
+MAX_DESCRIPTORS_PER_PROCESS = 256
+MAX_OBSERVATIONS = 16
+MAX_PROC_NET_BYTES = 1024 * 1024
+OBSERVATION_SECONDS = 15
+
+
+def fail(message):
+    raise SystemExit(message)
+
+
+host_path = pathlib.Path(sys.argv[1])
+output_path = pathlib.Path(sys.argv[2])
+host = json.loads(host_path.read_text(encoding="utf-8"))
+agent = host.get("systemd", {}).get("azure_platform_agent", {})
+if host.get("schema_version") != 3 or agent.get("control_group") != CONTROL_GROUP:
+    fail("WireServer agent observation did not receive the reviewed host evidence")
+if output_path.exists():
+    fail("WireServer agent observation requires an absent output path")
+
+cgroup_processes = pathlib.Path("/sys/fs/cgroup/azure.slice/walinuxagent.service/cgroup.procs")
+
+
+def process_identity(pid):
+    root = pathlib.Path(f"/proc/{pid}")
+    try:
+        metadata = root.stat()
+        executable = (root / "exe").resolve(strict=True)
+        executable_metadata = executable.stat()
+        fields = (root / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        start_time = int(fields[19])
+    except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError, ValueError):
+        return None
+    basename = executable.name
+    if metadata.st_uid != 0 or not re.fullmatch(r"python3(?:\.[0-9]+)?", basename):
+        return None
+    return {
+        "pid": pid,
+        "start_time_ticks": start_time,
+        "executable_basename": basename,
+        "executable_device": executable_metadata.st_dev,
+        "executable_inode": executable_metadata.st_ino,
+    }
+
+
+def wireserver_socket_inodes():
+    try:
+        with open("/proc/net/tcp", "rb") as source:
+            contents = source.read(MAX_PROC_NET_BYTES + 1)
+    except OSError:
+        return {}
+    if len(contents) > MAX_PROC_NET_BYTES:
+        fail("WireServer agent observation exceeded the socket-table bound")
+    matches = {}
+    for raw_line in contents.decode("ascii", errors="ignore").splitlines()[1:]:
+        fields = raw_line.split()
+        if len(fields) < 10:
+            continue
+        remote_address, separator, remote_port = fields[2].partition(":")
+        if not separator or len(remote_address) != 8:
+            continue
+        try:
+            address = socket.inet_ntoa(struct.pack("<I", int(remote_address, 16)))
+            port = int(remote_port, 16)
+            inode = int(fields[9])
+        except (OSError, ValueError):
+            continue
+        if address == AZURE_PLATFORM_ADDRESS and port in AZURE_PLATFORM_PORTS:
+            matches[inode] = port
+    return matches
+
+
+observations = {}
+deadline = time.monotonic() + OBSERVATION_SECONDS
+while time.monotonic() < deadline:
+    sockets = wireserver_socket_inodes()
+    try:
+        process_ids = sorted({
+            int(value)
+            for value in cgroup_processes.read_text(encoding="utf-8").splitlines()
+            if value.isdecimal()
+        })
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        fail("WireServer agent control group became unavailable")
+    if len(process_ids) > MAX_CGROUP_PROCESSES:
+        fail("WireServer agent control group exceeded its process bound")
+    for pid in process_ids:
+        identity = process_identity(pid)
+        if identity is None:
+            continue
+        descriptor_root = pathlib.Path(f"/proc/{pid}/fd")
+        try:
+            descriptors = list(descriptor_root.iterdir())
+        except OSError:
+            continue
+        if len(descriptors) > MAX_DESCRIPTORS_PER_PROCESS:
+            fail("WireServer agent process exceeded its descriptor bound")
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+            match = re.fullmatch(r"socket:\[([0-9]+)\]", target)
+            if match is None:
+                continue
+            port = sockets.get(int(match.group(1)))
+            if port is None:
+                continue
+            key = (identity["pid"], identity["start_time_ticks"], port)
+            observations[key] = {**identity, "port": port}
+            if len(observations) > MAX_OBSERVATIONS:
+                fail("WireServer agent observation exceeded its result bound")
+    time.sleep(0.005)
+
+document = {
+    "schema_version": 1,
+    "status": "wireserver_agent_observation_only",
+    "control_group": CONTROL_GROUP,
+    "destination": AZURE_PLATFORM_ADDRESS,
+    "observations": [observations[key] for key in sorted(observations)],
+    "observations_truncated": False,
+}
+encoded = json.dumps(document, sort_keys=True, separators=(",", ":"))
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+try:
+    descriptor = os.open(output_path, flags, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+except OSError:
+    fail("WireServer agent observation could not create its bounded evidence file")
+with os.fdopen(descriptor, "w", encoding="utf-8") as destination:
+    destination.write(encoded)
+print(encoded)
+PY

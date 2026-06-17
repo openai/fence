@@ -187,6 +187,12 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Must not emit sudo policy contents, environment values, process arguments, WireServer request or response content, workload identifiers, credentials, or arbitrary host files.
   - Must not establish support, enable public enforcement, write readiness, or leave host state after its bounded synthetic probes and runner-temporary evidence. Schema-`3` permission and Azure-agent observations remain evidence-only until reviewed hosted runs justify a separate production hardening change.
 
+- `script/observe-wireserver-agent`
+  - Linux x64-only, GitHub-Actions-only evidence helper for the disposable hosted `audit` scenario; it must not run on developer machines or reusable runners.
+  - Observes natural sockets only within the fixed `/azure.slice/walinuxagent.service` control group for the exact Azure platform address and TCP ports `80` and `32526`, with bounded process, descriptor, socket-table, duration, and result limits.
+  - Retains only root-owned process PID, start time, executable basename/device/inode, and destination port. It must not generate traffic or inspect command lines, environment values, local tuples, HTTP paths, payloads, responses, VM identifiers, goal-state data, certificates, or arbitrary processes.
+  - Writes runner-readable observation-only evidence under the runner-provided temporary root. It must not mutate policy, establish support, write readiness, or make a protection claim.
+
 - `script/test-package-smoke`
   - Linux x64-only offline packaged-artifact acceptance entrypoint; it accepts exactly one already-built Fence binary path.
   - Uses only a literal-IP/CIDR policy fixture and Python standard-library JSON parsing; it must not resolve hostnames, install tools, or use network access.

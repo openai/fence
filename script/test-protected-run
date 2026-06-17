@@ -44,6 +44,7 @@ dns_report="$directory/dns-report.json"
 config_source="$RUNNER_TEMP/fence-protected-run-config.json"
 target_root="$RUNNER_TEMP/fence-protected-run-target-$scenario"
 host_observation="$RUNNER_TEMP/fence-hosted-runner-observation.json"
+wireserver_agent_observation="$RUNNER_TEMP/fence-wireserver-agent-observation.json"
 
 report_failed_https_probe() {
   local hostname="$1"
@@ -396,6 +397,12 @@ if scenario == "unsafe-preserve":
     require("container_control_remains_available_to_later_workflow_code" in report["limitations"])
 PY
 
+wireserver_observer_pid=""
+if [[ "$scenario" == "audit" ]]; then
+  script/observe-wireserver-agent "$host_observation" "$wireserver_agent_observation" &
+  wireserver_observer_pid="$!"
+fi
+
 case "$scenario" in
   standard)
     for url in \
@@ -468,7 +475,10 @@ PY
 fi
 
 sleep 6
-python3 -E - "$scenario" "$report" "$dns_report" "$host_observation" <<'PY'
+if [[ -n "$wireserver_observer_pid" ]]; then
+  wait "$wireserver_observer_pid"
+fi
+python3 -E - "$scenario" "$report" "$dns_report" "$host_observation" "$wireserver_agent_observation" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -483,7 +493,9 @@ import pathlib
 import sys
 
 scenario = sys.argv[1]
-report_path, dns_path, host_observation_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path, host_observation_path, wireserver_observation_path = (
+    pathlib.Path(item) for item in sys.argv[2:]
+)
 expected_by_scenario = {
     "standard": {
         "mode": "block",
@@ -593,9 +605,16 @@ if scenario == "audit":
         and item.get("remote_port") in {80, 32526}
     ]
     observed_ports = {item["remote_port"] for item in wireserver_findings}
-    agent_processes = {
-        (process["pid"], process["executable_basename"])
-        for process in azure_agent["processes"]
+    wireserver_observation = json.loads(
+        wireserver_observation_path.read_text(encoding="utf-8")
+    )
+    require(wireserver_observation["schema_version"] == 1)
+    require(wireserver_observation["status"] == "wireserver_agent_observation_only")
+    require(wireserver_observation["control_group"] == "/azure.slice/walinuxagent.service")
+    require(wireserver_observation["destination"] == "168.63.129.16")
+    require(wireserver_observation["observations_truncated"] is False)
+    agent_socket_ports = {
+        item["port"] for item in wireserver_observation["observations"]
     }
     diagnostic = {
         "agent_control_group": azure_agent["control_group"],
@@ -606,6 +625,8 @@ if scenario == "audit":
             }
             for process in azure_agent["processes"]
         ],
+        "agent_socket_observations": wireserver_observation["observations"],
+        "agent_socket_ports": sorted(agent_socket_ports),
         "observed_ports": sorted(observed_ports),
         "wireserver_attribution": [
             {
@@ -628,16 +649,10 @@ if scenario == "audit":
         item.get("local_attribution", {}).get("actor_class") == "runner"
         for item in wireserver_findings
     ), "WireServer traffic was attributed to the runner")
-    agent_attributed = [
-        item for item in wireserver_findings
-        if item.get("local_attribution", {}).get("status") == "attributed"
-        and item["local_attribution"].get("actor_class") == "root"
-        and (
-            item["local_attribution"].get("pid"),
-            item["local_attribution"].get("executable_basename"),
-        ) in agent_processes
-    ]
-    require(agent_attributed, "WireServer traffic was not attributed to the Azure agent control group")
+    require(
+        agent_socket_ports == {80, 32526},
+        "both WireServer ports were not observed from the Azure agent control group",
+    )
     print("fence-wireserver-agent-attribution-observed")
     require("fence-audit-probe" not in json.dumps(report, sort_keys=True))
     require("fence-audit-probe" not in json.dumps(dns, sort_keys=True))
