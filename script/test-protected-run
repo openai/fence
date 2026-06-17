@@ -288,6 +288,25 @@ while time.monotonic() < deadline:
             break
     time.sleep(0.1)
 
+if report is None or report.get("setup_status") != expected["resident"]:
+    diagnostic = {
+        "critical_codes": [
+            item.get("code")
+            for item in (report or {}).get("critical_findings", [])
+        ][:8],
+        "dns_routing_status": (dns or {}).get("routing_status"),
+        "network_application_status": (report or {}).get("network_application_status"),
+        "network_verification_status": (report or {}).get("network_verification_status"),
+        "readiness_status": (report or {}).get("readiness_status"),
+        "report_present": report is not None,
+        "setup_status": (report or {}).get("setup_status"),
+    }
+    print("bounded protected startup evidence: " + json.dumps(
+        diagnostic,
+        sort_keys=True,
+        separators=(",", ":"),
+    ))
+
 require(report is not None)
 require(dns is not None)
 require(ready is not None)
