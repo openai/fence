@@ -107,6 +107,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV1 {
                     sha256: "55b0a6eab1edea9a2151c9b73deff81fb365854a070045452766aa4a0397ab13",
                     alternate_sha256: vec![
                         "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
+                        "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d",
                     ],
                     runner_nopasswd_markers: vec![],
                 },
@@ -214,7 +215,10 @@ mod tests {
         );
         assert_eq!(
             requirement.accepted.sudo_policy_sources[1].alternate_sha256,
-            vec!["9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950"]
+            vec![
+                "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
+                "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d",
+            ]
         );
         assert_eq!(
             requirement.accepted.container_units[0].name,

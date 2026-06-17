@@ -33,6 +33,8 @@ See [`v0.md`](v0.md) for normative behavior and
 - Root-owned runtime storage, transient `systemd` supervision, five-second
   resident verification, readiness ordering, and pre-ready rollback were
   proved before public activation.
+- Later hosted evidence added a second exact reviewed digest for the fixed
+  cloud-init sudo-policy source without broadening any other fingerprint fact.
 - Standard block added measured passwordless-sudo and Docker/containerd
   lockdown. `unsafe_preserve` retained container access with degraded
   assurance, while audit preserved sudo and containers and made no containment

@@ -105,6 +105,17 @@ rejected symlinks but did not require a regular file after opening. Policy
 sources now use a non-blocking open and fail closed unless the opened object is
 a bounded regular file.
 
+### Exact hosted sudo-policy variants
+
+Fresh hosted evidence showed a second exact digest for the fixed
+`90-cloud-init-users` sudo-policy source. Four independent hosted VMs matched
+that digest while ten matched the previously accepted variant; after excluding
+non-enforced volatile device, inode, PID, and start-time identifiers, the
+bounded observations were otherwise identical. The fingerprint accepts the
+new digest only as an additional exact value and retains the same source name,
+regular-file, ownership, mode, non-writability, marker, unit, socket, resolver,
+principal, and group checks.
+
 ### Invocation slug consistency
 
 The Action wrapper rejected consecutive hyphens in invocation identifiers,
