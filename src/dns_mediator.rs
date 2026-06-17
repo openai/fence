@@ -70,7 +70,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
-    "github_hosted_workflow_bootstrap_dns_provenance_v3";
+    "github_hosted_workflow_bootstrap_dns_provenance_v4";
 pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 4;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =

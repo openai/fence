@@ -28,7 +28,7 @@ require_cmd docker
 require_cmd python3
 require_cmd sudo
 
-for required in /usr/bin/install /usr/bin/mount /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/umount /usr/sbin/nft; do
+for required in /usr/bin/install /usr/bin/journalctl /usr/bin/mount /usr/bin/systemctl /usr/bin/systemd-run /usr/bin/umount /usr/sbin/nft; do
   if [[ ! -x "$required" ]]; then
     die "protected block proof requires executable $required"
   fi
@@ -43,6 +43,8 @@ report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 config_source="$RUNNER_TEMP/fence-protected-run-config.json"
 target_root="$RUNNER_TEMP/fence-protected-run-target-$scenario"
+host_observation="$RUNNER_TEMP/fence-hosted-runner-observation.json"
+wireserver_agent_observation="$RUNNER_TEMP/fence-wireserver-agent-observation.json"
 
 report_failed_https_probe() {
   local hostname="$1"
@@ -172,7 +174,7 @@ sudo /usr/bin/systemd-run \
   --unit "$unit" \
   "$binary" run --config "$config"
 
-python3 -E - "$scenario" "$report" "$dns_report" "$ready" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" "$ready" "$unit" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -185,11 +187,13 @@ def require(condition, message="evidence validation failed"):
 import json
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
 scenario = sys.argv[1]
-report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:5])
+unit = sys.argv[5]
 expected_by_scenario = {
     "standard": {
         "mode": "block",
@@ -274,7 +278,7 @@ expected_by_scenario = {
 }
 expected_by_scenario["standard-finalization"] = expected_by_scenario["standard"]
 expected = expected_by_scenario[scenario]
-deadline = time.monotonic() + 30
+deadline = time.monotonic() + 60
 report = None
 dns = None
 ready = None
@@ -287,6 +291,72 @@ while time.monotonic() < deadline:
             break
     time.sleep(0.1)
 
+if report is None or report.get("setup_status") != expected["resident"]:
+    properties = subprocess.run(
+        [
+            "/usr/bin/systemctl",
+            "show",
+            unit,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=Result",
+            "--property=ExecMainCode",
+            "--property=ExecMainStatus",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    unit_state = {}
+    for line in properties.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator:
+            unit_state[key] = value
+
+    journal = subprocess.run(
+        [
+            "/usr/bin/journalctl",
+            "--unit",
+            unit,
+            "--no-pager",
+            "--output=cat",
+            "--lines=20",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    service_error_codes = []
+    for line in journal.stdout.splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        code = entry.get("error", {}).get("code")
+        if isinstance(code, str) and code not in service_error_codes:
+            service_error_codes.append(code)
+
+    diagnostic = {
+        "critical_codes": [
+            item.get("code")
+            for item in (report or {}).get("critical_findings", [])
+        ][:8],
+        "dns_routing_status": (dns or {}).get("routing_status"),
+        "network_application_status": (report or {}).get("network_application_status"),
+        "network_verification_status": (report or {}).get("network_verification_status"),
+        "readiness_status": (report or {}).get("readiness_status"),
+        "report_present": report is not None,
+        "service_error_codes": service_error_codes[:8],
+        "setup_status": (report or {}).get("setup_status"),
+        "unit_state": unit_state,
+    }
+    print("bounded protected startup evidence: " + json.dumps(
+        diagnostic,
+        sort_keys=True,
+        separators=(",", ":"),
+    ))
+
 require(report is not None)
 require(dns is not None)
 require(ready is not None)
@@ -296,9 +366,9 @@ require(report["mode"] == expected["mode"])
 require(report["setup_status"] == expected["resident"])
 require(report["readiness_status"] == expected["ready"])
 require(report["protection_available"] is expected["protection_available"])
-require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
-require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
-require(report["policy_hash_schema_version"] == 6)
+require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
+require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
+require(report["policy_hash_schema_version"] == 7)
 require(re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]))
@@ -327,8 +397,8 @@ require(ready["status"] == expected["ready"])
 require(ready["runtime_evidence_schema_version"] == 4)
 require(ready["mode"] == expected["mode"])
 require(ready["protection_available"] is expected["protection_available"])
-require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
-require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
+require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
 require(ready["policy_hash"] == report["policy_hash"])
 require(ready["base_ruleset_hash"] == report["base_ruleset_hash"])
 require(ready["resident_health"]["resident_pid"] == resident["resident_pid"])
@@ -336,8 +406,8 @@ require(dns["status"] == expected["status"])
 require(dns["runtime_evidence_schema_version"] == 4)
 require(dns["mode"] == expected["mode"])
 require(dns["protection_available"] is expected["protection_available"])
-require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v3")
-require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v3")
+require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
+require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
 require(dns["routing_status"] == "active")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
 require(dns["docker_dns_routing"] == "local_root_resident_mediator")
@@ -376,6 +446,12 @@ if scenario == "unsafe-preserve":
     require("container_control_remains_available_to_later_workflow_code" in report["limitations"])
 PY
 
+wireserver_observer_pid=""
+if [[ "$scenario" == "audit" ]]; then
+  script/observe-wireserver-agent "$host_observation" "$wireserver_agent_observation" &
+  wireserver_observer_pid="$!"
+fi
+
 case "$scenario" in
   standard)
     for url in \
@@ -411,6 +487,22 @@ except socket.gaierror:
     pass
 else:
     raise SystemExit("workflow process unexpectedly authorized a results-storage hostname")
+
+for address, port in [
+    ("168.63.129.16", 80),
+    ("168.63.129.16", 32526),
+    ("169.254.169.254", 80),
+]:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(2)
+    try:
+        sock.connect((address, port))
+    except OSError:
+        pass
+    else:
+        raise SystemExit(f"workflow process unexpectedly connected to {address}:{port}")
+    finally:
+        sock.close()
 PY
 fi
 
@@ -448,7 +540,10 @@ PY
 fi
 
 sleep 6
-python3 -E - "$scenario" "$report" "$dns_report" <<'PY'
+if [[ -n "$wireserver_observer_pid" ]]; then
+  wait "$wireserver_observer_pid"
+fi
+python3 -E - "$scenario" "$report" "$dns_report" "$host_observation" "$wireserver_agent_observation" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -463,7 +558,9 @@ import pathlib
 import sys
 
 scenario = sys.argv[1]
-report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path, host_observation_path, wireserver_observation_path = (
+    pathlib.Path(item) for item in sys.argv[2:]
+)
 expected_by_scenario = {
     "standard": {
         "mode": "block",
@@ -557,6 +654,70 @@ if scenario == "audit":
         "executable_basename",
         "parent_executable_basenames",
     })
+    observation = json.loads(host_observation_path.read_text(encoding="utf-8"))
+    require(observation["schema_version"] == 3)
+    azure_agent = observation["systemd"]["azure_platform_agent"]
+    require(azure_agent["name"] == "walinuxagent.service")
+    require(azure_agent["active_state"] == "active")
+    require(azure_agent["sub_state"] == "running")
+    require(azure_agent["configured_user_class"] == "root_or_default")
+    require(azure_agent["process_owner_class"] == "root")
+    require(azure_agent["process_status"] == "observed")
+    wireserver_findings = [
+        item for item in report["findings"]
+        if item.get("remote_address") == "168.63.129.16"
+        and item.get("protocol") == "tcp"
+        and item.get("remote_port") in {80, 32526}
+    ]
+    observed_ports = {item["remote_port"] for item in wireserver_findings}
+    wireserver_observation = json.loads(
+        wireserver_observation_path.read_text(encoding="utf-8")
+    )
+    require(wireserver_observation["schema_version"] == 1)
+    require(wireserver_observation["status"] == "wireserver_agent_observation_only")
+    require(wireserver_observation["control_group"] == "/azure.slice/walinuxagent.service")
+    require(wireserver_observation["destination"] == "168.63.129.16")
+    require(wireserver_observation["observations_truncated"] is False)
+    agent_socket_ports = {
+        item["port"] for item in wireserver_observation["observations"]
+    }
+    diagnostic = {
+        "agent_control_group": azure_agent["control_group"],
+        "agent_processes": [
+            {
+                "executable_basename": process["executable_basename"],
+                "pid": process["pid"],
+            }
+            for process in azure_agent["processes"]
+        ],
+        "agent_socket_observations": wireserver_observation["observations"],
+        "agent_socket_ports": sorted(agent_socket_ports),
+        "observed_ports": sorted(observed_ports),
+        "wireserver_attribution": [
+            {
+                "actor_class": item.get("local_attribution", {}).get("actor_class"),
+                "executable_basename": item.get("local_attribution", {}).get("executable_basename"),
+                "pid": item.get("local_attribution", {}).get("pid"),
+                "port": item["remote_port"],
+                "status": item.get("local_attribution", {}).get("status"),
+            }
+            for item in wireserver_findings
+        ],
+    }
+    print("fence-wireserver-agent-correlation=" + json.dumps(
+        diagnostic,
+        sort_keys=True,
+        separators=(",", ":"),
+    ))
+    require(not observed_ports, "natural WireServer traffic was reported as blocked")
+    require(not any(
+        item.get("local_attribution", {}).get("actor_class") == "runner"
+        for item in wireserver_findings
+    ), "WireServer traffic was attributed to the runner")
+    if agent_socket_ports:
+        print("fence-wireserver-agent-attribution-observed")
+    else:
+        print("fence-wireserver-agent-attribution-not-observed")
     require("fence-audit-probe" not in json.dumps(report, sort_keys=True))
     require("fence-audit-probe" not in json.dumps(dns, sort_keys=True))
 if scenario != "standard-finalization":

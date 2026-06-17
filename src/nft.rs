@@ -1,6 +1,9 @@
 use crate::config::{Mode, Protocol};
 use crate::findings::ConnectionFinding;
 use crate::plan::EffectiveAllowance;
+use crate::platform_profile::{
+    AZURE_WIRESERVER_ADDRESS, AZURE_WIRESERVER_ROOT_UID, AZURE_WIRESERVER_TCP_PORTS,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
@@ -141,6 +144,13 @@ pub enum OwnedRule {
         protocol: String,
         port: u16,
     },
+    WireServerPlatform {
+        chain: String,
+        uid: u32,
+        destination: String,
+        protocol: String,
+        port: u16,
+    },
     ViolationDispatch {
         chain: String,
     },
@@ -177,6 +187,21 @@ pub fn implicit_ipv6_control() -> ImplicitIpv6Control {
 }
 
 pub fn build_preview(mode: Mode, allowances: &[EffectiveAllowance]) -> NetworkEnforcementPreview {
+    build_preview_with_dns_mediator(mode, allowances, false)
+}
+
+pub fn build_dns_mediated_preview(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+) -> NetworkEnforcementPreview {
+    build_preview_with_dns_mediator(mode, allowances, true)
+}
+
+fn build_preview_with_dns_mediator(
+    mode: Mode,
+    allowances: &[EffectiveAllowance],
+    dns_mediator_upstream: bool,
+) -> NetworkEnforcementPreview {
     NetworkEnforcementPreview {
         backend: NFT_BACKEND,
         activation_status: "not_applied",
@@ -194,7 +219,7 @@ pub fn build_preview(mode: Mode, allowances: &[EffectiveAllowance]) -> NetworkEn
             sample_rate_per_second: NFLOG_SAMPLE_RATE_PER_SECOND,
             sample_burst: NFLOG_SAMPLE_BURST,
         },
-        ruleset: render_ruleset(mode, allowances),
+        ruleset: render_ruleset_with_dns_mediator(mode, allowances, dns_mediator_upstream, false),
     }
 }
 
@@ -412,6 +437,15 @@ fn build_rules(
             protocol: "udp".to_owned(),
             port: DNS_MEDIATOR_UPSTREAM_PORT,
         });
+        rules.extend(
+            AZURE_WIRESERVER_TCP_PORTS.map(|port| OwnedRule::WireServerPlatform {
+                chain: NFT_CLASSIFY_CHAIN.to_owned(),
+                uid: AZURE_WIRESERVER_ROOT_UID,
+                destination: AZURE_WIRESERVER_ADDRESS.to_owned(),
+                protocol: "tcp".to_owned(),
+                port,
+            }),
+        );
     }
     rules.extend(allowances.iter().map(|allowance| OwnedRule::Allowance {
         chain: NFT_CLASSIFY_CHAIN.to_owned(),
@@ -505,6 +539,19 @@ fn render_rule(program: &mut String, rule: &OwnedRule) {
             writeln!(
                 program,
                 "add rule {NFT_FAMILY} {NFT_TABLE} {chain} meta skuid {uid} ip daddr {destination} {protocol} dport {port} accept comment \"fence:dns_mediator_upstream\""
+            )
+            .unwrap();
+        }
+        OwnedRule::WireServerPlatform {
+            chain,
+            uid,
+            destination,
+            protocol,
+            port,
+        } => {
+            writeln!(
+                program,
+                "add rule {NFT_FAMILY} {NFT_TABLE} {chain} meta skuid {uid} ip daddr {destination} {protocol} dport {port} accept comment \"fence:wireserver_platform\""
             )
             .unwrap();
         }
@@ -606,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_dns_mediator_upstream_as_root_only_owned_backend_rule() {
+    fn renders_root_only_platform_service_rules_as_owned_backend_state() {
         let program = render_dns_mediated_ruleset(Mode::Block, &allowances());
         let replacement = render_dns_mediated_replacement_ruleset(Mode::Block, &allowances());
         let expected = expected_dns_mediated_owned_state(Mode::Block, &allowances());
@@ -614,6 +661,19 @@ mod tests {
         assert!(program.contains(
             "meta skuid 0 ip daddr 168.63.129.16 udp dport 53 accept comment \"fence:dns_mediator_upstream\""
         ));
+        assert_eq!(
+            program
+                .matches("comment \"fence:wireserver_platform\"")
+                .count(),
+            2
+        );
+        assert!(program.contains(
+            "meta skuid 0 ip daddr 168.63.129.16 tcp dport 80 accept comment \"fence:wireserver_platform\""
+        ));
+        assert!(program.contains(
+            "meta skuid 0 ip daddr 168.63.129.16 tcp dport 32526 accept comment \"fence:wireserver_platform\""
+        ));
+        assert!(!program.contains("169.254.169.254"));
         assert!(
             replacement.starts_with("delete table inet fence_v0\ncreate table inet fence_v0\n")
         );
@@ -626,6 +686,34 @@ mod tests {
                 ..
             } if destination == "168.63.129.16"
         )));
+        let wireserver = expected
+            .rules
+            .iter()
+            .filter_map(|rule| match rule {
+                OwnedRule::WireServerPlatform {
+                    uid,
+                    destination,
+                    protocol,
+                    port,
+                    ..
+                } => Some((*uid, destination.as_str(), protocol.as_str(), *port)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wireserver,
+            vec![
+                (0, "168.63.129.16", "tcp", 80),
+                (0, "168.63.129.16", "tcp", 32526)
+            ]
+        );
+        let audit = render_dns_mediated_ruleset(Mode::Audit, &[]);
+        assert_eq!(
+            audit
+                .matches("comment \"fence:wireserver_platform\"")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -657,6 +745,41 @@ mod tests {
                 NFT_TOTAL_VIOLATIONS_COUNTER.to_owned()
             ]
         );
+    }
+
+    #[test]
+    fn dns_mediated_verification_rejects_missing_or_broadened_wireserver_rules() {
+        let expected = expected_dns_mediated_owned_state(Mode::Block, &[]);
+        let mut missing = expected.clone();
+        missing
+            .rules
+            .retain(|rule| !matches!(rule, OwnedRule::WireServerPlatform { port: 80, .. }));
+        assert!(verify_owned_state(&expected, &missing).is_err());
+
+        let mut broadened = expected.clone();
+        let index = broadened
+            .rules
+            .iter()
+            .position(|rule| matches!(rule, OwnedRule::WireServerPlatform { port: 32526, .. }))
+            .unwrap();
+        broadened.rules[index] = OwnedRule::WireServerPlatform {
+            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            uid: 1001,
+            destination: AZURE_WIRESERVER_ADDRESS.to_owned(),
+            protocol: "tcp".to_owned(),
+            port: 32526,
+        };
+        assert!(verify_owned_state(&expected, &broadened).is_err());
+
+        let mut duplicated = expected.clone();
+        let duplicate = duplicated
+            .rules
+            .iter()
+            .find(|rule| matches!(rule, OwnedRule::WireServerPlatform { port: 80, .. }))
+            .unwrap()
+            .clone();
+        duplicated.rules.push(duplicate);
+        assert!(verify_owned_state(&expected, &duplicated).is_err());
     }
 
     #[test]

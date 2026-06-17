@@ -8,4 +8,5 @@ require_cmd node
 
 node -e 'require("./action/lib.cts"); require("./action/main.cts"); require("./action/post.cts")'
 node --test action/test.cts
+python3 -E script/lib/action_bundle_host.py --self-test
 script/test-action-bundle-provenance

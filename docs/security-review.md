@@ -105,6 +105,29 @@ rejected symlinks but did not require a regular file after opening. Policy
 sources now use a non-blocking open and fail closed unless the opened object is
 a bounded regular file.
 
+### Exact hosted sudo-policy variants
+
+Fresh hosted evidence showed a second exact digest for the fixed
+`90-cloud-init-users` sudo-policy source. Four independent hosted VMs matched
+that digest while ten matched the previously accepted variant; after excluding
+non-enforced volatile device, inode, PID, and start-time identifiers, the
+bounded observations were otherwise identical. The fingerprint accepts the
+new digest only as an additional exact value and retains the same source name,
+regular-file, ownership, mode, non-writability, marker, unit, socket, resolver,
+principal, and group checks.
+
+### Source-before-bundle host compatibility
+
+An immutable bundled agent can temporarily predate a newly reviewed hosted-runner
+sudo-policy digest even though source-built integration already accepts and
+tests that host shape. Action acceptance now compares the bounded live
+observation against the bundle's serialized `check-support` fingerprint before
+destructive activation. It skips activation only when every fixed executable,
+resolver, sudo source, principal, group, unit, socket, and workload fact matches
+and the sole mismatch is an exact source-reviewed digest in the checked-in
+transition file. Unknown drift fails. After the refreshed bundle includes the
+digest, the same classifier automatically requires normal bundled activation.
+
 ### Invocation slug consistency
 
 The Action wrapper rejected consecutive hyphens in invocation identifiers,
@@ -185,9 +208,15 @@ compile TypeScript at workflow runtime. See Node's
   transaction identity, but does not add DNSSEC validation.
 - [Azure documents `168.63.129.16`](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
   as its fixed platform virtual address for DNS, VM-agent, and health
-  communication. Fence permits only its root-resident DNS mediator to reach UDP
-  `53`; it does not grant later workflow code general access to Azure WireServer
-  TCP `80` or `32526`.
+  communication. Fence permits its root-resident DNS mediator to reach UDP `53`
+  and UID `0` host traffic to reach WireServer TCP `80` and `32526`. The latter
+  is a dedicated platform-service rule class, not a workflow or user allowance.
+  Unprivileged and forwarded traffic does not match it, and Azure IMDS at
+  `169.254.169.254` remains blocked.
+- Any root-owned host process can use the two WireServer ports. Standard block
+  relies on verified sudo and container lockdown to prevent later workflow code
+  from obtaining UID `0`; degraded block and audit already disclaim ordinary
+  containment.
 - Untrusted workflow code can intentionally deny service to its own job. Fence
   bounds individual mediator and subprocess waits but does not claim local
   availability against malicious later steps.

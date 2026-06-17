@@ -915,7 +915,10 @@ fn finish_nflog_worker(
 fn wait_for_path(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !path.exists() {
-        assert!(Instant::now() < deadline, "listener did not become ready");
+        assert!(
+            Instant::now() < deadline,
+            "expected path did not become ready"
+        );
         thread::sleep(Duration::from_millis(10));
     }
 }

@@ -1,0 +1,41 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/classify-action-bundle-host"
+fi
+if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
+  die "Action bundle host classification runs only in GitHub Actions"
+fi
+if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
+  die "Action bundle host classification requires Linux x86_64"
+fi
+
+require_cmd python3
+
+observation="$RUNNER_TEMP/fence-hosted-runner-observation.json"
+support="$RUNNER_TEMP/fence-action-bundle-support.json"
+bundle="$DIR/action/bin/fence"
+transitions="$DIR/.github/action-bundle-host-transitions.json"
+
+for required in "$observation" "$bundle" "$transitions"; do
+  if [[ ! -f "$required" ]]; then
+    die "Action bundle host classification requires $required"
+  fi
+done
+if [[ ! -x "$bundle" ]]; then
+  die "Action bundle host classification requires executable $bundle"
+fi
+if [[ -z "${GITHUB_OUTPUT:-}" ]]; then
+  die "Action bundle host classification requires GITHUB_OUTPUT"
+fi
+
+"$bundle" check-support >"$support"
+python3 -E "$DIR/script/lib/action_bundle_host.py" \
+  "$observation" \
+  "$support" \
+  "$transitions" \
+  "$GITHUB_OUTPUT"

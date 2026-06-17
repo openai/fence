@@ -1,7 +1,7 @@
 use crate::config::Mode;
 use crate::findings::{ConnectionFinding, FindingCollection, bounded_timestamp_now};
 use crate::nflog::{NflogError, NflogReader};
-use crate::nft::{NetworkEvidenceCounters, OwnedNftState, expected_owned_state};
+use crate::nft::{NetworkEvidenceCounters, OwnedNftState, expected_dns_mediated_owned_state};
 use crate::nft_backend::{BackendError, NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, PlanData};
 use crate::runtime::{RESIDENT_EVIDENCE_STATUS, RuntimeError, TEST_READY_STATUS, TestRuntimeStore};
@@ -184,7 +184,8 @@ impl<N: ResidentNetwork> ResidentSession<N> {
         plan: &PlanData,
         network: N,
     ) -> Result<Self, LifecycleError> {
-        let expected_state = expected_owned_state(plan.selected_mode, &plan.effective_policy);
+        let expected_state =
+            expected_dns_mediated_owned_state(plan.selected_mode, &plan.effective_policy);
         Self::establish_test_only_with_expected(runtime, plan, network, expected_state)
     }
 
@@ -672,6 +673,10 @@ mod tests {
         ]);
         network.total = VecDeque::from([Ok(0), Ok(1), Ok(1)]);
         let mut session = ResidentSession::establish_test_only(runtime, &plan, network).unwrap();
+        assert_eq!(
+            session.expected_state,
+            expected_dns_mediated_owned_state(plan.selected_mode, &plan.effective_policy)
+        );
         assert_eq!(
             *session.network.operations.borrow(),
             vec!["bind", "preflight", "apply", "verify", "counter"]

@@ -33,6 +33,10 @@ See [`v0.md`](v0.md) for normative behavior and
 - Root-owned runtime storage, transient `systemd` supervision, five-second
   resident verification, readiness ordering, and pre-ready rollback were
   proved before public activation.
+- Later hosted evidence added a second exact reviewed digest for the fixed
+  cloud-init sudo-policy source without broadening any other fingerprint fact.
+- A bounded Action-acceptance classifier removed the source-before-bundle
+  release deadlock while continuing to reject every unreviewed host drift.
 - Standard block added measured passwordless-sudo and Docker/containerd
   lockdown. `unsafe_preserve` retained container access with degraded
   assurance, while audit preserved sudo and containers and made no containment
@@ -78,5 +82,10 @@ See [`v0.md`](v0.md) for normative behavior and
 - Bounded local `/proc` correlation may add best-effort process attribution to
   actual findings without telemetry, command arguments, full paths,
   environments, or payload data.
+- Hosted evidence pinned the root-owned `walinuxagent.service` identity and
+  observed the same service process naturally connecting to both Azure
+  WireServer ports. The next profile version added exact UID `0` TCP `80` and
+  `32526` rules for `168.63.129.16` as a dedicated platform-service class while
+  leaving workflow traffic and Azure IMDS blocked.
 
 Future release details belong in GitHub Releases rather than this document.
