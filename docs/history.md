@@ -79,8 +79,9 @@ See [`v0.md`](v0.md) for normative behavior and
 - Source-built policy added exact-depth one- and two-label user wildcard
   hostnames with one shared eight-name lifetime budget, lazy DNS-mediated
   materialization, deterministic transport union, and explicit local evidence.
-  Adoption by the checked-in Action remains gated on an atomic attested bundle
-  refresh.
+  The subsequent atomic Action refresh adopted the attested v0.5.0 agent,
+  native wildcard parsing, policy-hash schema `8`, runtime-evidence schema `5`,
+  bounded wildcard warnings, and hosted Docker-registry endpoint evidence.
 - Resident workers now report through one health channel; fresh evidence and a
   live matching service are required at post-job time.
 - The Action runtime and bundled agent are copied to root-owned storage and

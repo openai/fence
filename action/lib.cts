@@ -89,19 +89,23 @@ const ALLOWED_DNS_CLASSIFICATIONS = new Set([
   "runner_authorized_results_storage_cname_derived",
   "user_allowlist",
   "user_cname_derived",
+  "user_wildcard_allowlist",
 ]);
+const DNS_CLASSIFICATIONS = new Set([...ALLOWED_DNS_CLASSIFICATIONS, "outside_policy"]);
 const OUTSIDE_POLICY_DNS_CLASSIFICATIONS = new Set(["outside_policy"]);
 const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net$/;
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
+const MAX_USER_WILDCARD_AUTHORIZATIONS = 8;
+const MAX_USER_WILDCARD_PREFIX_LABELS = 2;
 const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v4";
 const PROFILE_REALIZATIONS = new Map([
   [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_provenance_v4"],
 ]);
-const POLICY_HASH_SCHEMA_VERSION = 7;
-const RUNTIME_EVIDENCE_SCHEMA_VERSION = 4;
+const POLICY_HASH_SCHEMA_VERSION = 8;
+const RUNTIME_EVIDENCE_SCHEMA_VERSION = 5;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
 const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
@@ -240,10 +244,78 @@ function normalizePort(value: string): number {
   return port;
 }
 
+function isAscii(value: string): boolean {
+  return /^[\x00-\x7f]*$/.test(value);
+}
+
+function isNumericIpv4Component(component: string): boolean {
+  if (component.startsWith("0x")) {
+    return component.length > 2 && /^[0-9a-f]+$/.test(component.slice(2));
+  }
+  return /^[0-9]+$/.test(component);
+}
+
+function resemblesNumericIpv4Address(value: string): boolean {
+  const components = value.split(".");
+  return components.length >= 1 &&
+    components.length <= 4 &&
+    components.every(isNumericIpv4Component);
+}
+
+function normalizeExactHostname(value: string): string | undefined {
+  if (
+    value.length < 1 ||
+    value.length > 253 ||
+    !isAscii(value) ||
+    value.endsWith(".")
+  ) {
+    return undefined;
+  }
+  const normalized = value.toLowerCase();
+  if (
+    net.isIP(normalized) !== 0 ||
+    resemblesNumericIpv4Address(normalized) ||
+    !DNS_HOSTNAME.test(normalized)
+  ) {
+    return undefined;
+  }
+  return normalized;
+}
+
+function normalizeHostnameDestination(value: string): string | undefined {
+  if (!value.includes("*")) {
+    return normalizeExactHostname(value);
+  }
+  if (
+    value.length < 1 ||
+    value.length > 253 ||
+    !isAscii(value) ||
+    value.endsWith(".")
+  ) {
+    return undefined;
+  }
+  const labels = value.toLowerCase().split(".");
+  let prefixLabels = 0;
+  while (labels[prefixLabels] === "*") {
+    prefixLabels += 1;
+  }
+  const suffixLabels = labels.slice(prefixLabels);
+  if (
+    prefixLabels < 1 ||
+    prefixLabels > MAX_USER_WILDCARD_PREFIX_LABELS ||
+    suffixLabels.length < 2 ||
+    suffixLabels.some((label) => label.includes("*"))
+  ) {
+    return undefined;
+  }
+  const suffix = normalizeExactHostname(suffixLabels.join("."));
+  return suffix === undefined ? undefined : `${"*.".repeat(prefixLabels)}${suffix}`;
+}
+
 function validateHostname(value: string): string {
-  const destination = value.toLowerCase();
-  if (!isSafeHostname(destination) || net.isIP(destination) !== 0) {
-    fail("allowlist hostname entries must be valid DNS hostnames");
+  const destination = normalizeHostnameDestination(value);
+  if (destination === undefined) {
+    fail("allowlist hostname entries must be valid exact names or bounded wildcard patterns");
   }
   return destination;
 }
@@ -312,6 +384,9 @@ function parseExplicitAllowlistLine(tokens: string[]): AllowlistEntry {
 }
 
 function parseUrlAllowlistLine(line: string): AllowlistEntry {
+  if (!isAscii(line) || line.includes("%") || line.includes("@") || line.includes("?") || line.includes("#")) {
+    fail("allowlist URL entries may contain only protocol, hostname, and port");
+  }
   let parsed: URL;
   try {
     parsed = new URL(line);
@@ -322,7 +397,7 @@ function parseUrlAllowlistLine(line: string): AllowlistEntry {
   if (
     parsed.username ||
     parsed.password ||
-    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.pathname !== "" ||
     parsed.search ||
     parsed.hash ||
     parsed.port.length === 0
@@ -376,13 +451,19 @@ function parseAllowlistInput(value: unknown): AllowlistEntry[] {
     return [];
   }
   const entries: AllowlistEntry[] = [];
+  const seen = new Set<string>();
   for (const [index, originalLine] of raw.split(/\r?\n/).entries()) {
     const line = originalLine.trim();
     if (line.length === 0 || line.startsWith("#")) {
       continue;
     }
     try {
-      entries.push(parseAllowlistLine(line));
+      const entry = parseAllowlistLine(line);
+      const key = `${entry.destination_type}\0${entry.destination}\0${entry.protocol}\0${entry.port}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        entries.push(entry);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       fail(`allowlist line ${index + 1}: ${message}`);
@@ -1155,8 +1236,71 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
   return dnsEvidence;
 }
 
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function validateUserWildcardPolicy(hostnamePolicy: any): void {
+  if (
+    hostnamePolicy === null ||
+    Array.isArray(hostnamePolicy) ||
+    typeof hostnamePolicy !== "object" ||
+    !Array.isArray(hostnamePolicy.exact) ||
+    !Array.isArray(hostnamePolicy.user_wildcards) ||
+    typeof hostnamePolicy.allow_dynamic_githubapp_suffix !== "boolean" ||
+    hostnamePolicy.user_wildcards.length > 64
+  ) {
+    fail("Fence DNS evidence does not contain bounded wildcard policy");
+  }
+  let previousPattern: string | undefined;
+  for (const wildcard of hostnamePolicy.user_wildcards) {
+    if (
+      wildcard === null ||
+      Array.isArray(wildcard) ||
+      typeof wildcard !== "object" ||
+      Object.keys(wildcard).sort().join(",") !== "pattern,prefix_labels,suffix,transports" ||
+      typeof wildcard.pattern !== "string" ||
+      normalizeHostnameDestination(wildcard.pattern) !== wildcard.pattern ||
+      !wildcard.pattern.includes("*") ||
+      !isSafeHostname(wildcard.suffix) ||
+      !Number.isSafeInteger(wildcard.prefix_labels) ||
+      wildcard.prefix_labels < 1 ||
+      wildcard.prefix_labels > MAX_USER_WILDCARD_PREFIX_LABELS ||
+      wildcard.pattern !== `${"*.".repeat(wildcard.prefix_labels)}${wildcard.suffix}` ||
+      !Array.isArray(wildcard.transports) ||
+      wildcard.transports.length < 1 ||
+      wildcard.transports.length > 64 ||
+      (previousPattern !== undefined && compareStrings(previousPattern, wildcard.pattern) >= 0)
+    ) {
+      fail("Fence DNS evidence contains invalid wildcard policy");
+    }
+    let previousTransport: string | undefined;
+    for (const transport of wildcard.transports) {
+      if (
+        transport === null ||
+        Array.isArray(transport) ||
+        typeof transport !== "object" ||
+        Object.keys(transport).sort().join(",") !== "port,protocol" ||
+        !isSupportedProtocol(transport.protocol) ||
+        !isValidPort(transport.port)
+      ) {
+        fail("Fence DNS evidence contains invalid wildcard transport policy");
+      }
+      const transportKey = `${transport.protocol === "tcp" ? "0" : "1"}:${String(transport.port).padStart(5, "0")}`;
+      if (previousTransport !== undefined && compareStrings(previousTransport, transportKey) >= 0) {
+        fail("Fence DNS evidence contains unsorted wildcard transport policy");
+      }
+      previousTransport = transportKey;
+    }
+    previousPattern = wildcard.pattern;
+  }
+}
+
 function validateDnsProvenanceEvidence(dnsEvidence: any): void {
   const authorizations = dnsEvidence.runner_authorized_results_storage;
+  const wildcardAuthorizations = dnsEvidence.bounded_user_wildcard_authorizations;
+  const wildcardTruncated = dnsEvidence.bounded_user_wildcard_authorizations_truncated;
+  const wildcardRejections = dnsEvidence.user_wildcard_request_rejections;
   if (
     dnsEvidence.host_dns_routing !== "direct_client_to_root_resident_mediator" ||
     dnsEvidence.docker_dns_routing !== "local_root_resident_mediator" ||
@@ -1167,15 +1311,44 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
     !isNonnegativeSafeInteger(dnsEvidence.results_storage_authorization_count) ||
     !isNonnegativeSafeInteger(dnsEvidence.results_storage_attribution_failures) ||
     !isNonnegativeSafeInteger(dnsEvidence.results_storage_request_rejections) ||
-    dnsEvidence.results_storage_authorization_count !== authorizations.length
+    dnsEvidence.results_storage_authorization_count !== authorizations.length ||
+    !Array.isArray(wildcardAuthorizations) ||
+    wildcardAuthorizations.length > MAX_USER_WILDCARD_AUTHORIZATIONS ||
+    typeof wildcardTruncated !== "boolean" ||
+    !isNonnegativeSafeInteger(wildcardRejections) ||
+    wildcardTruncated !== (wildcardRejections > 0) ||
+    !Array.isArray(dnsEvidence.observations) ||
+    typeof dnsEvidence.observations_truncated !== "boolean"
   ) {
     fail("Fence DNS evidence does not contain bounded runner provenance");
   }
   const expectedProxyPolicy = dnsEvidence.mode === "audit"
-    ? "audit_forwards_without_name_authorization"
-    : "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants";
+    ? "audit_forwards_while_simulating_name_authorization"
+    : "block_forwards_exact_roots_bounded_user_wildcard_names_actions_suffix_names_githubapp_suffix_names_results_storage_and_bounded_cname_descendants";
   if (dnsEvidence.proxy_policy_status !== expectedProxyPolicy) {
     fail("Fence DNS evidence does not contain the reviewed proxy policy");
+  }
+  validateUserWildcardPolicy(dnsEvidence.hostname_policy);
+  let previousWildcard: string | undefined;
+  for (const hostname of wildcardAuthorizations) {
+    if (
+      !isSafeHostname(hostname) ||
+      (previousWildcard !== undefined && compareStrings(previousWildcard, hostname) >= 0)
+    ) {
+      fail("Fence DNS evidence contains invalid wildcard authorization");
+    }
+    previousWildcard = hostname;
+  }
+  for (const observation of dnsEvidence.observations) {
+    if (
+      observation === null ||
+      Array.isArray(observation) ||
+      typeof observation !== "object" ||
+      !isSafeHostname(observation.hostname) ||
+      !DNS_CLASSIFICATIONS.has(observation.policy_classification)
+    ) {
+      fail("Fence DNS evidence contains invalid hostname observation");
+    }
   }
   const seen = new Set<string>();
   for (const authorization of authorizations) {
@@ -1314,10 +1487,7 @@ function markdownCode(value: unknown, maximum = 128): string {
 
 function isSafeHostname(value: unknown): value is string {
   return typeof value === "string" &&
-    value === value.toLowerCase() &&
-    !value.includes("*") &&
-    !value.endsWith(".") &&
-    DNS_HOSTNAME.test(value);
+    normalizeExactHostname(value) === value;
 }
 
 function isSupportedProtocol(value: unknown): value is string {
@@ -1459,6 +1629,8 @@ function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence
     auditSummary.omittedIpRows > 0 ||
     (report.mode === "audit" && auditSummary.dnsMissing) ||
     materializationRequestRejections(dnsEvidence) > 0 ||
+    materializationEvidenceCounter(dnsEvidence, "user_wildcard_request_rejections") > 0 ||
+    Boolean(dnsEvidence && dnsEvidence.bounded_user_wildcard_authorizations_truncated === true) ||
     resultsStorageEvidenceCounter(dnsEvidence, "results_storage_attribution_failures") > 0 ||
     resultsStorageEvidenceCounter(dnsEvidence, "results_storage_request_rejections") > 0 ||
     Boolean(dnsEvidence && dnsEvidence.runner_authorized_results_storage_truncated === true)
@@ -1513,6 +1685,19 @@ function resultsStorageWarningRows(dnsEvidence: any): string[] {
     rows.push("| ⚠️ Additional results-storage accounts were denied after the authorization limit | `1+` |");
   }
   return rows;
+}
+
+function userWildcardWarningRows(dnsEvidence: any): string[] {
+  const requestRejections = materializationEvidenceCounter(
+    dnsEvidence,
+    "user_wildcard_request_rejections",
+  );
+  const truncated = Boolean(
+    dnsEvidence && dnsEvidence.bounded_user_wildcard_authorizations_truncated === true,
+  );
+  return requestRejections > 0 || truncated
+    ? [`| ⚠️ User wildcard hostname authorization budget exhausted | ${markdownCode(Math.max(1, requestRejections))} |`]
+    : [];
 }
 
 function warningTableLines(rows: string[]): string[] {
@@ -1926,6 +2111,7 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
     ...criticalFindingLines(report),
     ...warningTableLines([
       ...materializationWarningRows(dnsEvidence),
+      ...userWildcardWarningRows(dnsEvidence),
       ...resultsStorageWarningRows(dnsEvidence),
     ]),
     ...networkActivitySummary(report, dnsEvidence, auditSummary),
