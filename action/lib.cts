@@ -1173,7 +1173,7 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
   }
   const expectedProxyPolicy = dnsEvidence.mode === "audit"
     ? "audit_forwards_without_name_authorization"
-    : "block_forwards_exact_roots_bounded_actions_suffix_names_runner_authorized_results_storage_and_bounded_cname_descendants";
+    : "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants";
   if (dnsEvidence.proxy_policy_status !== expectedProxyPolicy) {
     fail("Fence DNS evidence does not contain the reviewed proxy policy");
   }

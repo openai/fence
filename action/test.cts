@@ -719,7 +719,7 @@ test("validates stable runtime evidence", () => {
     host_dns_routing: "direct_client_to_root_resident_mediator",
     docker_dns_routing: "local_root_resident_mediator",
     answer_attribution_status: "bounded_reportable_hostname_answers_only",
-    proxy_policy_status: "block_forwards_exact_roots_bounded_actions_suffix_names_runner_authorized_results_storage_and_bounded_cname_descendants",
+    proxy_policy_status: "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants",
     runner_authorized_results_storage: [],
     runner_authorized_results_storage_truncated: false,
     results_storage_authorization_count: 0,

@@ -179,6 +179,12 @@ require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
 require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
 require(dns["docker_dns_routing"] == "local_root_resident_mediator")
+expected_proxy_policy = (
+    "audit_forwards_without_name_authorization"
+    if mode == "audit"
+    else "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
+)
+require(dns["proxy_policy_status"] == expected_proxy_policy)
 require(len(dns["runner_authorized_results_storage"]) <= 4)
 require(dns["results_storage_authorization_count"] == len(dns["runner_authorized_results_storage"]))
 require(dns["results_storage_attribution_failures"] == 0)
