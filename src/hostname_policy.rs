@@ -1,4 +1,4 @@
-use crate::config::{DestinationType, NormalizedConfig, Protocol};
+use crate::config::{DestinationType, NormalizedConfig, Protocol, parse_hostname_wildcard_pattern};
 use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HOSTNAMES, github_hosted_workflow_bootstrap_hostnames,
@@ -26,9 +26,18 @@ pub struct ExactHostnamePolicy {
     pub transports: Vec<HostnameTransport>,
 }
 
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct UserWildcardHostnamePolicy {
+    pub pattern: String,
+    pub suffix: String,
+    pub prefix_labels: u8,
+    pub transports: Vec<HostnameTransport>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct RuntimeHostnamePolicy {
     pub exact: Vec<ExactHostnamePolicy>,
+    pub user_wildcards: Vec<UserWildcardHostnamePolicy>,
     pub allow_dynamic_githubapp_suffix: bool,
 }
 
@@ -51,11 +60,34 @@ impl RuntimeHostnamePolicy {
             .map(|hostname| (*hostname).to_owned())
             .collect()
     }
+
+    pub fn has_user_wildcards(&self) -> bool {
+        !self.user_wildcards.is_empty()
+    }
+
+    pub fn user_wildcard_transports(&self, hostname: &str) -> Vec<HostnameTransport> {
+        self.user_wildcards
+            .iter()
+            .filter(|pattern| user_wildcard_matches(pattern, hostname))
+            .flat_map(|pattern| pattern.transports.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+fn user_wildcard_matches(pattern: &UserWildcardHostnamePolicy, hostname: &str) -> bool {
+    let hostname_labels = hostname.split('.').collect::<Vec<_>>();
+    let suffix_labels = pattern.suffix.split('.').collect::<Vec<_>>();
+    let prefix_labels = usize::from(pattern.prefix_labels);
+    hostname_labels.len() == prefix_labels + suffix_labels.len()
+        && hostname_labels[prefix_labels..] == suffix_labels
 }
 
 pub fn build_runtime_hostname_policy(config: &NormalizedConfig) -> RuntimeHostnamePolicy {
     let mut entries =
         BTreeMap::<String, (BTreeSet<HostnamePolicyOrigin>, BTreeSet<HostnameTransport>)>::new();
+    let mut user_wildcards = BTreeMap::<String, (String, u8, BTreeSet<HostnameTransport>)>::new();
 
     for hostname in github_hosted_workflow_bootstrap_hostnames(config.disable_broad_github_domains)
         .into_iter()
@@ -77,6 +109,16 @@ pub fn build_runtime_hostname_policy(config: &NormalizedConfig) -> RuntimeHostna
         if allowance.destination_type != DestinationType::Hostname {
             continue;
         }
+        if let Some(pattern) = parse_hostname_wildcard_pattern(&allowance.destination) {
+            let entry = user_wildcards
+                .entry(pattern.pattern)
+                .or_insert_with(|| (pattern.suffix, pattern.prefix_labels, BTreeSet::new()));
+            entry.2.insert(HostnameTransport {
+                protocol: allowance.protocol,
+                port: allowance.port,
+            });
+            continue;
+        }
         let (origins, transports) = entries.entry(allowance.destination.clone()).or_default();
         origins.insert(HostnamePolicyOrigin::User);
         transports.insert(HostnameTransport {
@@ -94,6 +136,17 @@ pub fn build_runtime_hostname_policy(config: &NormalizedConfig) -> RuntimeHostna
                 transports: transports.into_iter().collect(),
             })
             .collect(),
+        user_wildcards: user_wildcards
+            .into_iter()
+            .map(
+                |(pattern, (suffix, prefix_labels, transports))| UserWildcardHostnamePolicy {
+                    pattern,
+                    suffix,
+                    prefix_labels,
+                    transports: transports.into_iter().collect(),
+                },
+            )
+            .collect(),
         allow_dynamic_githubapp_suffix: !config.disable_broad_github_domains,
     }
 }
@@ -110,7 +163,7 @@ mod tests {
     #[test]
     fn merges_platform_and_user_hosts_without_losing_transports() {
         let policy = build_runtime_hostname_policy(&parse(
-            r#"{"schema_version":1,"mode":"block","invocation_id":"merge","allowlist":[{"destination_type":"hostname","destination":"github.com","protocol":"udp","port":53},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"example.com","protocol":"udp","port":53}]}"#,
+            r#"{"schema_version":1,"mode":"block","invocation_id":"merge","allowlist":[{"destination_type":"hostname","destination":"github.com","protocol":"udp","port":53},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"example.com","protocol":"udp","port":53},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}"#,
         ));
 
         let github = policy.exact_entry("github.com").unwrap();
@@ -156,6 +209,80 @@ mod tests {
             ]
         );
         assert!(policy.allow_dynamic_githubapp_suffix);
+        assert!(policy.has_user_wildcards());
+        assert_eq!(policy.user_wildcards.len(), 2);
+        assert_eq!(
+            policy.user_wildcard_transports("auth.docker.io"),
+            [
+                HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                },
+                HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 8443,
+                },
+            ]
+        );
+        assert_eq!(
+            policy.user_wildcard_transports("edge.auth.docker.io"),
+            [HostnameTransport {
+                protocol: Protocol::Udp,
+                port: 53,
+            }]
+        );
+        for hostname in ["docker.io", "too.deep.edge.auth.docker.io", "example.com"] {
+            assert!(policy.user_wildcard_transports(hostname).is_empty());
+        }
+        assert!(
+            policy.user_wildcard_transports("example.com").is_empty(),
+            "*.*.docker.io must never degenerate into a match-all suffix"
+        );
+    }
+
+    #[test]
+    fn unions_every_matching_wildcard_pattern_deterministically() {
+        let first = build_runtime_hostname_policy(&parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"overlap-one","allowlist":[{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53},{"destination_type":"hostname","destination":"*.registry.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.registry.docker.io","protocol":"tcp","port":443}]}"#,
+        ));
+        let second = build_runtime_hostname_policy(&parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"overlap-two","allowlist":[{"destination_type":"hostname","destination":"*.registry.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}"#,
+        ));
+
+        assert_eq!(first.user_wildcards, second.user_wildcards);
+        assert_eq!(
+            first.user_wildcard_transports("edge.registry.docker.io"),
+            [
+                HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                },
+                HostnameTransport {
+                    protocol: Protocol::Udp,
+                    port: 53,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcard_declarations_do_not_change_exact_readiness_origins() {
+        let policy = build_runtime_hostname_policy(&parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"origin-separation","allowlist":[{"destination_type":"hostname","destination":"*.githubapp.com","protocol":"tcp","port":8443}]}"#,
+        ));
+        let watchdog = policy
+            .exact_entry("hosted-compute-watchdog-prod-eus-01.githubapp.com")
+            .unwrap();
+
+        assert_eq!(watchdog.origins, [HostnamePolicyOrigin::Platform]);
+        assert_eq!(
+            watchdog.transports,
+            [HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: 443,
+            }]
+        );
+        assert_eq!(policy.user_wildcards.len(), 1);
     }
 
     #[test]
@@ -192,5 +319,6 @@ mod tests {
             ]
         );
         assert!(!policy.allow_dynamic_githubapp_suffix);
+        assert!(!policy.has_user_wildcards());
     }
 }

@@ -3,8 +3,8 @@ use crate::attribution::{
     DnsClientSocket, SocketProtocol, TrustedRunnerWorker, attribution_channel,
 };
 use crate::config::{
-    ContainerPolicy, DestinationType, MAX_EXPANDED_RULES, MAX_REPORT_BYTES, Mode, Protocol,
-    parse_and_normalize,
+    ContainerPolicy, DestinationType, MAX_EXPANDED_RULES, MAX_REPORT_BYTES,
+    MAX_USER_WILDCARD_AUTHORIZATIONS, Mode, Protocol, parse_and_normalize,
 };
 use crate::error::ErrorDetail;
 use crate::findings::{
@@ -71,7 +71,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DNS_MEDIATED_PROFILE_REALIZATION_ID: &str =
     "github_hosted_workflow_bootstrap_dns_provenance_v4";
-pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 4;
+pub const RUNTIME_EVIDENCE_SCHEMA_VERSION: u32 = 5;
 pub const SELECTED_PROFILE_RUNTIME_EVIDENCE_STATUS: &str = "selected_profile_runtime_test_only";
 pub const SELECTED_PROFILE_RUNTIME_READY_STATUS: &str =
     "selected_profile_runtime_ready_no_public_activation";
@@ -113,6 +113,7 @@ const MAX_DYNAMIC_GITHUBAPP_SUFFIX_PREFIX_LABELS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_GITHUBAPP_SUFFIX_PREFIX_LABELS;
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS;
+const MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS: usize = MAX_USER_WILDCARD_AUTHORIZATIONS;
 const MAX_DERIVED_CNAME_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS;
 const MAX_DERIVED_CNAME_DEPTH: u8 = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_DEPTH;
@@ -331,6 +332,15 @@ fn test_hostname_policy(disable_broad_github_domains: bool) -> RuntimeHostnamePo
     crate::hostname_policy::build_runtime_hostname_policy(&normalized)
 }
 
+#[cfg(test)]
+fn test_user_wildcard_hostname_policy() -> RuntimeHostnamePolicy {
+    let normalized = parse_and_normalize(
+        br#"{"schema_version":1,"mode":"block","invocation_id":"test-wildcard-policy","allowlist":[{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}"#,
+    )
+    .expect("test wildcard policy must parse");
+    crate::hostname_policy::build_runtime_hostname_policy(&normalized)
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DnsEvidenceScope {
     ProtectedHostAudit,
@@ -445,8 +455,12 @@ impl DnsBlockRuntimeScope {
         }
     }
 
-    fn limitations(self, allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
-        match self {
+    fn limitations(
+        self,
+        allow_dynamic_githubapp_suffix: bool,
+        has_user_wildcards: bool,
+    ) -> Vec<&'static str> {
+        let mut limitations = match self {
             Self::TestEvidence => dns_block_test_limitations(allow_dynamic_githubapp_suffix),
             Self::ProductionStandardBlock => {
                 protected_block_limitations(allow_dynamic_githubapp_suffix)
@@ -454,7 +468,9 @@ impl DnsBlockRuntimeScope {
             Self::ProductionUnsafePreserve => {
                 protected_degraded_block_limitations(allow_dynamic_githubapp_suffix)
             }
-        }
+        };
+        limitations.extend(user_wildcard_limitations(has_user_wildcards));
+        limitations
     }
 
     fn lockdown_posture(self) -> LockdownPosture {
@@ -514,6 +530,9 @@ pub struct DnsMediationEvidence {
     pub bounded_actions_suffix_authorizations_truncated: bool,
     pub bounded_githubapp_suffix_authorizations: Vec<String>,
     pub bounded_githubapp_suffix_authorizations_truncated: bool,
+    pub bounded_user_wildcard_authorizations: Vec<String>,
+    pub bounded_user_wildcard_authorizations_truncated: bool,
+    pub user_wildcard_request_rejections: u64,
     pub runner_authorized_results_storage: Vec<DnsResultsStorageAuthorization>,
     pub runner_authorized_results_storage_truncated: bool,
     pub results_storage_authorization_count: u64,
@@ -699,6 +718,7 @@ struct ObservationState {
     results_storage_authorization_count: u64,
     results_storage_attribution_failures: u64,
     results_storage_request_rejections: u64,
+    user_wildcard_request_rejections: u64,
 }
 
 #[derive(Debug, Default)]
@@ -817,6 +837,8 @@ struct CnameAuthorizationState {
     bounded_actions_suffix_truncated: bool,
     bounded_githubapp_suffix: BTreeSet<String>,
     bounded_githubapp_suffix_truncated: bool,
+    bounded_user_wildcard: BTreeSet<String>,
+    bounded_user_wildcard_truncated: bool,
     runner_authorized_results_storage: BTreeSet<String>,
     runner_authorized_results_storage_truncated: bool,
     active: BTreeMap<String, ActiveCnameAuthorization>,
@@ -855,7 +877,7 @@ impl ObservationRecorder {
         match self.scope {
             DnsEvidenceScope::ProtectedHostAudit => {
                 if !matches_supported_block_query_type(query_type) {
-                    return Ok(DnsQueryAuthorization::Forward(None));
+                    return Ok(DnsQueryAuthorization::Forward(Some("outside_policy")));
                 }
                 let requires_runner_provenance = {
                     let mut authorizations = self
@@ -869,14 +891,20 @@ impl ObservationRecorder {
                         &self.hostname_policy,
                     )
                 };
-                if !requires_runner_provenance {
-                    return Ok(DnsQueryAuthorization::Forward(None));
-                }
-                let provenance = self.results_storage_provenance(client)?;
+                let provenance = if requires_runner_provenance {
+                    self.results_storage_provenance(client)?
+                } else {
+                    DnsQueryProvenance::Untrusted
+                };
                 let mut authorizations = self
                     .cname_authorizations
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned");
+                let wildcard_capacity_rejected = user_wildcard_capacity_rejected(
+                    hostname,
+                    &authorizations,
+                    &self.hostname_policy,
+                );
                 let previous_results_storage_count =
                     authorizations.runner_authorized_results_storage.len();
                 let authorized = authorized_hostname(
@@ -889,7 +917,12 @@ impl ObservationRecorder {
                 let authorization_added = authorizations.runner_authorized_results_storage.len()
                     > previous_results_storage_count;
                 drop(authorizations);
-                self.record_results_storage_observation(authorization_added, provenance);
+                if requires_runner_provenance {
+                    self.record_results_storage_observation(authorization_added, provenance);
+                }
+                if wildcard_capacity_rejected {
+                    self.record_user_wildcard_rejection();
+                }
                 Ok(DnsQueryAuthorization::Forward(
                     (!authorized).then_some("outside_policy"),
                 ))
@@ -921,6 +954,11 @@ impl ObservationRecorder {
                     .cname_authorizations
                     .lock()
                     .expect("DNS CNAME authorization lock poisoned");
+                let wildcard_capacity_rejected = user_wildcard_capacity_rejected(
+                    hostname,
+                    &authorizations,
+                    &self.hostname_policy,
+                );
                 let previous_results_storage_count =
                     authorizations.runner_authorized_results_storage.len();
                 let authorized = authorized_hostname(
@@ -939,6 +977,9 @@ impl ObservationRecorder {
                         authorization_added,
                         provenance,
                     );
+                }
+                if wildcard_capacity_rejected {
+                    self.record_user_wildcard_rejection();
                 }
                 Ok(query_authorization(
                     authorized,
@@ -1001,6 +1042,12 @@ impl ObservationRecorder {
         }
     }
 
+    fn record_user_wildcard_rejection(&self) {
+        let mut state = self.state.lock().expect("DNS observation lock poisoned");
+        state.user_wildcard_request_rejections =
+            state.user_wildcard_request_rejections.saturating_add(1);
+    }
+
     fn record_results_storage_decision(
         &self,
         authorized: bool,
@@ -1043,6 +1090,7 @@ impl ObservationRecorder {
         remove_expired_cname_authorizations(&mut authorizations, now);
         if authorizations.bounded_actions_suffix.contains(hostname)
             || authorizations.bounded_githubapp_suffix.contains(hostname)
+            || authorizations.bounded_user_wildcard.contains(hostname)
             || authorizations
                 .runner_authorized_results_storage
                 .contains(hostname)
@@ -1137,28 +1185,36 @@ impl ObservationRecorder {
             };
         };
         let forwardable_block_response = self.scope.is_block();
-        let policy = {
-            let mut authorizations = self
-                .cname_authorizations
-                .lock()
-                .expect("DNS CNAME authorization lock poisoned");
-            remove_expired_cname_authorizations(&mut authorizations, Instant::now());
-            let policy = hostname_policy_for_authorized_name(
-                &hostname,
-                &authorizations,
-                &self.hostname_policy,
-            );
-            if policy.is_some() {
-                retain_cname_authorizations(
-                    &mut authorizations,
-                    parse_dns_cname_answers(packet),
-                    Instant::now(),
+        let complete_block_response = !forwardable_block_response
+            || dns_response_is_structurally_complete(packet, &hostname, query_type);
+        let policy = complete_block_response
+            .then(|| {
+                let mut authorizations = self
+                    .cname_authorizations
+                    .lock()
+                    .expect("DNS CNAME authorization lock poisoned");
+                remove_expired_cname_authorizations(&mut authorizations, Instant::now());
+                let policy = hostname_policy_for_authorized_name(
+                    &hostname,
+                    &authorizations,
                     &self.hostname_policy,
                 );
-            }
-            policy
+                if policy.is_some() {
+                    retain_cname_authorizations(
+                        &mut authorizations,
+                        parse_dns_cname_answers(packet),
+                        Instant::now(),
+                        &self.hostname_policy,
+                    );
+                }
+                policy
+            })
+            .flatten();
+        let answers = if complete_block_response {
+            parse_dns_address_answers(packet)
+        } else {
+            Vec::new()
         };
-        let answers = parse_dns_address_answers(packet);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         let classification =
             classification_override.unwrap_or_else(|| self.policy_classification(&hostname));
@@ -1166,7 +1222,7 @@ impl ObservationRecorder {
         if let Some(observation) = state.retained.get_mut(&key) {
             retain_address_answers(observation, answers.clone());
         }
-        let mut block_response_is_fully_materializable = true;
+        let mut block_response_is_fully_materializable = complete_block_response;
         let mut materializations = Vec::new();
         if forwardable_block_response {
             if let Some((origins, transports)) = policy {
@@ -1927,7 +1983,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             ruleset_hash: &ruleset_hash,
             resident_health: &evidence.resident_health,
             protection_available: false,
-            limitations: protected_audit_limitations(),
+            limitations: protected_audit_limitations(
+                plan.runtime_hostname_policy.has_user_wildcards(),
+            ),
         }) {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
@@ -2291,8 +2349,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             ruleset_hash: &ruleset_hash,
             resident_health: &evidence.resident_health,
             protection_available: scope.protection_available(),
-            limitations: scope
-                .limitations(plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix),
+            limitations: scope.limitations(
+                plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix,
+                plan.runtime_hostname_policy.has_user_wildcards(),
+            ),
         }) {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status =
@@ -2819,7 +2879,7 @@ fn initial_dns_block_evidence(
         rollback_status: "not_required",
         ruleset_hash,
         dns_upstream_policy: "root_resident_mediator_only_udp_53",
-        materialization_status: "bounded_ttl_exact_host_and_cname_transport_policy",
+        materialization_status: "bounded_ttl_exact_host_user_wildcard_and_cname_transport_policy",
         materialized_allowances: report_materializations(active),
         materializations_truncated,
         expired_materializations: 0,
@@ -2834,7 +2894,10 @@ fn initial_dns_block_evidence(
         critical_findings_truncated: false,
         resident_health,
         protection_available: scope.protection_available(),
-        limitations: scope.limitations(plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix),
+        limitations: scope.limitations(
+            plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix,
+            plan.runtime_hostname_policy.has_user_wildcards(),
+        ),
     }
 }
 
@@ -2870,7 +2933,7 @@ fn initial_dns_audit_evidence(
         critical_findings_truncated: false,
         resident_health,
         protection_available: false,
-        limitations: protected_audit_limitations(),
+        limitations: protected_audit_limitations(plan.runtime_hostname_policy.has_user_wildcards()),
     }
 }
 
@@ -2882,6 +2945,18 @@ fn githubapp_profile_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'
         ]
     } else {
         vec!["dynamic_githubapp_suffix_authorization_disabled"]
+    }
+}
+
+fn user_wildcard_limitations(has_user_wildcards: bool) -> Vec<&'static str> {
+    if has_user_wildcards {
+        vec![
+            "bounded_user_wildcard_dns_authorization_remains_an_egress_limitation",
+            "configured_user_wildcard_dns_names_and_transports_remain_egress_and_data_channels",
+            "user_wildcard_authorizations_are_limited_to_8_unique_names_and_two_exact_prefix_label_shapes",
+        ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -2917,12 +2992,12 @@ fn dns_block_test_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'sta
     limitations
 }
 
-fn protected_audit_limitations() -> Vec<&'static str> {
-    vec![
+fn protected_audit_limitations(has_user_wildcards: bool) -> Vec<&'static str> {
+    let mut limitations = vec![
         "audit_observation_only_no_containment_claim",
         "audit_installs_owned_non_blocking_nftables_observation_rules",
         "audit_routes_host_dns_directly_and_docker_dns_separately_through_local_root_resident_mediator",
-        "audit_forwards_dns_without_name_authorization",
+        "audit_forwards_dns_while_simulating_name_authorization",
         "audit_preserves_passwordless_sudo_and_container_control",
         "later_workflow_code_retains_arbitrary_egress_in_audit_mode",
         "packet_prefixes_transiently_inspected_in_memory_not_serialized",
@@ -2930,7 +3005,9 @@ fn protected_audit_limitations() -> Vec<&'static str> {
         "process_arguments_full_paths_and_environment_are_not_retained",
         "socket_ownership_races_may_produce_ambiguous_or_missing_attribution",
         "remote_reporting_not_implemented",
-    ]
+    ];
+    limitations.extend(user_wildcard_limitations(has_user_wildcards));
+    limitations
 }
 
 fn protected_block_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'static str> {
@@ -3191,7 +3268,7 @@ fn query_fixed_upstream_for_prehydration(
         .map_err(|_| PrehydrationQueryError::Transient)?;
     let response = response[..response_length].to_vec();
     if !response_matches_upstream_query(&response, &query)
-        || parse_dns_question(&response) != Some((hostname.to_owned(), query_type))
+        || !dns_response_is_structurally_complete(&response, hostname, query_type)
     {
         return Err(PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
@@ -3208,7 +3285,7 @@ fn pending_materializations_from_bootstrap_response(
     now: Instant,
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, DnsMediationError> {
-    if parse_dns_question(packet) != Some((queried_hostname.to_owned(), query_type)) {
+    if !dns_response_is_structurally_complete(packet, queried_hostname, query_type) {
         return Err(DnsMediationError::new(
             "dns_block_prehydration_failed",
             "fixed upstream DNS response did not match the bootstrap query",
@@ -3971,6 +4048,94 @@ fn response_matches_upstream_query(response: &[u8], upstream_query: &[u8]) -> bo
     response.len() >= 2 && upstream_query.len() >= 2 && response[..2] == upstream_query[..2]
 }
 
+fn dns_response_is_structurally_complete(
+    packet: &[u8],
+    queried_hostname: &str,
+    query_type: u16,
+) -> bool {
+    if packet.len() < 12 {
+        return false;
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
+    if flags & 0x8000 == 0
+        || flags & 0x0200 != 0
+        || question_count != 1
+        || parse_dns_question(packet) != Some((queried_hostname.to_owned(), query_type))
+    {
+        return false;
+    }
+
+    let Some(question_name_end) = skip_dns_name(packet, 12) else {
+        return false;
+    };
+    if question_name_end + 4 > packet.len()
+        || u16::from_be_bytes([packet[question_name_end], packet[question_name_end + 1]])
+            != query_type
+        || u16::from_be_bytes([packet[question_name_end + 2], packet[question_name_end + 3]]) != 1
+    {
+        return false;
+    }
+
+    let answer_count = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
+    let record_count = answer_count
+        .checked_add(usize::from(u16::from_be_bytes([packet[8], packet[9]])))
+        .and_then(|count| {
+            count.checked_add(usize::from(u16::from_be_bytes([packet[10], packet[11]])))
+        });
+    let Some(record_count) = record_count else {
+        return false;
+    };
+    let mut offset = question_name_end + 4;
+    for record_index in 0..record_count {
+        let owner_offset = offset;
+        let Some(owner_end) = skip_dns_name(packet, owner_offset) else {
+            return false;
+        };
+        if owner_end + 10 > packet.len() {
+            return false;
+        }
+        let record_type = u16::from_be_bytes([packet[owner_end], packet[owner_end + 1]]);
+        let record_class = u16::from_be_bytes([packet[owner_end + 2], packet[owner_end + 3]]);
+        let data_length = usize::from(u16::from_be_bytes([
+            packet[owner_end + 8],
+            packet[owner_end + 9],
+        ]));
+        let data_offset = owner_end + 10;
+        let Some(data_end) = data_offset.checked_add(data_length) else {
+            return false;
+        };
+        if data_end > packet.len() {
+            return false;
+        }
+
+        let owner_is_root = packet.get(owner_offset) == Some(&0);
+        let owner_is_valid = owner_is_root || parse_dns_name(packet, owner_offset).is_some();
+        if !owner_is_valid {
+            return false;
+        }
+        if record_class == 1 {
+            match record_type {
+                1 if data_length != 4 || owner_is_root || record_index >= answer_count => {
+                    return false;
+                }
+                28 if data_length != 16 || owner_is_root || record_index >= answer_count => {
+                    return false;
+                }
+                5 if owner_is_root
+                    || skip_dns_name(packet, data_offset) != Some(data_end)
+                    || parse_dns_name(packet, data_offset).is_none() =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        offset = data_end;
+    }
+    offset == packet.len()
+}
+
 fn query_for_upstream(
     recorder: &ObservationRecorder,
     query: &[u8],
@@ -4386,41 +4551,98 @@ fn platform_transport_policy() -> (Vec<HostnamePolicyOrigin>, Vec<HostnameTransp
     )
 }
 
+fn direct_hostname_policy(
+    hostname: &str,
+    state: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> Option<(Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>)> {
+    let mut origins = BTreeSet::new();
+    let mut transports = BTreeSet::new();
+    if let Some(entry) = hostname_policy.exact_entry(hostname) {
+        origins.extend(entry.origins.iter().copied());
+        transports.extend(entry.transports.iter().copied());
+    }
+    if state.bounded_actions_suffix.contains(hostname)
+        || state.bounded_githubapp_suffix.contains(hostname)
+        || state.runner_authorized_results_storage.contains(hostname)
+    {
+        let (platform_origins, platform_transports) = platform_transport_policy();
+        origins.extend(platform_origins);
+        transports.extend(platform_transports);
+    }
+    if state.bounded_user_wildcard.contains(hostname) {
+        let wildcard_transports = hostname_policy.user_wildcard_transports(hostname);
+        if !wildcard_transports.is_empty() {
+            origins.insert(HostnamePolicyOrigin::User);
+            transports.extend(wildcard_transports);
+        }
+    }
+    (!origins.is_empty() && !transports.is_empty()).then(|| {
+        (
+            origins.into_iter().collect(),
+            transports.into_iter().collect(),
+        )
+    })
+}
+
 fn hostname_policy_for_authorized_name(
     hostname: &str,
     state: &CnameAuthorizationState,
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Option<(Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>)> {
-    if let Some(entry) = hostname_policy.exact_entry(hostname) {
-        return Some((entry.origins.clone(), entry.transports.clone()));
+    if let Some(policy) = direct_hostname_policy(hostname, state, hostname_policy) {
+        return Some(policy);
     }
-    if state.bounded_actions_suffix.contains(hostname) {
-        return Some(platform_transport_policy());
-    }
-    if state.bounded_githubapp_suffix.contains(hostname) {
-        return Some(platform_transport_policy());
-    }
-    if state.runner_authorized_results_storage.contains(hostname) {
-        return Some(platform_transport_policy());
-    }
+    cname_policy_for_authorized_name(hostname, state, hostname_policy)
+}
+
+fn cname_policy_for_authorized_name(
+    hostname: &str,
+    state: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> Option<(Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>)> {
     let mut current = hostname;
     for _ in 0..MAX_DERIVED_CNAME_DEPTH {
         let authorization = state.active.get(current)?;
         current = &authorization.source_hostname;
-        if let Some(entry) = hostname_policy.exact_entry(current) {
-            return Some((entry.origins.clone(), entry.transports.clone()));
-        }
-        if state.bounded_actions_suffix.contains(current) {
-            return Some(platform_transport_policy());
-        }
-        if state.bounded_githubapp_suffix.contains(current) {
-            return Some(platform_transport_policy());
-        }
-        if state.runner_authorized_results_storage.contains(current) {
-            return Some(platform_transport_policy());
+        if let Some(policy) = direct_hostname_policy(current, state, hostname_policy) {
+            return Some(policy);
         }
     }
     None
+}
+
+fn user_wildcard_capacity_rejected(
+    hostname: &str,
+    state: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> bool {
+    cname_policy_for_authorized_name(hostname, state, hostname_policy).is_none()
+        && !state.bounded_user_wildcard.contains(hostname)
+        && !hostname_policy
+            .user_wildcard_transports(hostname)
+            .is_empty()
+        && state.bounded_user_wildcard.len() >= MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS
+}
+
+fn admit_user_wildcard_hostname(
+    hostname: &str,
+    state: &mut CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
+) {
+    if cname_policy_for_authorized_name(hostname, state, hostname_policy).is_some()
+        || state.bounded_user_wildcard.contains(hostname)
+        || hostname_policy
+            .user_wildcard_transports(hostname)
+            .is_empty()
+    {
+        return;
+    }
+    if state.bounded_user_wildcard.len() >= MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS {
+        state.bounded_user_wildcard_truncated = true;
+        return;
+    }
+    state.bounded_user_wildcard.insert(hostname.to_owned());
 }
 
 fn authorized_hostname(
@@ -4436,36 +4658,43 @@ fn authorized_hostname(
     {
         return false;
     }
-    if hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some() {
+    if cname_policy_for_authorized_name(hostname, state, hostname_policy).is_some() {
         return true;
     }
-    if matches_results_storage_hostname(hostname) {
-        if state.runner_authorized_results_storage.len() >= MAX_RESULTS_STORAGE_AUTHORIZATIONS {
+    admit_user_wildcard_hostname(hostname, state, hostname_policy);
+    if matches_results_storage_hostname(hostname) && hostname_policy.exact_entry(hostname).is_none()
+    {
+        if !state.runner_authorized_results_storage.contains(hostname)
+            && state.runner_authorized_results_storage.len() >= MAX_RESULTS_STORAGE_AUTHORIZATIONS
+        {
             state.runner_authorized_results_storage_truncated = true;
-            return false;
+        } else {
+            state
+                .runner_authorized_results_storage
+                .insert(hostname.to_owned());
         }
-        state
-            .runner_authorized_results_storage
-            .insert(hostname.to_owned());
-        return true;
+        return hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some();
     }
     if matches_constrained_dynamic_githubapp_suffix_hostname(hostname, hostname_policy) {
-        if state.bounded_githubapp_suffix.len() >= MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS {
+        if !state.bounded_githubapp_suffix.contains(hostname)
+            && state.bounded_githubapp_suffix.len() >= MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS
+        {
             state.bounded_githubapp_suffix_truncated = true;
-            return false;
+        } else {
+            state.bounded_githubapp_suffix.insert(hostname.to_owned());
         }
-        state.bounded_githubapp_suffix.insert(hostname.to_owned());
-        return true;
+        return hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some();
     }
-    if !matches_constrained_dynamic_actions_suffix_hostname(hostname, hostname_policy) {
-        return false;
+    if matches_constrained_dynamic_actions_suffix_hostname(hostname, hostname_policy) {
+        if !state.bounded_actions_suffix.contains(hostname)
+            && state.bounded_actions_suffix.len() >= MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS
+        {
+            state.bounded_actions_suffix_truncated = true;
+        } else {
+            state.bounded_actions_suffix.insert(hostname.to_owned());
+        }
     }
-    if state.bounded_actions_suffix.len() >= MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS {
-        state.bounded_actions_suffix_truncated = true;
-        return false;
-    }
-    state.bounded_actions_suffix.insert(hostname.to_owned());
-    true
+    hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some()
 }
 
 fn retain_cname_authorizations(
@@ -4482,6 +4711,7 @@ fn retain_cname_authorizations(
             let source_depth = if hostname_policy.exact_entry(&alias.owner).is_some()
                 || state.bounded_actions_suffix.contains(&alias.owner)
                 || state.bounded_githubapp_suffix.contains(&alias.owner)
+                || state.bounded_user_wildcard.contains(&alias.owner)
                 || state
                     .runner_authorized_results_storage
                     .contains(&alias.owner)
@@ -4695,28 +4925,36 @@ fn policy_classification(
     authorizations: &CnameAuthorizationState,
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> &'static str {
-    if let Some(entry) = hostname_policy.exact_entry(hostname) {
+    if let Some((origins, _)) = direct_hostname_policy(hostname, authorizations, hostname_policy) {
+        let wildcard = authorizations.bounded_user_wildcard.contains(hostname);
         return match (
-            entry.origins.contains(&HostnamePolicyOrigin::Platform),
-            entry.origins.contains(&HostnamePolicyOrigin::User),
+            origins.contains(&HostnamePolicyOrigin::Platform),
+            origins.contains(&HostnamePolicyOrigin::User),
         ) {
             (true, true) => "platform_and_user_allowlist",
-            (true, false) => "platform_profile",
-            (false, true) => "user_allowlist",
+            (true, false) => {
+                if authorizations.bounded_actions_suffix.contains(hostname)
+                    || authorizations.bounded_githubapp_suffix.contains(hostname)
+                {
+                    "dynamic_platform"
+                } else if authorizations
+                    .runner_authorized_results_storage
+                    .contains(hostname)
+                {
+                    "runner_authorized_results_storage"
+                } else {
+                    "platform_profile"
+                }
+            }
+            (false, true) => {
+                if wildcard {
+                    "user_wildcard_allowlist"
+                } else {
+                    "user_allowlist"
+                }
+            }
             (false, false) => "outside_policy",
         };
-    }
-    if authorizations.bounded_actions_suffix.contains(hostname) {
-        return "dynamic_platform";
-    }
-    if authorizations.bounded_githubapp_suffix.contains(hostname) {
-        return "dynamic_platform";
-    }
-    if authorizations
-        .runner_authorized_results_storage
-        .contains(hostname)
-    {
-        return "runner_authorized_results_storage";
     }
     if let Some(authorization) = authorizations.active.get(hostname) {
         if requires_runner_results_storage_provenance(hostname, authorizations, hostname_policy) {
@@ -4802,11 +5040,13 @@ fn evidence_from_state_and_authorizations(
         },
         answer_attribution_status: "bounded_reportable_hostname_answers_only",
         proxy_policy_status: match scope {
-            DnsEvidenceScope::ProtectedHostAudit => "audit_forwards_without_name_authorization",
+            DnsEvidenceScope::ProtectedHostAudit => {
+                "audit_forwards_while_simulating_name_authorization"
+            }
             DnsEvidenceScope::SelectedProfileRuntimeTest
             | DnsEvidenceScope::ProtectedHostBlock
             | DnsEvidenceScope::ProtectedHostBlockDegraded => {
-                "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
+                "block_forwards_exact_roots_bounded_user_wildcard_names_actions_suffix_names_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
             }
         },
         observations: state
@@ -4843,6 +5083,14 @@ fn evidence_from_state_and_authorizations(
             .collect(),
         bounded_githubapp_suffix_authorizations_truncated: cname_authorizations
             .bounded_githubapp_suffix_truncated,
+        bounded_user_wildcard_authorizations: cname_authorizations
+            .bounded_user_wildcard
+            .iter()
+            .cloned()
+            .collect(),
+        bounded_user_wildcard_authorizations_truncated: cname_authorizations
+            .bounded_user_wildcard_truncated,
+        user_wildcard_request_rejections: state.user_wildcard_request_rejections,
         runner_authorized_results_storage: cname_authorizations
             .runner_authorized_results_storage
             .iter()
@@ -4875,7 +5123,9 @@ fn evidence_from_state_and_authorizations(
         hostname_refresh_warnings: state.hostname_refresh_warnings,
         upstream_request_failures: state.upstream_request_failures,
         limitations: match scope {
-            DnsEvidenceScope::ProtectedHostAudit => protected_dns_audit_limitations(),
+            DnsEvidenceScope::ProtectedHostAudit => {
+                protected_dns_audit_limitations(hostname_policy.has_user_wildcards())
+            }
             DnsEvidenceScope::SelectedProfileRuntimeTest => vec![
                 "selected_profile_runtime_test_only_no_public_activation",
                 "test_only_evidence_path_does_not_activate_default_planning_descriptor",
@@ -4902,10 +5152,12 @@ fn evidence_from_state_and_authorizations(
             DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(
                 false,
                 hostname_policy.allow_dynamic_githubapp_suffix,
+                hostname_policy.has_user_wildcards(),
             ),
             DnsEvidenceScope::ProtectedHostBlockDegraded => protected_dns_scope_limitations(
                 true,
                 hostname_policy.allow_dynamic_githubapp_suffix,
+                hostname_policy.has_user_wildcards(),
             ),
         },
     }
@@ -4914,6 +5166,7 @@ fn evidence_from_state_and_authorizations(
 fn protected_dns_scope_limitations(
     degraded: bool,
     allow_dynamic_githubapp_suffix: bool,
+    has_user_wildcards: bool,
 ) -> Vec<&'static str> {
     let mut limitations = vec![
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
@@ -4938,22 +5191,25 @@ fn protected_dns_scope_limitations(
     limitations.extend(githubapp_profile_limitations(
         allow_dynamic_githubapp_suffix,
     ));
+    limitations.extend(user_wildcard_limitations(has_user_wildcards));
     if degraded {
         limitations.push("container_control_preserved_invalidates_containment");
     }
     limitations
 }
 
-fn protected_dns_audit_limitations() -> Vec<&'static str> {
-    vec![
+fn protected_dns_audit_limitations(has_user_wildcards: bool) -> Vec<&'static str> {
+    let mut limitations = vec![
         "audit_observation_only_no_containment_claim",
         "audit_routes_host_dns_directly_and_docker_dns_separately_through_local_root_resident_mediator",
-        "audit_forwards_dns_without_name_authorization",
+        "audit_forwards_dns_while_simulating_name_authorization",
         "dns_query_timing_and_count_remain_egress_limitations",
         "dns_answers_attribute_addresses_without_authorizing_firewall_rules",
         "audit_preserves_passwordless_sudo_and_container_control",
         "later_workflow_code_retains_arbitrary_egress_in_audit_mode",
-    ]
+    ];
+    limitations.extend(user_wildcard_limitations(has_user_wildcards));
+    limitations
 }
 
 fn write_report(path: &Path, evidence: &DnsMediationEvidence) -> Result<(), DnsMediationError> {
@@ -5542,6 +5798,140 @@ mod tests {
         assert_eq!(
             caller.join().unwrap(),
             DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn gates_wildcard_answers_on_every_matching_transport_materialization() {
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            test_user_wildcard_hostname_policy(),
+        );
+        let hostname = "auth.docker.io";
+        {
+            let mut authorizations = recorder.cname_authorizations.lock().unwrap();
+            assert!(authorized_hostname(
+                hostname,
+                &mut authorizations,
+                Instant::now(),
+                &recorder.hostname_policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+        let mut response = response_with_address(hostname, 1, 60, &[192, 0, 2, 44]);
+        response[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c]);
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&1_u16.to_be_bytes());
+        response.extend_from_slice(&60_u32.to_be_bytes());
+        response.extend_from_slice(&4_u16.to_be_bytes());
+        response.extend_from_slice(&[192, 0, 2, 45]);
+        let caller = thread::spawn(move || recorder.record_response(hostname, 1, &response, None));
+        let request = requests.recv().unwrap();
+        assert_eq!(request.materializations.len(), 4);
+        assert_eq!(
+            request
+                .materializations
+                .iter()
+                .map(|materialization| (materialization.protocol, materialization.port))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([(Protocol::Tcp, 443), (Protocol::Tcp, 8443)])
+        );
+        assert!(!caller.is_finished());
+        request
+            .completion
+            .send(MaterializationCompletion::AppliedAndVerified)
+            .unwrap();
+        assert_eq!(
+            caller.join().unwrap(),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn gates_wildcard_aaaa_answers_on_verified_materialization() {
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            test_user_wildcard_hostname_policy(),
+        );
+        let hostname = "auth.docker.io";
+        assert!(
+            recorder
+                .forward_query(hostname, 28, None)
+                .is_ok_and(|authorization| authorization == DnsQueryAuthorization::Forward(None))
+        );
+        let caller = thread::spawn(move || {
+            recorder.record_response(
+                hostname,
+                28,
+                &response_with_address(
+                    hostname,
+                    28,
+                    60,
+                    &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 44],
+                ),
+                None,
+            )
+        });
+        let request = requests.recv().unwrap();
+        assert_eq!(request.materializations.len(), 2);
+        assert!(request.materializations.iter().all(|materialization| {
+            matches!(materialization.address, IpAddr::V6(_))
+                && materialization.protocol == Protocol::Tcp
+                && matches!(materialization.port, 443 | 8443)
+        }));
+        request
+            .completion
+            .send(MaterializationCompletion::AppliedAndVerified)
+            .unwrap();
+        assert_eq!(
+            caller.join().unwrap(),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn malformed_or_truncated_block_responses_fail_closed() {
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            test_user_wildcard_hostname_policy(),
+        );
+        let hostname = "auth.docker.io";
+        assert_eq!(
+            recorder.forward_query(hostname, 1, None).unwrap(),
+            DnsQueryAuthorization::Forward(None)
+        );
+        let mut malformed = response_with_address(hostname, 1, 60, &[192, 0, 2, 44]);
+        malformed.pop();
+        assert_eq!(
+            recorder.record_response(hostname, 1, &malformed, None),
+            DnsResponseDisposition::RetryableFailure
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+
+        let mut truncated = response_with_address(hostname, 1, 60, &[192, 0, 2, 44]);
+        truncated[2..4].copy_from_slice(&0x8380_u16.to_be_bytes());
+        assert_eq!(
+            recorder.record_response(hostname, 1, &truncated, None),
+            DnsResponseDisposition::RetryableFailure
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(
+            recorder
+                .state
+                .lock()
+                .unwrap()
+                .materialization_request_rejections,
+            2
         );
         let _ = fs::remove_file(report_path);
     }
@@ -6369,6 +6759,82 @@ mod tests {
     }
 
     #[test]
+    fn block_refuses_and_audit_marks_wildcard_budget_overflow() {
+        for scope in [
+            DnsEvidenceScope::ProtectedHostBlock,
+            DnsEvidenceScope::ProtectedHostAudit,
+        ] {
+            let (recorder, report_path) =
+                test_recorder_with_policy(scope, None, test_user_wildcard_hostname_policy());
+            for index in 0..MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS {
+                assert_eq!(
+                    recorder
+                        .forward_query(&format!("host-{index}.docker.io"), 1, None)
+                        .unwrap(),
+                    DnsQueryAuthorization::Forward(None)
+                );
+            }
+            assert_eq!(
+                recorder
+                    .forward_query("host-0.docker.io", 28, None)
+                    .unwrap(),
+                DnsQueryAuthorization::Forward(None)
+            );
+            let overflow = recorder
+                .forward_query("overflow.docker.io", 1, None)
+                .unwrap();
+            if scope.is_block() {
+                assert_eq!(overflow, DnsQueryAuthorization::Refused(None));
+            } else {
+                assert_eq!(
+                    overflow,
+                    DnsQueryAuthorization::Forward(Some("outside_policy"))
+                );
+            }
+            assert_eq!(
+                recorder
+                    .state
+                    .lock()
+                    .unwrap()
+                    .user_wildcard_request_rejections,
+                1
+            );
+            assert_eq!(
+                recorder
+                    .cname_authorizations
+                    .lock()
+                    .unwrap()
+                    .bounded_user_wildcard
+                    .len(),
+                MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS
+            );
+            let _ = fs::remove_file(report_path);
+        }
+    }
+
+    #[test]
+    fn audit_forwards_unsupported_wildcard_queries_as_outside_policy() {
+        let (recorder, report_path) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostAudit,
+            None,
+            test_user_wildcard_hostname_policy(),
+        );
+        assert_eq!(
+            recorder.forward_query("auth.docker.io", 16, None).unwrap(),
+            DnsQueryAuthorization::Forward(Some("outside_policy"))
+        );
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .bounded_user_wildcard
+                .is_empty()
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
     fn bounds_dynamic_actions_suffix_names_for_the_profile_lifetime() {
         let now = Instant::now();
         let policy = test_hostname_policy(false);
@@ -6499,6 +6965,399 @@ mod tests {
             &test_hostname_policy(true),
             DnsQueryProvenance::Untrusted,
         ));
+    }
+
+    #[test]
+    fn bounds_user_wildcard_names_across_exact_one_and_two_label_patterns() {
+        let now = Instant::now();
+        let policy = test_user_wildcard_hostname_policy();
+        let mut authorizations = CnameAuthorizationState::default();
+        for index in 0..MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS - 1 {
+            assert!(authorized_hostname(
+                &format!("host-{index}.docker.io"),
+                &mut authorizations,
+                now,
+                &policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+        assert!(authorized_hostname(
+            "edge.registry.docker.io",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            authorizations.bounded_user_wildcard.len(),
+            MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS
+        );
+        assert!(authorized_hostname(
+            "host-0.docker.io",
+            &mut authorizations,
+            now + Duration::from_secs(600),
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(!authorized_hostname(
+            "overflow.docker.io",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(authorizations.bounded_user_wildcard_truncated);
+        assert!(user_wildcard_capacity_rejected(
+            "overflow.docker.io",
+            &authorizations,
+            &policy,
+        ));
+        assert_eq!(
+            policy_classification("host-0.docker.io", &authorizations, &policy),
+            "user_wildcard_allowlist"
+        );
+        let evidence = evidence_from_state_and_authorizations(
+            &ObservationState {
+                user_wildcard_request_rejections: 1,
+                ..ObservationState::default()
+            },
+            "active",
+            DnsEvidenceScope::ProtectedHostBlock,
+            &authorizations,
+            &policy,
+            &initial_resident_health(),
+        );
+        assert_eq!(
+            evidence.bounded_user_wildcard_authorizations.len(),
+            MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS
+        );
+        assert!(evidence.bounded_user_wildcard_authorizations_truncated);
+        assert_eq!(evidence.user_wildcard_request_rejections, 1);
+        assert!(
+            evidence
+                .limitations
+                .contains(&"bounded_user_wildcard_dns_authorization_remains_an_egress_limitation")
+        );
+        assert!(evidence.limitations.contains(
+            &"configured_user_wildcard_dns_names_and_transports_remain_egress_and_data_channels"
+        ));
+        for outside in [
+            "docker.io",
+            "too.deep.edge.registry.docker.io",
+            "example.com",
+        ] {
+            assert!(!authorized_hostname(
+                outside,
+                &mut CnameAuthorizationState::default(),
+                now,
+                &policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+    }
+
+    #[test]
+    fn user_wildcards_union_transports_and_preserve_results_storage_provenance() {
+        let now = Instant::now();
+        let policy = test_user_wildcard_hostname_policy();
+        let mut authorizations = CnameAuthorizationState::default();
+        assert!(authorized_hostname(
+            "auth.docker.io",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            hostname_policy_for_authorized_name("auth.docker.io", &authorizations, &policy)
+                .unwrap(),
+            (
+                vec![HostnamePolicyOrigin::User],
+                vec![
+                    HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                    },
+                    HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 8443,
+                    },
+                ],
+            )
+        );
+
+        let results_config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-results","allowlist":[{"destination_type":"hostname","destination":"*.blob.core.windows.net","protocol":"tcp","port":443}]}"#,
+        )
+        .unwrap();
+        let results_policy = crate::hostname_policy::build_runtime_hostname_policy(&results_config);
+        let results_hostname = "productionresultssa17.blob.core.windows.net";
+        let mut results_authorizations = CnameAuthorizationState::default();
+        assert!(!authorized_hostname(
+            results_hostname,
+            &mut results_authorizations,
+            now,
+            &results_policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(results_authorizations.bounded_user_wildcard.is_empty());
+        assert!(authorized_hostname(
+            results_hostname,
+            &mut results_authorizations,
+            now,
+            &results_policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        assert!(
+            results_authorizations
+                .runner_authorized_results_storage
+                .contains(results_hostname)
+        );
+        assert!(
+            results_authorizations
+                .bounded_user_wildcard
+                .contains(results_hostname)
+        );
+    }
+
+    #[test]
+    fn exact_policy_survives_wildcard_budget_exhaustion_without_wildcard_transports() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-exact","allowlist":[{"destination_type":"hostname","destination":"auth.docker.io","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        for index in 0..MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS {
+            assert!(authorized_hostname(
+                &format!("host-{index}.docker.io"),
+                &mut authorizations,
+                now,
+                &policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+        assert!(user_wildcard_capacity_rejected(
+            "auth.docker.io",
+            &authorizations,
+            &policy,
+        ));
+        assert!(authorized_hostname(
+            "auth.docker.io",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            hostname_policy_for_authorized_name("auth.docker.io", &authorizations, &policy)
+                .unwrap()
+                .1,
+            vec![HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: 8443,
+            }]
+        );
+    }
+
+    #[test]
+    fn platform_policy_survives_wildcard_budget_exhaustion_without_wildcard_transports() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-platform","allowlist":[{"destination_type":"hostname","destination":"*.github.com","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        for index in 0..MAX_DYNAMIC_USER_WILDCARD_AUTHORIZATIONS {
+            assert!(authorized_hostname(
+                &format!("host-{index}.github.com"),
+                &mut authorizations,
+                now,
+                &policy,
+                DnsQueryProvenance::Untrusted,
+            ));
+        }
+        assert!(user_wildcard_capacity_rejected(
+            "api.github.com",
+            &authorizations,
+            &policy,
+        ));
+        assert!(authorized_hostname(
+            "api.github.com",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            hostname_policy_for_authorized_name("api.github.com", &authorizations, &policy)
+                .unwrap(),
+            (
+                vec![HostnamePolicyOrigin::Platform],
+                vec![HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                }],
+            )
+        );
+    }
+
+    #[test]
+    fn platform_broad_opt_out_does_not_remove_explicit_user_wildcards() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-opt-out","disable_broad_github_domains":true,"allowlist":[{"destination_type":"hostname","destination":"*.githubapp.com","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        assert!(!policy.allow_dynamic_githubapp_suffix);
+        let hostname = "explicit-user.githubapp.com";
+        let mut authorizations = CnameAuthorizationState::default();
+        assert!(authorized_hostname(
+            hostname,
+            &mut authorizations,
+            Instant::now(),
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            hostname_policy_for_authorized_name(hostname, &authorizations, &policy).unwrap(),
+            (
+                vec![HostnamePolicyOrigin::User],
+                vec![HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 8443,
+                }],
+            )
+        );
+        let exact_platform = "actions-results-receiver-production.githubapp.com";
+        assert!(authorized_hostname(
+            exact_platform,
+            &mut authorizations,
+            Instant::now(),
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            hostname_policy_for_authorized_name(exact_platform, &authorizations, &policy).unwrap(),
+            (
+                vec![HostnamePolicyOrigin::Platform, HostnamePolicyOrigin::User],
+                vec![
+                    HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                    },
+                    HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 8443,
+                    },
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn wildcard_cname_descendants_inherit_transports_with_existing_ttl_bounds() {
+        let now = Instant::now();
+        let policy = test_user_wildcard_hostname_policy();
+        let mut authorizations = CnameAuthorizationState::default();
+        let root = "registry.docker.io";
+        assert!(authorized_hostname(
+            root,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        retain_cname_authorizations(
+            &mut authorizations,
+            [DnsCnameAnswer {
+                owner: root.to_owned(),
+                target: "registry-cdn.example.net".to_owned(),
+                ttl_seconds: 60,
+            }],
+            now,
+            &policy,
+        );
+        assert!(authorized_hostname(
+            "registry-cdn.example.net",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            policy_classification("registry-cdn.example.net", &authorizations, &policy,),
+            "user_cname_derived"
+        );
+        assert_eq!(
+            hostname_policy_for_authorized_name(
+                "registry-cdn.example.net",
+                &authorizations,
+                &policy,
+            )
+            .unwrap()
+            .1,
+            vec![
+                HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                },
+                HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 8443,
+                },
+            ]
+        );
+        assert!(!authorized_hostname(
+            "registry-cdn.example.net",
+            &mut authorizations,
+            now + Duration::from_secs(61),
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+    }
+
+    #[test]
+    fn wildcard_matching_cname_descendants_do_not_consume_root_slots() {
+        let now = Instant::now();
+        let policy = test_user_wildcard_hostname_policy();
+        let mut authorizations = CnameAuthorizationState::default();
+        let root = "registry.docker.io";
+        let descendant = "registry-cdn.docker.io";
+        assert!(authorized_hostname(
+            root,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        retain_cname_authorizations(
+            &mut authorizations,
+            [DnsCnameAnswer {
+                owner: root.to_owned(),
+                target: descendant.to_owned(),
+                ttl_seconds: 60,
+            }],
+            now,
+            &policy,
+        );
+        assert!(authorized_hostname(
+            descendant,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert_eq!(
+            authorizations.bounded_user_wildcard,
+            BTreeSet::from([root.to_owned()])
+        );
+        assert_eq!(
+            policy_classification(descendant, &authorizations, &policy),
+            "user_cname_derived"
+        );
     }
 
     #[test]
@@ -7113,7 +7972,7 @@ mod tests {
         );
         assert!(
             scope
-                .limitations(true)
+                .limitations(true, false)
                 .contains(&"container_control_remains_available_to_later_workflow_code")
         );
     }
@@ -7145,7 +8004,7 @@ mod tests {
                 .contains(&"audit_observation_only_no_containment_claim")
         );
         assert!(
-            protected_audit_limitations()
+            protected_audit_limitations(false)
                 .contains(&"audit_preserves_passwordless_sudo_and_container_control")
         );
     }

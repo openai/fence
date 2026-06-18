@@ -76,6 +76,11 @@ See [`v0.md`](v0.md) for normative behavior and
 - The logical policy now merges platform and user hostname transports,
   prehydrates exact roots, refreshes them during the resident lifecycle, and
   keeps transient addresses out of the logical hash.
+- Source-built policy added exact-depth one- and two-label user wildcard
+  hostnames with one shared eight-name lifetime budget, lazy DNS-mediated
+  materialization, deterministic transport union, and explicit local evidence.
+  Adoption by the checked-in Action remains gated on an atomic attested bundle
+  refresh.
 - Resident workers now report through one health channel; fresh evidence and a
   live matching service are required at post-job time.
 - The Action runtime and bundled agent are copied to root-owned storage and

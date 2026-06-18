@@ -2,7 +2,7 @@
 
 Status: security-claim source for the v0 protected target
 Audience: workflow authors, maintainers, adopters, and security reviewers
-Last reviewed: 2026-06-15
+Last reviewed: 2026-06-18
 
 This model must be reviewed before changing the supported runner class,
 platform profile, trusted launcher, privilege controls, evidence trust model,
@@ -10,9 +10,10 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree and released Action define the schema-`7` policy and schema-`4`
-runtime-evidence contract. Future contract changes must update the attested
-agent and wrapper validators atomically. The bundle remains governed by
+The source tree defines the schema-`8` policy and schema-`5` runtime-evidence
+contract. The released Action adopts that contract only when the attested
+agent and wrapper validators update atomically. Until that bundle refresh, the
+bundle remains governed by
 `action/bundle-manifest.json` and the wrapper schema constants; the
 wrapper rejects older evidence, stale verification state, an incomplete worker
 set, or a resident PID that does not match the active systemd service. This
@@ -26,8 +27,8 @@ the transition from runner-user code to the root resident agent, the exact
 network policy realized from DNS, the privileged host controls that prevent
 later bypass, and the local evidence consumed by the protected post hook. Fence
 reduces arbitrary outbound access; it does not eliminate exfiltration because
-approved GitHub destinations, DNS behavior, user allowlist entries, and shared
-destination IP addresses remain usable channels.
+approved GitHub destinations, DNS behavior, exact and wildcard user allowlist
+entries, and shared destination IP addresses remain usable channels.
 
 The versioned platform contract separately permits UID `0` host traffic to
 Azure WireServer at exact destination `168.63.129.16` on TCP `80` and `32526`.
@@ -71,6 +72,8 @@ Out of scope:
 - semantic restrictions inside TLS or HTTP requests to approved endpoints;
 - confidentiality from an endpoint intentionally placed in the user
   `allowlist`;
+- preventing data encoding in the bounded concrete names queried beneath an
+  explicitly allowed wildcard suffix;
 - preventing a malicious workflow from denying service to its own job; and
 - guaranteed process ownership attribution or process isolation.
 
@@ -122,7 +125,8 @@ GitHub profile requires a new threat-model review.
 - **Workflow process -> DNS mediator:** a reviewed read-only resolver mount
   sends host UDP/TCP DNS directly to Fence so caller sockets remain visible;
   Docker uses its separate local route. Block mode canonicalizes and forwards
-  only authorized `A`/`AAAA` names; audit forwards observation traffic without a containment claim
+  only authorized `A`/`AAAA` names; audit forwards observation traffic while
+  simulating the same bounded name policy without a containment claim
   (`src/dns_mediator.rs`).
 - **DNS mediator -> fixed resolver and firewall owner:** bounded queries go to
   the reviewed resolver path. An approved answer is withheld until all matching
@@ -133,6 +137,13 @@ GitHub profile requires a new threat-model review.
   eight single-label `*.githubapp.com` names unless broad GitHub compatibility
   is disabled. Each resulting HTTPS grant is available to other local code and
   remains an explicit residual channel (`src/platform_profile.rs`,
+  `src/dns_mediator.rs`).
+- **User wildcard policy -> concrete DNS names:** one- and two-label leading
+  patterns share eight lifetime concrete-name admissions. Names materialize
+  lazily, all matching transports are unioned, and failed or empty lookups
+  still consume a slot because the query label is itself a data channel.
+  Derived CNAME targets may leave the configured suffix under the existing
+  depth, count, and TTL limits (`src/hostname_policy.rs`,
   `src/dns_mediator.rs`).
 - **Pinned runner -> additional GitHub results storage:** Fence accepts up to
   four other exact results-storage names only when their host DNS sockets belong
@@ -147,12 +158,14 @@ GitHub profile requires a new threat-model review.
   status, actor class, PID, executable basename, and four parent basenames;
   local endpoints are not serialized (`src/attribution.rs`).
 - **Resident agent -> post hook:** root-owned `ready.json`, `report.json`, and
-  `dns-report.json` are runner-readable but not runner-writable. For schema-`4`
-  evidence, the post hook also verifies the live systemd PID and evidence
-  freshness before trusting the report. Writable self-bind guards pin every
-  runner-renameable ancestor of the registered Action path, while protected
-  mount, device/inode, and runtime-digest checks apply at the wrapper boundary.
-  All five supervised resident workers must remain healthy (`src/runtime.rs`,
+  `dns-report.json` are runner-readable but not runner-writable. Source
+  schema-`5` preserves the live systemd PID, worker health, and evidence
+  freshness fields that its eventual post-hook consumer must validate before
+  trusting the report. Writable self-bind guards pin every runner-renameable
+  ancestor of the registered Action path, while protected mount, device/inode,
+  and runtime-digest checks apply at the wrapper boundary. The checked-in
+  wrapper continues validating its bundle-declared contract until it and the
+  attested binary adopt schema `5` together (`src/runtime.rs`,
   `action/post.cts`).
 - **Release workflow -> committed Action bundle:** immutable release assets are
   checksum- and attestation-verified before the maintainer updater installs the
@@ -231,7 +244,8 @@ flowchart TD
 ## Top abuse paths
 
 1. **Exfiltrate through an approved channel:** malicious later code reads a
-   token, sends it to an allowed GitHub or user allowlist destination, and the
+   token, sends it to an allowed GitHub, exact user, or wildcard-derived user
+   destination, and the
    firewall permits it because Fence does not inspect TLS/HTTP semantics.
 2. **Regain root and rewrite policy:** later code uses a residual sudo or
    container-control path, modifies `inet fence_v0`, and opens arbitrary
@@ -251,7 +265,7 @@ flowchart TD
    ancestor, root-copies and bind-mounts the runtime read-only, then checks the
    exact mounts, device/inode identities, and digest in post.
 6. **Forge or replay evidence:** later code writes a false report or leaves a
-   stale healthy file after killing the service. In the schema-`4` runtime
+   stale healthy file after killing the service. In the schema-`5` runtime
    contract, root ownership, active MainPID checks, worker health, monotonic
    verification sequence, and a 20-second freshness bound reject the evidence.
 7. **Disable or alter firewall state after readiness:** later code or host drift
@@ -275,15 +289,15 @@ flowchart TD
 | Threat ID | Threat source | Prerequisites | Threat action | Impact | Impacted assets | Existing controls (evidence) | Gaps | Recommended mitigations | Detection ideas | Likelihood | Impact severity | Priority |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | TM-001 | Malicious workflow process | Residual root-equivalent path or unsupported host drift | Regain privilege and change firewall or agent state | Arbitrary egress and forged evidence | Credentials, policy, reports | Fingerprint gate and verified sudo/container lockdown (`src/hosted_runner.rs`, `src/lockdown.rs`) | New runner layouts can invalidate assumptions | Keep fail-closed fingerprint updates reviewable; add support only with hosted proof | Critical lockdown finding and support mismatch | Medium | High | High |
-| TM-002 | Malicious workflow process | Access to an approved GitHub or user destination | Exfiltrate sensitive data through allowed HTTPS or DNS behavior | Credential/source disclosure | Credentials, source | Exact profile roots, opt-out for broad roots, typed allowlist, disclosed limits (`src/hostname_policy.rs`, `README.md`) | Core GitHub reporting and shared IPs remain channels | Continue narrowing the profile when hosted evidence permits; keep least-privilege job tokens | DNS/finding summary and audit-mode tuning | High | High | High |
-| TM-003 | Malicious workflow process or DNS response | Authorized name, suffix, CNAME, or address rotation | Expand usable addresses or race first connection | Policy broadening or unexpected denial | Effective policy, job availability | Canonical A/AAAA queries, depth/name/TTL caps, completion-driven verified materialization (`src/dns_mediator.rs`) | IP authorization cannot prove TLS service identity | Preserve exact-host user policy; review suffix and CNAME bounds before expansion | DNS evidence counters, materialized allowances, critical backend findings | Medium | High | High |
-| TM-004 | Malicious workflow process | Writable launcher/post/binary, renameable registered-path ancestor, or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, writable self-bind ancestor guards, read-only runtime bind mount, device/inode and digest records, no-follow files, and schema-`4` live PID/freshness checks (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | Kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact path-guard/runtime manifests, worker set, freshness bounds, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
+| TM-002 | Malicious workflow process | Access to an approved GitHub, exact user, or wildcard-derived destination | Exfiltrate sensitive data through allowed HTTPS or DNS behavior | Credential/source disclosure | Credentials, source | Exact profile roots, opt-out for broad platform roots, exact-depth wildcard grammar, shared eight-name lifetime cap, typed transports, and disclosed limits (`src/hostname_policy.rs`, `README.md`) | Core GitHub reporting, wildcard query labels, CNAME delegation, and shared IPs remain channels | Keep wildcard use explicit, use least-privilege job tokens, and prefer exact names where practical | DNS/finding summary, wildcard admission/rejection evidence, and audit-mode tuning | High | High | High |
+| TM-003 | Malicious workflow process or DNS response | Authorized exact name, wildcard match, CNAME, or address rotation | Expand usable addresses or race first connection | Policy broadening or unexpected denial | Effective policy, job availability | Canonical A/AAAA queries, exact label-depth matching, shared name/depth/TTL caps, deterministic transport union, and completion-driven verified materialization (`src/dns_mediator.rs`) | IP authorization cannot prove TLS service identity; no public-suffix ownership validation is performed | Preserve exact-depth matching, lifetime admission bounds, and complete apply-and-verify gating | DNS evidence counters, wildcard admissions, materialized allowances, and critical backend findings | Medium | High | High |
+| TM-004 | Malicious workflow process | Writable launcher/post/binary, renameable registered-path ancestor, or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, writable self-bind ancestor guards, read-only runtime bind mount, device/inode and digest records, no-follow files, live PID/freshness checks in the bundle-declared wrapper contract, and equivalent source schema-`5` evidence fields (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | The checked-in wrapper cannot consume source schema `5` until atomic bundle adoption; kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact path-guard/runtime manifests, worker set, freshness bounds, atomic schema adoption, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
 | TM-005 | Local process or host drift | Ability to alter owned kernel state after readiness | Remove or replace firewall rules | Temporary or persistent unintended egress | Network policy | Exact structured state verification every five seconds and terminal critical health (`src/nft_backend.rs`, `src/dns_mediator.rs`) | Detection is periodic rather than instantaneous | Keep interval fixed and evaluate event-driven integrity only with bounded complexity | Critical drift finding; Action post failure | Medium | High | High |
 | TM-006 | Workflow author or malicious config producer | Control of Action inputs before launcher validation | Inject paths, nft syntax, oversized policy, or ambiguous JSON | Privileged mutation or resource exhaustion | Host state, availability | Strict JSON, unknown-field rejection, fixed paths, typed entries, fixed limits (`action/lib.cts`, `src/config.rs`) | Raw JSON remains an advanced surface | Preserve schema-`1` strictness; add fields only through reviewed typed models | Structured pre-mutation setup failure | Low | High | Medium |
 | TM-007 | Supply-chain attacker | Ability to alter a release asset, workflow dependency, or bundle refresh | Distribute an agent not built by the reviewed workflow | Fleet-wide compromise | Release agent, downstream workflows | SHA-pinned actions, protected release environment, checksums, non-draft immutable releases, resolved release tags, source-ref/source-commit/signer-digest-bound attestations, offline bundle validation (`.github/workflows/release.yml`, `script/validate-action-bundle`) | Attestation trusts GitHub identity and the reviewed workflow commit | Add SBOM and auditable/reproducible binary work as post-v0 hardening | Release verification job and bundle validation | Low | High | Medium |
 | TM-008 | Malicious workflow process | Ability to generate local load | Saturate DNS, NFLOG, reports, or attribution scans | Job slowdown or failure | Job availability, evidence completeness | Queue/sample/query/scan/report caps and explicit truncation (`src/dns_mediator.rs`, `src/attribution.rs`, `src/findings.rs`) | Fence does not guarantee availability against later code | Keep limits non-configurable in v0; review CPU cost with real workloads | Warning counters, truncation, critical worker health | High | Medium | Medium |
 | TM-009 | Local process race or namespace boundary | Socket disappears, is shared, or is outside the scanned namespace | Produce missing or ambiguous process attribution | Reduced incident context, not control bypass | Local evidence | Unique-owner requirement, bounded statuses, no guessing (`src/attribution.rs`) | Attribution is inherently best effort | Keep attribution advisory; do not gate containment on individual matches | `not_found`, `ambiguous`, and limit statuses | High | Low | Low |
-| TM-010 | Malicious workflow process | The static compatibility account or a runner-authorized results-storage account is reachable | Reuse its resolved HTTPS address or a usable signed URL | Data exfiltration through a required GitHub channel | Credentials, source | One source-defined exact account, strict provenance for all other matching accounts, four-account dynamic cap, TTL bounds, and explicit evidence (`src/platform_profile.rs`, `src/attribution.rs`, `src/dns_mediator.rs`) | Fence cannot inspect TLS semantics or revoke per-request signed URLs | Keep the static exception exact, keep other accounts provenance-bound, and never broaden to a storage wildcard | Authorized-account evidence and DNS counters | Medium | High | High |
+| TM-010 | Malicious workflow process | The static compatibility account or a runner-authorized results-storage account is reachable | Reuse its resolved HTTPS address or a usable signed URL | Data exfiltration through a required GitHub channel | Credentials, source | One source-defined exact account, strict provenance for all other matching accounts, four-account dynamic cap, TTL bounds, and explicit evidence (`src/platform_profile.rs`, `src/attribution.rs`, `src/dns_mediator.rs`) | Fence cannot inspect TLS semantics or revoke per-request signed URLs | Keep the static exception exact and ensure exact or wildcard user policy cannot bypass pinned-runner provenance for other matching accounts | Authorized-account evidence and DNS counters | Medium | High | High |
 
 ## Criticality calibration
 

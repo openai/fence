@@ -104,6 +104,10 @@ jobs:
             replica: required
           - scenario: unsafe-preserve
             replica: required
+          - scenario: wildcard-docker
+            replica: required
+          - scenario: malformed-wildcard
+            replica: pre-mutation
           - scenario: audit
             replica: required
     timeout-minutes: 8

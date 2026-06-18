@@ -136,6 +136,14 @@ Fence resolves exact hostname entries before lockdown is ready and refreshes
 their approved addresses while the job runs. Each hostname keeps the protocol
 and port you configured as DNS answers change.
 
+The source-built agent also accepts exact-depth `*.example.com` and
+`*.*.example.com` hostname patterns. Each `*` represents exactly one DNS label,
+and all user patterns share an eight-name lifetime authorization budget. These
+names materialize lazily after matching DNS queries and do not delay readiness.
+The checked-in Action wrapper and bundled binary adopt this source-ahead
+contract only through a later atomic attested bundle refresh; the current
+bundle contract remains identified by `action/bundle-manifest.json`.
+
 ## How It Works 🔧
 
 1. Your workflow starts with `uses: GrantBirki/fence@<commit-sha>`.

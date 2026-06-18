@@ -1,8 +1,9 @@
 use crate::IMPLEMENTATION_PHASE;
 use crate::config::{
     ContainerPolicy, DestinationType, MAX_ALLOWANCES, MAX_EXPANDED_RULES, MAX_FINDINGS,
-    MAX_REPORT_BYTES, MAX_RESOLVED_ADDRESSES, Mode, NormalizedAllowance, NormalizedConfig,
-    PlatformProfile, Protocol,
+    MAX_REPORT_BYTES, MAX_RESOLVED_ADDRESSES, MAX_USER_WILDCARD_AUTHORIZATIONS,
+    MAX_USER_WILDCARD_PREFIX_LABELS, Mode, NormalizedAllowance, NormalizedConfig, PlatformProfile,
+    Protocol, parse_hostname_wildcard_pattern,
 };
 use crate::error::ErrorDetail;
 use crate::hostname_policy::{RuntimeHostnamePolicy, build_runtime_hostname_policy};
@@ -21,7 +22,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 7;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +66,8 @@ pub struct LimitStatus {
     pub duplicate_effective_rules_collapsed: usize,
     pub max_sampled_findings: usize,
     pub max_report_bytes: usize,
+    pub max_user_wildcard_prefix_labels: usize,
+    pub max_user_wildcard_authorizations: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -146,7 +149,10 @@ fn build_plan_inner(
             .requested_allowances
             .iter()
             .chain(platform_requested_policy.iter())
-            .filter(|allowance| allowance.destination_type == DestinationType::Hostname)
+            .filter(|allowance| {
+                allowance.destination_type == DestinationType::Hostname
+                    && parse_hostname_wildcard_pattern(&allowance.destination).is_none()
+            })
             .map(|allowance| allowance.destination.clone())
             .collect::<BTreeSet<_>>()
     });
@@ -190,7 +196,12 @@ fn build_plan_inner(
     let mut runtime_static_policy = config
         .requested_allowances
         .iter()
-        .filter(|allowance| allowance.destination_type != DestinationType::Hostname)
+        .filter(|allowance| {
+            matches!(
+                allowance.destination_type,
+                DestinationType::Ip | DestinationType::Cidr
+            )
+        })
         .map(|allowance| EffectiveAllowance {
             destination_type: allowance.destination_type,
             destination: allowance.destination.clone(),
@@ -250,7 +261,10 @@ fn build_plan_inner(
     let network_enforcement_preview = build_dns_mediated_preview(config.mode, &effective_policy);
     let ruleset_hash = sha256_hex(network_enforcement_preview.ruleset.as_bytes());
     let assurance_status = assurance_status(config.mode, config.container_policy);
-    let limitations = limitations(assurance_status);
+    let limitations = limitations(
+        assurance_status,
+        runtime_hostname_policy.has_user_wildcards(),
+    );
     let invocation_id = config.invocation_id.clone();
     let duplicate_effective_rules_collapsed =
         expanded_rules_before_deduplication - effective_policy.len();
@@ -284,6 +298,8 @@ fn build_plan_inner(
             duplicate_effective_rules_collapsed,
             max_sampled_findings: MAX_FINDINGS,
             max_report_bytes: MAX_REPORT_BYTES,
+            max_user_wildcard_prefix_labels: MAX_USER_WILDCARD_PREFIX_LABELS,
+            max_user_wildcard_authorizations: MAX_USER_WILDCARD_AUTHORIZATIONS,
         },
         findings: FindingState {
             retained: Vec::new(),
@@ -327,6 +343,9 @@ fn expand_allowances(
     for allowance in allowances {
         match allowance.destination_type {
             DestinationType::Hostname => {
+                if parse_hostname_wildcard_pattern(&allowance.destination).is_some() {
+                    continue;
+                }
                 let addresses = resolved
                     .get(&allowance.destination)
                     .expect("each validated hostname is resolved before expansion");
@@ -408,7 +427,7 @@ fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> As
     }
 }
 
-fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
+fn limitations(status: AssuranceStatus, has_user_wildcards: bool) -> Vec<&'static str> {
     let mut limitations = vec!["render_plan_does_not_apply_or_verify_security_state"];
     match status {
         AssuranceStatus::PlannedBlockContainment => {
@@ -422,6 +441,12 @@ fn limitations(status: AssuranceStatus) -> Vec<&'static str> {
             limitations.push("audit_requires_supported_trusted_launcher_for_activation");
             limitations.push("audit_observes_only_and_never_contains");
         }
+    }
+    if has_user_wildcards {
+        limitations.extend([
+            "user_wildcard_hostnames_materialize_only_after_runtime_dns_queries",
+            "bounded_user_wildcard_dns_authorization_remains_an_egress_limitation",
+        ]);
     }
     limitations
 }
@@ -619,7 +644,7 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
-        assert_eq!(default.policy_hash_schema_version, 7);
+        assert_eq!(default.policy_hash_schema_version, 8);
         assert_eq!(
             default.platform_profile.id,
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
@@ -931,5 +956,68 @@ mod tests {
                 port: 8443,
             }]
         );
+    }
+
+    #[test]
+    fn wildcard_hostnames_remain_logical_runtime_policy_without_preview_resolution() {
+        let config = parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"wildcard","allowlist":[{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}"#,
+        );
+        let plan = build_plan(config, &resolver(vec![])).unwrap();
+
+        assert!(plan.frozen_resolution_results.is_empty());
+        assert!(plan.effective_policy.is_empty());
+        assert!(plan.runtime_static_policy.is_empty());
+        assert_eq!(plan.runtime_hostname_policy.user_wildcards.len(), 2);
+        assert_eq!(
+            plan.limits.max_user_wildcard_prefix_labels,
+            MAX_USER_WILDCARD_PREFIX_LABELS
+        );
+        assert_eq!(
+            plan.limits.max_user_wildcard_authorizations,
+            MAX_USER_WILDCARD_AUTHORIZATIONS
+        );
+        assert!(
+            plan.limitations
+                .contains(&"user_wildcard_hostnames_materialize_only_after_runtime_dns_queries")
+        );
+
+        let reordered = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-other","allowlist":[{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443}]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        assert_eq!(plan.policy_hash, reordered.policy_hash);
+        assert_eq!(plan.ruleset_hash, reordered.ruleset_hash);
+
+        let duplicate = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-duplicate","allowlist":[{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        assert_eq!(plan.policy_hash, duplicate.policy_hash);
+
+        let different_depth = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-depth","allowlist":[{"destination_type":"hostname","destination":"*.docker.io","protocol":"udp","port":53},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"tcp","port":443}]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let different_transport = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-transport","allowlist":[{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        assert_ne!(plan.policy_hash, different_depth.policy_hash);
+        assert_ne!(plan.policy_hash, different_transport.policy_hash);
+        assert_eq!(plan.ruleset_hash, different_depth.ruleset_hash);
+        assert_eq!(plan.ruleset_hash, different_transport.ruleset_hash);
     }
 }

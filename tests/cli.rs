@@ -91,7 +91,7 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     assert_eq!(first, second);
     assert_eq!(first["data"]["application_status"], "not_applied");
     assert_eq!(first["data"]["verification_status"], "not_verified");
-    assert_eq!(first["data"]["policy_hash_schema_version"], 7);
+    assert_eq!(first["data"]["policy_hash_schema_version"], 8);
     assert_eq!(
         first["data"]["network_enforcement_preview"]["owned_table"]["name"],
         "fence_v0"
@@ -124,7 +124,7 @@ fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
     let profile = &response["data"]["platform_profile"];
     let dns = &profile["dns_mediated_compatibility"];
 
-    assert_eq!(response["data"]["policy_hash_schema_version"], 7);
+    assert_eq!(response["data"]["policy_hash_schema_version"], 8);
     assert_eq!(profile["id"], "github_hosted_workflow_bootstrap_v4");
     assert_eq!(profile["selection_status"], "default_bounded_dns_mediated");
     assert_eq!(
@@ -161,6 +161,43 @@ fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
 }
 
 #[test]
+fn renders_wildcard_hostname_policy_without_resolving_it() {
+    let invocation_id = format!("wildcard-plan-{}", std::process::id());
+    let path = config_file(
+        "wildcard-plan.json",
+        format!(
+            r#"{{"schema_version":1,"mode":"block","invocation_id":"{invocation_id}","allowlist":[{{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443}},{{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}}]}}"#
+        )
+        .as_bytes(),
+    );
+    let response = success_json(&["render-plan", "--config", path.to_str().unwrap()]);
+    let data = &response["data"];
+
+    assert_eq!(data["policy_hash_schema_version"], 8);
+    assert_eq!(data["frozen_resolution_results"], serde_json::json!([]));
+    assert_eq!(data["effective_policy"], serde_json::json!([]));
+    assert_eq!(
+        data["runtime_hostname_policy"]["user_wildcards"],
+        serde_json::json!([
+            {
+                "pattern": "*.*.docker.io",
+                "suffix": "docker.io",
+                "prefix_labels": 2,
+                "transports": [{"protocol": "udp", "port": 53}],
+            },
+            {
+                "pattern": "*.docker.io",
+                "suffix": "docker.io",
+                "prefix_labels": 1,
+                "transports": [{"protocol": "tcp", "port": 443}],
+            },
+        ])
+    );
+    assert_eq!(data["limits"]["max_user_wildcard_prefix_labels"], 2);
+    assert_eq!(data["limits"]["max_user_wildcard_authorizations"], 8);
+}
+
+#[test]
 fn run_fails_closed_without_reading_config() {
     let response = error_json(&["run", "--config", "/not/a/real/config.json"], 1);
 
@@ -185,15 +222,31 @@ fn invalid_and_oversized_configs_are_structured_errors() {
         "oversized.json",
         &vec![b' '; fence::config::MAX_CONFIG_BYTES + 1],
     );
+    let invalid_wildcard = config_file(
+        "invalid-wildcard.json",
+        br#"{"schema_version":1,"mode":"block","invocation_id":"bad-wildcard","allowlist":[{"destination_type":"hostname","destination":"*.*.*.docker.io","protocol":"tcp","port":443}]}"#,
+    );
     let invalid_response = error_json(&["render-plan", "--config", invalid.to_str().unwrap()], 1);
     let oversized_response =
         error_json(&["render-plan", "--config", oversized.to_str().unwrap()], 1);
+    let invalid_wildcard_response = error_json(
+        &[
+            "render-plan",
+            "--config",
+            invalid_wildcard.to_str().unwrap(),
+        ],
+        1,
+    );
 
     assert_eq!(
         invalid_response["error"]["code"],
         "invalid_json_configuration"
     );
     assert_eq!(oversized_response["error"]["code"], "config_too_large");
+    assert_eq!(
+        invalid_wildcard_response["error"]["code"],
+        "invalid_destination"
+    );
 }
 
 #[test]
