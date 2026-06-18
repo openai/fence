@@ -361,7 +361,7 @@ pub(crate) fn parse_hostname_wildcard_pattern(value: &str) -> Option<HostnameWil
     Some(HostnameWildcardPattern {
         pattern,
         suffix,
-        prefix_labels: u8::try_from(prefix_labels).ok()?,
+        prefix_labels: prefix_labels as u8,
     })
 }
 
