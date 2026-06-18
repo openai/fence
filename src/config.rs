@@ -12,6 +12,8 @@ pub const MAX_RESOLVED_ADDRESSES: usize = 32;
 pub const MAX_EXPANDED_RULES: usize = 1024;
 pub const MAX_FINDINGS: usize = 1024;
 pub const MAX_REPORT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_USER_WILDCARD_PREFIX_LABELS: usize = 2;
+pub const MAX_USER_WILDCARD_AUTHORIZATIONS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +88,13 @@ pub struct NormalizedAllowance {
     pub destination: String,
     pub protocol: Protocol,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct HostnameWildcardPattern {
+    pub pattern: String,
+    pub suffix: String,
+    pub prefix_labels: u8,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -264,10 +273,10 @@ fn normalize_allowance(
     let (destination_type, destination) = match input.destination_type.as_str() {
         "hostname" => (
             DestinationType::Hostname,
-            normalize_hostname(&input.destination).ok_or_else(|| {
+            normalize_hostname_destination(&input.destination).ok_or_else(|| {
                 ErrorDetail::new(
                     "invalid_destination",
-                    "hostname destination is not a valid explicit DNS name",
+                    "hostname destination is not a valid exact name or bounded wildcard pattern",
                 )
                 .indexed_field("allowlist.destination", index)
             })?,
@@ -324,7 +333,39 @@ fn valid_invocation_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn normalize_hostname(value: &str) -> Option<String> {
+pub(crate) fn normalize_hostname_destination(value: &str) -> Option<String> {
+    if value.as_bytes().contains(&b'*') {
+        return parse_hostname_wildcard_pattern(value).map(|pattern| pattern.pattern);
+    }
+    normalize_hostname(value)
+}
+
+pub(crate) fn parse_hostname_wildcard_pattern(value: &str) -> Option<HostnameWildcardPattern> {
+    if value.is_empty() || value.len() > 253 || !value.is_ascii() || value.ends_with('.') {
+        return None;
+    }
+
+    let labels = value.split('.').collect::<Vec<_>>();
+    let prefix_labels = labels.iter().take_while(|label| **label == "*").count();
+    if !(1..=MAX_USER_WILDCARD_PREFIX_LABELS).contains(&prefix_labels)
+        || labels.len().saturating_sub(prefix_labels) < 2
+        || labels[prefix_labels..]
+            .iter()
+            .any(|label| label.as_bytes().contains(&b'*'))
+    {
+        return None;
+    }
+
+    let suffix = normalize_hostname(&labels[prefix_labels..].join("."))?;
+    let pattern = format!("{}{}", "*.".repeat(prefix_labels), suffix);
+    Some(HostnameWildcardPattern {
+        pattern,
+        suffix,
+        prefix_labels: u8::try_from(prefix_labels).ok()?,
+    })
+}
+
+pub(crate) fn normalize_hostname(value: &str) -> Option<String> {
     if value.is_empty()
         || value.len() > 253
         || !value.is_ascii()
@@ -592,9 +633,68 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_bounded_leading_hostname_wildcards() {
+        assert_eq!(
+            parse_hostname_wildcard_pattern("*.Docker.IO"),
+            Some(HostnameWildcardPattern {
+                pattern: "*.docker.io".to_owned(),
+                suffix: "docker.io".to_owned(),
+                prefix_labels: 1,
+            })
+        );
+        assert_eq!(
+            parse_hostname_wildcard_pattern("*.*.docker.io"),
+            Some(HostnameWildcardPattern {
+                pattern: "*.*.docker.io".to_owned(),
+                suffix: "docker.io".to_owned(),
+                prefix_labels: 2,
+            })
+        );
+        assert_eq!(
+            parse_hostname_wildcard_pattern("*.Co.UK"),
+            Some(HostnameWildcardPattern {
+                pattern: "*.co.uk".to_owned(),
+                suffix: "co.uk".to_owned(),
+                prefix_labels: 1,
+            })
+        );
+        for invalid in [
+            "*",
+            "*.*",
+            "*.com",
+            "*.*.com",
+            "*.*.*.docker.io",
+            "foo*.docker.io",
+            "*.foo.*.io",
+            "docker.*.io",
+            "*..docker.io",
+            "*.-docker.io",
+            "*.docker-.io",
+            "*.docker.io.",
+            "*.döcker.io",
+            "*.127.0.0.1",
+        ] {
+            assert_eq!(parse_hostname_wildcard_pattern(invalid), None, "{invalid}");
+        }
+        assert!(
+            parse_hostname_wildcard_pattern(&format!("*.{}.example.com", "a".repeat(64))).is_none()
+        );
+        assert!(
+            parse_hostname_wildcard_pattern(&format!(
+                "*.{}.{}.{}.{}.com",
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(63),
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn normalizes_typed_destinations_and_deduplicates() {
         let parsed = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"hostname","destination":"Example.COM","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"ip","destination":"2001:0db8::1","protocol":"udp","port":53},{"destination_type":"cidr","destination":"192.0.2.0/24","protocol":"tcp","port":443}]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"x","allowlist":[{"destination_type":"hostname","destination":"Example.COM","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.Docker.IO","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.docker.io","protocol":"tcp","port":443},{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53},{"destination_type":"ip","destination":"2001:0db8::1","protocol":"udp","port":53},{"destination_type":"cidr","destination":"192.0.2.0/24","protocol":"tcp","port":443}]}"#,
         )
         .unwrap();
         let zero_prefix_networks = parse_and_normalize(
@@ -602,9 +702,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(parsed.declared_allowance_count, 4);
-        assert_eq!(parsed.duplicate_requested_allowances_collapsed, 1);
-        assert_eq!(parsed.requested_allowances.len(), 3);
+        assert_eq!(parsed.declared_allowance_count, 7);
+        assert_eq!(parsed.duplicate_requested_allowances_collapsed, 2);
+        assert_eq!(parsed.requested_allowances.len(), 5);
         assert!(
             parsed
                 .requested_allowances
@@ -616,6 +716,18 @@ mod tests {
                 .requested_allowances
                 .iter()
                 .any(|rule| rule.destination == "2001:db8::1")
+        );
+        assert!(
+            parsed
+                .requested_allowances
+                .iter()
+                .any(|rule| rule.destination == "*.docker.io")
+        );
+        assert!(
+            parsed
+                .requested_allowances
+                .iter()
+                .any(|rule| rule.destination == "*.*.docker.io")
         );
         assert_eq!(zero_prefix_networks.requested_allowances.len(), 2);
         assert_eq!(
@@ -632,7 +744,43 @@ mod tests {
                 "invalid_destination_type",
             ),
             (
-                one_allowance("hostname", "*.example.com", "tcp", 443),
+                one_allowance("hostname", "*", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.com", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.*.com", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.*.*.example.com", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "foo*.example.com", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.foo.*.com", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "example.*.com", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.example.com.", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.example.\u{00e9}om", "tcp", 443),
+                "invalid_destination",
+            ),
+            (
+                one_allowance("hostname", "*.127.0.0.1", "tcp", 443),
                 "invalid_destination",
             ),
             (

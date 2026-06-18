@@ -197,6 +197,12 @@ compile TypeScript at workflow runtime. See Node's
   up to eight single-label `*.githubapp.com` names;
   `disable_broad_github_domains: true` removes those broad channels but retains
   core Actions status/finalization channels.
+- Explicit user wildcard patterns authorize at most eight concrete names per
+  invocation across all patterns. Each wildcard matches exactly one DNS label,
+  but the admitted query labels, matching HTTPS destinations, shared resolved
+  addresses, and bounded external CNAME descendants remain exfiltration
+  channels. Fence validates DNS structure rather than registrable-domain
+  ownership and carries no public-suffix database.
 - The exact `productionresultssa19.blob.core.windows.net` account is always a
   reachable TCP `443` compatibility channel. Other matching results-storage
   accounts remain runner-authorized and bounded.
