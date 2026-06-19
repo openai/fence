@@ -83,13 +83,19 @@ Allow UDP or CIDR targets with the explicit line form:
 ```
 
 Keep Docker/container access available while still locking down the network and
-passwordless sudo:
+passwordless sudo, and lazily authorize one-label `docker.io` hostnames:
 
 ```yaml
 - uses: GrantBirki/fence@<commit-sha>
   with:
     container_policy: unsafe_preserve
+    allowlist: |
+      *.docker.io
 ```
+
+This pattern can authorize names such as `auth.docker.io` and
+`registry-1.docker.io`. It does not guarantee a complete image pull because
+layer, CDN, or storage traffic may use unrelated domains.
 
 Disable the broad GitHub web/API/release-asset allowlist entries while keeping
 the core GitHub Actions reporting path alive:
@@ -123,6 +129,8 @@ example.com:8443
 tcp://example.com:443
 udp://dns.example.com:53
 hostname example.com tcp 443
+*.example.com
+*.*.example.com
 ip 192.0.2.10 tcp 443
 cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
@@ -136,13 +144,12 @@ Fence resolves exact hostname entries before lockdown is ready and refreshes
 their approved addresses while the job runs. Each hostname keeps the protocol
 and port you configured as DNS answers change.
 
-The source-built agent also accepts exact-depth `*.example.com` and
-`*.*.example.com` hostname patterns. Each `*` represents exactly one DNS label,
-and all user patterns share an eight-name lifetime authorization budget. These
-names materialize lazily after matching DNS queries and do not delay readiness.
-The checked-in Action wrapper and bundled binary adopt this source-ahead
-contract only through a later atomic attested bundle refresh; the current
-bundle contract remains identified by `action/bundle-manifest.json`.
+The Action and agent accept exact-depth `*.example.com` and `*.*.example.com`
+hostname patterns. Each `*` represents exactly one DNS label, and all user
+patterns share an eight-name lifetime authorization budget. These names
+materialize lazily after matching DNS queries and do not delay readiness.
+Fence validates DNS structure rather than registrable-domain ownership, so use
+broad or shared suffixes only as explicit egress and DNS-data-channel choices.
 
 ## How It Works 🔧
 

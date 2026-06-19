@@ -127,6 +127,10 @@ function main(): void {
   }
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
   const dnsMaterializationRequestRejections = materializationRequestRejections(dnsEvidence);
+  const userWildcardRequestRejections = materializationEvidenceCounter(
+    dnsEvidence,
+    "user_wildcard_request_rejections",
+  );
   const resultsStorageAuthorizationCount = materializationEvidenceCounter(
     dnsEvidence,
     "results_storage_authorization_count",
@@ -159,6 +163,9 @@ function main(): void {
     `materialization_request_rejections=${dnsMaterializationRequestRejections}`,
     `materialization_update_max_milliseconds=${materializationEvidenceCounter(dnsEvidence, "materialization_update_max_milliseconds")}`,
     `upstream_request_failures=${materializationEvidenceCounter(dnsEvidence, "upstream_request_failures")}`,
+    `user_wildcard_authorizations=${Array.isArray(dnsEvidence?.bounded_user_wildcard_authorizations) ? dnsEvidence.bounded_user_wildcard_authorizations.length : "unknown"}`,
+    `user_wildcard_authorizations_truncated=${dnsEvidence?.bounded_user_wildcard_authorizations_truncated === true}`,
+    `user_wildcard_request_rejections=${userWildcardRequestRejections}`,
     `results_storage_authorizations=${resultsStorageAuthorizationCount}`,
     `results_storage_attribution_failures=${resultsStorageAttributionFailures}`,
     `results_storage_request_rejections=${resultsStorageRequestRejections}`,
@@ -178,6 +185,11 @@ function main(): void {
   if (dnsMaterializationRequestRejections > 0) {
     log.warning(
       `Fence withheld ${dnsMaterializationRequestRejections} DNS answer(s) because firewall update work could not be accepted`,
+    );
+  }
+  if (userWildcardRequestRejections > 0) {
+    log.warning(
+      `Fence denied ${userWildcardRequestRejections} DNS request(s) after the user wildcard hostname authorization budget was exhausted`,
     );
   }
   if (resultsStorageAttributionFailures > 0 || resultsStorageRequestRejections > 0) {

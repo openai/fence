@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  die "usage: script/test-action-acceptance <standard|standard-opt-out|unsafe-preserve|audit> [invocation-id]"
+  die "usage: script/test-action-acceptance <standard|standard-opt-out|unsafe-preserve|wildcard-docker|audit> [invocation-id]"
 fi
 
 scenario="$1"
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve|audit) ;;
+  standard|standard-opt-out|unsafe-preserve|wildcard-docker|audit) ;;
   *) die "unknown Action acceptance scenario: $scenario" ;;
 esac
 
@@ -34,6 +34,11 @@ report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 launcher_directory="/run/fence-launcher/$invocation"
 launcher_integrity="$launcher_directory/integrity.json"
+
+probe_https_once() {
+  local url="$1"
+  curl --head --silent --show-error --max-time 10 --retry 0 --output /dev/null "$url"
+}
 
 assert_action_runtime_immutable() {
   local action_root="$DIR/action"
@@ -109,6 +114,7 @@ def require(condition, message="evidence validation failed"):
 
 import json
 import pathlib
+import re
 import sys
 import time
 
@@ -141,6 +147,7 @@ expected = {
     "standard": ("block", "protected_host_block", "resident_protected", "ready", True, "disabled_verified", "disabled_verified"),
     "standard-opt-out": ("block", "protected_host_block", "resident_protected", "ready", True, "disabled_verified", "disabled_verified"),
     "unsafe-preserve": ("block", "protected_host_block_degraded", "resident_degraded", "ready_degraded", False, "disabled_verified", "preserved_unsafe"),
+    "wildcard-docker": ("block", "protected_host_block_degraded", "resident_degraded", "ready_degraded", False, "disabled_verified", "preserved_unsafe"),
     "audit": ("audit", "protected_host_audit_observation", "resident_observation_only", "ready_observation_only", False, "preserved_verified", "preserved_verified"),
 }[scenario]
 mode, status, resident, readiness, protection, sudo_status, container_status = expected
@@ -166,25 +173,51 @@ require(report["network_verification_status"] == "verified")
 require(report["critical_findings"] == [])
 require(ready["status"] == readiness)
 require(dns["routing_status"] == "active")
-require(report["runtime_evidence_schema_version"] == 4)
-require(report["policy_hash_schema_version"] == 7)
+require(report["runtime_evidence_schema_version"] == 5)
+require(report["policy_hash_schema_version"] == 8)
 require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
 require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
-require(ready["runtime_evidence_schema_version"] == 4)
-require(ready["policy_hash_schema_version"] == 7)
+require(ready["runtime_evidence_schema_version"] == 5)
+require(ready["policy_hash_schema_version"] == 8)
 require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
 require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
-require(dns["runtime_evidence_schema_version"] == 4)
+require(dns["runtime_evidence_schema_version"] == 5)
 require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
 require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
 require(dns["docker_dns_routing"] == "local_root_resident_mediator")
 expected_proxy_policy = (
-    "audit_forwards_without_name_authorization"
+    "audit_forwards_while_simulating_name_authorization"
     if mode == "audit"
-    else "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
+    else "block_forwards_exact_roots_bounded_user_wildcard_names_actions_suffix_names_githubapp_suffix_names_results_storage_and_bounded_cname_descendants"
 )
 require(dns["proxy_policy_status"] == expected_proxy_policy)
+wildcard_authorizations = dns["bounded_user_wildcard_authorizations"]
+require(isinstance(wildcard_authorizations, list))
+require(len(wildcard_authorizations) <= 8)
+require(wildcard_authorizations == sorted(set(wildcard_authorizations)))
+require(all(
+    isinstance(hostname, str)
+    and "*" not in hostname
+    and re.fullmatch(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", hostname)
+    for hostname in wildcard_authorizations
+))
+require(dns["bounded_user_wildcard_authorizations_truncated"] is False)
+require(dns["user_wildcard_request_rejections"] == 0)
+require(all("*" not in item["hostname"] for item in dns["observations"]))
+wildcard_policy = dns["hostname_policy"]["user_wildcards"]
+if scenario == "wildcard-docker":
+    require(wildcard_policy == [{
+        "pattern": "*.docker.io",
+        "suffix": "docker.io",
+        "prefix_labels": 1,
+        "transports": [{"protocol": "tcp", "port": 443}],
+    }])
+    require(wildcard_authorizations == [])
+    require("bounded_user_wildcard_dns_authorization_remains_an_egress_limitation" in report["limitations"])
+else:
+    require(wildcard_policy == [])
+    require(wildcard_authorizations == [])
 require(len(dns["runner_authorized_results_storage"]) <= 4)
 require(dns["results_storage_authorization_count"] == len(dns["runner_authorized_results_storage"]))
 require(dns["results_storage_attribution_failures"] == 0)
@@ -206,7 +239,7 @@ else:
 PY
 
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve)
+  standard|standard-opt-out|unsafe-preserve|wildcard-docker)
     if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
       die "Fence Action did not disable runner passwordless sudo"
     fi
@@ -221,10 +254,15 @@ case "$scenario" in
       die "Fence Action standard block did not disable Docker access"
     fi
     ;;
-  unsafe-preserve|audit)
+  unsafe-preserve|wildcard-docker|audit)
     docker ps --quiet >/dev/null
     ;;
 esac
+
+if [[ "$scenario" == "wildcard-docker" ]]; then
+  probe_https_once https://auth.docker.io
+  probe_https_once https://registry-1.docker.io
+fi
 
 if [[ "$scenario" == "audit" ]]; then
   python3 -E <<'PY'
@@ -268,8 +306,8 @@ scenario = sys.argv[1]
 report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-require(report["runtime_evidence_schema_version"] == 4)
-require(report["policy_hash_schema_version"] == 7)
+require(report["runtime_evidence_schema_version"] == 5)
+require(report["policy_hash_schema_version"] == 8)
 require(report["network_verification_status"] == "verified")
 require(report["critical_findings"] == [])
 resident = report["resident_health"]
@@ -280,12 +318,43 @@ require(resident["workers"] == expected_workers)
 verified_at = resident["last_successful_verification_unix_milliseconds"]
 now = int(time.time() * 1000)
 require(now - 20_000 <= verified_at <= now + 5_000)
-require(dns["runtime_evidence_schema_version"] == 4)
+require(dns["runtime_evidence_schema_version"] == 5)
 require(dns["resident_health"]["resident_pid"] == resident["resident_pid"])
 require(dns["resident_health"]["workers"] == expected_workers)
 require(dns["resident_health"]["verification_sequence"] >= 2)
 require("fence-action-audit-probe" not in json.dumps(report, sort_keys=True))
 require("fence-action-audit-probe" not in json.dumps(dns, sort_keys=True))
+require(dns["materialization_request_rejections"] == 0)
+require(dns["user_wildcard_request_rejections"] == 0)
+require(dns["bounded_user_wildcard_authorizations_truncated"] is False)
+wildcard_authorizations = dns["bounded_user_wildcard_authorizations"]
+require(wildcard_authorizations == sorted(set(wildcard_authorizations)))
+require(len(wildcard_authorizations) <= 8)
+require(all("*" not in hostname for hostname in wildcard_authorizations))
+if scenario == "wildcard-docker":
+    require({"auth.docker.io", "registry-1.docker.io"}.issubset(wildcard_authorizations))
+    wildcard_materializations = [
+        item for item in report["materialized_allowances"]
+        if item.get("source_hostname") in {"auth.docker.io", "registry-1.docker.io"}
+    ]
+    require(wildcard_materializations)
+    require(all(
+        item["protocol"] == "tcp"
+        and item["port"] == 443
+        and "user" in item["origins"]
+        for item in wildcard_materializations
+    ))
+    wildcard_observations = [
+        item for item in dns["observations"]
+        if item.get("hostname") in {"auth.docker.io", "registry-1.docker.io"}
+    ]
+    require(wildcard_observations)
+    require(all(
+        item["policy_classification"] == "user_wildcard_allowlist"
+        for item in wildcard_observations
+    ))
+else:
+    require(wildcard_authorizations == [])
 if scenario == "audit":
     require(report["counters"]["total_violations"] >= 1)
     require(report["counters"]["sampled_violations"] >= 1)

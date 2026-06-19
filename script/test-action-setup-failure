@@ -52,4 +52,33 @@ if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1
   die "Action setup-failure evidence unexpectedly created inet fence_v0"
 fi
 
-echo -e "${GREEN}Action setup-failure evidence verified:${OFF} rejected before mutation"
+wildcard_invocation="fence-12345-2"
+if [[ -e "/run/fence/$wildcard_invocation" ]]; then
+  die "Action setup-failure evidence requires no preexisting wildcard runtime directory"
+fi
+: >"$state"
+: >"$summary"
+: >"$stdout"
+: >"$stderr"
+if INPUT_CONFIG='' \
+  INPUT_ALLOWLIST='*.*.*.docker.io' \
+  GITHUB_RUN_ID='12345' \
+  GITHUB_RUN_ATTEMPT='2' \
+  GITHUB_STATE="$state" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/main.cts >"$stdout" 2>"$stderr"; then
+  die "Action setup unexpectedly accepted an unbounded wildcard hostname"
+fi
+
+grep -q "allowlist line 1: allowlist hostname entries must be valid exact names or bounded wildcard patterns" "$stderr"
+if [[ -s "$stdout" || -s "$state" || -s "$summary" ]]; then
+  die "Action wildcard setup-failure evidence unexpectedly emitted success state"
+fi
+if [[ -e "/run/fence/$wildcard_invocation" ]]; then
+  die "Action wildcard setup-failure evidence unexpectedly created a runtime directory"
+fi
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action wildcard setup-failure evidence unexpectedly created inet fence_v0"
+fi
+
+echo -e "${GREEN}Action setup-failure evidence verified:${OFF} invalid slug and wildcard rejected before mutation"

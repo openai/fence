@@ -57,7 +57,7 @@ function residentHealth(overrides: Record<string, unknown> = {}): Record<string,
 }
 
 const report = {
-  runtime_evidence_schema_version: 4,
+  runtime_evidence_schema_version: 5,
   status: "protected_host_block",
   mode: "block",
   readiness_status: "ready",
@@ -68,7 +68,7 @@ const report = {
   protection_available: true,
   sudo_status: "disabled_verified",
   container_status: "disabled_verified",
-  policy_hash_schema_version: 7,
+  policy_hash_schema_version: 8,
   policy_hash: "a".repeat(64),
   base_ruleset_hash: "b".repeat(64),
   ruleset_hash: "c".repeat(64),
@@ -172,6 +172,12 @@ test("validates explicit and zero-input inline configurations", () => {
         "tcp://upload.example.com:9443",
         "udp://dns.example.com:53",
         "hostname mirror.example.com tcp 443",
+        "*.Docker.IO",
+        "tcp://*.docker.io:443",
+        "*.Docker.IO:8443",
+        "tcp://*.*.Docker.IO:443",
+        "udp://*.*.Example.COM:53",
+        "hostname *.Mirror.Example.COM tcp 443",
         "ip 192.0.2.10 tcp 443",
         "cidr 192.0.2.0/24 udp 123",
         "cidr 2001:db8::/64 tcp 443",
@@ -187,6 +193,11 @@ test("validates explicit and zero-input inline configurations", () => {
         { destination_type: "hostname", destination: "upload.example.com", protocol: "tcp", port: 9443 },
         { destination_type: "hostname", destination: "dns.example.com", protocol: "udp", port: 53 },
         { destination_type: "hostname", destination: "mirror.example.com", protocol: "tcp", port: 443 },
+        { destination_type: "hostname", destination: "*.docker.io", protocol: "tcp", port: 443 },
+        { destination_type: "hostname", destination: "*.docker.io", protocol: "tcp", port: 8443 },
+        { destination_type: "hostname", destination: "*.*.docker.io", protocol: "tcp", port: 443 },
+        { destination_type: "hostname", destination: "*.*.example.com", protocol: "udp", port: 53 },
+        { destination_type: "hostname", destination: "*.mirror.example.com", protocol: "tcp", port: 443 },
         { destination_type: "ip", destination: "192.0.2.10", protocol: "tcp", port: 443 },
         { destination_type: "cidr", destination: "192.0.2.0/24", protocol: "udp", port: 123 },
         { destination_type: "cidr", destination: "2001:db8::/64", protocol: "tcp", port: 443 },
@@ -202,6 +213,8 @@ test("validates explicit and zero-input inline configurations", () => {
     }),
     defaultConfig,
   );
+  const rawWildcardConfig = '{"schema_version":1,"mode":"block","invocation_id":"raw-wildcard","allowlist":[{"destination_type":"hostname","destination":"*.*.docker.io","protocol":"udp","port":53}]}';
+  assert.equal(validateInlineConfig(rawWildcardConfig).raw, rawWildcardConfig);
   assert.throws(
     () => validateInlineConfig(
       '{"schema_version":1,"mode":"block","invocation_id":"action-test","allowlist":[]}',
@@ -248,6 +261,32 @@ test("validates explicit and zero-input inline configurations", () => {
   );
   for (const allowlist of [
     "https://example.com:443",
+    "*",
+    "*.com",
+    "*.*.com",
+    "*.*.*.docker.io",
+    "foo*.docker.io",
+    "docker.*.io",
+    "*.foo.*.io",
+    "*..docker.io",
+    "*.-docker.io",
+    "*.docker-.io",
+    "*.docker.io.",
+    "*.döcker.io",
+    "*.127.0.0.1",
+    "2130706433",
+    "127.1",
+    "0X7f000001",
+    "0177.0.0.1",
+    "tcp://*.docker.io:443/",
+    "tcp://*.docker.io:443/path",
+    "tcp://user@*.docker.io:443",
+    "tcp://*.docker.io:443?query=1",
+    "tcp://*.docker.io:443#fragment",
+    "tcp://%65xample.com:443",
+    "tcp://döcker.io:443",
+    `*.${"a".repeat(64)}.example.com`,
+    `*.${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(63)}.com`,
     "example.com:notaport",
     "example.com:0",
     "192.0.2.10",
@@ -709,7 +748,7 @@ test("requires active registered Action path guards to remain exact writable mou
 test("validates stable runtime evidence", () => {
   validateReport(report);
   const dnsEvidence = {
-    runtime_evidence_schema_version: 4,
+    runtime_evidence_schema_version: 5,
     status: report.status,
     mode: report.mode,
     platform_profile_id: report.platform_profile_id,
@@ -719,7 +758,17 @@ test("validates stable runtime evidence", () => {
     host_dns_routing: "direct_client_to_root_resident_mediator",
     docker_dns_routing: "local_root_resident_mediator",
     answer_attribution_status: "bounded_reportable_hostname_answers_only",
-    proxy_policy_status: "block_forwards_exact_roots_bounded_actions_and_githubapp_suffix_names_results_storage_and_bounded_cname_descendants",
+    proxy_policy_status: "block_forwards_exact_roots_bounded_user_wildcard_names_actions_suffix_names_githubapp_suffix_names_results_storage_and_bounded_cname_descendants",
+    hostname_policy: {
+      exact: [],
+      user_wildcards: [],
+      allow_dynamic_githubapp_suffix: true,
+    },
+    observations: [],
+    observations_truncated: false,
+    bounded_user_wildcard_authorizations: [],
+    bounded_user_wildcard_authorizations_truncated: false,
+    user_wildcard_request_rejections: 0,
     runner_authorized_results_storage: [],
     runner_authorized_results_storage_truncated: false,
     results_storage_authorization_count: 0,
@@ -744,10 +793,10 @@ test("validates stable runtime evidence", () => {
     status: auditReport.status,
     mode: auditReport.mode,
     protection_available: false,
-    proxy_policy_status: "audit_forwards_without_name_authorization",
+    proxy_policy_status: "audit_forwards_while_simulating_name_authorization",
   }, auditReport);
   validateReady({
-    runtime_evidence_schema_version: 4,
+    runtime_evidence_schema_version: 5,
     status: "ready",
     platform_profile_id: "github_hosted_workflow_bootstrap_v4",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v4",
@@ -759,7 +808,7 @@ test("validates stable runtime evidence", () => {
     resident_health: report.resident_health,
   }, report);
   validateReady({
-    runtime_evidence_schema_version: 4,
+    runtime_evidence_schema_version: 5,
     status: "ready",
     platform_profile_id: "github_hosted_workflow_bootstrap_v4",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v4",
@@ -792,6 +841,103 @@ test("validates stable runtime evidence", () => {
     }],
     results_storage_authorization_count: 1,
   }, report);
+  const wildcardPolicy = {
+    exact: [],
+    user_wildcards: [
+      {
+        pattern: "*.*.docker.io",
+        suffix: "docker.io",
+        prefix_labels: 2,
+        transports: [{ protocol: "udp", port: 53 }],
+      },
+      {
+        pattern: "*.docker.io",
+        suffix: "docker.io",
+        prefix_labels: 1,
+        transports: [
+          { protocol: "tcp", port: 443 },
+          { protocol: "udp", port: 53 },
+        ],
+      },
+    ],
+    allow_dynamic_githubapp_suffix: true,
+  };
+  validateDnsEvidence({
+    ...dnsEvidence,
+    hostname_policy: wildcardPolicy,
+    bounded_user_wildcard_authorizations: ["auth.docker.io", "registry-1.docker.io"],
+    observations: [{
+      hostname: "auth.docker.io",
+      policy_classification: "user_wildcard_allowlist",
+    }],
+  }, report);
+  validateDnsEvidence({
+    ...dnsEvidence,
+    hostname_policy: wildcardPolicy,
+    bounded_user_wildcard_authorizations: Array.from(
+      { length: 8 },
+      (_, index) => `host-${index}.docker.io`,
+    ),
+    bounded_user_wildcard_authorizations_truncated: true,
+    user_wildcard_request_rejections: 1,
+  }, report);
+  for (const invalidWildcardEvidence of [
+    {
+      bounded_user_wildcard_authorizations: ["registry-1.docker.io", "auth.docker.io"],
+    },
+    {
+      bounded_user_wildcard_authorizations: ["auth.docker.io", "auth.docker.io"],
+    },
+    {
+      bounded_user_wildcard_authorizations: ["*.docker.io"],
+    },
+    {
+      bounded_user_wildcard_authorizations: Array.from(
+        { length: 9 },
+        (_, index) => `host-${index}.docker.io`,
+      ),
+    },
+    {
+      bounded_user_wildcard_authorizations_truncated: true,
+      user_wildcard_request_rejections: 0,
+    },
+    {
+      bounded_user_wildcard_authorizations_truncated: false,
+      user_wildcard_request_rejections: 1,
+    },
+    {
+      observations: [{
+        hostname: "*.docker.io",
+        policy_classification: "user_wildcard_allowlist",
+      }],
+    },
+    {
+      observations: [{
+        hostname: "auth.docker.io",
+        policy_classification: "unreviewed",
+      }],
+    },
+  ]) {
+    assert.throws(
+      () => validateDnsEvidence({ ...dnsEvidence, ...invalidWildcardEvidence }, report),
+      /DNS evidence/,
+    );
+  }
+  assert.throws(
+    () => validateDnsEvidence({
+      ...dnsEvidence,
+      hostname_policy: {
+        ...wildcardPolicy,
+        user_wildcards: [{
+          pattern: "*.*.*.docker.io",
+          suffix: "docker.io",
+          prefix_labels: 3,
+          transports: [{ protocol: "tcp", port: 443 }],
+        }],
+      },
+    }, report),
+    /wildcard policy/,
+  );
   assert.throws(
     () => validateDnsEvidence({
       ...dnsEvidence,
@@ -943,6 +1089,13 @@ test("renders a concise healthy block results table without raw evidence fields"
         resolved_addresses: ["2001:db8::17"],
       },
       {
+        hostname: "auth.docker.io",
+        query_type: "a",
+        policy_classification: "user_wildcard_allowlist",
+        occurrences: 1,
+        resolved_addresses: ["192.0.2.18"],
+      },
+      {
         hostname: "codeload.github.com",
         query_type: "a",
         policy_classification: "outside_policy",
@@ -973,6 +1126,7 @@ test("renders a concise healthy block results table without raw evidence fields"
   assert.match(summary, /\| `api.github.com` \| ✅ Allowed \| 1 AAAA query \|/);
   assert.match(summary, /\| `productionresultssa17.blob.core.windows.net` \| ✅ Allowed \| 1 A query \|/);
   assert.match(summary, /\| `result-storage-cname.example.net` \| ✅ Allowed \| 1 AAAA query \|/);
+  assert.match(summary, /\| `auth.docker.io` \| ✅ Allowed \| 1 A query \|/);
   assert.match(summary, /\| `codeload.github.com` \| ⛔ Blocked \| 1 A query \|/);
   assert.equal(summary.match(/Fence Summary/g)?.length, 1);
   assert.doesNotMatch(summary, /Fence local evidence/);
@@ -1320,6 +1474,19 @@ test("renders bounded results-storage provenance warnings without a healthy indi
   assert.match(summary, /GitHub results-storage requests could not be attributed \| `2`/);
   assert.match(summary, /GitHub results-storage requests were rejected \| `3`/);
   assert.match(summary, /Additional results-storage accounts were denied/);
+});
+
+test("renders wildcard authorization budget exhaustion as a bounded warning", () => {
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    bounded_user_wildcard_authorizations_truncated: true,
+    user_wildcard_request_rejections: 3,
+  };
+  const summary = summaryLines(report, dnsEvidence).join("\n");
+  assert.match(summary, /^### 🟡 Fence Summary/);
+  assert.doesNotMatch(summary, /🟢/);
+  assert.match(summary, /User wildcard hostname authorization budget exhausted \| `3`/);
 });
 
 test("renders bounded allowlist YAML snippets", () => {

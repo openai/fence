@@ -10,14 +10,13 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree defines the schema-`8` policy and schema-`5` runtime-evidence
-contract. The released Action adopts that contract only when the attested
-agent and wrapper validators update atomically. Until that bundle refresh, the
-bundle remains governed by
-`action/bundle-manifest.json` and the wrapper schema constants; the
-wrapper rejects older evidence, stale verification state, an incomplete worker
-set, or a resident PID that does not match the active systemd service. This
-atomic contract is the critical-adoption gate for this model.
+The source tree and released Action define the schema-`8` policy and schema-`5`
+runtime-evidence contract. The bundle remains governed by
+`action/bundle-manifest.json` and the wrapper schema constants; the wrapper
+rejects older evidence, stale verification state, malformed wildcard evidence,
+an incomplete worker set, or a resident PID that does not match the active
+systemd service. Future contract changes must update the attested agent and
+wrapper validators atomically.
 
 ## Executive summary
 
@@ -158,15 +157,13 @@ GitHub profile requires a new threat-model review.
   status, actor class, PID, executable basename, and four parent basenames;
   local endpoints are not serialized (`src/attribution.rs`).
 - **Resident agent -> post hook:** root-owned `ready.json`, `report.json`, and
-  `dns-report.json` are runner-readable but not runner-writable. Source
-  schema-`5` preserves the live systemd PID, worker health, and evidence
-  freshness fields that its eventual post-hook consumer must validate before
-  trusting the report. Writable self-bind guards pin every runner-renameable
-  ancestor of the registered Action path, while protected mount, device/inode,
-  and runtime-digest checks apply at the wrapper boundary. The checked-in
-  wrapper continues validating its bundle-declared contract until it and the
-  attested binary adopt schema `5` together (`src/runtime.rs`,
-  `action/post.cts`).
+  `dns-report.json` are runner-readable but not runner-writable. Schema-`5`
+  preserves the live systemd PID, worker health, evidence freshness, bounded
+  concrete wildcard authorizations, and rejection counters that the post hook
+  validates before trusting the report. Writable self-bind guards pin every
+  runner-renameable ancestor of the registered Action path, while protected
+  mount, device/inode, and runtime-digest checks apply at the wrapper boundary
+  (`src/runtime.rs`, `action/post.cts`).
 - **Release workflow -> committed Action bundle:** immutable release assets are
   checksum- and attestation-verified before the maintainer updater installs the
   binary and provenance manifest (`.github/workflows/release.yml`,
@@ -291,7 +288,7 @@ flowchart TD
 | TM-001 | Malicious workflow process | Residual root-equivalent path or unsupported host drift | Regain privilege and change firewall or agent state | Arbitrary egress and forged evidence | Credentials, policy, reports | Fingerprint gate and verified sudo/container lockdown (`src/hosted_runner.rs`, `src/lockdown.rs`) | New runner layouts can invalidate assumptions | Keep fail-closed fingerprint updates reviewable; add support only with hosted proof | Critical lockdown finding and support mismatch | Medium | High | High |
 | TM-002 | Malicious workflow process | Access to an approved GitHub, exact user, or wildcard-derived destination | Exfiltrate sensitive data through allowed HTTPS or DNS behavior | Credential/source disclosure | Credentials, source | Exact profile roots, opt-out for broad platform roots, exact-depth wildcard grammar, shared eight-name lifetime cap, typed transports, and disclosed limits (`src/hostname_policy.rs`, `README.md`) | Core GitHub reporting, wildcard query labels, CNAME delegation, and shared IPs remain channels | Keep wildcard use explicit, use least-privilege job tokens, and prefer exact names where practical | DNS/finding summary, wildcard admission/rejection evidence, and audit-mode tuning | High | High | High |
 | TM-003 | Malicious workflow process or DNS response | Authorized exact name, wildcard match, CNAME, or address rotation | Expand usable addresses or race first connection | Policy broadening or unexpected denial | Effective policy, job availability | Canonical A/AAAA queries, exact label-depth matching, shared name/depth/TTL caps, deterministic transport union, and completion-driven verified materialization (`src/dns_mediator.rs`) | IP authorization cannot prove TLS service identity; no public-suffix ownership validation is performed | Preserve exact-depth matching, lifetime admission bounds, and complete apply-and-verify gating | DNS evidence counters, wildcard admissions, materialized allowances, and critical backend findings | Medium | High | High |
-| TM-004 | Malicious workflow process | Writable launcher/post/binary, renameable registered-path ancestor, or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, writable self-bind ancestor guards, read-only runtime bind mount, device/inode and digest records, no-follow files, live PID/freshness checks in the bundle-declared wrapper contract, and equivalent source schema-`5` evidence fields (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | The checked-in wrapper cannot consume source schema `5` until atomic bundle adoption; kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact path-guard/runtime manifests, worker set, freshness bounds, atomic schema adoption, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
+| TM-004 | Malicious workflow process | Writable launcher/post/binary, renameable registered-path ancestor, or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, writable self-bind ancestor guards, read-only runtime bind mount, device/inode and digest records, no-follow files, live PID/freshness checks, schema-`5` wildcard-evidence validation, and hosted tamper coverage (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | Kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact path-guard/runtime manifests, worker set, freshness bounds, atomic schema adoption, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
 | TM-005 | Local process or host drift | Ability to alter owned kernel state after readiness | Remove or replace firewall rules | Temporary or persistent unintended egress | Network policy | Exact structured state verification every five seconds and terminal critical health (`src/nft_backend.rs`, `src/dns_mediator.rs`) | Detection is periodic rather than instantaneous | Keep interval fixed and evaluate event-driven integrity only with bounded complexity | Critical drift finding; Action post failure | Medium | High | High |
 | TM-006 | Workflow author or malicious config producer | Control of Action inputs before launcher validation | Inject paths, nft syntax, oversized policy, or ambiguous JSON | Privileged mutation or resource exhaustion | Host state, availability | Strict JSON, unknown-field rejection, fixed paths, typed entries, fixed limits (`action/lib.cts`, `src/config.rs`) | Raw JSON remains an advanced surface | Preserve schema-`1` strictness; add fields only through reviewed typed models | Structured pre-mutation setup failure | Low | High | Medium |
 | TM-007 | Supply-chain attacker | Ability to alter a release asset, workflow dependency, or bundle refresh | Distribute an agent not built by the reviewed workflow | Fleet-wide compromise | Release agent, downstream workflows | SHA-pinned actions, protected release environment, checksums, non-draft immutable releases, resolved release tags, source-ref/source-commit/signer-digest-bound attestations, offline bundle validation (`.github/workflows/release.yml`, `script/validate-action-bundle`) | Attestation trusts GitHub identity and the reviewed workflow commit | Add SBOM and auditable/reproducible binary work as post-v0 hardening | Release verification job and bundle validation | Low | High | Medium |
