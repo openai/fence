@@ -680,10 +680,8 @@ def _scan_process_owners(proc_root, relevant_listener_inodes):
             before["canonical_executable"] != UNREVIEWED_EXECUTABLE_PATH
         )
         identity_complete = cgroup_reviewed and executable_reviewed
-        if not cgroup_reviewed:
+        if is_root_container and not cgroup_matches:
             unavailable.add("cgroup_identity")
-        if not executable_reviewed:
-            unavailable.add("process_identity")
         identity = {
             "uid": before["uid"],
             "executable_basename": before["executable_basename"],
@@ -2530,10 +2528,63 @@ class HostObservationTests(unittest.TestCase):
                 side_effect=[before, before],
             ):
                 result = _scan_process_owners(proc_root, {42})
-            self.assertIn("cgroup_identity", result[5])
+            self.assertNotIn("cgroup_identity", result[5])
             owner = next(iter(result[0][42].values()))
             self.assertFalse(owner["_identity_complete"])
             self.assertEqual(owner["unified_cgroup"], UNREVIEWED_CGROUP)
+
+            nonroot = self._process_observation_fixture(
+                uid=102,
+                basename="private-service",
+                executable=UNREVIEWED_EXECUTABLE_PATH,
+            )
+            with mock.patch.object(
+                os.sys.modules[__name__],
+                "_process_observation",
+                side_effect=[nonroot, nonroot],
+            ):
+                result = _scan_process_owners(proc_root, {42})
+            self.assertNotIn("cgroup_identity", result[5])
+            self.assertNotIn("process_identity", result[5])
+            public = _public_snapshot(
+                self._collect_tcp(result, socket_uid=102)
+            )
+            self.assertEqual(public["scan_status"], "within_bounds")
+            self.assertEqual(public["tcp_listeners"], [])
+
+    def test_root_container_cgroup_drift_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = pathlib.Path(directory)
+            process_root = proc_root / "123"
+            (process_root / "fd").mkdir(parents=True)
+            dockerd = self._process_observation_fixture(
+                basename="dockerd",
+                executable="/usr/bin/dockerd",
+            )
+            with mock.patch.object(
+                os.sys.modules[__name__],
+                "_process_observation",
+                side_effect=[dockerd, dockerd],
+            ), mock.patch.object(
+                os.sys.modules[__name__],
+                "_classified_cgroup",
+                side_effect=[
+                    ("/system.slice/docker.service", "a" * 64, True),
+                    ("/init.scope", "b" * 64, True),
+                ],
+            ):
+                result = _scan_process_owners(proc_root, set())
+
+        self.assertIn("cgroup_identity", result[5])
+        self.assertFalse(result[3][0]["_identity_complete"])
+        public = _public_snapshot(
+            self._private_snapshot(
+                _unavailable_inputs=sorted(result[5]),
+                root_container_processes=result[3],
+            )
+        )
+        self.assertEqual(public["scan_status"], "unavailable")
+        self.assertFalse(public["ownership_complete"])
 
     def test_process_identity_uses_the_proc_executable_object_without_resolving_path(self):
         with tempfile.TemporaryDirectory() as directory:
