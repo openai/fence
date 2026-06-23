@@ -50,7 +50,7 @@ host_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
 host = json.loads(host_path.read_text(encoding="utf-8"))
 agent = host.get("systemd", {}).get("azure_platform_agent", {})
-if host.get("schema_version") != 3 or agent.get("control_group") != CONTROL_GROUP:
+if host.get("schema_version") != 4 or agent.get("control_group") != CONTROL_GROUP:
     fail("WireServer agent observation did not receive the reviewed host evidence")
 if output_path.exists():
     fail("WireServer agent observation requires an absent output path")

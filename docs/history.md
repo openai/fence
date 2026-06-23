@@ -43,6 +43,9 @@ See [`v0.md`](v0.md) for normative behavior and
   lockdown. `unsafe_preserve` retained container access with degraded
   assurance, while audit preserved sudo and containers and made no containment
   claim.
+- The evidence-only hosted observer advanced to schema `4` and added stable,
+  bounded, privacy-reduced Unix/TCP listener and root container-process
+  inventory for review before any closed-host enforcement change.
 
 ## Hosted workflow compatibility
 
