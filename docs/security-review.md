@@ -221,8 +221,9 @@ requests to the single resident firewall owner and releases an approved address
 answer only after that owner applies and structurally verifies the matching
 rules. Address-bearing responses are all-or-nothing: every returned address
 must be materializable before any answer is released. An approved zero-TTL
-address receives a one-second materialization lifetime before the existing
-refresh overlap. Partial coverage, queue rejection, service disconnection, or
+address receives a one-second materialization lifetime, and a valid zero-TTL
+CNAME edge receives a one-second effective lineage lifetime, before the
+existing refresh overlap. Partial coverage, queue rejection, service disconnection, or
 an explicit failed result returns a minimal retryable `SERVFAIL` response. The
 response contains the original DNS question but no answer, authority,
 additional, or raw upstream data. Rejections increment bounded warning
@@ -239,7 +240,7 @@ the chain, every address must belong to its terminal name, and the chain keeps
 the queried root's origins and transports even if an intermediate name is also
 directly allowed. Address records must match the echoed question family, and
 duplicate terminal endpoints use the minimum TTL. Conflicts, cycles, unrelated
-records, invalid TTL or depth, and capacity failures reject the whole
+records, self-referential aliases, invalid depth, and capacity failures reject the whole
 block-mode response without committing partial state. In block mode, valid
 derived authorization is committed only
 after the address rules are applied and verified. Audit may forward invalid

@@ -32,7 +32,8 @@ domains are still places later workflow code can send data.
 
 Before readiness, required exact hostnames retry only transient or addressless
 DNS rounds, at most three attempts under one shared ten-second startup budget.
-Malformed or integrity-invalid DNS responses are not retried.
+Malformed or integrity-invalid DNS responses are not retried. A valid zero-TTL
+CNAME edge receives the same one-second minimum lifetime as a zero-TTL address.
 
 GitHub uploads job logs and summaries to a per-run Azure storage account.
 Fence authorizes at most four exact results-storage hostnames, and only when

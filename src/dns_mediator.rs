@@ -4971,7 +4971,7 @@ fn validate_dns_response_lineage(
     let mut edges = BTreeMap::<String, DnsCnameAnswer>::new();
     let retains_lineage = !records.addresses.is_empty();
     for alias in &records.aliases {
-        if alias.ttl_seconds == 0 || alias.owner == alias.target {
+        if alias.owner == alias.target {
             return Err(DnsResponseValidationError::Invalid);
         }
         match edges.entry(alias.owner.clone()) {
@@ -4999,8 +4999,10 @@ fn validate_dns_response_lineage(
         if !forbidden.insert(alias.target.clone()) {
             return Err(DnsResponseValidationError::Invalid);
         }
-        let edge_expiry =
-            now + Duration::from_secs(u64::from(alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS)));
+        let edge_expiry = now
+            + Duration::from_secs(u64::from(
+                alias.ttl_seconds.clamp(1, MAX_DYNAMIC_TTL_SECONDS),
+            ));
         lineage_expiry =
             Some(lineage_expiry.map_or(edge_expiry, |existing| existing.min(edge_expiry)));
         let expiry = lineage_expiry.ok_or(DnsResponseValidationError::Invalid)?;
@@ -8319,7 +8321,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_address_ttl_caps_derived_authorization_lifetime() {
+    fn zero_ttl_address_or_cname_caps_derived_authorization_lifetime() {
         let now = Instant::now();
         let records = DnsAnswerRecords {
             aliases: vec![DnsCnameAnswer {
@@ -8342,6 +8344,71 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 1);
+        assert_eq!(
+            response.authorizations[0].1.expires_at,
+            now + Duration::from_secs(1)
+        );
+        assert_eq!(response.materializations[0].ttl_seconds, 1);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(1)));
+
+        let zero_middle_edge = DnsAnswerRecords {
+            aliases: vec![
+                DnsCnameAnswer {
+                    owner: "github.com".to_owned(),
+                    target: "first.example".to_owned(),
+                    ttl_seconds: 60,
+                },
+                DnsCnameAnswer {
+                    owner: "first.example".to_owned(),
+                    target: "terminal.example".to_owned(),
+                    ttl_seconds: 0,
+                },
+            ],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "terminal.example".to_owned(),
+                address: "192.0.2.37".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &zero_middle_edge,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+        assert_eq!(response.authorizations.len(), 2);
+        assert!(
+            response
+                .authorizations
+                .iter()
+                .all(|(_, authorization)| authorization.observed_ttl_seconds == 1)
+        );
+        assert_eq!(response.materializations[0].ttl_seconds, 1);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(1)));
+
+        let zero_cname = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "github.com".to_owned(),
+                target: "short-lived.example".to_owned(),
+                ttl_seconds: 0,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "short-lived.example".to_owned(),
+                address: "192.0.2.36".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &zero_cname,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
         assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 1);
         assert_eq!(
             response.authorizations[0].1.expires_at,
@@ -8817,14 +8884,6 @@ mod tests {
                     ttl_seconds: 60,
                 }],
                 addresses: vec![address("github.com")],
-            },
-            DnsAnswerRecords {
-                aliases: vec![DnsCnameAnswer {
-                    owner: "github.com".to_owned(),
-                    target: "edge.example".to_owned(),
-                    ttl_seconds: 0,
-                }],
-                addresses: vec![address("edge.example")],
             },
             DnsAnswerRecords {
                 aliases: vec![DnsCnameAnswer {
@@ -9506,6 +9565,22 @@ mod tests {
             &policy,
         )
         .unwrap();
+        let zero_ttl_cname_materializations = pending_materializations_from_bootstrap_response(
+            "github.com",
+            1,
+            &response_with_cname_and_address(
+                "github.com",
+                "zero-ttl-edge.example.net",
+                0,
+                120,
+                &[192, 0, 2, 21],
+            ),
+            now,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(zero_ttl_cname_materializations.len(), 1);
+        assert_eq!(zero_ttl_cname_materializations[0].ttl_seconds, 1);
         assert_eq!(
             pending_materializations_from_bootstrap_response(
                 "github.com",
@@ -9827,6 +9902,31 @@ mod tests {
             materializations[0].address,
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))
         );
+
+        let mut zero_ttl_cname_calls = 0;
+        let materializations = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |_, query_type, _| {
+                zero_ttl_cname_calls += 1;
+                if query_type == 1 {
+                    Ok(response_with_cname_and_address(
+                        "github.com",
+                        "zero-ttl-edge.example.net",
+                        0,
+                        60,
+                        &[192, 0, 2, 13],
+                    ))
+                } else {
+                    Err(PrehydrationQueryError::Transient)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(zero_ttl_cname_calls, 2);
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(materializations[0].ttl_seconds, 1);
 
         let mut transient_calls = 0;
         let error = prehydrate_exact_hostname_for_startup_with_query(
