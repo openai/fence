@@ -32,6 +32,7 @@ const MAX_POLICY_SOURCE_BYTES: u64 = 256 * 1024;
 const SUDOERS_PATH: &str = "/etc/sudoers";
 const SUDOERS_DROP_IN_ROOT: &str = "/etc/sudoers.d";
 const RUNNER_DROP_IN_PATH: &str = "/etc/sudoers.d/runner";
+const RESTORED_SUDO_VISUDO_ARGUMENTS: [&str; 3] = ["--check", "--file", SUDOERS_PATH];
 const RUNNER_SUDO_VALIDATION_ARGUMENTS: [&str; 3] =
     ["--non-interactive", "--reset-timestamp", "--validate"];
 const CONTAINER_UNITS: [&str; 3] = ["docker.socket", "docker.service", "containerd.service"];
@@ -1218,7 +1219,12 @@ fn verify_restored_runner_sudo_source(
         )
     })?;
     require_success(
-        fixed_command(executables, TrustedExecutable::Visudo, &["--check"]).map_err(|_| {
+        fixed_command(
+            executables,
+            TrustedExecutable::Visudo,
+            &RESTORED_SUDO_VISUDO_ARGUMENTS,
+        )
+        .map_err(|_| {
             LockdownError::new(
                 "sudo_restore_verification_rollback_failed",
                 "restored sudo policy syntax could not be verified",
@@ -1679,6 +1685,10 @@ mod tests {
         assert_eq!(
             RUNNER_SUDO_VALIDATION_ARGUMENTS,
             ["--non-interactive", "--reset-timestamp", "--validate"]
+        );
+        assert_eq!(
+            RESTORED_SUDO_VISUDO_ARGUMENTS,
+            ["--check", "--file", "/etc/sudoers"]
         );
     }
 
