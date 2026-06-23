@@ -116,6 +116,72 @@ new digest only as an additional exact value and retains the same source name,
 regular-file, ownership, mode, non-writability, marker, unit, socket, resolver,
 principal, and group checks.
 
+### Effective sudo and trusted-path access
+
+The production fingerprint previously relied on ownership and ordinary mode
+metadata without proving the runner's effective access after ACL processing.
+Fingerprint schema `2` now records every trusted executable, its reviewed
+ancestor directories, and every accepted sudo source. Before mutation, Fence
+uses descriptor-pinned `sudo` and descriptor-pinned `/usr/bin/test` to require
+that the runner cannot write any of those paths, can execute the fixed commands
+and searchable ancestors, and cannot search `/etc/sudoers.d`. Each probe is
+bound to exact path or policy identity immediately before and after execution,
+followed by a full trusted-executable and sudo-inventory recheck. Disposable
+hosted evidence adds an ACL that grants runner search without changing the
+root-owned directory's accepted `0750` mode and proves the effective-access
+check rejects it before readiness or mutation.
+
+### Descriptor-pinned privileged commands
+
+Security-critical host commands previously executed reviewed absolute paths
+after a metadata check, leaving a path replacement window between validation
+and execution. Fence now captures the twelve accepted root-owned command files
+with no-follow, close-on-exec descriptors and revalidates canonical path,
+device, inode, owner, group, and mode before every use. Root commands execute
+the captured inode through `/proc/self/fd`; effective runner probes use pinned
+outer sudo to execute the pinned target without a raw-path fallback. Standard
+descriptors are reserved throughout capture and retained executable descriptors
+must be at least `3`. The sudo transport requires the transient service to have
+no controlling terminal, and hosted audit evidence exercises that path.
+
+This provides forward identity under the first-step and trusted hosted-image
+assumptions. It does not hash or authenticate pre-capture bytes, same-inode
+modification by an already privileged process, the dynamic loader or shared
+libraries, or a malicious root/platform component.
+
+### Closed local root-control inventory
+
+Standard lockdown previously verified only named Docker/containerd units and
+sockets, so an additive rootful control endpoint outside that fixed list could
+escape the support gate. Three corrected same-image observations supplied one
+stable, within-bounds, reachability-complete, and ownership-complete reference.
+Fingerprint schema `2` now accepts the exact two root container identities,
+wildcard IPv4/IPv6 TCP port `22` listeners, and ten domain-separated Unix
+listener identities with reviewed owner sets and multiplicities.
+
+Production re-observes that inventory before mutation. Standard block may only
+remove accepted container processes or owners, then pins the verified reduction
+as its resident baseline; audit and degraded block require the full exact
+reference. The baseline is checked again before readiness and every five
+seconds afterward. Relative filesystem socket names, incomplete ownership,
+unavailable or unreviewed root identity, collection bounds, additive endpoints,
+and post-ready drift fail closed. Filesystem reachability probes are limited to
+possible root-control candidates, capped at forty, and share a five-second
+deadline so nonroot socket volume cannot create unbounded privileged probes.
+Hosted rejection evidence covers an unexpected pre-ready root listener and a
+separate post-ready listener that makes resident health permanently critical.
+
+### In-memory pre-ready rollback and no-restore commit
+
+The accepted runner sudo source is now captured only in bounded memory and
+compared exactly again before removal. Pre-ready rollback recreates it with
+exclusive no-follow creation and verifies bytes, mode, ownership, digest,
+complete policy inventory, `visudo`, and uncached runner capability. Sudo and
+container rollback are attempted independently and dual failures are
+aggregated. Once readiness is created, the control enters an explicit
+no-restore state before any later fallible report update, and every rollback
+attempt is rejected.
+
 ### Source-before-bundle host compatibility
 
 An immutable bundled agent can temporarily predate a newly reviewed hosted-runner
@@ -256,6 +322,11 @@ compile TypeScript at workflow runtime. See Node's
 - Process attribution is best effort. Short-lived processes, shared sockets,
   namespace boundaries, and bounded scan limits can produce missing or
   ambiguous ownership instead of a guessed actor.
+- Trusted executable capture prevents path replacement after capture but is not
+  a content-authentication boundary for an already compromised image or root
+  process. Pre-capture byte modification with restored metadata, same-inode
+  privileged writes, the dynamic loader, and shared libraries remain inside
+  the trusted hosted-image/platform assumption.
 - GitHub-hosted runner image drift intentionally fails closed until the pinned
   fingerprint is reviewed and updated.
 - macOS, Windows, ARM, self-hosted runners, and job-container protection remain
