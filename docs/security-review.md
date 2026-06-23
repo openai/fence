@@ -158,6 +158,33 @@ response contains the original DNS question but no answer, authority,
 additional, or raw upstream data. Rejections increment bounded warning
 evidence; backend apply and verification failures remain critical findings.
 
+### Response-local DNS alias authorization
+
+CNAME retention previously evaluated every answer edge against process-wide
+hostname authorization. An unrelated answer owner that was independently
+allowed could therefore seed a derived authorization unrelated to the echoed
+question. Fence now parses each complete DNS response once and accepts only one
+linear, acyclic alias chain rooted at that question. Every CNAME must belong to
+the chain, every address must belong to its terminal name, and the chain keeps
+the queried root's origins and transports even if an intermediate name is also
+directly allowed. Address records must match the echoed question family, and
+duplicate terminal endpoints use the minimum TTL. Conflicts, cycles, unrelated
+records, invalid TTL or depth, and capacity failures reject the whole
+block-mode response without committing partial state. In block mode, valid
+derived authorization is committed only
+after the address rules are applied and verified. Audit may forward invalid
+upstream data but does not retain authorization from it. A fully rooted CNAME
+response with no address records is forwarded as address-family NODATA and
+retains no derived authorization in either mode.
+
+The resident firewall owner rechecks queued block responses in order against a
+cloned authorization state before rendering any replacement. Stale, expired,
+or over-capacity transactions contribute no candidate address rules. After
+successful structural verification, the owner publishes the candidate
+authorization and active-materialization states before reporting success to
+the DNS worker. Validation-time expiry is absolute and is not restarted by
+queue delay.
+
 ### Runner-bound results-storage authorization
 
 GitHub's runner uploads job logs and summaries to signed Azure Blob URLs. A

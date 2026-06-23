@@ -743,6 +743,30 @@ struct DnsCnameAnswer {
     ttl_seconds: u32,
 }
 
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct DnsAnswerRecords {
+    addresses: Vec<DnsAddressAnswer>,
+    aliases: Vec<DnsCnameAnswer>,
+}
+
+type AuthorizedHostnamePolicy = (Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>);
+
+#[derive(Debug, Clone)]
+struct ValidatedDnsResponse {
+    authorizations: Vec<(String, ActiveCnameAuthorization)>,
+    materializations: Vec<PendingMaterialization>,
+    policy: AuthorizedHostnamePolicy,
+    requires_runner_provenance: bool,
+    root_authorization: Option<ActiveCnameAuthorization>,
+    valid_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DnsResponseValidationError {
+    Invalid,
+    Capacity,
+}
+
 #[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
 struct PendingMaterialization {
     source_hostname: String,
@@ -752,17 +776,28 @@ struct PendingMaterialization {
     port: u16,
     origins: Vec<HostnamePolicyOrigin>,
     ttl_seconds: u32,
+    expires_at: Instant,
 }
+
+type PendingMaterializationIdentity = (
+    String,
+    String,
+    IpAddr,
+    Protocol,
+    u16,
+    Vec<HostnamePolicyOrigin>,
+);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MaterializationCompletion {
-    AppliedAndVerified,
+    AppliedVerifiedAndCommitted,
     Failed,
 }
 
 #[derive(Debug)]
 struct MaterializationRequest {
-    materializations: BTreeSet<PendingMaterialization>,
+    queried_hostname: String,
+    response: ValidatedDnsResponse,
     completion: SyncSender<MaterializationCompletion>,
 }
 
@@ -817,7 +852,7 @@ struct MaterializationMerge {
     expired: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct ActiveMaterialization {
     source_hostname: String,
     hostname: String,
@@ -831,7 +866,7 @@ struct ActiveMaterialization {
 
 type ActiveMaterializationKey = (String, String, IpAddr, Protocol, u16);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct CnameAuthorizationState {
     bounded_actions_suffix: BTreeSet<String>,
     bounded_actions_suffix_truncated: bool,
@@ -845,9 +880,12 @@ struct CnameAuthorizationState {
     truncated: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct ActiveCnameAuthorization {
     source_hostname: String,
+    origins: Vec<HostnamePolicyOrigin>,
+    transports: Vec<HostnameTransport>,
+    requires_runner_provenance: bool,
     observed_ttl_seconds: u32,
     depth: u8,
     expires_at: Instant,
@@ -1078,33 +1116,6 @@ impl ObservationRecorder {
         policy_classification(hostname, &authorizations, &self.hostname_policy)
     }
 
-    fn materialization_ttl_seconds(&self, hostname: &str, ttl_seconds: u32) -> Option<u32> {
-        if self.hostname_policy.exact_entry(hostname).is_some() {
-            return bound_materialization_ttl(ttl_seconds, None);
-        }
-        let now = Instant::now();
-        let mut authorizations = self
-            .cname_authorizations
-            .lock()
-            .expect("DNS CNAME authorization lock poisoned");
-        remove_expired_cname_authorizations(&mut authorizations, now);
-        if authorizations.bounded_actions_suffix.contains(hostname)
-            || authorizations.bounded_githubapp_suffix.contains(hostname)
-            || authorizations.bounded_user_wildcard.contains(hostname)
-            || authorizations
-                .runner_authorized_results_storage
-                .contains(hostname)
-        {
-            return bound_materialization_ttl(ttl_seconds, None);
-        }
-        let remaining_seconds = authorizations
-            .active
-            .get(hostname)?
-            .expires_at
-            .saturating_duration_since(now);
-        bound_materialization_ttl(ttl_seconds, Some(remaining_seconds))
-    }
-
     fn evidence_from_state(
         &self,
         state: &ObservationState,
@@ -1185,81 +1196,72 @@ impl ObservationRecorder {
             };
         };
         let forwardable_block_response = self.scope.is_block();
-        let complete_block_response = !forwardable_block_response
-            || dns_response_is_structurally_complete(packet, &hostname, query_type);
-        let policy = complete_block_response
-            .then(|| {
-                let mut authorizations = self
-                    .cname_authorizations
-                    .lock()
-                    .expect("DNS CNAME authorization lock poisoned");
-                remove_expired_cname_authorizations(&mut authorizations, Instant::now());
-                let policy = hostname_policy_for_authorized_name(
-                    &hostname,
-                    &authorizations,
-                    &self.hostname_policy,
-                );
-                if policy.is_some() {
-                    retain_cname_authorizations(
-                        &mut authorizations,
-                        parse_dns_cname_answers(packet),
-                        Instant::now(),
-                        &self.hostname_policy,
-                    );
-                }
-                policy
-            })
-            .flatten();
-        let answers = if complete_block_response {
-            parse_dns_address_answers(packet)
-        } else {
+        let records = parse_complete_dns_response(packet, &hostname, query_type);
+        let mut observed_answers = if forwardable_block_response {
             Vec::new()
+        } else {
+            records
+                .as_ref()
+                .map(|records| records.addresses.clone())
+                .unwrap_or_default()
         };
+        let mut block_validation = None;
+        if let Some(records) = records.as_ref() {
+            let now = Instant::now();
+            let mut authorizations = self
+                .cname_authorizations
+                .lock()
+                .expect("DNS CNAME authorization lock poisoned");
+            remove_expired_cname_authorizations(&mut authorizations, now);
+            match validate_dns_response_lineage(
+                &hostname,
+                records,
+                &authorizations,
+                now,
+                &self.hostname_policy,
+            ) {
+                Ok(response) => {
+                    if forwardable_block_response {
+                        observed_answers = records.addresses.clone();
+                        block_validation = Some(response);
+                    } else {
+                        let _ = commit_dns_response_authorizations(&mut authorizations, response);
+                    }
+                }
+                Err(DnsResponseValidationError::Capacity) => {
+                    authorizations.truncated = true;
+                }
+                Err(DnsResponseValidationError::Invalid) => {}
+            }
+        }
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         let classification =
             classification_override.unwrap_or_else(|| self.policy_classification(&hostname));
         let key = (hostname.clone(), query_type, classification);
         if let Some(observation) = state.retained.get_mut(&key) {
-            retain_address_answers(observation, answers.clone());
-        }
-        let mut block_response_is_fully_materializable = complete_block_response;
-        let mut materializations = Vec::new();
-        if forwardable_block_response {
-            if let Some((origins, transports)) = policy {
-                for answer in answers {
-                    let Some(ttl_seconds) =
-                        self.materialization_ttl_seconds(&answer.hostname, answer.ttl_seconds)
-                    else {
-                        block_response_is_fully_materializable = false;
-                        continue;
-                    };
-                    materializations.extend(transports.iter().map(|transport| {
-                        PendingMaterialization {
-                            source_hostname: hostname.clone(),
-                            hostname: answer.hostname.clone(),
-                            address: answer.address,
-                            protocol: transport.protocol,
-                            port: transport.port,
-                            origins: origins.clone(),
-                            ttl_seconds,
-                        }
-                    }));
-                }
-            } else {
-                block_response_is_fully_materializable = false;
-            }
+            retain_address_answers(observation, observed_answers);
         }
         drop(state);
 
-        let disposition = if !block_response_is_fully_materializable {
+        let disposition = if !forwardable_block_response {
+            DnsResponseDisposition::ForwardOriginal
+        } else if block_validation.is_none() {
             self.record_materialization_rejection();
             DnsResponseDisposition::RetryableFailure
-        } else if materializations.is_empty() {
+        } else if block_validation
+            .as_ref()
+            .is_some_and(|response| response.materializations.is_empty())
+        {
             DnsResponseDisposition::ForwardOriginal
         } else if let Some(submitter) = &self.materializations {
-            let materializations = materializations.into_iter().collect::<BTreeSet<_>>();
-            match submit_materialization_request(submitter, materializations, &self.shutdown) {
-                Ok(MaterializationCompletion::AppliedAndVerified) => {
+            let response = block_validation.expect("block validation checked above");
+            match submit_materialization_request(
+                submitter,
+                hostname.clone(),
+                response,
+                &self.shutdown,
+            ) {
+                Ok(MaterializationCompletion::AppliedVerifiedAndCommitted) => {
                     DnsResponseDisposition::ForwardOriginal
                 }
                 Ok(MaterializationCompletion::Failed) => DnsResponseDisposition::RetryableFailure,
@@ -2456,62 +2458,93 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         let refresh_attempted = !refresh_materializations.is_empty();
-        let (materializations, accepted_requests, rejected_requests) =
-            self.collect_materialization_batch(refresh_materializations);
-        if rejected_requests > 0 {
-            self.evidence.materializations_truncated = true;
-            changed = true;
-        }
+        let requests = self.collect_materialization_requests();
         let batch_started = Instant::now();
+        let mut authorizations = self
+            ._mediation
+            .recorder
+            .cname_authorizations
+            .lock()
+            .expect("DNS CNAME authorization lock poisoned");
+        let transaction_now = Instant::now();
+        let (
+            proposed_authorizations,
+            materializations,
+            accepted_requests,
+            rejected_requests,
+            materialization_capacity_rejected,
+        ) = stage_materialization_transactions(
+            &authorizations,
+            &self._mediation.recorder.hostname_policy,
+            refresh_materializations,
+            requests,
+            transaction_now,
+        );
+        let accepted_request_count = accepted_requests.len();
+        let rejected_request_count = rejected_requests.len();
         let batch_has_work = !materializations.is_empty();
         let mut proposed = self.active.clone();
-        let merge = merge_materializations(&mut proposed, materializations, Instant::now());
+        let merge = merge_materializations(&mut proposed, materializations, transaction_now);
         let proposed_allowances =
             effective_allowances_with_materializations(&self.base_allowances, &proposed);
-        let effective_rule_limit_exceeded = proposed_allowances.len() > MAX_EXPANDED_RULES;
-        let update_succeeded = if merge.rules_changed {
-            if effective_rule_limit_exceeded {
-                self.evidence.materializations_truncated = true;
-                for _ in 0..accepted_requests.len() {
-                    self._mediation.recorder.record_materialization_rejection();
-                }
-                if refresh_attempted {
-                    self.evidence.hostname_refresh_warnings =
-                        self.evidence.hostname_refresh_warnings.saturating_add(1);
-                    self._mediation.recorder.record_hostname_refresh_warning();
-                }
-                false
-            } else {
-                let ruleset =
-                    render_dns_mediated_replacement_ruleset(Mode::Block, &proposed_allowances);
-                let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &proposed_allowances);
-                let expected = expected_dns_mediated_owned_state(Mode::Block, &proposed_allowances);
-                if self.backend.preflight(&ruleset).is_ok()
-                    && self.backend.replace_owned_state(&ruleset).is_ok()
-                    && self.backend.verify_owned_state(&expected).is_ok()
-                {
-                    self.active = proposed;
-                    self.expected_state = expected;
-                    self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
-                    self.evidence.network_verification_status = "verified";
-                    true
-                } else {
-                    self.evidence.network_verification_status = "critical_dynamic_update_failed";
-                    self.record_critical(
-                        "dns_block_dynamic_update_failed",
-                        "approved DNS-derived owned nftables replacement failed after readiness",
-                    );
-                    false
-                }
-            }
+        let materialization_bound_exceeded =
+            materialization_candidate_exceeds_bounds(&proposed, &proposed_allowances);
+        let ruleset = render_dns_mediated_replacement_ruleset(Mode::Block, &proposed_allowances);
+        let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &proposed_allowances);
+        let expected = expected_dns_mediated_owned_state(Mode::Block, &proposed_allowances);
+        let transaction_requires_verification =
+            materialization_candidate_requires_verification(accepted_request_count, &merge);
+        let verification_succeeded = if materialization_bound_exceeded {
+            false
+        } else if merge.rules_changed {
+            self.backend.preflight(&ruleset).is_ok()
+                && self.backend.replace_owned_state(&ruleset).is_ok()
+                && self.backend.verify_owned_state(&expected).is_ok()
+        } else if transaction_requires_verification {
+            self.backend.verify_owned_state(&expected).is_ok()
         } else {
-            if effective_rule_limit_exceeded {
-                false
-            } else {
-                self.active = proposed;
-                true
-            }
+            true
         };
+        let update_succeeded = publish_verified_materialization_transaction(
+            verification_succeeded,
+            &mut authorizations,
+            &mut self.active,
+            proposed_authorizations,
+            proposed,
+        );
+        if update_succeeded && transaction_requires_verification {
+            self.expected_state = expected;
+            self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
+            self.evidence.network_verification_status = "verified";
+        }
+        drop(authorizations);
+
+        if rejected_request_count > 0 {
+            for _ in 0..rejected_request_count {
+                self._mediation.recorder.record_materialization_rejection();
+            }
+            changed = true;
+        }
+        if materialization_capacity_rejected || materialization_bound_exceeded {
+            self.evidence.materializations_truncated = true;
+        }
+        if !update_succeeded {
+            for _ in 0..accepted_request_count {
+                self._mediation.recorder.record_materialization_rejection();
+            }
+            if refresh_attempted {
+                self.evidence.hostname_refresh_warnings =
+                    self.evidence.hostname_refresh_warnings.saturating_add(1);
+                self._mediation.recorder.record_hostname_refresh_warning();
+            }
+            if !materialization_bound_exceeded {
+                self.evidence.network_verification_status = "critical_dynamic_update_failed";
+                self.record_critical(
+                    "dns_block_dynamic_update_failed",
+                    "approved DNS-derived owned nftables replacement failed after readiness",
+                );
+            }
+        }
         if batch_has_work {
             self._mediation
                 .recorder
@@ -2527,11 +2560,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             }
             complete_materialization_requests(
                 accepted_requests,
-                MaterializationCompletion::AppliedAndVerified,
+                MaterializationCompletion::AppliedVerifiedAndCommitted,
             );
         } else {
             complete_materialization_requests(accepted_requests, MaterializationCompletion::Failed);
         }
+        complete_materialization_requests(rejected_requests, MaterializationCompletion::Failed);
         if batch_has_work || merge.rules_changed || merge.metadata_changed {
             changed = true;
         }
@@ -2654,14 +2688,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         Ok(())
     }
 
-    fn collect_materialization_batch(
-        &mut self,
-        initial: BTreeSet<PendingMaterialization>,
-    ) -> (
-        BTreeSet<PendingMaterialization>,
-        Vec<MaterializationRequest>,
-        u64,
-    ) {
+    fn collect_materialization_requests(&mut self) -> Vec<MaterializationRequest> {
         let mut requests = Vec::new();
         if let Some(request) = self.pending_materialization_request.take() {
             requests.push(request);
@@ -2673,14 +2700,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             }
         }
 
-        let (materializations, accepted, rejected_requests) =
-            build_bounded_materialization_batch(initial, requests);
-        let rejected = u64::try_from(rejected_requests.len()).unwrap_or(u64::MAX);
-        for _ in 0..rejected_requests.len() {
-            self._mediation.recorder.record_materialization_rejection();
-        }
-        complete_materialization_requests(rejected_requests, MaterializationCompletion::Failed);
-        (materializations, accepted, rejected)
+        requests
     }
 
     fn wait_for_materialization_or_housekeeping(&mut self, timeout: Duration) {
@@ -3267,9 +3287,7 @@ fn query_fixed_upstream_for_prehydration(
         .recv(&mut response)
         .map_err(|_| PrehydrationQueryError::Transient)?;
     let response = response[..response_length].to_vec();
-    if !response_matches_upstream_query(&response, &query)
-        || !dns_response_is_structurally_complete(&response, hostname, query_type)
-    {
+    if !response_matches_upstream_query(&response, &query) {
         return Err(PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
             "fixed upstream DNS response did not match the bootstrap query",
@@ -3285,49 +3303,28 @@ fn pending_materializations_from_bootstrap_response(
     now: Instant,
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, DnsMediationError> {
-    if !dns_response_is_structurally_complete(packet, queried_hostname, query_type) {
-        return Err(DnsMediationError::new(
-            "dns_block_prehydration_failed",
-            "fixed upstream DNS response did not match the bootstrap query",
-        ));
-    }
-    let mut authorizations = CnameAuthorizationState::default();
-    retain_cname_authorizations(
-        &mut authorizations,
-        parse_dns_cname_answers(packet),
+    let records =
+        parse_complete_dns_response(packet, queried_hostname, query_type).ok_or_else(|| {
+            DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "fixed upstream DNS response did not match the bootstrap query",
+            )
+        })?;
+    let authorizations = CnameAuthorizationState::default();
+    let response = validate_dns_response_lineage(
+        queried_hostname,
+        &records,
+        &authorizations,
         now,
         hostname_policy,
-    );
-
-    let mut materializations = Vec::new();
-    for answer in parse_dns_address_answers(packet) {
-        let Some(ttl_seconds) = prehydration_materialization_ttl_seconds(
-            &authorizations,
-            &answer.hostname,
-            answer.ttl_seconds,
-            now,
-            hostname_policy,
-        ) else {
-            continue;
-        };
-        let Some(entry) = hostname_policy.exact_entry(queried_hostname) else {
-            return Err(DnsMediationError::new(
-                "dns_block_prehydration_failed",
-                "an exact prehydration hostname was absent from the logical policy",
-            ));
-        };
-        for transport in &entry.transports {
-            materializations.push(PendingMaterialization {
-                source_hostname: queried_hostname.to_owned(),
-                hostname: answer.hostname.clone(),
-                address: answer.address,
-                protocol: transport.protocol,
-                port: transport.port,
-                origins: entry.origins.clone(),
-                ttl_seconds,
-            });
-        }
-    }
+    )
+    .map_err(|_| {
+        DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "a fixed DNS-mediated bootstrap response had invalid response-local lineage",
+        )
+    })?;
+    let mut materializations = response.materializations;
     materializations.sort();
     materializations.dedup();
     if materializations
@@ -3345,24 +3342,6 @@ fn pending_materializations_from_bootstrap_response(
     Ok(materializations)
 }
 
-fn prehydration_materialization_ttl_seconds(
-    authorizations: &CnameAuthorizationState,
-    hostname: &str,
-    ttl_seconds: u32,
-    now: Instant,
-    hostname_policy: &RuntimeHostnamePolicy,
-) -> Option<u32> {
-    if hostname_policy.exact_entry(hostname).is_some() {
-        return bound_materialization_ttl(ttl_seconds, None);
-    }
-    let remaining_seconds = authorizations
-        .active
-        .get(hostname)?
-        .expires_at
-        .saturating_duration_since(now);
-    bound_materialization_ttl(ttl_seconds, Some(remaining_seconds))
-}
-
 fn materialization_request_channel() -> (MaterializationSubmitter, Receiver<MaterializationRequest>)
 {
     let (requests, receiver) = mpsc::sync_channel(MATERIALIZATION_REQUEST_QUEUE_CAPACITY);
@@ -3371,15 +3350,21 @@ fn materialization_request_channel() -> (MaterializationSubmitter, Receiver<Mate
 
 fn submit_materialization_request(
     submitter: &MaterializationSubmitter,
-    materializations: BTreeSet<PendingMaterialization>,
+    queried_hostname: String,
+    mut response: ValidatedDnsResponse,
     shutdown: &AtomicBool,
 ) -> Result<MaterializationCompletion, ()> {
-    if materializations.is_empty() || materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+    response.materializations = coalesce_pending_materializations(response.materializations)
+        .into_iter()
+        .collect();
+    let materialization_count = response.materializations.len();
+    if materialization_count == 0 || materialization_count > MAX_MATERIALIZATIONS_PER_UPDATE {
         return Err(());
     }
     let (completion, result) = mpsc::sync_channel(1);
     let request = MaterializationRequest {
-        materializations,
+        queried_hostname,
+        response,
         completion,
     };
     match submitter.requests.try_send(request) {
@@ -3396,28 +3381,116 @@ fn submit_materialization_request(
     }
 }
 
-fn build_bounded_materialization_batch(
+fn stage_materialization_transactions(
+    current_authorizations: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
     initial: BTreeSet<PendingMaterialization>,
     requests: Vec<MaterializationRequest>,
+    now: Instant,
 ) -> (
+    CnameAuthorizationState,
     BTreeSet<PendingMaterialization>,
     Vec<MaterializationRequest>,
     Vec<MaterializationRequest>,
+    bool,
 ) {
-    let mut materializations = initial;
+    let mut authorizations = current_authorizations.clone();
+    let mut materializations = coalesce_pending_materializations(initial);
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
+    let mut materialization_capacity_rejected = false;
     for request in requests {
-        let mut combined = materializations.clone();
-        combined.extend(request.materializations.iter().cloned());
+        let mut proposed_authorizations = authorizations.clone();
+        if !commit_staged_dns_response(
+            &mut proposed_authorizations,
+            &request.queried_hostname,
+            request.response.clone(),
+            now,
+            hostname_policy,
+        ) {
+            authorizations.truncated |= proposed_authorizations.truncated;
+            rejected.push(request);
+            continue;
+        }
+        let combined = coalesce_pending_materializations(
+            materializations
+                .iter()
+                .cloned()
+                .chain(request.response.materializations.iter().cloned()),
+        );
         if combined.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+            materialization_capacity_rejected = true;
             rejected.push(request);
         } else {
+            authorizations = proposed_authorizations;
             materializations = combined;
             accepted.push(request);
         }
     }
-    (materializations, accepted, rejected)
+    (
+        authorizations,
+        materializations,
+        accepted,
+        rejected,
+        materialization_capacity_rejected,
+    )
+}
+
+fn materialization_candidate_exceeds_bounds(
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    effective_allowances: &[EffectiveAllowance],
+) -> bool {
+    active.len() > MAX_ACTIVE_MATERIALIZATIONS || effective_allowances.len() > MAX_EXPANDED_RULES
+}
+
+fn materialization_candidate_requires_verification(
+    accepted_request_count: usize,
+    merge: &MaterializationMerge,
+) -> bool {
+    accepted_request_count > 0 || merge.rules_changed || merge.metadata_changed
+}
+
+fn publish_verified_materialization_transaction(
+    verification_succeeded: bool,
+    authorizations: &mut CnameAuthorizationState,
+    active: &mut BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    proposed_authorizations: CnameAuthorizationState,
+    proposed_active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+) -> bool {
+    if !verification_succeeded {
+        return false;
+    }
+    *active = proposed_active;
+    *authorizations = proposed_authorizations;
+    true
+}
+
+fn coalesce_pending_materializations(
+    materializations: impl IntoIterator<Item = PendingMaterialization>,
+) -> BTreeSet<PendingMaterialization> {
+    let mut coalesced = BTreeMap::<PendingMaterializationIdentity, PendingMaterialization>::new();
+    for materialization in materializations {
+        let identity = (
+            materialization.source_hostname.clone(),
+            materialization.hostname.clone(),
+            materialization.address,
+            materialization.protocol,
+            materialization.port,
+            materialization.origins.clone(),
+        );
+        match coalesced.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(materialization);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let minimum_ttl = entry.get().ttl_seconds.min(materialization.ttl_seconds);
+                let minimum_expiry = entry.get().expires_at.min(materialization.expires_at);
+                entry.get_mut().ttl_seconds = minimum_ttl;
+                entry.get_mut().expires_at = minimum_expiry;
+            }
+        }
+    }
+    coalesced.into_values().collect()
 }
 
 fn merge_materializations(
@@ -3439,7 +3512,11 @@ fn merge_materializations(
         .extract_if(.., |_, materialization| materialization.expires_at <= now)
         .count() as u64;
     let mut metadata_changed = expired > 0;
-    for materialization in materializations {
+    for materialization in coalesce_pending_materializations(materializations) {
+        let expires_at = materialization.expires_at + DNS_MATERIALIZATION_REFRESH_OVERLAP;
+        if expires_at <= now {
+            continue;
+        }
         let key = (
             materialization.source_hostname.clone(),
             materialization.hostname.clone(),
@@ -3455,9 +3532,7 @@ fn merge_materializations(
             port: materialization.port,
             origins: materialization.origins,
             observed_ttl_seconds: materialization.ttl_seconds,
-            expires_at: now
-                + Duration::from_secs(u64::from(materialization.ttl_seconds))
-                + DNS_MATERIALIZATION_REFRESH_OVERLAP,
+            expires_at,
         };
         metadata_changed |= active.get(&key).is_none_or(|current| {
             current.observed_ttl_seconds != replacement.observed_ttl_seconds
@@ -4048,13 +4123,13 @@ fn response_matches_upstream_query(response: &[u8], upstream_query: &[u8]) -> bo
     response.len() >= 2 && upstream_query.len() >= 2 && response[..2] == upstream_query[..2]
 }
 
-fn dns_response_is_structurally_complete(
+fn parse_complete_dns_response(
     packet: &[u8],
     queried_hostname: &str,
     query_type: u16,
-) -> bool {
+) -> Option<DnsAnswerRecords> {
     if packet.len() < 12 {
-        return false;
+        return None;
     }
     let flags = u16::from_be_bytes([packet[2], packet[3]]);
     let question_count = u16::from_be_bytes([packet[4], packet[5]]);
@@ -4063,18 +4138,16 @@ fn dns_response_is_structurally_complete(
         || question_count != 1
         || parse_dns_question(packet) != Some((queried_hostname.to_owned(), query_type))
     {
-        return false;
+        return None;
     }
 
-    let Some(question_name_end) = skip_dns_name(packet, 12) else {
-        return false;
-    };
+    let question_name_end = skip_dns_name(packet, 12)?;
     if question_name_end + 4 > packet.len()
         || u16::from_be_bytes([packet[question_name_end], packet[question_name_end + 1]])
             != query_type
         || u16::from_be_bytes([packet[question_name_end + 2], packet[question_name_end + 3]]) != 1
     {
-        return false;
+        return None;
     }
 
     let answer_count = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
@@ -4083,57 +4156,88 @@ fn dns_response_is_structurally_complete(
         .and_then(|count| {
             count.checked_add(usize::from(u16::from_be_bytes([packet[10], packet[11]])))
         });
-    let Some(record_count) = record_count else {
-        return false;
-    };
+    let record_count = record_count?;
+    let mut records = DnsAnswerRecords::default();
     let mut offset = question_name_end + 4;
     for record_index in 0..record_count {
         let owner_offset = offset;
-        let Some(owner_end) = skip_dns_name(packet, owner_offset) else {
-            return false;
-        };
+        let owner_end = skip_dns_name(packet, owner_offset)?;
         if owner_end + 10 > packet.len() {
-            return false;
+            return None;
         }
         let record_type = u16::from_be_bytes([packet[owner_end], packet[owner_end + 1]]);
         let record_class = u16::from_be_bytes([packet[owner_end + 2], packet[owner_end + 3]]);
+        let ttl_seconds = u32::from_be_bytes([
+            packet[owner_end + 4],
+            packet[owner_end + 5],
+            packet[owner_end + 6],
+            packet[owner_end + 7],
+        ]);
         let data_length = usize::from(u16::from_be_bytes([
             packet[owner_end + 8],
             packet[owner_end + 9],
         ]));
         let data_offset = owner_end + 10;
-        let Some(data_end) = data_offset.checked_add(data_length) else {
-            return false;
-        };
+        let data_end = data_offset.checked_add(data_length)?;
         if data_end > packet.len() {
-            return false;
+            return None;
         }
 
         let owner_is_root = packet.get(owner_offset) == Some(&0);
-        let owner_is_valid = owner_is_root || parse_dns_name(packet, owner_offset).is_some();
-        if !owner_is_valid {
-            return false;
-        }
+        let owner = if owner_is_root {
+            None
+        } else {
+            Some(parse_dns_name(packet, owner_offset)?)
+        };
         if record_class == 1 {
             match record_type {
+                1 | 28 if record_type != query_type => {
+                    return None;
+                }
                 1 if data_length != 4 || owner_is_root || record_index >= answer_count => {
-                    return false;
+                    return None;
                 }
                 28 if data_length != 16 || owner_is_root || record_index >= answer_count => {
-                    return false;
+                    return None;
                 }
                 5 if owner_is_root
+                    || record_index >= answer_count
                     || skip_dns_name(packet, data_offset) != Some(data_end)
                     || parse_dns_name(packet, data_offset).is_none() =>
                 {
-                    return false;
+                    return None;
                 }
+                1 => records.addresses.push(DnsAddressAnswer {
+                    hostname: owner.expect("A owner checked above"),
+                    address: IpAddr::V4(Ipv4Addr::new(
+                        packet[data_offset],
+                        packet[data_offset + 1],
+                        packet[data_offset + 2],
+                        packet[data_offset + 3],
+                    )),
+                    ttl_seconds,
+                }),
+                28 => {
+                    let mut bytes = [0_u8; 16];
+                    bytes.copy_from_slice(&packet[data_offset..data_end]);
+                    records.addresses.push(DnsAddressAnswer {
+                        hostname: owner.expect("AAAA owner checked above"),
+                        address: IpAddr::V6(Ipv6Addr::from(bytes)),
+                        ttl_seconds,
+                    });
+                }
+                5 => records.aliases.push(DnsCnameAnswer {
+                    owner: owner.expect("CNAME owner checked above"),
+                    target: parse_dns_name(packet, data_offset)
+                        .expect("CNAME target checked above"),
+                    ttl_seconds,
+                }),
                 _ => {}
             }
         }
         offset = data_end;
     }
-    offset == packet.len()
+    (offset == packet.len()).then_some(records)
 }
 
 fn query_for_upstream(
@@ -4342,128 +4446,6 @@ fn parse_dns_question(packet: &[u8]) -> Option<(String, u16)> {
     ))
 }
 
-fn parse_dns_address_answers(packet: &[u8]) -> Vec<DnsAddressAnswer> {
-    if packet.len() < 12 {
-        return Vec::new();
-    }
-    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let answer_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let mut offset = 12;
-    for _ in 0..question_count {
-        let Some(next) = skip_dns_name(packet, offset) else {
-            return Vec::new();
-        };
-        if next + 4 > packet.len() {
-            return Vec::new();
-        }
-        offset = next + 4;
-    }
-    let mut addresses = Vec::new();
-    for _ in 0..answer_count {
-        let Some(hostname) = parse_dns_name(packet, offset) else {
-            return Vec::new();
-        };
-        let Some(next) = skip_dns_name(packet, offset) else {
-            return Vec::new();
-        };
-        if next + 10 > packet.len() {
-            return Vec::new();
-        }
-        let answer_type = u16::from_be_bytes([packet[next], packet[next + 1]]);
-        let answer_class = u16::from_be_bytes([packet[next + 2], packet[next + 3]]);
-        let ttl_seconds = u32::from_be_bytes([
-            packet[next + 4],
-            packet[next + 5],
-            packet[next + 6],
-            packet[next + 7],
-        ]);
-        let data_length = usize::from(u16::from_be_bytes([packet[next + 8], packet[next + 9]]));
-        let data_offset = next + 10;
-        if data_offset + data_length > packet.len() {
-            return Vec::new();
-        }
-        let address = match (answer_type, answer_class, data_length) {
-            (1, 1, 4) => Some(IpAddr::V4(Ipv4Addr::new(
-                packet[data_offset],
-                packet[data_offset + 1],
-                packet[data_offset + 2],
-                packet[data_offset + 3],
-            ))),
-            (28, 1, 16) => {
-                let mut bytes = [0_u8; 16];
-                bytes.copy_from_slice(&packet[data_offset..data_offset + 16]);
-                Some(IpAddr::V6(Ipv6Addr::from(bytes)))
-            }
-            _ => None,
-        };
-        if let Some(address) = address {
-            addresses.push(DnsAddressAnswer {
-                hostname,
-                address,
-                ttl_seconds,
-            });
-        }
-        offset = data_offset + data_length;
-    }
-    addresses
-}
-
-fn parse_dns_cname_answers(packet: &[u8]) -> Vec<DnsCnameAnswer> {
-    if packet.len() < 12 {
-        return Vec::new();
-    }
-    let question_count = u16::from_be_bytes([packet[4], packet[5]]);
-    let answer_count = u16::from_be_bytes([packet[6], packet[7]]);
-    let mut offset = 12;
-    for _ in 0..question_count {
-        let Some(next) = skip_dns_name(packet, offset) else {
-            return Vec::new();
-        };
-        if next + 4 > packet.len() {
-            return Vec::new();
-        }
-        offset = next + 4;
-    }
-    let mut aliases = Vec::new();
-    for _ in 0..answer_count {
-        let Some(owner) = parse_dns_name(packet, offset) else {
-            return Vec::new();
-        };
-        let Some(next) = skip_dns_name(packet, offset) else {
-            return Vec::new();
-        };
-        if next + 10 > packet.len() {
-            return Vec::new();
-        }
-        let answer_type = u16::from_be_bytes([packet[next], packet[next + 1]]);
-        let answer_class = u16::from_be_bytes([packet[next + 2], packet[next + 3]]);
-        let ttl_seconds = u32::from_be_bytes([
-            packet[next + 4],
-            packet[next + 5],
-            packet[next + 6],
-            packet[next + 7],
-        ]);
-        let data_length = usize::from(u16::from_be_bytes([packet[next + 8], packet[next + 9]]));
-        let data_offset = next + 10;
-        if data_offset + data_length > packet.len() {
-            return Vec::new();
-        }
-        if answer_type == 5
-            && answer_class == 1
-            && skip_dns_name(packet, data_offset) == Some(data_offset + data_length)
-            && let Some(target) = parse_dns_name(packet, data_offset)
-        {
-            aliases.push(DnsCnameAnswer {
-                owner,
-                target,
-                ttl_seconds,
-            });
-        }
-        offset = data_offset + data_length;
-    }
-    aliases
-}
-
 fn parse_dns_name(packet: &[u8], offset: usize) -> Option<String> {
     let mut current = offset;
     let mut labels = Vec::new();
@@ -4599,17 +4581,14 @@ fn hostname_policy_for_authorized_name(
 fn cname_policy_for_authorized_name(
     hostname: &str,
     state: &CnameAuthorizationState,
-    hostname_policy: &RuntimeHostnamePolicy,
+    _hostname_policy: &RuntimeHostnamePolicy,
 ) -> Option<(Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>)> {
-    let mut current = hostname;
-    for _ in 0..MAX_DERIVED_CNAME_DEPTH {
-        let authorization = state.active.get(current)?;
-        current = &authorization.source_hostname;
-        if let Some(policy) = direct_hostname_policy(current, state, hostname_policy) {
-            return Some(policy);
-        }
-    }
-    None
+    state.active.get(hostname).map(|authorization| {
+        (
+            authorization.origins.clone(),
+            authorization.transports.clone(),
+        )
+    })
 }
 
 fn user_wildcard_capacity_rejected(
@@ -4697,64 +4676,245 @@ fn authorized_hostname(
     hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some()
 }
 
-fn retain_cname_authorizations(
-    state: &mut CnameAuthorizationState,
-    aliases: impl IntoIterator<Item = DnsCnameAnswer>,
+fn validate_dns_response_lineage(
+    queried_hostname: &str,
+    records: &DnsAnswerRecords,
+    state: &CnameAuthorizationState,
     now: Instant,
     hostname_policy: &RuntimeHostnamePolicy,
-) {
-    remove_expired_cname_authorizations(state, now);
-    let mut pending: Vec<DnsCnameAnswer> = aliases.into_iter().collect();
-    for _ in 0..MAX_DERIVED_CNAME_DEPTH {
-        let mut progressed = false;
-        pending.retain(|alias| {
-            let source_depth = if hostname_policy.exact_entry(&alias.owner).is_some()
-                || state.bounded_actions_suffix.contains(&alias.owner)
-                || state.bounded_githubapp_suffix.contains(&alias.owner)
-                || state.bounded_user_wildcard.contains(&alias.owner)
-                || state
-                    .runner_authorized_results_storage
-                    .contains(&alias.owner)
-            {
-                Some(0)
-            } else {
-                state
-                    .active
-                    .get(&alias.owner)
-                    .map(|authorization| authorization.depth)
-            };
-            let Some(source_depth) = source_depth else {
-                return true;
-            };
-            let depth = source_depth.saturating_add(1);
-            if alias.ttl_seconds == 0 || depth > MAX_DERIVED_CNAME_DEPTH {
-                return false;
+) -> Result<ValidatedDnsResponse, DnsResponseValidationError> {
+    let policy = hostname_policy_for_authorized_name(queried_hostname, state, hostname_policy)
+        .ok_or(DnsResponseValidationError::Invalid)?;
+    let requires_runner_provenance =
+        requires_runner_results_storage_provenance(queried_hostname, state, hostname_policy);
+    let mut forbidden = BTreeSet::from([queried_hostname.to_owned()]);
+    let mut depth = 0_u8;
+    let mut lineage_expiry: Option<Instant> = None;
+    let mut root_authorization = None;
+    if direct_hostname_policy(queried_hostname, state, hostname_policy).is_none() {
+        let authorization = state
+            .active
+            .get(queried_hostname)
+            .ok_or(DnsResponseValidationError::Invalid)?;
+        depth = authorization.depth;
+        lineage_expiry = Some(authorization.expires_at);
+        if authorization
+            .expires_at
+            .saturating_duration_since(now)
+            .is_zero()
+        {
+            return Err(DnsResponseValidationError::Invalid);
+        }
+        root_authorization = Some(authorization.clone());
+    }
+
+    let mut edges = BTreeMap::<String, DnsCnameAnswer>::new();
+    let retains_lineage = !records.addresses.is_empty();
+    for alias in &records.aliases {
+        if alias.ttl_seconds == 0 || alias.owner == alias.target {
+            return Err(DnsResponseValidationError::Invalid);
+        }
+        match edges.entry(alias.owner.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(alias.clone());
             }
-            if !state.active.contains_key(&alias.target)
-                && state.active.len() >= MAX_DERIVED_CNAME_AUTHORIZATIONS
-            {
-                state.truncated = true;
-                return false;
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().target != alias.target {
+                    return Err(DnsResponseValidationError::Invalid);
+                }
+                let ttl_seconds = entry.get().ttl_seconds.min(alias.ttl_seconds);
+                entry.get_mut().ttl_seconds = ttl_seconds;
             }
-            state.active.insert(
-                alias.target.clone(),
-                ActiveCnameAuthorization {
-                    source_hostname: alias.owner.clone(),
-                    observed_ttl_seconds: alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS),
-                    depth,
-                    expires_at: now
-                        + Duration::from_secs(u64::from(
-                            alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS),
-                        )),
-                },
-            );
-            progressed = true;
-            false
-        });
-        if !progressed {
-            break;
         }
     }
+
+    let mut current = queried_hostname.to_owned();
+    let mut new_authorization_names = BTreeSet::new();
+    let mut authorizations = Vec::new();
+    while let Some(alias) = edges.remove(&current) {
+        depth = depth
+            .checked_add(1)
+            .filter(|value| *value <= MAX_DERIVED_CNAME_DEPTH)
+            .ok_or(DnsResponseValidationError::Invalid)?;
+        if !forbidden.insert(alias.target.clone()) {
+            return Err(DnsResponseValidationError::Invalid);
+        }
+        let edge_expiry =
+            now + Duration::from_secs(u64::from(alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS)));
+        lineage_expiry =
+            Some(lineage_expiry.map_or(edge_expiry, |existing| existing.min(edge_expiry)));
+        let expiry = lineage_expiry.ok_or(DnsResponseValidationError::Invalid)?;
+        let observed_ttl_seconds = u32::try_from(expiry.saturating_duration_since(now).as_secs())
+            .ok()
+            .filter(|ttl| *ttl > 0)
+            .ok_or(DnsResponseValidationError::Invalid)?;
+        if retains_lineage
+            && !state.active.contains_key(&alias.target)
+            && new_authorization_names.insert(alias.target.clone())
+            && state
+                .active
+                .len()
+                .saturating_add(new_authorization_names.len())
+                > MAX_DERIVED_CNAME_AUTHORIZATIONS
+        {
+            return Err(DnsResponseValidationError::Capacity);
+        }
+        if retains_lineage {
+            authorizations.push((
+                alias.target.clone(),
+                ActiveCnameAuthorization {
+                    source_hostname: current,
+                    origins: policy.0.clone(),
+                    transports: policy.1.clone(),
+                    requires_runner_provenance,
+                    observed_ttl_seconds,
+                    depth,
+                    expires_at: expiry,
+                },
+            ));
+        }
+        current = alias.target;
+    }
+    if !edges.is_empty() {
+        return Err(DnsResponseValidationError::Invalid);
+    }
+
+    // A resolver can return a fully rooted CNAME chain without an address for
+    // the requested family. Validate the complete chain and treat it as NODATA,
+    // retain none of it because no terminal address proved a materializable
+    // response-local lineage.
+    if records.addresses.is_empty() {
+        return Ok(ValidatedDnsResponse {
+            authorizations: Vec::new(),
+            materializations: Vec::new(),
+            policy,
+            requires_runner_provenance,
+            root_authorization,
+            valid_until: None,
+        });
+    }
+
+    let mut materializations = Vec::new();
+    let mut response_expiry = lineage_expiry;
+    for answer in &records.addresses {
+        if answer.hostname != current {
+            return Err(DnsResponseValidationError::Invalid);
+        }
+        let remaining = lineage_expiry.map(|expiry| expiry.saturating_duration_since(now));
+        let ttl_seconds = bound_materialization_ttl(answer.ttl_seconds, remaining)
+            .ok_or(DnsResponseValidationError::Invalid)?;
+        let address_expiry = now + Duration::from_secs(u64::from(ttl_seconds));
+        response_expiry =
+            Some(response_expiry.map_or(address_expiry, |existing| existing.min(address_expiry)));
+        materializations.extend(policy.1.iter().map(|transport| PendingMaterialization {
+            source_hostname: queried_hostname.to_owned(),
+            hostname: answer.hostname.clone(),
+            address: answer.address,
+            protocol: transport.protocol,
+            port: transport.port,
+            origins: policy.0.clone(),
+            ttl_seconds,
+            expires_at: address_expiry,
+        }));
+    }
+    if let Some(expiry) = response_expiry {
+        let observed_ttl_seconds = u32::try_from(expiry.saturating_duration_since(now).as_secs())
+            .ok()
+            .filter(|ttl| *ttl > 0)
+            .ok_or(DnsResponseValidationError::Invalid)?;
+        for (_, authorization) in &mut authorizations {
+            authorization.expires_at = authorization.expires_at.min(expiry);
+            authorization.observed_ttl_seconds =
+                authorization.observed_ttl_seconds.min(observed_ttl_seconds);
+        }
+    }
+    let materializations = coalesce_pending_materializations(materializations)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+        return Err(DnsResponseValidationError::Capacity);
+    }
+    Ok(ValidatedDnsResponse {
+        authorizations,
+        materializations,
+        policy,
+        requires_runner_provenance,
+        root_authorization,
+        valid_until: response_expiry,
+    })
+}
+
+fn commit_staged_dns_response(
+    state: &mut CnameAuthorizationState,
+    queried_hostname: &str,
+    response: ValidatedDnsResponse,
+    now: Instant,
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> bool {
+    remove_expired_cname_authorizations(state, now);
+    let root_is_unchanged = match response.root_authorization.as_ref() {
+        Some(expected) => {
+            direct_hostname_policy(queried_hostname, state, hostname_policy).is_none()
+                && state.active.get(queried_hostname) == Some(expected)
+        }
+        None => direct_hostname_policy(queried_hostname, state, hostname_policy).is_some(),
+    };
+    if !root_is_unchanged
+        || response
+            .valid_until
+            .is_some_and(|valid_until| valid_until <= now)
+        || hostname_policy_for_authorized_name(queried_hostname, state, hostname_policy)
+            != Some(response.policy.clone())
+        || requires_runner_results_storage_provenance(queried_hostname, state, hostname_policy)
+            != response.requires_runner_provenance
+    {
+        return false;
+    }
+    let new_authorizations = response
+        .authorizations
+        .iter()
+        .map(|(hostname, _)| hostname)
+        .filter(|hostname| !state.active.contains_key(*hostname))
+        .collect::<BTreeSet<_>>()
+        .len();
+    if state.active.len().saturating_add(new_authorizations) > MAX_DERIVED_CNAME_AUTHORIZATIONS {
+        state.truncated = true;
+        return false;
+    }
+    commit_dns_response_authorizations(state, response)
+}
+
+fn commit_dns_response_authorizations(
+    state: &mut CnameAuthorizationState,
+    response: ValidatedDnsResponse,
+) -> bool {
+    if response
+        .authorizations
+        .iter()
+        .any(|(hostname, authorization)| {
+            state.active.get(hostname).is_some_and(|existing| {
+                existing.origins != authorization.origins
+                    || existing.transports != authorization.transports
+                    || existing.requires_runner_provenance
+                        != authorization.requires_runner_provenance
+            })
+        })
+    {
+        return false;
+    }
+    for (hostname, authorization) in response.authorizations {
+        // A different validated parent can converge on an already authorized
+        // name with the same effective policy. Keep the existing lineage and
+        // expiry so the new response cannot refresh or reparent that grant.
+        if state.active.get(&hostname).is_some_and(|existing| {
+            existing.source_hostname != authorization.source_hostname
+                || existing.depth != authorization.depth
+        }) {
+            continue;
+        }
+        state.active.insert(hostname, authorization);
+    }
+    true
 }
 
 fn requires_runner_results_storage_provenance(
@@ -4772,17 +4932,10 @@ fn requires_runner_results_storage_provenance(
     {
         return true;
     }
-    let mut current = hostname;
-    for _ in 0..MAX_DERIVED_CNAME_DEPTH {
-        let Some(authorization) = state.active.get(current) else {
-            return false;
-        };
-        current = &authorization.source_hostname;
-        if state.runner_authorized_results_storage.contains(current) {
-            return true;
-        }
-    }
-    false
+    state
+        .active
+        .get(hostname)
+        .is_some_and(|authorization| authorization.requires_runner_provenance)
 }
 
 fn matches_results_storage_hostname(hostname: &str) -> bool {
@@ -4957,16 +5110,10 @@ fn policy_classification(
         };
     }
     if let Some(authorization) = authorizations.active.get(hostname) {
-        if requires_runner_results_storage_provenance(hostname, authorizations, hostname_policy) {
+        if authorization.requires_runner_provenance {
             return "runner_authorized_results_storage_cname_derived";
         }
-        return if hostname_policy_for_authorized_name(
-            &authorization.source_hostname,
-            authorizations,
-            hostname_policy,
-        )
-        .is_some_and(|(origins, _)| origins.contains(&HostnamePolicyOrigin::User))
-        {
+        return if authorization.origins.contains(&HostnamePolicyOrigin::User) {
             "user_cname_derived"
         } else {
             "platform_cname_derived"
@@ -5559,11 +5706,21 @@ mod tests {
         ttl_seconds: u32,
         data: &[u8],
     ) -> Vec<u8> {
+        response_with_typed_address(name, query_type, query_type, ttl_seconds, data)
+    }
+
+    fn response_with_typed_address(
+        name: &str,
+        query_type: u16,
+        answer_type: u16,
+        ttl_seconds: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = query(name, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&[0xc0, 0x0c]);
-        bytes.extend_from_slice(&query_type.to_be_bytes());
+        bytes.extend_from_slice(&answer_type.to_be_bytes());
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
         bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
@@ -5572,7 +5729,16 @@ mod tests {
     }
 
     fn response_with_cname(name: &str, target: &str, ttl_seconds: u32) -> Vec<u8> {
-        let mut bytes = query(name, 1);
+        response_with_cname_for_type(name, 1, target, ttl_seconds)
+    }
+
+    fn response_with_cname_for_type(
+        name: &str,
+        query_type: u16,
+        target: &str,
+        ttl_seconds: u32,
+    ) -> Vec<u8> {
+        let mut bytes = query(name, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&[0xc0, 0x0c]);
@@ -5586,6 +5752,51 @@ mod tests {
         bytes
     }
 
+    fn response_with_unrelated_cname(
+        question: &str,
+        owner: &str,
+        target: &str,
+        ttl_seconds: u32,
+    ) -> Vec<u8> {
+        let mut bytes = query(question, 1);
+        bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
+        append_dns_name(&mut bytes, owner);
+        bytes.extend_from_slice(&5_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
+        let mut target_bytes = Vec::new();
+        append_dns_name(&mut target_bytes, target);
+        bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&target_bytes);
+        bytes
+    }
+
+    fn append_test_cname_answer(bytes: &mut Vec<u8>, owner: &str, target: &str, ttl_seconds: u32) {
+        append_dns_name(bytes, owner);
+        bytes.extend_from_slice(&5_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
+        let mut target_bytes = Vec::new();
+        append_dns_name(&mut target_bytes, target);
+        bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&target_bytes);
+    }
+
+    fn append_test_ipv4_answer(
+        bytes: &mut Vec<u8>,
+        owner: &str,
+        ttl_seconds: u32,
+        address: [u8; 4],
+    ) {
+        append_dns_name(bytes, owner);
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
+        bytes.extend_from_slice(&4_u16.to_be_bytes());
+        bytes.extend_from_slice(&address);
+    }
+
     fn response_with_cname_and_address(
         name: &str,
         target: &str,
@@ -5593,7 +5804,27 @@ mod tests {
         address_ttl_seconds: u32,
         address: &[u8],
     ) -> Vec<u8> {
-        let mut bytes = query(name, 1);
+        response_with_cname_and_typed_address(
+            name,
+            1,
+            target,
+            1,
+            cname_ttl_seconds,
+            address_ttl_seconds,
+            address,
+        )
+    }
+
+    fn response_with_cname_and_typed_address(
+        name: &str,
+        query_type: u16,
+        target: &str,
+        answer_type: u16,
+        cname_ttl_seconds: u32,
+        address_ttl_seconds: u32,
+        address: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = query(name, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&2_u16.to_be_bytes());
         bytes.extend_from_slice(&[0xc0, 0x0c]);
@@ -5605,7 +5836,7 @@ mod tests {
         bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
         bytes.extend_from_slice(&target_bytes);
         append_dns_name(&mut bytes, target);
-        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&answer_type.to_be_bytes());
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&address_ttl_seconds.to_be_bytes());
         bytes.extend_from_slice(&(address.len() as u16).to_be_bytes());
@@ -5629,6 +5860,158 @@ mod tests {
         bytes.extend_from_slice(&(address.len() as u16).to_be_bytes());
         bytes.extend_from_slice(address);
         bytes
+    }
+
+    fn commit_test_cname_lineage(
+        authorizations: &mut CnameAuthorizationState,
+        root: &str,
+        target: &str,
+        ttl_seconds: u32,
+        now: Instant,
+        policy: &RuntimeHostnamePolicy,
+    ) {
+        let records = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: root.to_owned(),
+                target: target.to_owned(),
+                ttl_seconds,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: target.to_owned(),
+                address: "192.0.2.10".parse().unwrap(),
+                ttl_seconds,
+            }],
+        };
+        let response =
+            validate_dns_response_lineage(root, &records, authorizations, now, policy).unwrap();
+        assert!(commit_dns_response_authorizations(authorizations, response));
+    }
+
+    fn direct_test_validated_response(
+        hostname: &str,
+        address: IpAddr,
+        ttl_seconds: u32,
+        now: Instant,
+        policy: &RuntimeHostnamePolicy,
+    ) -> ValidatedDnsResponse {
+        validate_dns_response_lineage(
+            hostname,
+            &DnsAnswerRecords {
+                aliases: Vec::new(),
+                addresses: vec![DnsAddressAnswer {
+                    hostname: hostname.to_owned(),
+                    address,
+                    ttl_seconds,
+                }],
+            },
+            &CnameAuthorizationState::default(),
+            now,
+            policy,
+        )
+        .unwrap()
+    }
+
+    fn cname_test_validated_response(
+        root: &str,
+        target: &str,
+        address: IpAddr,
+        ttl_seconds: u32,
+        now: Instant,
+        policy: &RuntimeHostnamePolicy,
+        authorizations: &CnameAuthorizationState,
+    ) -> ValidatedDnsResponse {
+        validate_dns_response_lineage(
+            root,
+            &DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: root.to_owned(),
+                    target: target.to_owned(),
+                    ttl_seconds,
+                }],
+                addresses: vec![DnsAddressAnswer {
+                    hostname: target.to_owned(),
+                    address,
+                    ttl_seconds,
+                }],
+            },
+            authorizations,
+            now,
+            policy,
+        )
+        .unwrap()
+    }
+
+    fn stage_and_complete_test_request(
+        recorder: &ObservationRecorder,
+        request: MaterializationRequest,
+    ) {
+        let (failed_completion, failed_result) = mpsc::sync_channel(1);
+        let failed_request = MaterializationRequest {
+            queried_hostname: request.queried_hostname.clone(),
+            response: request.response.clone(),
+            completion: failed_completion,
+        };
+        let mut authorizations = recorder.cname_authorizations.lock().unwrap();
+        let mut active = BTreeMap::new();
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &recorder.hostname_policy,
+                BTreeSet::new(),
+                vec![failed_request],
+                Instant::now(),
+            );
+        assert!(rejected.is_empty());
+        assert!(!materialization_capacity_rejected);
+        assert_eq!(accepted.len(), 1);
+        let mut proposed_active = active.clone();
+        merge_materializations(
+            &mut proposed_active,
+            materializations.clone(),
+            Instant::now(),
+        );
+        assert!(!publish_verified_materialization_transaction(
+            false,
+            &mut authorizations,
+            &mut active,
+            staged,
+            proposed_active,
+        ));
+        assert!(authorizations.active.is_empty());
+        assert!(active.is_empty());
+        complete_materialization_requests(accepted, MaterializationCompletion::Failed);
+        assert_eq!(
+            failed_result.try_recv().unwrap(),
+            MaterializationCompletion::Failed
+        );
+
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &recorder.hostname_policy,
+                BTreeSet::new(),
+                vec![request],
+                Instant::now(),
+            );
+        assert!(rejected.is_empty());
+        assert!(!materialization_capacity_rejected);
+        assert_eq!(accepted.len(), 1);
+        let mut proposed_active = active.clone();
+        merge_materializations(&mut proposed_active, materializations, Instant::now());
+        assert!(publish_verified_materialization_transaction(
+            true,
+            &mut authorizations,
+            &mut active,
+            staged,
+            proposed_active,
+        ));
+        assert!(!authorizations.active.is_empty());
+        assert!(!active.is_empty());
+        drop(authorizations);
+        complete_materialization_requests(
+            accepted,
+            MaterializationCompletion::AppliedVerifiedAndCommitted,
+        );
     }
 
     #[test]
@@ -5720,7 +6103,7 @@ mod tests {
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5743,15 +6126,20 @@ mod tests {
             )
         });
         let request = requests.recv().unwrap();
-        assert_eq!(request.materializations.len(), 1);
+        assert_eq!(request.response.materializations.len(), 1);
         assert_eq!(
-            request.materializations.iter().next().unwrap().ttl_seconds,
+            request
+                .response
+                .materializations
+                .first()
+                .unwrap()
+                .ttl_seconds,
             1
         );
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5785,15 +6173,15 @@ mod tests {
             )
         });
         let request = requests.recv().unwrap();
-        let materialization = request.materializations.iter().next().unwrap();
-        assert_eq!(request.materializations.len(), 1);
+        let materialization = request.response.materializations.first().unwrap();
+        assert_eq!(request.response.materializations.len(), 1);
         assert_eq!(materialization.hostname, hostname);
         assert_eq!(materialization.protocol, Protocol::Tcp);
         assert_eq!(materialization.port, 443);
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5831,9 +6219,10 @@ mod tests {
         response.extend_from_slice(&[192, 0, 2, 45]);
         let caller = thread::spawn(move || recorder.record_response(hostname, 1, &response, None));
         let request = requests.recv().unwrap();
-        assert_eq!(request.materializations.len(), 4);
+        assert_eq!(request.response.materializations.len(), 4);
         assert_eq!(
             request
+                .response
                 .materializations
                 .iter()
                 .map(|materialization| (materialization.protocol, materialization.port))
@@ -5843,7 +6232,7 @@ mod tests {
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5880,15 +6269,21 @@ mod tests {
             )
         });
         let request = requests.recv().unwrap();
-        assert_eq!(request.materializations.len(), 2);
-        assert!(request.materializations.iter().all(|materialization| {
-            matches!(materialization.address, IpAddr::V6(_))
-                && materialization.protocol == Protocol::Tcp
-                && matches!(materialization.port, 443 | 8443)
-        }));
+        assert_eq!(request.response.materializations.len(), 2);
+        assert!(
+            request
+                .response
+                .materializations
+                .iter()
+                .all(|materialization| {
+                    matches!(materialization.address, IpAddr::V6(_))
+                        && materialization.protocol == Protocol::Tcp
+                        && matches!(materialization.port, 443 | 8443)
+                })
+        );
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5979,8 +6374,9 @@ mod tests {
             Some(submitter),
             policy,
         );
+        let caller_recorder = recorder.clone();
         let caller = thread::spawn(move || {
-            recorder.record_response(
+            caller_recorder.record_response(
                 "example.com",
                 1,
                 &response_with_cname_and_address(
@@ -5996,6 +6392,7 @@ mod tests {
         let request = requests.recv().unwrap();
         assert_eq!(
             request
+                .response
                 .materializations
                 .iter()
                 .map(|materialization| (
@@ -6011,17 +6408,228 @@ mod tests {
         );
         assert!(
             request
+                .response
                 .materializations
                 .iter()
                 .all(|materialization| { materialization.origins == [HostnamePolicyOrigin::User] })
         );
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
-            .unwrap();
+        stage_and_complete_test_request(&recorder, request);
         assert_eq!(
             caller.join().unwrap(),
             DnsResponseDisposition::ForwardOriginal
+        );
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .active
+                .contains_key("edge.example.net")
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn unrelated_platform_cname_in_user_response_is_rejected_without_state() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"unrelated-cname","allowlist":[{"destination_type":"hostname","destination":"user.example","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (submitter, requests) = materialization_request_channel();
+        let (recorder, report_path) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            policy,
+        );
+        let target = "attacker.example";
+        let unrelated = response_with_unrelated_cname("user.example", "github.com", target, 60);
+        assert!(parse_complete_dns_response(&unrelated, "user.example", 1).is_some());
+        assert_eq!(
+            recorder.record_response("user.example", 1, &unrelated, None),
+            DnsResponseDisposition::RetryableFailure,
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            recorder.forward_query(target, 1, None).unwrap(),
+            DnsQueryAuthorization::Refused(None),
+        );
+        assert_eq!(recorder.policy_classification(target), "outside_policy");
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn rooted_cname_nodata_never_seeds_authorization_state() {
+        let policy = test_hostname_policy(false);
+        let target = "nodata-edge.example";
+        let response = response_with_cname("github.com", target, 60);
+
+        let (submitter, requests) = materialization_request_channel();
+        let (block, block_report) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            policy.clone(),
+        );
+        assert_eq!(
+            block.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert!(block.cname_authorizations.lock().unwrap().active.is_empty());
+        assert_eq!(
+            block.forward_query(target, 1, None).unwrap(),
+            DnsQueryAuthorization::Refused(None),
+        );
+
+        let (audit, audit_report) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+        assert_eq!(
+            audit.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        assert!(audit.cname_authorizations.lock().unwrap().active.is_empty());
+
+        let _ = fs::remove_file(block_report);
+        let _ = fs::remove_file(audit_report);
+    }
+
+    #[test]
+    fn wrong_family_addresses_fail_closed_without_authorization_state() {
+        let policy = test_hostname_policy(false);
+        for (query_type, answer_type, address) in [
+            (28, 1, vec![192, 0, 2, 44]),
+            (
+                1,
+                28,
+                vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 44],
+            ),
+        ] {
+            let response = response_with_cname_and_typed_address(
+                "github.com",
+                query_type,
+                "wrong-family.example",
+                answer_type,
+                60,
+                60,
+                &address,
+            );
+            assert!(parse_complete_dns_response(&response, "github.com", query_type).is_none());
+
+            let (submitter, requests) = materialization_request_channel();
+            let (block, block_report) = test_recorder_with_policy(
+                DnsEvidenceScope::ProtectedHostBlock,
+                Some(submitter),
+                policy.clone(),
+            );
+            assert_eq!(
+                block.record_response("github.com", query_type, &response, None),
+                DnsResponseDisposition::RetryableFailure,
+            );
+            assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+            assert!(block.cname_authorizations.lock().unwrap().active.is_empty());
+
+            let (audit, audit_report) = test_recorder_with_policy(
+                DnsEvidenceScope::ProtectedHostAudit,
+                None,
+                policy.clone(),
+            );
+            assert_eq!(
+                audit.record_response("github.com", query_type, &response, None),
+                DnsResponseDisposition::ForwardOriginal,
+            );
+            assert!(audit.cname_authorizations.lock().unwrap().active.is_empty());
+
+            let _ = fs::remove_file(block_report);
+            let _ = fs::remove_file(audit_report);
+        }
+    }
+
+    #[test]
+    fn materialization_capacity_overflow_rejects_block_and_retains_no_audit_state() {
+        let policy = test_hostname_policy(false);
+        let target = "x.example";
+        let mut response = response_with_cname("github.com", target, 60);
+        for index in 0..=MAX_MATERIALIZATIONS_PER_UPDATE {
+            append_test_ipv4_answer(
+                &mut response,
+                target,
+                60,
+                [198, 51, (index / 256) as u8, (index % 256) as u8],
+            );
+        }
+        response[6..8].copy_from_slice(
+            &u16::try_from(MAX_MATERIALIZATIONS_PER_UPDATE + 2)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(parse_complete_dns_response(&response, "github.com", 1).is_some());
+
+        let (submitter, requests) = materialization_request_channel();
+        let (block, block_report) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            policy.clone(),
+        );
+        assert_eq!(
+            block.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::RetryableFailure,
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        let block_authorizations = block.cname_authorizations.lock().unwrap();
+        assert!(block_authorizations.active.is_empty());
+        assert!(block_authorizations.truncated);
+        drop(block_authorizations);
+
+        let (audit, audit_report) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+        assert_eq!(
+            audit.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        let audit_authorizations = audit.cname_authorizations.lock().unwrap();
+        assert!(audit_authorizations.active.is_empty());
+        assert!(audit_authorizations.truncated);
+        drop(audit_authorizations);
+
+        let _ = fs::remove_file(block_report);
+        let _ = fs::remove_file(audit_report);
+    }
+
+    #[test]
+    fn audit_forwards_but_does_not_retain_invalid_response_lineage() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-unrelated-cname","allowlist":[{"destination_type":"hostname","destination":"user.example","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (recorder, report_path) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+        let target = "outside.example";
+        let unrelated = response_with_unrelated_cname("user.example", "github.com", target, 60);
+
+        assert_eq!(
+            recorder.record_response("user.example", 1, &unrelated, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            recorder.forward_query(target, 1, None).unwrap(),
+            DnsQueryAuthorization::Forward(Some("outside_policy")),
         );
         let _ = fs::remove_file(report_path);
     }
@@ -6119,22 +6727,21 @@ mod tests {
         );
 
         let (saturated, _receiver) = materialization_request_channel();
+        let saturation_now = Instant::now();
+        let saturation_policy = test_hostname_policy(false);
         for index in 0..MATERIALIZATION_REQUEST_QUEUE_CAPACITY {
             let (completion, _result) = mpsc::sync_channel(1);
             saturated
                 .requests
                 .try_send(MaterializationRequest {
-                    materializations: [PendingMaterialization {
-                        source_hostname: "api.github.com".to_owned(),
-                        hostname: "api.github.com".to_owned(),
-                        address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
-                        protocol: Protocol::Tcp,
-                        port: 443,
-                        origins: vec![HostnamePolicyOrigin::Platform],
-                        ttl_seconds: 30,
-                    }]
-                    .into_iter()
-                    .collect(),
+                    queried_hostname: "api.github.com".to_owned(),
+                    response: direct_test_validated_response(
+                        "api.github.com",
+                        IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
+                        30,
+                        saturation_now,
+                        &saturation_policy,
+                    ),
                     completion,
                 })
                 .unwrap();
@@ -6228,6 +6835,7 @@ mod tests {
             port: 8443,
             origins: vec![HostnamePolicyOrigin::User],
             ttl_seconds,
+            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_seconds)),
         };
 
         assert_eq!(
@@ -6306,8 +6914,9 @@ mod tests {
             parse_dns_question(&response),
             Some(("api.github.com".to_owned(), 1))
         );
-        assert!(parse_dns_address_answers(&response).is_empty());
-        assert!(parse_dns_cname_answers(&response).is_empty());
+        let records = parse_complete_dns_response(&response, "api.github.com", 1).unwrap();
+        assert!(records.addresses.is_empty());
+        assert!(records.aliases.is_empty());
         assert!(server_failure_response(&[]).is_none());
     }
 
@@ -6540,13 +7149,11 @@ mod tests {
             &policy,
             DnsQueryProvenance::TrustedRunnerWorker,
         ));
-        retain_cname_authorizations(
+        commit_test_cname_lineage(
             &mut authorizations,
-            [DnsCnameAnswer {
-                owner: root.to_owned(),
-                target: "blob.region.store.core.windows.net".to_owned(),
-                ttl_seconds: 60,
-            }],
+            root,
+            "blob.region.store.core.windows.net",
+            60,
             now,
             &policy,
         );
@@ -7270,13 +7877,11 @@ mod tests {
             &policy,
             DnsQueryProvenance::Untrusted,
         ));
-        retain_cname_authorizations(
+        commit_test_cname_lineage(
             &mut authorizations,
-            [DnsCnameAnswer {
-                owner: root.to_owned(),
-                target: "registry-cdn.example.net".to_owned(),
-                ttl_seconds: 60,
-            }],
+            root,
+            "registry-cdn.example.net",
+            60,
             now,
             &policy,
         );
@@ -7333,16 +7938,7 @@ mod tests {
             &policy,
             DnsQueryProvenance::Untrusted,
         ));
-        retain_cname_authorizations(
-            &mut authorizations,
-            [DnsCnameAnswer {
-                owner: root.to_owned(),
-                target: descendant.to_owned(),
-                ttl_seconds: 60,
-            }],
-            now,
-            &policy,
-        );
+        commit_test_cname_lineage(&mut authorizations, root, descendant, 60, now, &policy);
         assert!(authorized_hostname(
             descendant,
             &mut authorizations,
@@ -7363,12 +7959,18 @@ mod tests {
     #[test]
     fn extracts_bounded_dns_answer_addresses_and_ttls() {
         assert_eq!(
-            parse_dns_address_answers(&response_with_address(
+            parse_complete_dns_response(
+                &response_with_address(
+                    "pipelines.actions.githubusercontent.com",
+                    1,
+                    30,
+                    &[192, 0, 2, 10],
+                ),
                 "pipelines.actions.githubusercontent.com",
                 1,
-                30,
-                &[192, 0, 2, 10],
-            )),
+            )
+            .unwrap()
+            .addresses,
             vec![DnsAddressAnswer {
                 hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                 address: "192.0.2.10".parse().expect("IPv4 fixture must parse"),
@@ -7376,22 +7978,727 @@ mod tests {
             }]
         );
         assert_eq!(
-            parse_dns_address_answers(&response_with_address(
+            parse_complete_dns_response(
+                &response_with_address(
+                    "pipelines.actions.githubusercontent.com",
+                    28,
+                    60,
+                    &"2001:db8::1"
+                        .parse::<Ipv6Addr>()
+                        .expect("IPv6 fixture must parse")
+                        .octets(),
+                ),
                 "pipelines.actions.githubusercontent.com",
                 28,
-                60,
-                &"2001:db8::1"
-                    .parse::<Ipv6Addr>()
-                    .expect("IPv6 fixture must parse")
-                    .octets(),
-            )),
+            )
+            .unwrap()
+            .addresses,
             vec![DnsAddressAnswer {
                 hostname: "pipelines.actions.githubusercontent.com".to_owned(),
                 address: "2001:db8::1".parse().expect("IPv6 fixture must parse"),
                 ttl_seconds: 60,
             }]
         );
-        assert!(parse_dns_address_answers(&[]).is_empty());
+        assert!(parse_complete_dns_response(&[], "example.com", 1).is_none());
+    }
+
+    #[test]
+    fn validates_reordered_duplicate_cname_chain_with_cumulative_ttl() {
+        let mut packet = query("github.com", 1);
+        packet[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        packet[6..8].copy_from_slice(&4_u16.to_be_bytes());
+        append_test_ipv4_answer(&mut packet, "edge-two.example", 120, [192, 0, 2, 30]);
+        append_test_cname_answer(&mut packet, "edge-one.example", "edge-two.example", 40);
+        append_test_cname_answer(&mut packet, "github.com", "edge-one.example", 60);
+        append_test_cname_answer(&mut packet, "github.com", "edge-one.example", 30);
+        let records = parse_complete_dns_response(&packet, "github.com", 1).unwrap();
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut authorizations = CnameAuthorizationState::default();
+        let response =
+            validate_dns_response_lineage("github.com", &records, &authorizations, now, &policy)
+                .unwrap();
+
+        assert_eq!(response.authorizations.len(), 2);
+        assert!(
+            response
+                .authorizations
+                .iter()
+                .all(|(_, authorization)| authorization.observed_ttl_seconds == 30)
+        );
+        assert_eq!(response.materializations.len(), 1);
+        assert_eq!(response.materializations[0].hostname, "edge-two.example");
+        assert_eq!(response.materializations[0].ttl_seconds, 30);
+        assert_eq!(response.materializations[0].protocol, Protocol::Tcp);
+        assert_eq!(response.materializations[0].port, 443);
+        assert_eq!(
+            response.materializations[0].origins,
+            [HostnamePolicyOrigin::Platform]
+        );
+        assert!(commit_dns_response_authorizations(
+            &mut authorizations,
+            response
+        ));
+        assert!(authorized_hostname(
+            "edge-two.example",
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+    }
+
+    #[test]
+    fn terminal_address_ttl_caps_derived_authorization_lifetime() {
+        let now = Instant::now();
+        let records = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "github.com".to_owned(),
+                target: "short-lived.example".to_owned(),
+                ttl_seconds: 60,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "short-lived.example".to_owned(),
+                address: "192.0.2.36".parse().unwrap(),
+                ttl_seconds: 0,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &records,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+
+        assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 1);
+        assert_eq!(
+            response.authorizations[0].1.expires_at,
+            now + Duration::from_secs(1)
+        );
+        assert_eq!(response.materializations[0].ttl_seconds, 1);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn duplicate_terminal_addresses_use_the_minimum_ttl() {
+        let now = Instant::now();
+        let address = "192.0.2.37".parse().unwrap();
+        let records = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "github.com".to_owned(),
+                target: "duplicate.example".to_owned(),
+                ttl_seconds: 60,
+            }],
+            addresses: vec![
+                DnsAddressAnswer {
+                    hostname: "duplicate.example".to_owned(),
+                    address,
+                    ttl_seconds: 40,
+                },
+                DnsAddressAnswer {
+                    hostname: "duplicate.example".to_owned(),
+                    address,
+                    ttl_seconds: 5,
+                },
+            ],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &records,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+
+        assert_eq!(response.materializations.len(), 1);
+        assert_eq!(response.materializations[0].ttl_seconds, 5);
+        assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 5);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn derived_query_extension_inherits_depth_policy_and_remaining_lifetime() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut authorizations = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut authorizations,
+            "github.com",
+            "edge-one.example",
+            20,
+            now,
+            &policy,
+        );
+        let records = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "edge-one.example".to_owned(),
+                target: "edge-two.example".to_owned(),
+                ttl_seconds: 60,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "edge-two.example".to_owned(),
+                address: "192.0.2.31".parse().unwrap(),
+                ttl_seconds: 120,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "edge-one.example",
+            &records,
+            &authorizations,
+            now + Duration::from_secs(5),
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(response.authorizations[0].1.depth, 2);
+        assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 15);
+        assert_eq!(response.materializations[0].ttl_seconds, 15);
+        assert_eq!(
+            response.materializations[0].origins,
+            [HostnamePolicyOrigin::Platform]
+        );
+    }
+
+    #[test]
+    fn staged_commit_rechecks_derived_root_without_restarting_ttl() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut staged_root = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut staged_root,
+            "github.com",
+            "edge.example",
+            20,
+            now,
+            &policy,
+        );
+        let direct_records = DnsAnswerRecords {
+            aliases: Vec::new(),
+            addresses: vec![DnsAddressAnswer {
+                hostname: "edge.example".to_owned(),
+                address: "192.0.2.34".parse().unwrap(),
+                ttl_seconds: 1,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "edge.example",
+            &direct_records,
+            &staged_root,
+            now,
+            &policy,
+        )
+        .unwrap();
+        assert!(response.authorizations.is_empty());
+        assert!(!commit_staged_dns_response(
+            &mut staged_root,
+            "edge.example",
+            response,
+            now + Duration::from_secs(2),
+            &policy,
+        ));
+        assert!(staged_root.active.contains_key("edge.example"));
+
+        let mut active_root = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut active_root,
+            "github.com",
+            "edge.example",
+            60,
+            now,
+            &policy,
+        );
+        let extension = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "edge.example".to_owned(),
+                target: "terminal.example".to_owned(),
+                ttl_seconds: 30,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "terminal.example".to_owned(),
+                address: "192.0.2.35".parse().unwrap(),
+                ttl_seconds: 120,
+            }],
+        };
+        let response =
+            validate_dns_response_lineage("edge.example", &extension, &active_root, now, &policy)
+                .unwrap();
+        let changed_root = active_root.active.get_mut("edge.example").unwrap();
+        changed_root.depth = MAX_DERIVED_CNAME_DEPTH;
+        changed_root.expires_at = now + Duration::from_secs(15);
+        assert!(!commit_staged_dns_response(
+            &mut active_root,
+            "edge.example",
+            response,
+            now + Duration::from_secs(10),
+            &policy,
+        ));
+        assert!(!active_root.active.contains_key("terminal.example"));
+
+        let mut active_root = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut active_root,
+            "github.com",
+            "edge.example",
+            60,
+            now,
+            &policy,
+        );
+        let response =
+            validate_dns_response_lineage("edge.example", &extension, &active_root, now, &policy)
+                .unwrap();
+        let initial_expiry = response.authorizations[0].1.expires_at;
+        assert!(commit_staged_dns_response(
+            &mut active_root,
+            "edge.example",
+            response,
+            now + Duration::from_secs(10),
+            &policy,
+        ));
+        assert_eq!(
+            active_root
+                .active
+                .get("terminal.example")
+                .unwrap()
+                .expires_at,
+            initial_expiry
+        );
+    }
+
+    #[test]
+    fn cname_chain_keeps_queried_policy_across_directly_authorized_intermediate() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"rooted-policy","allowlist":[{"destination_type":"hostname","destination":"user.example","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let records = DnsAnswerRecords {
+            aliases: vec![
+                DnsCnameAnswer {
+                    owner: "user.example".to_owned(),
+                    target: "github.com".to_owned(),
+                    ttl_seconds: 60,
+                },
+                DnsCnameAnswer {
+                    owner: "github.com".to_owned(),
+                    target: "terminal.example".to_owned(),
+                    ttl_seconds: 60,
+                },
+            ],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "terminal.example".to_owned(),
+                address: "192.0.2.32".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        let mut authorizations = CnameAuthorizationState::default();
+        let response = validate_dns_response_lineage(
+            "user.example",
+            &records,
+            &authorizations,
+            Instant::now(),
+            &policy,
+        )
+        .unwrap();
+
+        assert_eq!(response.materializations[0].port, 8443);
+        assert_eq!(
+            response.materializations[0].origins,
+            [HostnamePolicyOrigin::User]
+        );
+        assert_eq!(
+            response.authorizations[1].1.origins,
+            [HostnamePolicyOrigin::User]
+        );
+        assert!(commit_dns_response_authorizations(
+            &mut authorizations,
+            response
+        ));
+        assert_eq!(
+            hostname_policy_for_authorized_name("terminal.example", &authorizations, &policy),
+            Some((
+                vec![HostnamePolicyOrigin::User],
+                vec![HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 8443,
+                }],
+            ))
+        );
+    }
+
+    #[test]
+    fn conflicting_retained_target_rejects_the_owner_transaction() {
+        let now = Instant::now();
+        let platform_policy = test_hostname_policy(false);
+        let mut authorizations = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut authorizations,
+            "github.com",
+            "shared.example",
+            60,
+            now,
+            &platform_policy,
+        );
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"retained-policy","allowlist":[{"destination_type":"hostname","destination":"user.example","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let records = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "user.example".to_owned(),
+                target: "shared.example".to_owned(),
+                ttl_seconds: 60,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "shared.example".to_owned(),
+                address: "192.0.2.33".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        let response =
+            validate_dns_response_lineage("user.example", &records, &authorizations, now, &policy)
+                .unwrap();
+        assert_eq!(response.materializations[0].port, 8443);
+        let (completion, result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &policy,
+                BTreeSet::new(),
+                vec![MaterializationRequest {
+                    queried_hostname: "user.example".to_owned(),
+                    response,
+                    completion,
+                }],
+                now,
+            );
+        assert_eq!(staged, authorizations);
+        assert!(materializations.is_empty());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(!capacity_rejected);
+        complete_materialization_requests(rejected, MaterializationCompletion::Failed);
+        assert_eq!(
+            result.try_recv().unwrap(),
+            MaterializationCompletion::Failed
+        );
+
+        let retained = authorizations.active.get("shared.example").unwrap();
+        assert_eq!(retained.source_hostname, "github.com");
+        assert_eq!(retained.origins, [HostnamePolicyOrigin::Platform]);
+        assert_eq!(retained.transports[0].port, 443);
+    }
+
+    #[test]
+    fn retained_target_accepts_compatible_convergence_and_same_lineage_refresh() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut authorizations = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut authorizations,
+            "github.com",
+            "shared.example",
+            20,
+            now,
+            &policy,
+        );
+
+        let different_parent = validate_dns_response_lineage(
+            "api.github.com",
+            &DnsAnswerRecords {
+                aliases: vec![
+                    DnsCnameAnswer {
+                        owner: "api.github.com".to_owned(),
+                        target: "new-intermediate.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                    DnsCnameAnswer {
+                        owner: "new-intermediate.example".to_owned(),
+                        target: "shared.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                ],
+                addresses: vec![DnsAddressAnswer {
+                    hostname: "shared.example".to_owned(),
+                    address: "192.0.2.34".parse().unwrap(),
+                    ttl_seconds: 60,
+                }],
+            },
+            &authorizations,
+            now + Duration::from_secs(5),
+            &policy,
+        )
+        .unwrap();
+        let (completion, _result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &policy,
+                BTreeSet::new(),
+                vec![MaterializationRequest {
+                    queried_hostname: "api.github.com".to_owned(),
+                    response: different_parent,
+                    completion,
+                }],
+                now + Duration::from_secs(5),
+            );
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(accepted.len(), 1);
+        assert!(rejected.is_empty());
+        assert!(!capacity_rejected);
+        assert!(staged.active.contains_key("new-intermediate.example"));
+        assert_eq!(
+            staged.active.get("shared.example"),
+            authorizations.active.get("shared.example")
+        );
+        let mut expired_convergence = staged.clone();
+        remove_expired_cname_authorizations(
+            &mut expired_convergence,
+            now + Duration::from_secs(21),
+        );
+        assert!(!expired_convergence.active.contains_key("shared.example"));
+        assert!(
+            expired_convergence
+                .active
+                .contains_key("new-intermediate.example")
+        );
+
+        let original_expiry = authorizations
+            .active
+            .get("shared.example")
+            .unwrap()
+            .expires_at;
+        let same_lineage = cname_test_validated_response(
+            "github.com",
+            "shared.example",
+            "192.0.2.35".parse().unwrap(),
+            60,
+            now + Duration::from_secs(5),
+            &policy,
+            &authorizations,
+        );
+        let (completion, _result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &policy,
+                BTreeSet::new(),
+                vec![MaterializationRequest {
+                    queried_hostname: "github.com".to_owned(),
+                    response: same_lineage,
+                    completion,
+                }],
+                now + Duration::from_secs(5),
+            );
+        assert!(rejected.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(materializations.len(), 1);
+        assert!(!capacity_rejected);
+        assert!(staged.active.get("shared.example").unwrap().expires_at > original_expiry);
+    }
+
+    #[test]
+    fn rejects_invalid_response_graphs_without_partial_authorization() {
+        let policy = test_hostname_policy(false);
+        let now = Instant::now();
+        let address = |hostname: &str| DnsAddressAnswer {
+            hostname: hostname.to_owned(),
+            address: "192.0.2.40".parse().unwrap(),
+            ttl_seconds: 60,
+        };
+        let invalid = vec![
+            DnsAnswerRecords {
+                aliases: vec![
+                    DnsCnameAnswer {
+                        owner: "github.com".to_owned(),
+                        target: "one.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                    DnsCnameAnswer {
+                        owner: "github.com".to_owned(),
+                        target: "two.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                ],
+                addresses: vec![address("one.example")],
+            },
+            DnsAnswerRecords {
+                aliases: vec![
+                    DnsCnameAnswer {
+                        owner: "github.com".to_owned(),
+                        target: "edge.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                    DnsCnameAnswer {
+                        owner: "edge.example".to_owned(),
+                        target: "github.com".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                ],
+                addresses: vec![address("github.com")],
+            },
+            DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: "github.com".to_owned(),
+                    target: "github.com".to_owned(),
+                    ttl_seconds: 60,
+                }],
+                addresses: vec![address("github.com")],
+            },
+            DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: "github.com".to_owned(),
+                    target: "edge.example".to_owned(),
+                    ttl_seconds: 0,
+                }],
+                addresses: vec![address("edge.example")],
+            },
+            DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: "unrelated.example".to_owned(),
+                    target: "edge.example".to_owned(),
+                    ttl_seconds: 60,
+                }],
+                addresses: vec![address("edge.example")],
+            },
+            DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: "github.com".to_owned(),
+                    target: "edge.example".to_owned(),
+                    ttl_seconds: 60,
+                }],
+                addresses: vec![address("github.com")],
+            },
+            DnsAnswerRecords {
+                aliases: vec![
+                    DnsCnameAnswer {
+                        owner: "github.com".to_owned(),
+                        target: "edge.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                    DnsCnameAnswer {
+                        owner: "unrelated.example".to_owned(),
+                        target: "outside.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                ],
+                addresses: vec![address("edge.example")],
+            },
+        ];
+        for records in invalid {
+            let authorizations = CnameAuthorizationState::default();
+            assert_eq!(
+                validate_dns_response_lineage(
+                    "github.com",
+                    &records,
+                    &authorizations,
+                    now,
+                    &policy,
+                )
+                .unwrap_err(),
+                DnsResponseValidationError::Invalid,
+            );
+            assert!(authorizations.active.is_empty());
+        }
+
+        let mut over_depth_aliases = Vec::new();
+        let mut owner = "github.com".to_owned();
+        for index in 0..=MAX_DERIVED_CNAME_DEPTH {
+            let target = format!("edge-{index}.example");
+            over_depth_aliases.push(DnsCnameAnswer {
+                owner,
+                target: target.clone(),
+                ttl_seconds: 60,
+            });
+            owner = target;
+        }
+        let over_depth = DnsAnswerRecords {
+            aliases: over_depth_aliases,
+            addresses: vec![address(&owner)],
+        };
+        assert_eq!(
+            validate_dns_response_lineage(
+                "github.com",
+                &over_depth,
+                &CnameAuthorizationState::default(),
+                now,
+                &policy,
+            )
+            .unwrap_err(),
+            DnsResponseValidationError::Invalid,
+        );
+
+        let mut full = CnameAuthorizationState::default();
+        for index in 0..MAX_DERIVED_CNAME_AUTHORIZATIONS {
+            full.active.insert(
+                format!("existing-{index}.example"),
+                ActiveCnameAuthorization {
+                    source_hostname: "github.com".to_owned(),
+                    origins: vec![HostnamePolicyOrigin::Platform],
+                    transports: vec![HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                    }],
+                    requires_runner_provenance: false,
+                    observed_ttl_seconds: 60,
+                    depth: 1,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+        let over_capacity = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "github.com".to_owned(),
+                target: "new.example".to_owned(),
+                ttl_seconds: 60,
+            }],
+            addresses: vec![address("new.example")],
+        };
+        assert_eq!(
+            validate_dns_response_lineage("github.com", &over_capacity, &full, now, &policy)
+                .unwrap_err(),
+            DnsResponseValidationError::Capacity,
+        );
+        assert_eq!(full.active.len(), MAX_DERIVED_CNAME_AUTHORIZATIONS);
+    }
+
+    #[test]
+    fn accepts_empty_negative_response_and_rejects_cname_outside_answer_section() {
+        let mut negative = query("github.com", 1);
+        negative[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        let records = parse_complete_dns_response(&negative, "github.com", 1).unwrap();
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &records,
+            &CnameAuthorizationState::default(),
+            Instant::now(),
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+        assert!(response.authorizations.is_empty());
+        assert!(response.materializations.is_empty());
+
+        let cname_nodata = response_with_cname("github.com", "edge.example", 60);
+        let records = parse_complete_dns_response(&cname_nodata, "github.com", 1).unwrap();
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &records,
+            &CnameAuthorizationState::default(),
+            Instant::now(),
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+        assert!(response.authorizations.is_empty());
+        assert!(response.materializations.is_empty());
+        assert!(response.valid_until.is_none());
+
+        let mut authority_cname = negative;
+        authority_cname[8..10].copy_from_slice(&1_u16.to_be_bytes());
+        append_test_cname_answer(&mut authority_cname, "github.com", "edge.example", 60);
+        assert!(parse_complete_dns_response(&authority_cname, "github.com", 1).is_none());
     }
 
     #[test]
@@ -7420,13 +8727,11 @@ mod tests {
             &policy,
             DnsQueryProvenance::Untrusted,
         ));
-        retain_cname_authorizations(
+        commit_test_cname_lineage(
             &mut authorizations,
-            parse_dns_cname_answers(&response_with_cname(
-                "payload.pipelines.actions.githubusercontent.com",
-                "glb-example.github.com",
-                60,
-            )),
+            "payload.pipelines.actions.githubusercontent.com",
+            "glb-example.github.com",
+            60,
             now,
             &policy,
         );
@@ -7444,13 +8749,11 @@ mod tests {
             &policy,
             DnsQueryProvenance::Untrusted,
         ));
-        retain_cname_authorizations(
+        commit_test_cname_lineage(
             &mut authorizations,
-            [DnsCnameAnswer {
-                owner: "payload.pipelines.actions.githubusercontent.com".to_owned(),
-                target: "edge.example.net".to_owned(),
-                ttl_seconds: 60,
-            }],
+            "payload.pipelines.actions.githubusercontent.com",
+            "edge.example.net",
+            60,
             now,
             &policy,
         );
@@ -7461,15 +8764,28 @@ mod tests {
             &policy,
             DnsQueryProvenance::Untrusted,
         ));
-        retain_cname_authorizations(
-            &mut authorizations,
-            [DnsCnameAnswer {
+        let unrelated = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
                 owner: "unrelated.example.net".to_owned(),
                 target: "not-derived.example.net".to_owned(),
                 ttl_seconds: 60,
             }],
-            now,
-            &policy,
+            addresses: vec![DnsAddressAnswer {
+                hostname: "not-derived.example.net".to_owned(),
+                address: "192.0.2.20".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        assert_eq!(
+            validate_dns_response_lineage(
+                "payload.pipelines.actions.githubusercontent.com",
+                &unrelated,
+                &authorizations,
+                now,
+                &policy,
+            )
+            .unwrap_err(),
+            DnsResponseValidationError::Invalid,
         );
         assert!(!authorized_hostname(
             "not-derived.example.net",
@@ -7484,7 +8800,14 @@ mod tests {
             60,
         );
         truncated.pop();
-        assert!(parse_dns_cname_answers(&truncated).is_empty());
+        assert!(
+            parse_complete_dns_response(
+                &truncated,
+                "payload.pipelines.actions.githubusercontent.com",
+                1,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -7534,13 +8857,26 @@ mod tests {
             port: 443,
             origins: vec![HostnamePolicyOrigin::Platform],
             ttl_seconds: 30,
+            expires_at: now + Duration::from_secs(30),
         };
         let mut active = BTreeMap::new();
-        let merge = merge_materializations(&mut active, [materialization.clone()], now);
+        let mut longer_duplicate = materialization.clone();
+        longer_duplicate.ttl_seconds = 90;
+        longer_duplicate.expires_at = now + Duration::from_secs(90);
+        let merge = merge_materializations(
+            &mut active,
+            [longer_duplicate, materialization.clone()],
+            now,
+        );
 
         assert!(merge.rules_changed);
         assert!(merge.metadata_changed);
         assert_eq!(merge.expired, 0);
+        assert_eq!(active.values().next().unwrap().observed_ttl_seconds, 30);
+        assert_eq!(
+            active.values().next().unwrap().expires_at,
+            now + Duration::from_secs(30) + DNS_MATERIALIZATION_REFRESH_OVERLAP,
+        );
         assert_eq!(
             effective_allowances_with_materializations(&[], &active),
             vec![EffectiveAllowance {
@@ -7556,13 +8892,13 @@ mod tests {
             now + Duration::from_secs(31),
         );
         assert!(!merge.rules_changed);
-        assert!(merge.metadata_changed);
+        assert!(!merge.metadata_changed);
         assert_eq!(merge.expired, 0);
         assert_eq!(active.len(), 1);
         let merge = merge_materializations(
             &mut active,
             std::iter::empty(),
-            now + Duration::from_secs(92),
+            now + Duration::from_secs(61),
         );
         assert!(merge.rules_changed);
         assert!(merge.metadata_changed);
@@ -7571,41 +8907,307 @@ mod tests {
     }
 
     #[test]
-    fn materialization_batch_coalesces_duplicates_and_rejects_overflow_atomically() {
-        let materialization = |index: usize| PendingMaterialization {
-            source_hostname: "api.github.com".to_owned(),
-            hostname: "api.github.com".to_owned(),
-            address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
-            protocol: Protocol::Tcp,
-            port: 443,
-            origins: vec![HostnamePolicyOrigin::Platform],
-            ttl_seconds: 30,
-        };
-        let initial = (0..MAX_MATERIALIZATIONS_PER_UPDATE - 1)
-            .map(materialization)
-            .collect::<BTreeSet<_>>();
-        let request = |values: BTreeSet<PendingMaterialization>| {
+    fn materialization_transactions_recheck_capacity_roots_and_deadlines_atomically() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let request = |queried_hostname: &str, response: ValidatedDnsResponse| {
             let (completion, _result) = mpsc::sync_channel(1);
             MaterializationRequest {
-                materializations: values,
+                queried_hostname: queried_hostname.to_owned(),
+                response,
                 completion,
             }
         };
-        let duplicate = request([materialization(0)].into_iter().collect());
-        let overflow = request(
-            [
-                materialization(MAX_MATERIALIZATIONS_PER_UPDATE - 1),
-                materialization(MAX_MATERIALIZATIONS_PER_UPDATE),
-            ]
-            .into_iter()
-            .collect(),
+
+        let mut nearly_full = CnameAuthorizationState::default();
+        for index in 0..MAX_DERIVED_CNAME_AUTHORIZATIONS - 1 {
+            nearly_full.active.insert(
+                format!("existing-{index}.example"),
+                ActiveCnameAuthorization {
+                    source_hostname: "github.com".to_owned(),
+                    origins: vec![HostnamePolicyOrigin::Platform],
+                    transports: vec![HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                    }],
+                    requires_runner_provenance: false,
+                    observed_ttl_seconds: 60,
+                    depth: 1,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+        let first = cname_test_validated_response(
+            "github.com",
+            "first.example",
+            "192.0.2.51".parse().unwrap(),
+            60,
+            now,
+            &policy,
+            &nearly_full,
         );
-        let (combined, accepted, rejected) =
-            build_bounded_materialization_batch(initial, vec![duplicate, overflow]);
-        assert_eq!(combined.len(), MAX_MATERIALIZATIONS_PER_UPDATE - 1);
+        let second = cname_test_validated_response(
+            "github.com",
+            "second.example",
+            "192.0.2.52".parse().unwrap(),
+            60,
+            now,
+            &policy,
+            &nearly_full,
+        );
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &nearly_full,
+                &policy,
+                BTreeSet::new(),
+                vec![request("github.com", first), request("github.com", second)],
+                now,
+            );
+        assert_eq!(staged.active.len(), MAX_DERIVED_CNAME_AUTHORIZATIONS);
+        assert!(staged.active.contains_key("first.example"));
+        assert!(!staged.active.contains_key("second.example"));
+        assert!(staged.truncated);
+        assert!(!materialization_capacity_rejected);
         assert_eq!(accepted.len(), 1);
         assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0].materializations.len(), 2);
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(
+            materializations.iter().next().unwrap().address,
+            "192.0.2.51".parse::<IpAddr>().unwrap(),
+        );
+
+        let mut original_root = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut original_root,
+            "github.com",
+            "derived.example",
+            60,
+            now,
+            &policy,
+        );
+        let extension = cname_test_validated_response(
+            "derived.example",
+            "extended.example",
+            "192.0.2.53".parse().unwrap(),
+            60,
+            now,
+            &policy,
+            &original_root,
+        );
+        let mut changed_root = original_root.clone();
+        changed_root
+            .active
+            .get_mut("derived.example")
+            .unwrap()
+            .source_hostname = "changed.example".to_owned();
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &changed_root,
+                &policy,
+                BTreeSet::new(),
+                vec![request("derived.example", extension)],
+                now,
+            );
+        assert_eq!(staged.active, changed_root.active);
+        assert!(materializations.is_empty());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(!materialization_capacity_rejected);
+
+        let expired = direct_test_validated_response(
+            "github.com",
+            "192.0.2.54".parse().unwrap(),
+            5,
+            now,
+            &policy,
+        );
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &CnameAuthorizationState::default(),
+                &policy,
+                BTreeSet::new(),
+                vec![request("github.com", expired)],
+                now + Duration::from_secs(6),
+            );
+        assert!(staged.active.is_empty());
+        assert!(materializations.is_empty());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(!materialization_capacity_rejected);
+
+        let mut current_authorizations = CnameAuthorizationState::default();
+        let mut current_active = BTreeMap::new();
+        let mut proposed_authorizations = CnameAuthorizationState::default();
+        proposed_authorizations.active.insert(
+            "published.example".to_owned(),
+            ActiveCnameAuthorization {
+                source_hostname: "github.com".to_owned(),
+                origins: vec![HostnamePolicyOrigin::Platform],
+                transports: vec![HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                }],
+                requires_runner_provenance: false,
+                observed_ttl_seconds: 30,
+                depth: 1,
+                expires_at: now + Duration::from_secs(30),
+            },
+        );
+        let mut proposed_active = BTreeMap::new();
+        merge_materializations(
+            &mut proposed_active,
+            [PendingMaterialization {
+                source_hostname: "github.com".to_owned(),
+                hostname: "published.example".to_owned(),
+                address: "192.0.2.55".parse().unwrap(),
+                protocol: Protocol::Tcp,
+                port: 443,
+                origins: vec![HostnamePolicyOrigin::Platform],
+                ttl_seconds: 30,
+                expires_at: now + Duration::from_secs(30),
+            }],
+            now,
+        );
+        assert!(!publish_verified_materialization_transaction(
+            false,
+            &mut current_authorizations,
+            &mut current_active,
+            proposed_authorizations.clone(),
+            proposed_active.clone(),
+        ));
+        assert!(current_authorizations.active.is_empty());
+        assert!(current_active.is_empty());
+        assert!(publish_verified_materialization_transaction(
+            true,
+            &mut current_authorizations,
+            &mut current_active,
+            proposed_authorizations.clone(),
+            proposed_active.clone(),
+        ));
+        assert_eq!(current_authorizations, proposed_authorizations);
+        assert_eq!(current_active, proposed_active);
+    }
+
+    #[test]
+    fn materialization_transaction_preserves_batch_and_active_capacity_bounds() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let initial = (0..MAX_MATERIALIZATIONS_PER_UPDATE)
+            .map(|index| PendingMaterialization {
+                source_hostname: format!("source-{index}.example"),
+                hostname: format!("target-{index}.example"),
+                address: "192.0.2.60".parse().unwrap(),
+                protocol: Protocol::Tcp,
+                port: 443,
+                origins: vec![HostnamePolicyOrigin::Platform],
+                ttl_seconds: 60,
+                expires_at: now + Duration::from_secs(60),
+            })
+            .collect::<BTreeSet<_>>();
+        let response = direct_test_validated_response(
+            "github.com",
+            "192.0.2.61".parse().unwrap(),
+            60,
+            now,
+            &policy,
+        );
+        let (completion, _result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &CnameAuthorizationState::default(),
+                &policy,
+                initial,
+                vec![MaterializationRequest {
+                    queried_hostname: "github.com".to_owned(),
+                    response,
+                    completion,
+                }],
+                now,
+            );
+        assert!(staged.active.is_empty());
+        assert_eq!(materializations.len(), MAX_MATERIALIZATIONS_PER_UPDATE);
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(capacity_rejected);
+
+        let address = "192.0.2.62".parse().unwrap();
+        let mut active = BTreeMap::new();
+        for index in 0..=MAX_ACTIVE_MATERIALIZATIONS {
+            let source_hostname = format!("source-{index}.example");
+            let hostname = format!("target-{index}.example");
+            active.insert(
+                (
+                    source_hostname.clone(),
+                    hostname.clone(),
+                    address,
+                    Protocol::Tcp,
+                    443,
+                ),
+                ActiveMaterialization {
+                    source_hostname,
+                    hostname,
+                    address,
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                    origins: vec![HostnamePolicyOrigin::Platform],
+                    observed_ttl_seconds: 60,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+        let effective = effective_allowances_with_materializations(&[], &active);
+        assert_eq!(effective.len(), 1);
+        assert!(materialization_candidate_exceeds_bounds(
+            &active, &effective
+        ));
+    }
+
+    #[test]
+    fn refresh_only_metadata_requires_verification_before_publication() {
+        let now = Instant::now();
+        let idle = MaterializationMerge {
+            rules_changed: false,
+            metadata_changed: false,
+            expired: 0,
+        };
+        assert!(!materialization_candidate_requires_verification(0, &idle));
+        let pending = |expires_at| PendingMaterialization {
+            source_hostname: "github.com".to_owned(),
+            hostname: "edge.example".to_owned(),
+            address: "192.0.2.63".parse().unwrap(),
+            protocol: Protocol::Tcp,
+            port: 443,
+            origins: vec![HostnamePolicyOrigin::Platform],
+            ttl_seconds: 60,
+            expires_at,
+        };
+        let mut current_active = BTreeMap::new();
+        merge_materializations(
+            &mut current_active,
+            [pending(now + Duration::from_secs(30))],
+            now,
+        );
+        let original_active = current_active.clone();
+        let mut proposed_active = current_active.clone();
+        let merge = merge_materializations(
+            &mut proposed_active,
+            [pending(now + Duration::from_secs(60))],
+            now,
+        );
+        assert!(!merge.rules_changed);
+        assert!(merge.metadata_changed);
+        assert!(materialization_candidate_requires_verification(0, &merge));
+
+        let mut current_authorizations = CnameAuthorizationState::default();
+        assert!(!publish_verified_materialization_transaction(
+            false,
+            &mut current_authorizations,
+            &mut current_active,
+            CnameAuthorizationState::default(),
+            proposed_active,
+        ));
+        assert_eq!(current_active, original_active);
+        assert!(current_authorizations.active.is_empty());
     }
 
     #[test]
@@ -7634,22 +9236,25 @@ mod tests {
             &policy,
         )
         .unwrap();
-        let unrelated_materializations = pending_materializations_from_bootstrap_response(
-            "github.com",
-            1,
-            &response_with_unrelated_address(
+        assert_eq!(
+            pending_materializations_from_bootstrap_response(
                 "github.com",
                 1,
-                "unrelated.example.net",
-                &[192, 0, 2, 30],
-            ),
-            now,
-            &policy,
-        )
-        .unwrap();
+                &response_with_unrelated_address(
+                    "github.com",
+                    1,
+                    "unrelated.example.net",
+                    &[192, 0, 2, 30],
+                ),
+                now,
+                &policy,
+            )
+            .unwrap_err()
+            .code,
+            "dns_block_prehydration_failed"
+        );
         let mut materializations = root_materializations;
         materializations.extend(cname_materializations);
-        materializations.extend(unrelated_materializations);
         materializations.sort();
         materializations.dedup();
 
@@ -7785,6 +9390,29 @@ mod tests {
             "dns_block_prehydration_failed"
         );
 
+        let materializations = materializations_from_bootstrap_query_results(
+            "github.com",
+            now,
+            &policy,
+            [
+                (
+                    1,
+                    Ok(response_with_address("github.com", 1, 60, &[192, 0, 2, 10])),
+                ),
+                (
+                    28,
+                    Ok(response_with_cname_for_type(
+                        "github.com",
+                        28,
+                        "nodata-edge.example",
+                        60,
+                    )),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(materializations.len(), 1);
+
         let error = materializations_from_bootstrap_query_results(
             "github.com",
             now,
@@ -7811,7 +9439,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(matches!(error, PrehydrationError::Transient(_)));
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
         assert_eq!(
             prehydration_error_code(&error),
             "dns_block_prehydration_failed"
