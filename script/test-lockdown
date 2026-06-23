@@ -129,9 +129,17 @@ elif scenario == "standard":
     require(report["sudo_status"] == "disabled_verified")
     require(report["container_status"] == "disabled_verified")
 elif scenario == "rollback":
-    require(report["setup_status"] == "failed_pre_ready")
-    require(report["rollback_status"] == "rolled_back_pre_ready")
-    require("rollback_error_code" not in report)
+    require(
+        report["setup_status"] == "failed_pre_ready",
+        "rollback setup status mismatch",
+    )
+    rollback_status = report["rollback_status"]
+    rollback_error_code = report.get("rollback_error_code", "none")
+    require(
+        rollback_status == "rolled_back_pre_ready",
+        f"rollback status mismatch: {rollback_status}; error: {rollback_error_code}",
+    )
+    require(rollback_error_code == "none", f"rollback error: {rollback_error_code}")
 PY
 
 if [[ -n "$acl_fixture" ]]; then

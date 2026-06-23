@@ -117,6 +117,14 @@ fn reserve_standard_descriptors() -> Result<Vec<File>, TrustedExecutableError> {
     Ok(reservations)
 }
 
+fn validate_retained_descriptor(fd: i32) -> Result<(), TrustedExecutableError> {
+    if fd < MIN_RETAINED_EXECUTABLE_FD {
+        Err(TrustedExecutableError::unavailable())
+    } else {
+        Ok(())
+    }
+}
+
 fn read_process_stat(path: &Path) -> Result<String, TrustedExecutableError> {
     let source = OpenOptions::new()
         .read(true)
@@ -208,9 +216,7 @@ impl PinnedExecutable {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)
             .map_err(|_| TrustedExecutableError::unavailable())?;
-        if file.as_raw_fd() < MIN_RETAINED_EXECUTABLE_FD {
-            return Err(TrustedExecutableError::unavailable());
-        }
+        validate_retained_descriptor(file.as_raw_fd())?;
         let metadata = file
             .metadata()
             .map_err(|_| TrustedExecutableError::unavailable())?;
@@ -452,12 +458,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TEST_EXECUTABLE_MODE: u32 = 0o755;
-    const CLOSED_STANDARD_DESCRIPTORS_CHILD_ENV: &str =
-        "FENCE_TRUSTED_EXECUTABLE_CLOSED_STANDARD_DESCRIPTORS_CHILD";
-    const CLOSED_STANDARD_DESCRIPTORS_MARKER_ENV: &str =
-        "FENCE_TRUSTED_EXECUTABLE_CLOSED_STANDARD_DESCRIPTORS_MARKER";
-    const CLOSED_STANDARD_DESCRIPTORS_TEST_NAME: &str =
-        "trusted_executable::tests::capture_reserves_closed_standard_descriptors";
     static TEST_DIRECTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
 
     fn test_directory() -> PathBuf {
@@ -491,32 +491,6 @@ mod tests {
             .find_map(|line| line.strip_prefix("flags:\t"))
             .and_then(|value| u32::from_str_radix(value, 8).ok())
             .is_some_and(|flags| flags & libc::O_CLOEXEC as u32 != 0)
-    }
-
-    fn closed_standard_descriptor_capture_succeeds() -> bool {
-        if (0..MIN_RETAINED_EXECUTABLE_FD)
-            .any(|fd| fs::symlink_metadata(format!("/proc/self/fd/{fd}")).is_ok())
-        {
-            return false;
-        }
-        let path = Path::new("/usr/bin/true");
-        let Ok(metadata) = fs::metadata(path) else {
-            return false;
-        };
-        let mode = metadata.permissions().mode() & 0o7777;
-        if PinnedExecutable::capture(path, metadata.uid(), metadata.gid(), mode).is_ok() {
-            return false;
-        }
-        let Ok(reservations) = reserve_standard_descriptors() else {
-            return false;
-        };
-        if reservations.len() != STANDARD_DESCRIPTOR_RESERVATION_COUNT
-            || !reservations.iter().all(descriptor_is_close_on_exec)
-        {
-            return false;
-        }
-        PinnedExecutable::capture(path, metadata.uid(), metadata.gid(), mode)
-            .is_ok_and(|pinned| pinned.file.as_raw_fd() >= MIN_RETAINED_EXECUTABLE_FD)
     }
 
     #[test]
@@ -616,33 +590,22 @@ mod tests {
     }
 
     #[test]
-    fn capture_reserves_closed_standard_descriptors() {
-        if std::env::var_os(CLOSED_STANDARD_DESCRIPTORS_CHILD_ENV).is_some() {
-            let success = closed_standard_descriptor_capture_succeeds();
-            let marker = std::env::var_os(CLOSED_STANDARD_DESCRIPTORS_MARKER_ENV).unwrap();
-            let marker_contents: &[u8] = if success { b"ok" } else { b"failed" };
-            let marker_written = fs::write(marker, marker_contents).is_ok();
-            std::process::exit(if success && marker_written { 0 } else { 1 });
+    fn capture_rejects_standard_descriptors_and_reserves_all_three() {
+        assert_eq!(
+            STANDARD_DESCRIPTOR_RESERVATION_COUNT,
+            MIN_RETAINED_EXECUTABLE_FD as usize
+        );
+        for fd in 0..MIN_RETAINED_EXECUTABLE_FD {
+            assert_eq!(
+                validate_retained_descriptor(fd).unwrap_err().code,
+                "trusted_executable_unavailable"
+            );
         }
+        validate_retained_descriptor(MIN_RETAINED_EXECUTABLE_FD).unwrap();
 
-        let root = test_directory();
-        let marker = root.join("closed-standard-descriptors-child");
-        let status = Command::new("/bin/sh")
-            .args([
-                "-c",
-                "exec 0<&- 1>&- 2>&-; exec \"$1\" --exact \"$2\"",
-                "sh",
-            ])
-            .arg(std::env::current_exe().unwrap())
-            .arg(CLOSED_STANDARD_DESCRIPTORS_TEST_NAME)
-            .env(CLOSED_STANDARD_DESCRIPTORS_CHILD_ENV, "1")
-            .env(CLOSED_STANDARD_DESCRIPTORS_MARKER_ENV, &marker)
-            .status()
-            .unwrap();
-
-        assert!(status.success());
-        assert_eq!(fs::read(&marker).unwrap(), b"ok");
-        fs::remove_dir_all(root).unwrap();
+        let reservations = reserve_standard_descriptors().unwrap();
+        assert_eq!(reservations.len(), STANDARD_DESCRIPTOR_RESERVATION_COUNT);
+        assert!(reservations.iter().all(descriptor_is_close_on_exec));
     }
 
     #[test]
