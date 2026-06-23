@@ -76,7 +76,10 @@ See [`v0.md`](v0.md) for normative behavior and
 - Derived DNS authorization moved from process-wide answer-owner matching to a
   response-local chain rooted at the echoed question, with atomic validation
   and queried-root policy retention. Address-family NODATA responses retain no
-  derived authorization.
+  derived authorization, and duplicate terminal endpoints use the minimum TTL.
+- The single firewall owner now rechecks, applies, verifies, and publishes DNS
+  authorization and materialization candidates as one ordered transaction;
+  queued work cannot restart validation-time expiry.
 - The logical policy now merges platform and user hostname transports,
   prehydrates exact roots, refreshes them during the resident lifecycle, and
   keeps transient addresses out of the logical hash.

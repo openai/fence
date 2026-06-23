@@ -751,7 +751,7 @@ struct DnsAnswerRecords {
 
 type AuthorizedHostnamePolicy = (Vec<HostnamePolicyOrigin>, Vec<HostnameTransport>);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ValidatedDnsResponse {
     authorizations: Vec<(String, ActiveCnameAuthorization)>,
     materializations: Vec<PendingMaterialization>,
@@ -776,17 +776,28 @@ struct PendingMaterialization {
     port: u16,
     origins: Vec<HostnamePolicyOrigin>,
     ttl_seconds: u32,
+    expires_at: Instant,
 }
+
+type PendingMaterializationIdentity = (
+    String,
+    String,
+    IpAddr,
+    Protocol,
+    u16,
+    Vec<HostnamePolicyOrigin>,
+);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MaterializationCompletion {
-    AppliedAndVerified,
+    AppliedVerifiedAndCommitted,
     Failed,
 }
 
 #[derive(Debug)]
 struct MaterializationRequest {
-    materializations: BTreeSet<PendingMaterialization>,
+    queried_hostname: String,
+    response: ValidatedDnsResponse,
     completion: SyncSender<MaterializationCompletion>,
 }
 
@@ -841,7 +852,7 @@ struct MaterializationMerge {
     expired: u64,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct ActiveMaterialization {
     source_hostname: String,
     hostname: String,
@@ -855,7 +866,7 @@ struct ActiveMaterialization {
 
 type ActiveMaterializationKey = (String, String, IpAddr, Protocol, u16);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
 struct CnameAuthorizationState {
     bounded_actions_suffix: BTreeSet<String>,
     bounded_actions_suffix_truncated: bool,
@@ -1214,7 +1225,7 @@ impl ObservationRecorder {
                         observed_answers = records.addresses.clone();
                         block_validation = Some(response);
                     } else {
-                        commit_dns_response_authorizations(&mut authorizations, response);
+                        let _ = commit_dns_response_authorizations(&mut authorizations, response);
                     }
                 }
                 Err(DnsResponseValidationError::Capacity) => {
@@ -1244,19 +1255,14 @@ impl ObservationRecorder {
             DnsResponseDisposition::ForwardOriginal
         } else if let Some(submitter) = &self.materializations {
             let response = block_validation.expect("block validation checked above");
-            let materializations = response
-                .materializations
-                .iter()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            match submit_materialization_request(submitter, materializations, &self.shutdown) {
-                Ok(MaterializationCompletion::AppliedAndVerified) => {
-                    if self.commit_validated_dns_response(&hostname, response) {
-                        DnsResponseDisposition::ForwardOriginal
-                    } else {
-                        self.record_materialization_rejection();
-                        DnsResponseDisposition::RetryableFailure
-                    }
+            match submit_materialization_request(
+                submitter,
+                hostname.clone(),
+                response,
+                &self.shutdown,
+            ) {
+                Ok(MaterializationCompletion::AppliedVerifiedAndCommitted) => {
+                    DnsResponseDisposition::ForwardOriginal
                 }
                 Ok(MaterializationCompletion::Failed) => DnsResponseDisposition::RetryableFailure,
                 Err(()) => {
@@ -1277,25 +1283,6 @@ impl ObservationRecorder {
             self.report_write_failed.store(true, Ordering::Relaxed);
         }
         disposition
-    }
-
-    fn commit_validated_dns_response(
-        &self,
-        hostname: &str,
-        response: ValidatedDnsResponse,
-    ) -> bool {
-        let now = Instant::now();
-        let mut authorizations = self
-            .cname_authorizations
-            .lock()
-            .expect("DNS CNAME authorization lock poisoned");
-        commit_staged_dns_response(
-            &mut authorizations,
-            hostname,
-            response,
-            now,
-            &self.hostname_policy,
-        )
     }
 
     fn record_materialization_rejection(&self) {
@@ -2471,62 +2458,93 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         let refresh_attempted = !refresh_materializations.is_empty();
-        let (materializations, accepted_requests, rejected_requests) =
-            self.collect_materialization_batch(refresh_materializations);
-        if rejected_requests > 0 {
-            self.evidence.materializations_truncated = true;
-            changed = true;
-        }
+        let requests = self.collect_materialization_requests();
         let batch_started = Instant::now();
+        let mut authorizations = self
+            ._mediation
+            .recorder
+            .cname_authorizations
+            .lock()
+            .expect("DNS CNAME authorization lock poisoned");
+        let transaction_now = Instant::now();
+        let (
+            proposed_authorizations,
+            materializations,
+            accepted_requests,
+            rejected_requests,
+            materialization_capacity_rejected,
+        ) = stage_materialization_transactions(
+            &authorizations,
+            &self._mediation.recorder.hostname_policy,
+            refresh_materializations,
+            requests,
+            transaction_now,
+        );
+        let accepted_request_count = accepted_requests.len();
+        let rejected_request_count = rejected_requests.len();
         let batch_has_work = !materializations.is_empty();
         let mut proposed = self.active.clone();
-        let merge = merge_materializations(&mut proposed, materializations, Instant::now());
+        let merge = merge_materializations(&mut proposed, materializations, transaction_now);
         let proposed_allowances =
             effective_allowances_with_materializations(&self.base_allowances, &proposed);
-        let effective_rule_limit_exceeded = proposed_allowances.len() > MAX_EXPANDED_RULES;
-        let update_succeeded = if merge.rules_changed {
-            if effective_rule_limit_exceeded {
-                self.evidence.materializations_truncated = true;
-                for _ in 0..accepted_requests.len() {
-                    self._mediation.recorder.record_materialization_rejection();
-                }
-                if refresh_attempted {
-                    self.evidence.hostname_refresh_warnings =
-                        self.evidence.hostname_refresh_warnings.saturating_add(1);
-                    self._mediation.recorder.record_hostname_refresh_warning();
-                }
-                false
-            } else {
-                let ruleset =
-                    render_dns_mediated_replacement_ruleset(Mode::Block, &proposed_allowances);
-                let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &proposed_allowances);
-                let expected = expected_dns_mediated_owned_state(Mode::Block, &proposed_allowances);
-                if self.backend.preflight(&ruleset).is_ok()
-                    && self.backend.replace_owned_state(&ruleset).is_ok()
-                    && self.backend.verify_owned_state(&expected).is_ok()
-                {
-                    self.active = proposed;
-                    self.expected_state = expected;
-                    self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
-                    self.evidence.network_verification_status = "verified";
-                    true
-                } else {
-                    self.evidence.network_verification_status = "critical_dynamic_update_failed";
-                    self.record_critical(
-                        "dns_block_dynamic_update_failed",
-                        "approved DNS-derived owned nftables replacement failed after readiness",
-                    );
-                    false
-                }
-            }
+        let materialization_bound_exceeded =
+            materialization_candidate_exceeds_bounds(&proposed, &proposed_allowances);
+        let ruleset = render_dns_mediated_replacement_ruleset(Mode::Block, &proposed_allowances);
+        let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &proposed_allowances);
+        let expected = expected_dns_mediated_owned_state(Mode::Block, &proposed_allowances);
+        let transaction_requires_verification =
+            materialization_candidate_requires_verification(accepted_request_count, &merge);
+        let verification_succeeded = if materialization_bound_exceeded {
+            false
+        } else if merge.rules_changed {
+            self.backend.preflight(&ruleset).is_ok()
+                && self.backend.replace_owned_state(&ruleset).is_ok()
+                && self.backend.verify_owned_state(&expected).is_ok()
+        } else if transaction_requires_verification {
+            self.backend.verify_owned_state(&expected).is_ok()
         } else {
-            if effective_rule_limit_exceeded {
-                false
-            } else {
-                self.active = proposed;
-                true
-            }
+            true
         };
+        let update_succeeded = publish_verified_materialization_transaction(
+            verification_succeeded,
+            &mut authorizations,
+            &mut self.active,
+            proposed_authorizations,
+            proposed,
+        );
+        if update_succeeded && transaction_requires_verification {
+            self.expected_state = expected;
+            self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
+            self.evidence.network_verification_status = "verified";
+        }
+        drop(authorizations);
+
+        if rejected_request_count > 0 {
+            for _ in 0..rejected_request_count {
+                self._mediation.recorder.record_materialization_rejection();
+            }
+            changed = true;
+        }
+        if materialization_capacity_rejected || materialization_bound_exceeded {
+            self.evidence.materializations_truncated = true;
+        }
+        if !update_succeeded {
+            for _ in 0..accepted_request_count {
+                self._mediation.recorder.record_materialization_rejection();
+            }
+            if refresh_attempted {
+                self.evidence.hostname_refresh_warnings =
+                    self.evidence.hostname_refresh_warnings.saturating_add(1);
+                self._mediation.recorder.record_hostname_refresh_warning();
+            }
+            if !materialization_bound_exceeded {
+                self.evidence.network_verification_status = "critical_dynamic_update_failed";
+                self.record_critical(
+                    "dns_block_dynamic_update_failed",
+                    "approved DNS-derived owned nftables replacement failed after readiness",
+                );
+            }
+        }
         if batch_has_work {
             self._mediation
                 .recorder
@@ -2542,11 +2560,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             }
             complete_materialization_requests(
                 accepted_requests,
-                MaterializationCompletion::AppliedAndVerified,
+                MaterializationCompletion::AppliedVerifiedAndCommitted,
             );
         } else {
             complete_materialization_requests(accepted_requests, MaterializationCompletion::Failed);
         }
+        complete_materialization_requests(rejected_requests, MaterializationCompletion::Failed);
         if batch_has_work || merge.rules_changed || merge.metadata_changed {
             changed = true;
         }
@@ -2669,14 +2688,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         Ok(())
     }
 
-    fn collect_materialization_batch(
-        &mut self,
-        initial: BTreeSet<PendingMaterialization>,
-    ) -> (
-        BTreeSet<PendingMaterialization>,
-        Vec<MaterializationRequest>,
-        u64,
-    ) {
+    fn collect_materialization_requests(&mut self) -> Vec<MaterializationRequest> {
         let mut requests = Vec::new();
         if let Some(request) = self.pending_materialization_request.take() {
             requests.push(request);
@@ -2688,14 +2700,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             }
         }
 
-        let (materializations, accepted, rejected_requests) =
-            build_bounded_materialization_batch(initial, requests);
-        let rejected = u64::try_from(rejected_requests.len()).unwrap_or(u64::MAX);
-        for _ in 0..rejected_requests.len() {
-            self._mediation.recorder.record_materialization_rejection();
-        }
-        complete_materialization_requests(rejected_requests, MaterializationCompletion::Failed);
-        (materializations, accepted, rejected)
+        requests
     }
 
     fn wait_for_materialization_or_housekeeping(&mut self, timeout: Duration) {
@@ -3345,15 +3350,21 @@ fn materialization_request_channel() -> (MaterializationSubmitter, Receiver<Mate
 
 fn submit_materialization_request(
     submitter: &MaterializationSubmitter,
-    materializations: BTreeSet<PendingMaterialization>,
+    queried_hostname: String,
+    mut response: ValidatedDnsResponse,
     shutdown: &AtomicBool,
 ) -> Result<MaterializationCompletion, ()> {
-    if materializations.is_empty() || materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+    response.materializations = coalesce_pending_materializations(response.materializations)
+        .into_iter()
+        .collect();
+    let materialization_count = response.materializations.len();
+    if materialization_count == 0 || materialization_count > MAX_MATERIALIZATIONS_PER_UPDATE {
         return Err(());
     }
     let (completion, result) = mpsc::sync_channel(1);
     let request = MaterializationRequest {
-        materializations,
+        queried_hostname,
+        response,
         completion,
     };
     match submitter.requests.try_send(request) {
@@ -3370,28 +3381,116 @@ fn submit_materialization_request(
     }
 }
 
-fn build_bounded_materialization_batch(
+fn stage_materialization_transactions(
+    current_authorizations: &CnameAuthorizationState,
+    hostname_policy: &RuntimeHostnamePolicy,
     initial: BTreeSet<PendingMaterialization>,
     requests: Vec<MaterializationRequest>,
+    now: Instant,
 ) -> (
+    CnameAuthorizationState,
     BTreeSet<PendingMaterialization>,
     Vec<MaterializationRequest>,
     Vec<MaterializationRequest>,
+    bool,
 ) {
-    let mut materializations = initial;
+    let mut authorizations = current_authorizations.clone();
+    let mut materializations = coalesce_pending_materializations(initial);
     let mut accepted = Vec::new();
     let mut rejected = Vec::new();
+    let mut materialization_capacity_rejected = false;
     for request in requests {
-        let mut combined = materializations.clone();
-        combined.extend(request.materializations.iter().cloned());
+        let mut proposed_authorizations = authorizations.clone();
+        if !commit_staged_dns_response(
+            &mut proposed_authorizations,
+            &request.queried_hostname,
+            request.response.clone(),
+            now,
+            hostname_policy,
+        ) {
+            authorizations.truncated |= proposed_authorizations.truncated;
+            rejected.push(request);
+            continue;
+        }
+        let combined = coalesce_pending_materializations(
+            materializations
+                .iter()
+                .cloned()
+                .chain(request.response.materializations.iter().cloned()),
+        );
         if combined.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+            materialization_capacity_rejected = true;
             rejected.push(request);
         } else {
+            authorizations = proposed_authorizations;
             materializations = combined;
             accepted.push(request);
         }
     }
-    (materializations, accepted, rejected)
+    (
+        authorizations,
+        materializations,
+        accepted,
+        rejected,
+        materialization_capacity_rejected,
+    )
+}
+
+fn materialization_candidate_exceeds_bounds(
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    effective_allowances: &[EffectiveAllowance],
+) -> bool {
+    active.len() > MAX_ACTIVE_MATERIALIZATIONS || effective_allowances.len() > MAX_EXPANDED_RULES
+}
+
+fn materialization_candidate_requires_verification(
+    accepted_request_count: usize,
+    merge: &MaterializationMerge,
+) -> bool {
+    accepted_request_count > 0 || merge.rules_changed || merge.metadata_changed
+}
+
+fn publish_verified_materialization_transaction(
+    verification_succeeded: bool,
+    authorizations: &mut CnameAuthorizationState,
+    active: &mut BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    proposed_authorizations: CnameAuthorizationState,
+    proposed_active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+) -> bool {
+    if !verification_succeeded {
+        return false;
+    }
+    *active = proposed_active;
+    *authorizations = proposed_authorizations;
+    true
+}
+
+fn coalesce_pending_materializations(
+    materializations: impl IntoIterator<Item = PendingMaterialization>,
+) -> BTreeSet<PendingMaterialization> {
+    let mut coalesced = BTreeMap::<PendingMaterializationIdentity, PendingMaterialization>::new();
+    for materialization in materializations {
+        let identity = (
+            materialization.source_hostname.clone(),
+            materialization.hostname.clone(),
+            materialization.address,
+            materialization.protocol,
+            materialization.port,
+            materialization.origins.clone(),
+        );
+        match coalesced.entry(identity) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(materialization);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let minimum_ttl = entry.get().ttl_seconds.min(materialization.ttl_seconds);
+                let minimum_expiry = entry.get().expires_at.min(materialization.expires_at);
+                entry.get_mut().ttl_seconds = minimum_ttl;
+                entry.get_mut().expires_at = minimum_expiry;
+            }
+        }
+    }
+    coalesced.into_values().collect()
 }
 
 fn merge_materializations(
@@ -3413,7 +3512,11 @@ fn merge_materializations(
         .extract_if(.., |_, materialization| materialization.expires_at <= now)
         .count() as u64;
     let mut metadata_changed = expired > 0;
-    for materialization in materializations {
+    for materialization in coalesce_pending_materializations(materializations) {
+        let expires_at = materialization.expires_at + DNS_MATERIALIZATION_REFRESH_OVERLAP;
+        if expires_at <= now {
+            continue;
+        }
         let key = (
             materialization.source_hostname.clone(),
             materialization.hostname.clone(),
@@ -3429,9 +3532,7 @@ fn merge_materializations(
             port: materialization.port,
             origins: materialization.origins,
             observed_ttl_seconds: materialization.ttl_seconds,
-            expires_at: now
-                + Duration::from_secs(u64::from(materialization.ttl_seconds))
-                + DNS_MATERIALIZATION_REFRESH_OVERLAP,
+            expires_at,
         };
         metadata_changed |= active.get(&key).is_none_or(|current| {
             current.observed_ttl_seconds != replacement.observed_ttl_seconds
@@ -4090,6 +4191,9 @@ fn parse_complete_dns_response(
         };
         if record_class == 1 {
             match record_type {
+                1 | 28 if record_type != query_type => {
+                    return None;
+                }
                 1 if data_length != 4 || owner_is_root || record_index >= answer_count => {
                     return None;
                 }
@@ -4710,6 +4814,7 @@ fn validate_dns_response_lineage(
             port: transport.port,
             origins: policy.0.clone(),
             ttl_seconds,
+            expires_at: address_expiry,
         }));
     }
     if let Some(expiry) = response_expiry {
@@ -4722,6 +4827,12 @@ fn validate_dns_response_lineage(
             authorization.observed_ttl_seconds =
                 authorization.observed_ttl_seconds.min(observed_ttl_seconds);
         }
+    }
+    let materializations = coalesce_pending_materializations(materializations)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
+        return Err(DnsResponseValidationError::Capacity);
     }
     Ok(ValidatedDnsResponse {
         authorizations,
@@ -4770,14 +4881,13 @@ fn commit_staged_dns_response(
         state.truncated = true;
         return false;
     }
-    commit_dns_response_authorizations(state, response);
-    true
+    commit_dns_response_authorizations(state, response)
 }
 
 fn commit_dns_response_authorizations(
     state: &mut CnameAuthorizationState,
     response: ValidatedDnsResponse,
-) {
+) -> bool {
     if response
         .authorizations
         .iter()
@@ -4790,11 +4900,21 @@ fn commit_dns_response_authorizations(
             })
         })
     {
-        return;
+        return false;
     }
     for (hostname, authorization) in response.authorizations {
+        // A different validated parent can converge on an already authorized
+        // name with the same effective policy. Keep the existing lineage and
+        // expiry so the new response cannot refresh or reparent that grant.
+        if state.active.get(&hostname).is_some_and(|existing| {
+            existing.source_hostname != authorization.source_hostname
+                || existing.depth != authorization.depth
+        }) {
+            continue;
+        }
         state.active.insert(hostname, authorization);
     }
+    true
 }
 
 fn requires_runner_results_storage_provenance(
@@ -5586,11 +5706,21 @@ mod tests {
         ttl_seconds: u32,
         data: &[u8],
     ) -> Vec<u8> {
+        response_with_typed_address(name, query_type, query_type, ttl_seconds, data)
+    }
+
+    fn response_with_typed_address(
+        name: &str,
+        query_type: u16,
+        answer_type: u16,
+        ttl_seconds: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = query(name, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&[0xc0, 0x0c]);
-        bytes.extend_from_slice(&query_type.to_be_bytes());
+        bytes.extend_from_slice(&answer_type.to_be_bytes());
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&ttl_seconds.to_be_bytes());
         bytes.extend_from_slice(&(data.len() as u16).to_be_bytes());
@@ -5674,7 +5804,27 @@ mod tests {
         address_ttl_seconds: u32,
         address: &[u8],
     ) -> Vec<u8> {
-        let mut bytes = query(name, 1);
+        response_with_cname_and_typed_address(
+            name,
+            1,
+            target,
+            1,
+            cname_ttl_seconds,
+            address_ttl_seconds,
+            address,
+        )
+    }
+
+    fn response_with_cname_and_typed_address(
+        name: &str,
+        query_type: u16,
+        target: &str,
+        answer_type: u16,
+        cname_ttl_seconds: u32,
+        address_ttl_seconds: u32,
+        address: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = query(name, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&2_u16.to_be_bytes());
         bytes.extend_from_slice(&[0xc0, 0x0c]);
@@ -5686,7 +5836,7 @@ mod tests {
         bytes.extend_from_slice(&(target_bytes.len() as u16).to_be_bytes());
         bytes.extend_from_slice(&target_bytes);
         append_dns_name(&mut bytes, target);
-        bytes.extend_from_slice(&1_u16.to_be_bytes());
+        bytes.extend_from_slice(&answer_type.to_be_bytes());
         bytes.extend_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&address_ttl_seconds.to_be_bytes());
         bytes.extend_from_slice(&(address.len() as u16).to_be_bytes());
@@ -5734,7 +5884,134 @@ mod tests {
         };
         let response =
             validate_dns_response_lineage(root, &records, authorizations, now, policy).unwrap();
-        commit_dns_response_authorizations(authorizations, response);
+        assert!(commit_dns_response_authorizations(authorizations, response));
+    }
+
+    fn direct_test_validated_response(
+        hostname: &str,
+        address: IpAddr,
+        ttl_seconds: u32,
+        now: Instant,
+        policy: &RuntimeHostnamePolicy,
+    ) -> ValidatedDnsResponse {
+        validate_dns_response_lineage(
+            hostname,
+            &DnsAnswerRecords {
+                aliases: Vec::new(),
+                addresses: vec![DnsAddressAnswer {
+                    hostname: hostname.to_owned(),
+                    address,
+                    ttl_seconds,
+                }],
+            },
+            &CnameAuthorizationState::default(),
+            now,
+            policy,
+        )
+        .unwrap()
+    }
+
+    fn cname_test_validated_response(
+        root: &str,
+        target: &str,
+        address: IpAddr,
+        ttl_seconds: u32,
+        now: Instant,
+        policy: &RuntimeHostnamePolicy,
+        authorizations: &CnameAuthorizationState,
+    ) -> ValidatedDnsResponse {
+        validate_dns_response_lineage(
+            root,
+            &DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: root.to_owned(),
+                    target: target.to_owned(),
+                    ttl_seconds,
+                }],
+                addresses: vec![DnsAddressAnswer {
+                    hostname: target.to_owned(),
+                    address,
+                    ttl_seconds,
+                }],
+            },
+            authorizations,
+            now,
+            policy,
+        )
+        .unwrap()
+    }
+
+    fn stage_and_complete_test_request(
+        recorder: &ObservationRecorder,
+        request: MaterializationRequest,
+    ) {
+        let (failed_completion, failed_result) = mpsc::sync_channel(1);
+        let failed_request = MaterializationRequest {
+            queried_hostname: request.queried_hostname.clone(),
+            response: request.response.clone(),
+            completion: failed_completion,
+        };
+        let mut authorizations = recorder.cname_authorizations.lock().unwrap();
+        let mut active = BTreeMap::new();
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &recorder.hostname_policy,
+                BTreeSet::new(),
+                vec![failed_request],
+                Instant::now(),
+            );
+        assert!(rejected.is_empty());
+        assert!(!materialization_capacity_rejected);
+        assert_eq!(accepted.len(), 1);
+        let mut proposed_active = active.clone();
+        merge_materializations(
+            &mut proposed_active,
+            materializations.clone(),
+            Instant::now(),
+        );
+        assert!(!publish_verified_materialization_transaction(
+            false,
+            &mut authorizations,
+            &mut active,
+            staged,
+            proposed_active,
+        ));
+        assert!(authorizations.active.is_empty());
+        assert!(active.is_empty());
+        complete_materialization_requests(accepted, MaterializationCompletion::Failed);
+        assert_eq!(
+            failed_result.try_recv().unwrap(),
+            MaterializationCompletion::Failed
+        );
+
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &recorder.hostname_policy,
+                BTreeSet::new(),
+                vec![request],
+                Instant::now(),
+            );
+        assert!(rejected.is_empty());
+        assert!(!materialization_capacity_rejected);
+        assert_eq!(accepted.len(), 1);
+        let mut proposed_active = active.clone();
+        merge_materializations(&mut proposed_active, materializations, Instant::now());
+        assert!(publish_verified_materialization_transaction(
+            true,
+            &mut authorizations,
+            &mut active,
+            staged,
+            proposed_active,
+        ));
+        assert!(!authorizations.active.is_empty());
+        assert!(!active.is_empty());
+        drop(authorizations);
+        complete_materialization_requests(
+            accepted,
+            MaterializationCompletion::AppliedVerifiedAndCommitted,
+        );
     }
 
     #[test]
@@ -5826,7 +6103,7 @@ mod tests {
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5849,15 +6126,20 @@ mod tests {
             )
         });
         let request = requests.recv().unwrap();
-        assert_eq!(request.materializations.len(), 1);
+        assert_eq!(request.response.materializations.len(), 1);
         assert_eq!(
-            request.materializations.iter().next().unwrap().ttl_seconds,
+            request
+                .response
+                .materializations
+                .first()
+                .unwrap()
+                .ttl_seconds,
             1
         );
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5891,15 +6173,15 @@ mod tests {
             )
         });
         let request = requests.recv().unwrap();
-        let materialization = request.materializations.iter().next().unwrap();
-        assert_eq!(request.materializations.len(), 1);
+        let materialization = request.response.materializations.first().unwrap();
+        assert_eq!(request.response.materializations.len(), 1);
         assert_eq!(materialization.hostname, hostname);
         assert_eq!(materialization.protocol, Protocol::Tcp);
         assert_eq!(materialization.port, 443);
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5937,9 +6219,10 @@ mod tests {
         response.extend_from_slice(&[192, 0, 2, 45]);
         let caller = thread::spawn(move || recorder.record_response(hostname, 1, &response, None));
         let request = requests.recv().unwrap();
-        assert_eq!(request.materializations.len(), 4);
+        assert_eq!(request.response.materializations.len(), 4);
         assert_eq!(
             request
+                .response
                 .materializations
                 .iter()
                 .map(|materialization| (materialization.protocol, materialization.port))
@@ -5949,7 +6232,7 @@ mod tests {
         assert!(!caller.is_finished());
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -5986,15 +6269,21 @@ mod tests {
             )
         });
         let request = requests.recv().unwrap();
-        assert_eq!(request.materializations.len(), 2);
-        assert!(request.materializations.iter().all(|materialization| {
-            matches!(materialization.address, IpAddr::V6(_))
-                && materialization.protocol == Protocol::Tcp
-                && matches!(materialization.port, 443 | 8443)
-        }));
+        assert_eq!(request.response.materializations.len(), 2);
+        assert!(
+            request
+                .response
+                .materializations
+                .iter()
+                .all(|materialization| {
+                    matches!(materialization.address, IpAddr::V6(_))
+                        && materialization.protocol == Protocol::Tcp
+                        && matches!(materialization.port, 443 | 8443)
+                })
+        );
         request
             .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
             .unwrap();
         assert_eq!(
             caller.join().unwrap(),
@@ -6085,8 +6374,9 @@ mod tests {
             Some(submitter),
             policy,
         );
+        let caller_recorder = recorder.clone();
         let caller = thread::spawn(move || {
-            recorder.record_response(
+            caller_recorder.record_response(
                 "example.com",
                 1,
                 &response_with_cname_and_address(
@@ -6102,6 +6392,7 @@ mod tests {
         let request = requests.recv().unwrap();
         assert_eq!(
             request
+                .response
                 .materializations
                 .iter()
                 .map(|materialization| (
@@ -6117,17 +6408,23 @@ mod tests {
         );
         assert!(
             request
+                .response
                 .materializations
                 .iter()
                 .all(|materialization| { materialization.origins == [HostnamePolicyOrigin::User] })
         );
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedAndVerified)
-            .unwrap();
+        stage_and_complete_test_request(&recorder, request);
         assert_eq!(
             caller.join().unwrap(),
             DnsResponseDisposition::ForwardOriginal
+        );
+        assert!(
+            recorder
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .active
+                .contains_key("edge.example.net")
         );
         let _ = fs::remove_file(report_path);
     }
@@ -6199,6 +6496,108 @@ mod tests {
             DnsResponseDisposition::ForwardOriginal,
         );
         assert!(audit.cname_authorizations.lock().unwrap().active.is_empty());
+
+        let _ = fs::remove_file(block_report);
+        let _ = fs::remove_file(audit_report);
+    }
+
+    #[test]
+    fn wrong_family_addresses_fail_closed_without_authorization_state() {
+        let policy = test_hostname_policy(false);
+        for (query_type, answer_type, address) in [
+            (28, 1, vec![192, 0, 2, 44]),
+            (
+                1,
+                28,
+                vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 44],
+            ),
+        ] {
+            let response = response_with_cname_and_typed_address(
+                "github.com",
+                query_type,
+                "wrong-family.example",
+                answer_type,
+                60,
+                60,
+                &address,
+            );
+            assert!(parse_complete_dns_response(&response, "github.com", query_type).is_none());
+
+            let (submitter, requests) = materialization_request_channel();
+            let (block, block_report) = test_recorder_with_policy(
+                DnsEvidenceScope::ProtectedHostBlock,
+                Some(submitter),
+                policy.clone(),
+            );
+            assert_eq!(
+                block.record_response("github.com", query_type, &response, None),
+                DnsResponseDisposition::RetryableFailure,
+            );
+            assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+            assert!(block.cname_authorizations.lock().unwrap().active.is_empty());
+
+            let (audit, audit_report) = test_recorder_with_policy(
+                DnsEvidenceScope::ProtectedHostAudit,
+                None,
+                policy.clone(),
+            );
+            assert_eq!(
+                audit.record_response("github.com", query_type, &response, None),
+                DnsResponseDisposition::ForwardOriginal,
+            );
+            assert!(audit.cname_authorizations.lock().unwrap().active.is_empty());
+
+            let _ = fs::remove_file(block_report);
+            let _ = fs::remove_file(audit_report);
+        }
+    }
+
+    #[test]
+    fn materialization_capacity_overflow_rejects_block_and_retains_no_audit_state() {
+        let policy = test_hostname_policy(false);
+        let target = "x.example";
+        let mut response = response_with_cname("github.com", target, 60);
+        for index in 0..=MAX_MATERIALIZATIONS_PER_UPDATE {
+            append_test_ipv4_answer(
+                &mut response,
+                target,
+                60,
+                [198, 51, (index / 256) as u8, (index % 256) as u8],
+            );
+        }
+        response[6..8].copy_from_slice(
+            &u16::try_from(MAX_MATERIALIZATIONS_PER_UPDATE + 2)
+                .unwrap()
+                .to_be_bytes(),
+        );
+        assert!(parse_complete_dns_response(&response, "github.com", 1).is_some());
+
+        let (submitter, requests) = materialization_request_channel();
+        let (block, block_report) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            policy.clone(),
+        );
+        assert_eq!(
+            block.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::RetryableFailure,
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        let block_authorizations = block.cname_authorizations.lock().unwrap();
+        assert!(block_authorizations.active.is_empty());
+        assert!(block_authorizations.truncated);
+        drop(block_authorizations);
+
+        let (audit, audit_report) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+        assert_eq!(
+            audit.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        let audit_authorizations = audit.cname_authorizations.lock().unwrap();
+        assert!(audit_authorizations.active.is_empty());
+        assert!(audit_authorizations.truncated);
+        drop(audit_authorizations);
 
         let _ = fs::remove_file(block_report);
         let _ = fs::remove_file(audit_report);
@@ -6328,22 +6727,21 @@ mod tests {
         );
 
         let (saturated, _receiver) = materialization_request_channel();
+        let saturation_now = Instant::now();
+        let saturation_policy = test_hostname_policy(false);
         for index in 0..MATERIALIZATION_REQUEST_QUEUE_CAPACITY {
             let (completion, _result) = mpsc::sync_channel(1);
             saturated
                 .requests
                 .try_send(MaterializationRequest {
-                    materializations: [PendingMaterialization {
-                        source_hostname: "api.github.com".to_owned(),
-                        hostname: "api.github.com".to_owned(),
-                        address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
-                        protocol: Protocol::Tcp,
-                        port: 443,
-                        origins: vec![HostnamePolicyOrigin::Platform],
-                        ttl_seconds: 30,
-                    }]
-                    .into_iter()
-                    .collect(),
+                    queried_hostname: "api.github.com".to_owned(),
+                    response: direct_test_validated_response(
+                        "api.github.com",
+                        IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
+                        30,
+                        saturation_now,
+                        &saturation_policy,
+                    ),
                     completion,
                 })
                 .unwrap();
@@ -6437,6 +6835,7 @@ mod tests {
             port: 8443,
             origins: vec![HostnamePolicyOrigin::User],
             ttl_seconds,
+            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_seconds)),
         };
 
         assert_eq!(
@@ -7636,7 +8035,10 @@ mod tests {
             response.materializations[0].origins,
             [HostnamePolicyOrigin::Platform]
         );
-        commit_dns_response_authorizations(&mut authorizations, response);
+        assert!(commit_dns_response_authorizations(
+            &mut authorizations,
+            response
+        ));
         assert!(authorized_hostname(
             "edge-two.example",
             &mut authorizations,
@@ -7677,6 +8079,44 @@ mod tests {
         );
         assert_eq!(response.materializations[0].ttl_seconds, 1);
         assert_eq!(response.valid_until, Some(now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn duplicate_terminal_addresses_use_the_minimum_ttl() {
+        let now = Instant::now();
+        let address = "192.0.2.37".parse().unwrap();
+        let records = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "github.com".to_owned(),
+                target: "duplicate.example".to_owned(),
+                ttl_seconds: 60,
+            }],
+            addresses: vec![
+                DnsAddressAnswer {
+                    hostname: "duplicate.example".to_owned(),
+                    address,
+                    ttl_seconds: 40,
+                },
+                DnsAddressAnswer {
+                    hostname: "duplicate.example".to_owned(),
+                    address,
+                    ttl_seconds: 5,
+                },
+            ],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &records,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+
+        assert_eq!(response.materializations.len(), 1);
+        assert_eq!(response.materializations[0].ttl_seconds, 5);
+        assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 5);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(5)));
     }
 
     #[test]
@@ -7872,7 +8312,10 @@ mod tests {
             response.authorizations[1].1.origins,
             [HostnamePolicyOrigin::User]
         );
-        commit_dns_response_authorizations(&mut authorizations, response);
+        assert!(commit_dns_response_authorizations(
+            &mut authorizations,
+            response
+        ));
         assert_eq!(
             hostname_policy_for_authorized_name("terminal.example", &authorizations, &policy),
             Some((
@@ -7886,7 +8329,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_retained_target_does_not_change_existing_policy() {
+    fn conflicting_retained_target_rejects_the_owner_transaction() {
         let now = Instant::now();
         let platform_policy = test_hostname_policy(false);
         let mut authorizations = CnameAuthorizationState::default();
@@ -7919,12 +8362,142 @@ mod tests {
             validate_dns_response_lineage("user.example", &records, &authorizations, now, &policy)
                 .unwrap();
         assert_eq!(response.materializations[0].port, 8443);
-        commit_dns_response_authorizations(&mut authorizations, response);
+        let (completion, result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &policy,
+                BTreeSet::new(),
+                vec![MaterializationRequest {
+                    queried_hostname: "user.example".to_owned(),
+                    response,
+                    completion,
+                }],
+                now,
+            );
+        assert_eq!(staged, authorizations);
+        assert!(materializations.is_empty());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(!capacity_rejected);
+        complete_materialization_requests(rejected, MaterializationCompletion::Failed);
+        assert_eq!(
+            result.try_recv().unwrap(),
+            MaterializationCompletion::Failed
+        );
 
         let retained = authorizations.active.get("shared.example").unwrap();
         assert_eq!(retained.source_hostname, "github.com");
         assert_eq!(retained.origins, [HostnamePolicyOrigin::Platform]);
         assert_eq!(retained.transports[0].port, 443);
+    }
+
+    #[test]
+    fn retained_target_accepts_compatible_convergence_and_same_lineage_refresh() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let mut authorizations = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut authorizations,
+            "github.com",
+            "shared.example",
+            20,
+            now,
+            &policy,
+        );
+
+        let different_parent = validate_dns_response_lineage(
+            "api.github.com",
+            &DnsAnswerRecords {
+                aliases: vec![
+                    DnsCnameAnswer {
+                        owner: "api.github.com".to_owned(),
+                        target: "new-intermediate.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                    DnsCnameAnswer {
+                        owner: "new-intermediate.example".to_owned(),
+                        target: "shared.example".to_owned(),
+                        ttl_seconds: 60,
+                    },
+                ],
+                addresses: vec![DnsAddressAnswer {
+                    hostname: "shared.example".to_owned(),
+                    address: "192.0.2.34".parse().unwrap(),
+                    ttl_seconds: 60,
+                }],
+            },
+            &authorizations,
+            now + Duration::from_secs(5),
+            &policy,
+        )
+        .unwrap();
+        let (completion, _result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &policy,
+                BTreeSet::new(),
+                vec![MaterializationRequest {
+                    queried_hostname: "api.github.com".to_owned(),
+                    response: different_parent,
+                    completion,
+                }],
+                now + Duration::from_secs(5),
+            );
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(accepted.len(), 1);
+        assert!(rejected.is_empty());
+        assert!(!capacity_rejected);
+        assert!(staged.active.contains_key("new-intermediate.example"));
+        assert_eq!(
+            staged.active.get("shared.example"),
+            authorizations.active.get("shared.example")
+        );
+        let mut expired_convergence = staged.clone();
+        remove_expired_cname_authorizations(
+            &mut expired_convergence,
+            now + Duration::from_secs(21),
+        );
+        assert!(!expired_convergence.active.contains_key("shared.example"));
+        assert!(
+            expired_convergence
+                .active
+                .contains_key("new-intermediate.example")
+        );
+
+        let original_expiry = authorizations
+            .active
+            .get("shared.example")
+            .unwrap()
+            .expires_at;
+        let same_lineage = cname_test_validated_response(
+            "github.com",
+            "shared.example",
+            "192.0.2.35".parse().unwrap(),
+            60,
+            now + Duration::from_secs(5),
+            &policy,
+            &authorizations,
+        );
+        let (completion, _result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &authorizations,
+                &policy,
+                BTreeSet::new(),
+                vec![MaterializationRequest {
+                    queried_hostname: "github.com".to_owned(),
+                    response: same_lineage,
+                    completion,
+                }],
+                now + Duration::from_secs(5),
+            );
+        assert!(rejected.is_empty());
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(materializations.len(), 1);
+        assert!(!capacity_rejected);
+        assert!(staged.active.get("shared.example").unwrap().expires_at > original_expiry);
     }
 
     #[test]
@@ -8284,13 +8857,26 @@ mod tests {
             port: 443,
             origins: vec![HostnamePolicyOrigin::Platform],
             ttl_seconds: 30,
+            expires_at: now + Duration::from_secs(30),
         };
         let mut active = BTreeMap::new();
-        let merge = merge_materializations(&mut active, [materialization.clone()], now);
+        let mut longer_duplicate = materialization.clone();
+        longer_duplicate.ttl_seconds = 90;
+        longer_duplicate.expires_at = now + Duration::from_secs(90);
+        let merge = merge_materializations(
+            &mut active,
+            [longer_duplicate, materialization.clone()],
+            now,
+        );
 
         assert!(merge.rules_changed);
         assert!(merge.metadata_changed);
         assert_eq!(merge.expired, 0);
+        assert_eq!(active.values().next().unwrap().observed_ttl_seconds, 30);
+        assert_eq!(
+            active.values().next().unwrap().expires_at,
+            now + Duration::from_secs(30) + DNS_MATERIALIZATION_REFRESH_OVERLAP,
+        );
         assert_eq!(
             effective_allowances_with_materializations(&[], &active),
             vec![EffectiveAllowance {
@@ -8306,13 +8892,13 @@ mod tests {
             now + Duration::from_secs(31),
         );
         assert!(!merge.rules_changed);
-        assert!(merge.metadata_changed);
+        assert!(!merge.metadata_changed);
         assert_eq!(merge.expired, 0);
         assert_eq!(active.len(), 1);
         let merge = merge_materializations(
             &mut active,
             std::iter::empty(),
-            now + Duration::from_secs(92),
+            now + Duration::from_secs(61),
         );
         assert!(merge.rules_changed);
         assert!(merge.metadata_changed);
@@ -8321,41 +8907,307 @@ mod tests {
     }
 
     #[test]
-    fn materialization_batch_coalesces_duplicates_and_rejects_overflow_atomically() {
-        let materialization = |index: usize| PendingMaterialization {
-            source_hostname: "api.github.com".to_owned(),
-            hostname: "api.github.com".to_owned(),
-            address: IpAddr::V6(Ipv6Addr::from(index as u128 + 1)),
-            protocol: Protocol::Tcp,
-            port: 443,
-            origins: vec![HostnamePolicyOrigin::Platform],
-            ttl_seconds: 30,
-        };
-        let initial = (0..MAX_MATERIALIZATIONS_PER_UPDATE - 1)
-            .map(materialization)
-            .collect::<BTreeSet<_>>();
-        let request = |values: BTreeSet<PendingMaterialization>| {
+    fn materialization_transactions_recheck_capacity_roots_and_deadlines_atomically() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let request = |queried_hostname: &str, response: ValidatedDnsResponse| {
             let (completion, _result) = mpsc::sync_channel(1);
             MaterializationRequest {
-                materializations: values,
+                queried_hostname: queried_hostname.to_owned(),
+                response,
                 completion,
             }
         };
-        let duplicate = request([materialization(0)].into_iter().collect());
-        let overflow = request(
-            [
-                materialization(MAX_MATERIALIZATIONS_PER_UPDATE - 1),
-                materialization(MAX_MATERIALIZATIONS_PER_UPDATE),
-            ]
-            .into_iter()
-            .collect(),
+
+        let mut nearly_full = CnameAuthorizationState::default();
+        for index in 0..MAX_DERIVED_CNAME_AUTHORIZATIONS - 1 {
+            nearly_full.active.insert(
+                format!("existing-{index}.example"),
+                ActiveCnameAuthorization {
+                    source_hostname: "github.com".to_owned(),
+                    origins: vec![HostnamePolicyOrigin::Platform],
+                    transports: vec![HostnameTransport {
+                        protocol: Protocol::Tcp,
+                        port: 443,
+                    }],
+                    requires_runner_provenance: false,
+                    observed_ttl_seconds: 60,
+                    depth: 1,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+        let first = cname_test_validated_response(
+            "github.com",
+            "first.example",
+            "192.0.2.51".parse().unwrap(),
+            60,
+            now,
+            &policy,
+            &nearly_full,
         );
-        let (combined, accepted, rejected) =
-            build_bounded_materialization_batch(initial, vec![duplicate, overflow]);
-        assert_eq!(combined.len(), MAX_MATERIALIZATIONS_PER_UPDATE - 1);
+        let second = cname_test_validated_response(
+            "github.com",
+            "second.example",
+            "192.0.2.52".parse().unwrap(),
+            60,
+            now,
+            &policy,
+            &nearly_full,
+        );
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &nearly_full,
+                &policy,
+                BTreeSet::new(),
+                vec![request("github.com", first), request("github.com", second)],
+                now,
+            );
+        assert_eq!(staged.active.len(), MAX_DERIVED_CNAME_AUTHORIZATIONS);
+        assert!(staged.active.contains_key("first.example"));
+        assert!(!staged.active.contains_key("second.example"));
+        assert!(staged.truncated);
+        assert!(!materialization_capacity_rejected);
         assert_eq!(accepted.len(), 1);
         assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0].materializations.len(), 2);
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(
+            materializations.iter().next().unwrap().address,
+            "192.0.2.51".parse::<IpAddr>().unwrap(),
+        );
+
+        let mut original_root = CnameAuthorizationState::default();
+        commit_test_cname_lineage(
+            &mut original_root,
+            "github.com",
+            "derived.example",
+            60,
+            now,
+            &policy,
+        );
+        let extension = cname_test_validated_response(
+            "derived.example",
+            "extended.example",
+            "192.0.2.53".parse().unwrap(),
+            60,
+            now,
+            &policy,
+            &original_root,
+        );
+        let mut changed_root = original_root.clone();
+        changed_root
+            .active
+            .get_mut("derived.example")
+            .unwrap()
+            .source_hostname = "changed.example".to_owned();
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &changed_root,
+                &policy,
+                BTreeSet::new(),
+                vec![request("derived.example", extension)],
+                now,
+            );
+        assert_eq!(staged.active, changed_root.active);
+        assert!(materializations.is_empty());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(!materialization_capacity_rejected);
+
+        let expired = direct_test_validated_response(
+            "github.com",
+            "192.0.2.54".parse().unwrap(),
+            5,
+            now,
+            &policy,
+        );
+        let (staged, materializations, accepted, rejected, materialization_capacity_rejected) =
+            stage_materialization_transactions(
+                &CnameAuthorizationState::default(),
+                &policy,
+                BTreeSet::new(),
+                vec![request("github.com", expired)],
+                now + Duration::from_secs(6),
+            );
+        assert!(staged.active.is_empty());
+        assert!(materializations.is_empty());
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(!materialization_capacity_rejected);
+
+        let mut current_authorizations = CnameAuthorizationState::default();
+        let mut current_active = BTreeMap::new();
+        let mut proposed_authorizations = CnameAuthorizationState::default();
+        proposed_authorizations.active.insert(
+            "published.example".to_owned(),
+            ActiveCnameAuthorization {
+                source_hostname: "github.com".to_owned(),
+                origins: vec![HostnamePolicyOrigin::Platform],
+                transports: vec![HostnameTransport {
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                }],
+                requires_runner_provenance: false,
+                observed_ttl_seconds: 30,
+                depth: 1,
+                expires_at: now + Duration::from_secs(30),
+            },
+        );
+        let mut proposed_active = BTreeMap::new();
+        merge_materializations(
+            &mut proposed_active,
+            [PendingMaterialization {
+                source_hostname: "github.com".to_owned(),
+                hostname: "published.example".to_owned(),
+                address: "192.0.2.55".parse().unwrap(),
+                protocol: Protocol::Tcp,
+                port: 443,
+                origins: vec![HostnamePolicyOrigin::Platform],
+                ttl_seconds: 30,
+                expires_at: now + Duration::from_secs(30),
+            }],
+            now,
+        );
+        assert!(!publish_verified_materialization_transaction(
+            false,
+            &mut current_authorizations,
+            &mut current_active,
+            proposed_authorizations.clone(),
+            proposed_active.clone(),
+        ));
+        assert!(current_authorizations.active.is_empty());
+        assert!(current_active.is_empty());
+        assert!(publish_verified_materialization_transaction(
+            true,
+            &mut current_authorizations,
+            &mut current_active,
+            proposed_authorizations.clone(),
+            proposed_active.clone(),
+        ));
+        assert_eq!(current_authorizations, proposed_authorizations);
+        assert_eq!(current_active, proposed_active);
+    }
+
+    #[test]
+    fn materialization_transaction_preserves_batch_and_active_capacity_bounds() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let initial = (0..MAX_MATERIALIZATIONS_PER_UPDATE)
+            .map(|index| PendingMaterialization {
+                source_hostname: format!("source-{index}.example"),
+                hostname: format!("target-{index}.example"),
+                address: "192.0.2.60".parse().unwrap(),
+                protocol: Protocol::Tcp,
+                port: 443,
+                origins: vec![HostnamePolicyOrigin::Platform],
+                ttl_seconds: 60,
+                expires_at: now + Duration::from_secs(60),
+            })
+            .collect::<BTreeSet<_>>();
+        let response = direct_test_validated_response(
+            "github.com",
+            "192.0.2.61".parse().unwrap(),
+            60,
+            now,
+            &policy,
+        );
+        let (completion, _result) = mpsc::sync_channel(1);
+        let (staged, materializations, accepted, rejected, capacity_rejected) =
+            stage_materialization_transactions(
+                &CnameAuthorizationState::default(),
+                &policy,
+                initial,
+                vec![MaterializationRequest {
+                    queried_hostname: "github.com".to_owned(),
+                    response,
+                    completion,
+                }],
+                now,
+            );
+        assert!(staged.active.is_empty());
+        assert_eq!(materializations.len(), MAX_MATERIALIZATIONS_PER_UPDATE);
+        assert!(accepted.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(capacity_rejected);
+
+        let address = "192.0.2.62".parse().unwrap();
+        let mut active = BTreeMap::new();
+        for index in 0..=MAX_ACTIVE_MATERIALIZATIONS {
+            let source_hostname = format!("source-{index}.example");
+            let hostname = format!("target-{index}.example");
+            active.insert(
+                (
+                    source_hostname.clone(),
+                    hostname.clone(),
+                    address,
+                    Protocol::Tcp,
+                    443,
+                ),
+                ActiveMaterialization {
+                    source_hostname,
+                    hostname,
+                    address,
+                    protocol: Protocol::Tcp,
+                    port: 443,
+                    origins: vec![HostnamePolicyOrigin::Platform],
+                    observed_ttl_seconds: 60,
+                    expires_at: now + Duration::from_secs(60),
+                },
+            );
+        }
+        let effective = effective_allowances_with_materializations(&[], &active);
+        assert_eq!(effective.len(), 1);
+        assert!(materialization_candidate_exceeds_bounds(
+            &active, &effective
+        ));
+    }
+
+    #[test]
+    fn refresh_only_metadata_requires_verification_before_publication() {
+        let now = Instant::now();
+        let idle = MaterializationMerge {
+            rules_changed: false,
+            metadata_changed: false,
+            expired: 0,
+        };
+        assert!(!materialization_candidate_requires_verification(0, &idle));
+        let pending = |expires_at| PendingMaterialization {
+            source_hostname: "github.com".to_owned(),
+            hostname: "edge.example".to_owned(),
+            address: "192.0.2.63".parse().unwrap(),
+            protocol: Protocol::Tcp,
+            port: 443,
+            origins: vec![HostnamePolicyOrigin::Platform],
+            ttl_seconds: 60,
+            expires_at,
+        };
+        let mut current_active = BTreeMap::new();
+        merge_materializations(
+            &mut current_active,
+            [pending(now + Duration::from_secs(30))],
+            now,
+        );
+        let original_active = current_active.clone();
+        let mut proposed_active = current_active.clone();
+        let merge = merge_materializations(
+            &mut proposed_active,
+            [pending(now + Duration::from_secs(60))],
+            now,
+        );
+        assert!(!merge.rules_changed);
+        assert!(merge.metadata_changed);
+        assert!(materialization_candidate_requires_verification(0, &merge));
+
+        let mut current_authorizations = CnameAuthorizationState::default();
+        assert!(!publish_verified_materialization_transaction(
+            false,
+            &mut current_authorizations,
+            &mut current_active,
+            CnameAuthorizationState::default(),
+            proposed_active,
+        ));
+        assert_eq!(current_active, original_active);
+        assert!(current_authorizations.active.is_empty());
     }
 
     #[test]
