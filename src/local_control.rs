@@ -497,15 +497,72 @@ pub fn verify_no_additive_local_control_observation(
     let tcp_is_subset = tcp_listeners_are_subset(&snapshot.tcp_listeners, &accepted.tcp_listeners);
     let unix_is_subset =
         unix_listeners_are_subset(&snapshot.unix_listeners, &accepted.unix_listeners);
-    if containers_are_subset && tcp_is_subset && unix_is_subset {
-        Ok(())
-    } else {
-        Err(verification_error(
+    if !containers_are_subset || !tcp_is_subset || !unix_is_subset {
+        return Err(verification_error(
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added),
             "local_control_inventory_additive_drift",
             "local control inventory gained an endpoint or owner outside the accepted fingerprint",
-        ))
+        ));
     }
+
+    let reviewed_containers = &accepted.root_container_processes;
+    if non_container_tcp_projection(&snapshot.tcp_listeners, reviewed_containers)
+        != non_container_tcp_projection(&accepted.tcp_listeners, reviewed_containers)
+        || non_container_unix_projection(&snapshot.unix_listeners, reviewed_containers)
+            != non_container_unix_projection(&accepted.unix_listeners, reviewed_containers)
+    {
+        return Err(verification_error(
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed),
+            "local_control_inventory_unreviewed_reduction",
+            "local control inventory lost a non-container endpoint or owner",
+        ));
+    }
+
+    Ok(())
+}
+
+fn non_container_tcp_projection(
+    listeners: &[TcpListener],
+    reviewed_containers: &[RootContainerProcess],
+) -> Vec<TcpListener> {
+    listeners
+        .iter()
+        .cloned()
+        .map(|mut projected| {
+            projected
+                .owners
+                .retain(|owner| !is_reviewed_container_owner(owner, reviewed_containers));
+            projected
+        })
+        .collect()
+}
+
+fn non_container_unix_projection(
+    listeners: &[UnixListener],
+    reviewed_containers: &[RootContainerProcess],
+) -> Vec<UnixListener> {
+    listeners
+        .iter()
+        .cloned()
+        .map(|mut projected| {
+            projected
+                .owners
+                .retain(|owner| !is_reviewed_container_owner(owner, reviewed_containers));
+            projected
+        })
+        .collect()
+}
+
+fn is_reviewed_container_owner(
+    owner: &LocalControlOwner,
+    reviewed_containers: &[RootContainerProcess],
+) -> bool {
+    reviewed_containers.iter().any(|container| {
+        owner.uid == container.uid
+            && owner.executable_basename == container.executable_basename
+            && owner.canonical_executable == container.canonical_executable
+            && owner.unified_cgroup == container.unified_cgroup
+    })
 }
 
 fn root_container_processes_are_subset(
@@ -3257,7 +3314,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_lockdown_allows_only_reductive_inventory_changes() {
+    fn standard_lockdown_allows_only_reviewed_container_reductions() {
         let accepted = accepted_observation().snapshot;
         let mut reduced = accepted_observation();
         reduced.snapshot.root_container_processes.clear();
@@ -3276,6 +3333,91 @@ mod tests {
             .owners
             .retain(|owner| owner.executable_basename != "dockerd");
         verify_no_additive_local_control_observation(&accepted, &reduced).unwrap();
+
+        let mut missing_tcp = accepted_observation();
+        missing_tcp.snapshot.tcp_listeners.remove(0);
+        let error =
+            verify_no_additive_local_control_observation(&accepted, &missing_tcp).unwrap_err();
+        assert_eq!(
+            error.kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
+        );
+        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+
+        let mut missing_non_container_owner = accepted_observation();
+        missing_non_container_owner
+            .snapshot
+            .unix_listeners
+            .iter_mut()
+            .find(|listener| {
+                listener
+                    .owners
+                    .iter()
+                    .any(|owner| owner.executable_basename == "multipathd")
+            })
+            .unwrap()
+            .owners
+            .retain(|owner| owner.executable_basename == "multipathd");
+        let error =
+            verify_no_additive_local_control_observation(&accepted, &missing_non_container_owner)
+                .unwrap_err();
+        assert_eq!(
+            error.kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
+        );
+        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+
+        let mut missing_mixed_container_listener = accepted_observation();
+        let dockerd_listener = missing_mixed_container_listener
+            .snapshot
+            .unix_listeners
+            .iter()
+            .position(|listener| {
+                listener
+                    .owners
+                    .iter()
+                    .any(|owner| owner.executable_basename == "dockerd")
+            })
+            .unwrap();
+        missing_mixed_container_listener
+            .snapshot
+            .unix_listeners
+            .remove(dockerd_listener);
+        let error = verify_no_additive_local_control_observation(
+            &accepted,
+            &missing_mixed_container_listener,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
+        );
+        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+
+        let mut missing_mixed_container_co_owner = accepted_observation();
+        missing_mixed_container_co_owner
+            .snapshot
+            .unix_listeners
+            .iter_mut()
+            .find(|listener| {
+                listener
+                    .owners
+                    .iter()
+                    .any(|owner| owner.executable_basename == "dockerd")
+            })
+            .unwrap()
+            .owners
+            .retain(|owner| owner.executable_basename == "dockerd");
+        let error = verify_no_additive_local_control_observation(
+            &accepted,
+            &missing_mixed_container_co_owner,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
+        );
+        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
 
         reduced.snapshot.tcp_listeners.push(TcpListener {
             family: InternetAddressFamily::Ipv4,
