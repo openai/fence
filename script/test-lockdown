@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -ne 1 ]]; then
-  die "usage: script/test-lockdown <audit|rollback|unsafe-preserve|standard>"
+  die "usage: script/test-lockdown <acl-reject|audit|local-control-reject|rollback|unsafe-preserve|standard>"
 fi
 
 scenario="$1"
 case "$scenario" in
-  audit|rollback|unsafe-preserve|standard) ;;
+  acl-reject|audit|local-control-reject|rollback|unsafe-preserve|standard) ;;
   *) die "unknown lockdown evidence scenario: $scenario" ;;
 esac
 
@@ -55,6 +55,23 @@ unit="fence-evidence-${invocation}.service"
 runtime_root="/run/fence-lockdown-evidence-${scenario}-${suffix}"
 report="$runtime_root/$invocation/report.json"
 
+test_environment=()
+acl_fixture=""
+if [[ "$scenario" == "acl-reject" ]]; then
+  for required in /usr/bin/install /usr/bin/rmdir /usr/bin/setfacl; do
+    if [[ ! -x "$required" ]]; then
+      die "ACL rejection evidence requires executable $required"
+    fi
+  done
+  acl_fixture="/run/fence-lockdown-acl-fixture-$suffix"
+  sudo /usr/bin/install --directory --owner=root --group=root --mode=0750 "$acl_fixture"
+  sudo /usr/bin/setfacl --modify user:runner:--x "$acl_fixture"
+  if [[ "$(sudo /usr/bin/stat --format=%a:%U:%G "$acl_fixture")" != "750:root:root" ]]; then
+    die "ACL rejection fixture metadata changed unexpectedly"
+  fi
+  test_environment+=("--setenv=FENCE_LOCKDOWN_ACL_FIXTURE=$acl_fixture")
+fi
+
 # This service mutates only a disposable hosted runner. Standard and degraded
 # evidence deliberately leave successful lockdown state in place until VM
 # teardown; no restore command is issued after verified evidence.
@@ -70,6 +87,7 @@ sudo /usr/bin/systemd-run \
   "--setenv=FENCE_LOCKDOWN_ROOT=$runtime_root" \
   "--setenv=FENCE_LOCKDOWN_INVOCATION=$invocation" \
   "--setenv=FENCE_LOCKDOWN_SCENARIO=$scenario" \
+  "${test_environment[@]}" \
   "${test_binaries[0]}" --ignored --exact lockdown_service_worker --nocapture
 
 python3 -E - "$scenario" "$report" "$runtime_root/$invocation/ready.json" "/run/fence/$invocation/ready.json" <<'PY'
@@ -87,6 +105,11 @@ import pathlib
 import sys
 
 scenario, report_path, test_ready_path, production_ready_path = sys.argv[1:]
+if scenario in {"acl-reject", "local-control-reject"}:
+    require(not pathlib.Path(report_path).exists())
+    require(not pathlib.Path(test_ready_path).exists())
+    require(not pathlib.Path(production_ready_path).exists())
+    raise SystemExit(0)
 report = json.loads(pathlib.Path(report_path).read_text(encoding="utf-8"))
 require(report["status"] == "lockdown_evidence_test_only")
 require(report["protection_available"] is False)
@@ -111,8 +134,12 @@ elif scenario == "rollback":
     require("rollback_error_code" not in report)
 PY
 
+if [[ -n "$acl_fixture" ]]; then
+  sudo /usr/bin/rmdir "$acl_fixture"
+fi
+
 case "$scenario" in
-  audit|rollback)
+  acl-reject|audit|local-control-reject|rollback)
     sudo --non-interactive /usr/bin/true
     docker ps --quiet >/dev/null
     ;;

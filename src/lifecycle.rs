@@ -5,11 +5,13 @@ use crate::nft::{NetworkEvidenceCounters, OwnedNftState, expected_dns_mediated_o
 use crate::nft_backend::{BackendError, NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, PlanData};
 use crate::runtime::{RESIDENT_EVIDENCE_STATUS, RuntimeError, TEST_READY_STATUS, TestRuntimeStore};
+use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
 use serde::Serialize;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -119,9 +121,9 @@ pub struct NativeResidentNetwork {
 }
 
 impl NativeResidentNetwork {
-    pub fn in_current_namespace() -> Self {
+    pub(crate) fn in_current_namespace(executables: Arc<TrustedExecutableSet>) -> Self {
         Self {
-            backend: NativeNftBackend::new(SystemNftExecutor::host()),
+            backend: NativeNftBackend::new(SystemNftExecutor::host(executables)),
             reader: None,
         }
     }
@@ -373,7 +375,10 @@ impl<N: ResidentNetwork> ResidentSession<N> {
     }
 }
 
-pub fn validate_test_service_context(unit_name: &str) -> Result<(), LifecycleError> {
+pub(crate) fn validate_test_service_context(
+    unit_name: &str,
+    executables: &TrustedExecutableSet,
+) -> Result<(), LifecycleError> {
     if !valid_test_service_name(unit_name) {
         return Err(LifecycleError::new(
             "invalid_test_service_name",
@@ -381,20 +386,23 @@ pub fn validate_test_service_context(unit_name: &str) -> Result<(), LifecycleErr
         ));
     }
     validate_service_main_pid(
-        query_service_main_pid(unit_name)?,
+        query_service_main_pid(executables, unit_name)?,
         std::process::id(),
         "trusted_test_service_required",
         "resident test lifecycle must execute as the matching transient service main process",
     )
 }
 
-pub fn validate_production_service_context(invocation_id: &str) -> Result<(), LifecycleError> {
+pub(crate) fn validate_production_service_context(
+    invocation_id: &str,
+    executables: &TrustedExecutableSet,
+) -> Result<(), LifecycleError> {
     let unit_name = production_service_name(invocation_id)?;
     let effective_uid = production_effective_uid()?;
     validate_production_service_identity(
         invocation_id,
         effective_uid,
-        query_service_main_pid(&unit_name)?,
+        query_service_main_pid(executables, &unit_name)?,
         std::process::id(),
     )
 }
@@ -416,8 +424,17 @@ fn production_effective_uid() -> Result<u32, LifecycleError> {
         .map(|metadata| metadata.uid())
 }
 
-fn query_service_main_pid(unit_name: &str) -> Result<Option<u32>, LifecycleError> {
-    let mut child = Command::new("/usr/bin/systemctl")
+fn query_service_main_pid(
+    executables: &TrustedExecutableSet,
+    unit_name: &str,
+) -> Result<Option<u32>, LifecycleError> {
+    executables
+        .verify_all()
+        .map_err(|error| LifecycleError::new(error.code, error.message))?;
+    let mut command = executables
+        .command(TrustedExecutable::Systemctl)
+        .map_err(|error| LifecycleError::new(error.code, error.message))?;
+    let mut child = command
         .args(["show", "--property=MainPID", "--value", unit_name])
         .env_clear()
         .env("LC_ALL", "C")
@@ -542,9 +559,13 @@ pub fn run_resident_test_service(
     plan: &PlanData,
     expected_state: Option<OwnedNftState>,
 ) -> Result<(), LifecycleError> {
-    validate_test_service_context(unit_name)?;
+    let executables = Arc::new(
+        TrustedExecutableSet::capture_reviewed_hosted()
+            .map_err(|error| LifecycleError::new(error.code, error.message))?,
+    );
+    validate_test_service_context(unit_name, &executables)?;
     let runtime = TestRuntimeStore::create(runtime_root, &plan.invocation_id)?;
-    let network = NativeResidentNetwork::in_current_namespace();
+    let network = NativeResidentNetwork::in_current_namespace(executables);
     let mut session = match expected_state {
         Some(expected) => {
             ResidentSession::establish_test_only_with_expected(runtime, plan, network, expected)?

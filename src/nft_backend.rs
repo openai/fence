@@ -7,11 +7,22 @@ use crate::nft::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(any(target_os = "linux", test))]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", test))]
 use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
+#[cfg(any(target_os = "linux", test))]
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(target_os = "linux", test))]
+use std::time::Instant;
+
+#[cfg(target_os = "linux")]
+use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
 
 pub const NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 pub const IP_BINARY_PATH: &str = "/usr/sbin/ip";
@@ -49,6 +60,7 @@ pub enum NftOperation {
 }
 
 impl NftOperation {
+    #[cfg(target_os = "linux")]
     fn arguments(self) -> &'static [&'static str] {
         match self {
             Self::Preflight => &["-c", "-f", "-"],
@@ -73,16 +85,27 @@ pub trait NftExecutor {
     fn execute(&self, operation: NftOperation, input: &[u8]) -> Result<Vec<u8>, BackendError>;
 }
 
-#[derive(Debug, Clone)]
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
 pub struct SystemNftExecutor {
-    executable: PathBuf,
+    executables: Option<Arc<TrustedExecutableSet>>,
+    command: SystemNftCommand,
     prefix_arguments: Vec<String>,
 }
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SystemNftCommand {
+    TrustedNft,
+    TestNamespaceIp,
+}
+
+#[cfg(target_os = "linux")]
 impl SystemNftExecutor {
-    pub fn host() -> Self {
+    pub(crate) fn host(executables: Arc<TrustedExecutableSet>) -> Self {
         Self {
-            executable: PathBuf::from(NFT_BINARY_PATH),
+            executables: Some(executables),
+            command: SystemNftCommand::TrustedNft,
             prefix_arguments: Vec::new(),
         }
     }
@@ -90,7 +113,8 @@ impl SystemNftExecutor {
     pub fn in_test_network_namespace(namespace: &str) -> Result<Self, BackendError> {
         validate_test_identifier(namespace)?;
         Ok(Self {
-            executable: PathBuf::from(IP_BINARY_PATH),
+            executables: None,
+            command: SystemNftCommand::TestNamespaceIp,
             prefix_arguments: vec![
                 "netns".to_owned(),
                 "exec".to_owned(),
@@ -101,8 +125,28 @@ impl SystemNftExecutor {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl NftExecutor for SystemNftExecutor {
     fn execute(&self, operation: NftOperation, input: &[u8]) -> Result<Vec<u8>, BackendError> {
+        let command = match self.command {
+            SystemNftCommand::TrustedNft => {
+                let executables = self.executables.as_deref().ok_or_else(|| {
+                    BackendError::new(
+                        "trusted_executable_unavailable",
+                        "the fixed trusted-executable boundary is unavailable",
+                    )
+                })?;
+                executables
+                    .verify_all()
+                    .map_err(|error| BackendError::new(error.code, error.message))?;
+                executables
+                    .command(TrustedExecutable::Nft)
+                    .map_err(|error| BackendError::new(error.code, error.message))?
+            }
+            // This path is restricted to disposable namespace evidence. The
+            // protected host executor has no raw-path fallback from its nft fd.
+            SystemNftCommand::TestNamespaceIp => Command::new(IP_BINARY_PATH),
+        };
         let arguments = self
             .prefix_arguments
             .iter()
@@ -110,7 +154,7 @@ impl NftExecutor for SystemNftExecutor {
             .chain(operation.arguments().iter().copied())
             .collect::<Vec<_>>();
         run_process_bounded(
-            &self.executable,
+            command,
             &arguments,
             input,
             COMMAND_TIMEOUT,
@@ -184,20 +228,21 @@ impl<E: NftExecutor> NativeNftBackend<E> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug)]
 struct CapturedOutput {
     bytes: Vec<u8>,
     overflowed: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn run_process_bounded(
-    executable: &Path,
+    mut command: Command,
     arguments: &[&str],
     input: &[u8],
     timeout: Duration,
     output_limit: usize,
 ) -> Result<Vec<u8>, BackendError> {
-    let mut command = Command::new(executable);
     command
         .args(arguments)
         .env_clear()
@@ -284,6 +329,7 @@ fn run_process_bounded(
     Ok(stdout.bytes)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn read_bounded(mut stream: impl Read, limit: usize) -> std::io::Result<CapturedOutput> {
     let mut bytes = Vec::new();
     let mut overflowed = false;
@@ -1624,7 +1670,7 @@ mod tests {
     #[test]
     fn subprocess_runner_bounds_output_error_and_deadline() {
         let echoed = run_process_bounded(
-            Path::new("/bin/cat"),
+            Command::new("/bin/cat"),
             &[],
             b"rules",
             Duration::from_secs(1),
@@ -1634,7 +1680,7 @@ mod tests {
         assert_eq!(echoed, b"rules");
 
         let failed = run_process_bounded(
-            Path::new("/bin/sh"),
+            Command::new("/bin/sh"),
             &["-c", "printf denied >&2; exit 3"],
             b"",
             Duration::from_secs(1),
@@ -1645,7 +1691,7 @@ mod tests {
         assert_eq!(failed.message, "denied");
 
         let overflow = run_process_bounded(
-            Path::new("/bin/sh"),
+            Command::new("/bin/sh"),
             &["-c", "printf 123456789"],
             b"",
             Duration::from_secs(1),
@@ -1655,7 +1701,7 @@ mod tests {
         assert_eq!(overflow.code, "nft_output_too_large");
 
         let timeout = run_process_bounded(
-            Path::new("/bin/sleep"),
+            Command::new("/bin/sleep"),
             &["1"],
             b"",
             Duration::from_millis(1),
@@ -1665,7 +1711,7 @@ mod tests {
         assert_eq!(timeout.code, "nft_command_timeout");
 
         let blocked_stdin_timeout = run_process_bounded(
-            Path::new("/bin/sleep"),
+            Command::new("/bin/sleep"),
             &["1"],
             &vec![b'x'; 1024 * 1024],
             Duration::from_millis(1),
@@ -1675,7 +1721,7 @@ mod tests {
         assert_eq!(blocked_stdin_timeout.code, "nft_command_timeout");
 
         let missing = run_process_bounded(
-            Path::new("/missing/fence-command"),
+            Command::new("/missing/fence-command"),
             &[],
             b"",
             Duration::from_secs(1),
@@ -1686,15 +1732,25 @@ mod tests {
         assert!(bounded_message(&"x".repeat(600)).ends_with("..."));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn executor_selects_fixed_host_or_bounded_test_namespace_command() {
-        let host = SystemNftExecutor::host();
-        assert_eq!(host.executable, PathBuf::from(NFT_BINARY_PATH));
-        assert!(host.prefix_arguments.is_empty());
-
         let namespace = SystemNftExecutor::in_test_network_namespace("proof-1").unwrap();
-        assert_eq!(namespace.executable, PathBuf::from(IP_BINARY_PATH));
+        assert_eq!(namespace.command, SystemNftCommand::TestNamespaceIp);
+        assert!(namespace.executables.is_none());
         assert_eq!(namespace.prefix_arguments[2], "proof-1");
+        let unavailable_host = SystemNftExecutor {
+            executables: None,
+            command: SystemNftCommand::TrustedNft,
+            prefix_arguments: Vec::new(),
+        };
+        assert_eq!(
+            unavailable_host
+                .execute(NftOperation::ReadOwnedState, &[])
+                .unwrap_err()
+                .code,
+            "trusted_executable_unavailable"
+        );
         assert_eq!(
             SystemNftExecutor::in_test_network_namespace("../host")
                 .unwrap_err()

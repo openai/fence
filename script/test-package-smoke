@@ -184,7 +184,7 @@ require(
     "support nft path mismatch",
 )
 require(data["network_backend"]["nft_binary_present"] is True, "support omitted nft binary")
-require(data["hosted_runner_fingerprint"]["schema_version"] == 1, "support fingerprint schema mismatch")
+require(data["hosted_runner_fingerprint"]["schema_version"] == 2, "support fingerprint schema mismatch")
 require(data["hosted_runner_fingerprint"]["status"] == "accepted_reference_not_checked", "support fingerprint status mismatch")
 require(
     data["hosted_runner_fingerprint"]["accepted"]["expected_principal"] == "runner",

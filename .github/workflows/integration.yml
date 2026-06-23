@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [audit, rollback, unsafe-preserve]
+        scenario: [acl-reject, audit, local-control-reject, rollback, unsafe-preserve]
     runs-on: ubuntu-24.04
 
     steps:
@@ -55,7 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [healthy, worker-failure]
+        scenario: [healthy, local-control-drift, worker-failure]
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 

@@ -10,7 +10,7 @@ use crate::error::ErrorDetail;
 use crate::findings::{
     ConnectionEvent, ConnectionFinding, FindingCollection, bounded_timestamp_now,
 };
-use crate::hosted_runner::{AcceptedResolverV1, hosted_runner_fingerprint_requirement};
+use crate::hosted_runner::{AcceptedResolverV2, hosted_runner_fingerprint_requirement};
 use crate::hostname_policy::{
     ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
 };
@@ -18,7 +18,15 @@ use crate::lifecycle::{
     CriticalFinding, RESIDENT_VERIFICATION_INTERVAL, require_production_root_process,
     validate_production_service_context, validate_test_service_context,
 };
-use crate::lockdown::{LockdownControl, LockdownPosture, SystemLockdownControl};
+use crate::local_control::{
+    CurrentFenceOwner, LocalControlObservation, LocalControlSnapshot, NoCurrentFenceOwner,
+    OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner, SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess,
+    accepted_local_control_snapshot, observe_local_control_inventory,
+    verify_local_control_observation, verify_no_additive_local_control_observation,
+};
+use crate::lockdown::{
+    LockdownControl, LockdownPosture, SystemLockdownControl, runner_path_writable,
+};
 use crate::nflog::NflogReader;
 use crate::nft::{
     NetworkEvidenceCounters, OwnedNftState, expected_dns_mediated_owned_state,
@@ -50,6 +58,7 @@ use crate::platform_profile::{
 use crate::runtime::{
     ProductionRuntimeStore, RuntimeDocumentStore, RuntimeError, TestRuntimeStore,
 };
+use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -60,7 +69,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -1395,6 +1404,7 @@ fn query_authorization(
 }
 
 struct DnsRouting {
+    executables: Arc<TrustedExecutableSet>,
     docker_original: Option<Vec<u8>>,
     resolver_source: PathBuf,
     resolver_target: PathBuf,
@@ -1404,9 +1414,13 @@ struct DnsRouting {
 }
 
 impl DnsRouting {
-    fn activate(runtime_directory: &Path) -> Result<Self, DnsMediationError> {
+    fn activate(
+        runtime_directory: &Path,
+        executables: Arc<TrustedExecutableSet>,
+    ) -> Result<Self, DnsMediationError> {
         let accepted = hosted_runner_fingerprint_requirement().accepted.resolver;
         let mut routing = Self {
+            executables,
             docker_original: None,
             resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
             resolver_target: PathBuf::from(accepted.canonical_target),
@@ -1448,7 +1462,11 @@ impl DnsRouting {
                 "accepted resolver target path is not valid UTF-8",
             )
         })?;
-        if let Err(error) = fixed_command("/usr/bin/mount", &["--bind", source, target]) {
+        if let Err(error) = fixed_command(
+            &self.executables,
+            TrustedExecutable::Mount,
+            &["--bind", source, target],
+        ) {
             self.resolver_mounted = paths_have_same_identity(
                 self.resolver_source.as_path(),
                 self.resolver_target.as_path(),
@@ -1457,7 +1475,8 @@ impl DnsRouting {
         }
         self.resolver_mounted = true;
         fixed_command(
-            "/usr/bin/mount",
+            &self.executables,
+            TrustedExecutable::Mount,
             &["-o", "remount,bind,ro,nodev,nosuid", source, target],
         )?;
         self.verify_active_resolver_mount()?;
@@ -1491,7 +1510,11 @@ impl DnsRouting {
         })?;
         replace_external_file(docker_path, &docker_bytes)?;
         self.docker_changed = true;
-        fixed_command("/usr/bin/systemctl", &["restart", "docker.service"])?;
+        fixed_command(
+            &self.executables,
+            TrustedExecutable::Systemctl,
+            &["restart", "docker.service"],
+        )?;
         self.verify_active()
     }
 
@@ -1504,7 +1527,11 @@ impl DnsRouting {
                     let _ = fs::remove_file(DOCKER_DAEMON_PATH);
                 }
             }
-            fixed_command("/usr/bin/systemctl", &["restart", "docker.service"])?;
+            fixed_command(
+                &self.executables,
+                TrustedExecutable::Systemctl,
+                &["restart", "docker.service"],
+            )?;
             self.docker_changed = false;
         }
         if self.resolver_mounted {
@@ -1514,7 +1541,7 @@ impl DnsRouting {
                     "accepted resolver target path is not valid UTF-8",
                 )
             })?;
-            fixed_command("/usr/bin/umount", &[target])?;
+            fixed_command(&self.executables, TrustedExecutable::Umount, &[target])?;
             self.resolver_mounted = false;
         }
         if self.resolver_source_created {
@@ -1619,7 +1646,7 @@ impl DnsRouting {
 fn resolver_layout_is_supported(
     resolv_conf_is_symlink: bool,
     canonical_target: &Path,
-    accepted: &AcceptedResolverV1,
+    accepted: &AcceptedResolverV2,
     target_is_file: bool,
     target_is_symlink: bool,
     target_uid: u32,
@@ -1645,6 +1672,7 @@ fn paths_have_same_identity(left: &Path, right: &Path) -> bool {
 
 pub struct DnsMediationSession {
     routing: DnsRouting,
+    fence_owner: PinnedCurrentFenceOwner,
     recorder: ObservationRecorder,
     resident_health: Arc<Mutex<ResidentHealth>>,
     supervisor: ResidentWorkerSupervisor,
@@ -1662,10 +1690,13 @@ struct DnsProxyRuntime {
 impl DnsMediationSession {
     fn establish(
         runtime_directory: &Path,
+        executables: Arc<TrustedExecutableSet>,
         scope: DnsEvidenceScope,
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
+        let fence_owner =
+            PinnedCurrentFenceOwner::capture(Path::new("/proc")).map_err(local_control_error)?;
         let trusted_runner_worker = Arc::new(
             TrustedRunnerWorker::discover_system()
                 .map_err(|error| DnsMediationError::new(error.code, error.message))?,
@@ -1719,7 +1750,7 @@ impl DnsMediationSession {
                 .expect("resident health lock poisoned");
             health.workers = supervisor.worker_health();
         }
-        let routing = match DnsRouting::activate(runtime_directory) {
+        let routing = match DnsRouting::activate(runtime_directory, executables) {
             Ok(routing) => routing,
             Err(error) => {
                 shutdown_dns_workers(&stop_workers, &mut threads);
@@ -1734,6 +1765,7 @@ impl DnsMediationSession {
         }
         Ok(Self {
             routing,
+            fence_owner,
             recorder,
             resident_health,
             supervisor,
@@ -1851,6 +1883,72 @@ fn apply_attribution_results(
     changed
 }
 
+fn local_control_error(
+    error: crate::local_control::LocalControlVerificationError,
+) -> DnsMediationError {
+    DnsMediationError::new(error.code, error.message)
+}
+
+fn accepted_local_control_inventory() -> Result<LocalControlSnapshot, DnsMediationError> {
+    accepted_local_control_snapshot(
+        &hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory,
+    )
+    .map_err(local_control_error)
+}
+
+fn observe_local_control(
+    executables: &TrustedExecutableSet,
+    current_fence: &dyn CurrentFenceOwner,
+) -> LocalControlObservation {
+    let deadline = Instant::now() + OBSERVATION_TIMEOUT;
+    let socket_access = SystemUnixSocketAccess::new(|path: &std::ffi::OsStr| {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let timeout = remaining.min(SOCKET_PROBE_TIMEOUT);
+        if timeout.is_zero() {
+            None
+        } else {
+            runner_path_writable(executables, path, timeout).ok()
+        }
+    });
+    observe_local_control_inventory(Path::new("/proc"), &socket_access, current_fence)
+}
+
+fn verify_pre_activation_local_control(
+    executables: &TrustedExecutableSet,
+) -> Result<(), DnsMediationError> {
+    let accepted = accepted_local_control_inventory()?;
+    let observed = observe_local_control(executables, &NoCurrentFenceOwner);
+    verify_local_control_observation(&accepted, &observed).map_err(local_control_error)
+}
+
+fn establish_local_control_baseline(
+    mediation: &DnsMediationSession,
+    posture: LockdownPosture,
+) -> Result<LocalControlSnapshot, DnsMediationError> {
+    let accepted = accepted_local_control_inventory()?;
+    let observed = observe_local_control(&mediation.routing.executables, &mediation.fence_owner);
+    match posture {
+        LockdownPosture::StandardBlock => {
+            verify_no_additive_local_control_observation(&accepted, &observed)
+        }
+        LockdownPosture::UnsafePreserve | LockdownPosture::Audit => {
+            verify_local_control_observation(&accepted, &observed)
+        }
+    }
+    .map_err(local_control_error)?;
+    Ok(observed.snapshot)
+}
+
+fn verify_resident_local_control(
+    mediation: &DnsMediationSession,
+    baseline: &LocalControlSnapshot,
+) -> Result<(), crate::local_control::LocalControlVerificationError> {
+    let observed = observe_local_control(&mediation.routing.executables, &mediation.fence_owner);
+    verify_local_control_observation(baseline, &observed)
+}
+
 struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
     _mediation: DnsMediationSession,
     backend: NativeNftBackend<SystemNftExecutor>,
@@ -1858,6 +1956,7 @@ struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
     reader: NflogReader,
     runtime: R,
     expected_state: OwnedNftState,
+    local_control_baseline: LocalControlSnapshot,
     evidence: DnsMediatedAuditEvidence,
     findings: FindingCollection,
     next_verification: Duration,
@@ -1897,8 +1996,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             return Err(runtime_error(error));
         }
 
-        let mut backend = NativeNftBackend::new(SystemNftExecutor::host());
-        let mut lockdown = SystemLockdownControl::new(runtime.directory());
+        let executables = Arc::clone(&mediation.routing.executables);
+        let mut backend = NativeNftBackend::new(SystemNftExecutor::host(Arc::clone(&executables)));
+        let mut lockdown = SystemLockdownControl::new(executables);
         let reader = match NflogReader::bind(Mode::Audit) {
             Ok(reader) => reader,
             Err(error) => {
@@ -1927,14 +2027,17 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             evidence.container_status = "preserved_verified";
             evidence.counters.total_violations =
                 backend.total_violation_packets().map_err(backend_error)?;
-            Ok(())
+            establish_local_control_baseline(&mediation, LockdownPosture::Audit)
         })();
-        if let Err(error) = setup_result {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
+        let local_control_baseline = match setup_result {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                evidence.setup_status = "failed_pre_ready";
+                evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+                let _ = runtime.replace_report(&evidence);
+                return Err(error);
+            }
+        };
 
         if let Some(failure) = mediation.drain_worker_failures().into_iter().next() {
             evidence.setup_status = "failed_pre_ready";
@@ -1965,6 +2068,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(error);
         }
+        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline) {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(local_control_error(error));
+        }
 
         evidence.setup_status = "verified_before_observation_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
@@ -1994,6 +2103,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
+        lockdown.commit_no_restore();
         evidence.setup_status = "resident_observation_only";
         evidence.readiness_status = PROTECTED_AUDIT_READY_STATUS;
         runtime.replace_report(&evidence).map_err(runtime_error)?;
@@ -2004,6 +2114,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             reader,
             runtime,
             expected_state,
+            local_control_baseline,
             evidence,
             findings: FindingCollection::empty(),
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
@@ -2084,6 +2195,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                     "dns_audit_container_drift",
                     "measured container availability drifted after observation readiness",
                 );
+            }
+            if let Err(error) =
+                verify_resident_local_control(&self._mediation, &self.local_control_baseline)
+            {
+                verification_succeeded = false;
+                self.record_critical(error.code, error.message);
             }
             if !self._mediation.workers_healthy() {
                 verification_succeeded = false;
@@ -2170,6 +2287,7 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     base_allowances: Vec<EffectiveAllowance>,
     active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
     expected_state: OwnedNftState,
+    local_control_baseline: LocalControlSnapshot,
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
     scope: DnsBlockRuntimeScope,
@@ -2245,8 +2363,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             return Err(runtime_error(error));
         }
 
-        let mut backend = NativeNftBackend::new(SystemNftExecutor::host());
-        let mut lockdown = SystemLockdownControl::new(runtime.directory());
+        let executables = Arc::clone(&mediation.routing.executables);
+        let mut backend = NativeNftBackend::new(SystemNftExecutor::host(Arc::clone(&executables)));
+        let mut lockdown = SystemLockdownControl::new(executables);
         let reader = match NflogReader::bind(Mode::Block) {
             Ok(reader) => reader,
             Err(error) => {
@@ -2289,15 +2408,18 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 }
                 LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
             }
-            Ok(())
+            establish_local_control_baseline(&mediation, scope.lockdown_posture())
         })();
-        if let Err(error) = setup_result {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
+        let local_control_baseline = match setup_result {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                evidence.setup_status = "failed_pre_ready";
+                evidence.rollback_status =
+                    rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+                let _ = runtime.replace_report(&evidence);
+                return Err(error);
+            }
+        };
         if let Some(failure) = mediation.drain_worker_failures().into_iter().next() {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status =
@@ -2331,6 +2453,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(error);
         }
+        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline) {
+            evidence.setup_status = "failed_pre_ready";
+            evidence.rollback_status =
+                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+            let _ = runtime.replace_report(&evidence);
+            return Err(local_control_error(error));
+        }
         evidence.setup_status = "verified_before_test_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
             evidence.setup_status = "failed_pre_ready";
@@ -2362,6 +2491,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
+        lockdown.commit_no_restore();
         evidence.setup_status = scope.resident_status();
         evidence.readiness_status = scope.ready_status();
         runtime.replace_report(&evidence).map_err(runtime_error)?;
@@ -2378,6 +2508,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             base_allowances: plan.runtime_static_policy.clone(),
             active,
             expected_state,
+            local_control_baseline,
             evidence,
             findings: FindingCollection::empty(),
             scope,
@@ -2631,6 +2762,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 }
                 LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
             }
+            if let Err(error) =
+                verify_resident_local_control(&self._mediation, &self.local_control_baseline)
+            {
+                verification_succeeded = false;
+                self.record_critical(error.code, error.message);
+            }
             if !self._mediation.workers_healthy() {
                 verification_succeeded = false;
                 self.record_critical(
@@ -2730,8 +2867,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
 pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
     require_production_root_process()
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+    let executables = Arc::new(
+        TrustedExecutableSet::capture_reviewed_hosted()
+            .map_err(|error| DnsMediationError::new(error.code, error.message))?,
+    );
     let runtime = ProductionRuntimeStore::open(config).map_err(runtime_error)?;
-    validate_production_service_context(&runtime.invocation_id)
+    validate_production_service_context(&runtime.invocation_id, &executables)
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     let normalized = parse_and_normalize(&runtime.read_config_bounded().map_err(runtime_error)?)
         .map_err(config_error)?;
@@ -2757,15 +2898,17 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
         ));
     }
     let hostname_policy = plan.runtime_hostname_policy.clone();
-    let mut fingerprint = SystemLockdownControl::new(runtime.directory());
+    let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
     fingerprint
         .verify_supported_host()
         .map_err(lockdown_error)?;
+    verify_pre_activation_local_control(&executables)?;
 
     match (plan.assurance_status, plan.container_policy) {
         (AssuranceStatus::AuditObservationOnly, None) => {
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
+                Arc::clone(&executables),
                 DnsEvidenceScope::ProtectedHostAudit,
                 hostname_policy.clone(),
                 None,
@@ -2794,6 +2937,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
                 materialization_request_channel();
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
+                Arc::clone(&executables),
                 scope.dns_scope(),
                 hostname_policy.clone(),
                 Some(materialization_submitter),
@@ -2824,7 +2968,11 @@ pub fn run_selected_profile_runtime_test_service(
     plan: &PlanData,
     inject_worker_failure: bool,
 ) -> Result<(), DnsMediationError> {
-    validate_test_service_context(unit_name)
+    let executables = Arc::new(
+        TrustedExecutableSet::capture_reviewed_hosted()
+            .map_err(|error| DnsMediationError::new(error.code, error.message))?,
+    );
+    validate_test_service_context(unit_name, &executables)
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     if plan.selected_mode != Mode::Block
         || plan.assurance_status != AssuranceStatus::PlannedBlockContainment
@@ -2843,11 +2991,17 @@ pub fn run_selected_profile_runtime_test_service(
             "DNS-mediated block evidence accepts only standard block with the reviewed hosted workflow-bootstrap profile and no user allowlist entries",
         ));
     }
+    let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
+    fingerprint
+        .verify_supported_host()
+        .map_err(lockdown_error)?;
+    verify_pre_activation_local_control(&executables)?;
     let runtime =
         TestRuntimeStore::create(runtime_root, &plan.invocation_id).map_err(runtime_error)?;
     let (materialization_submitter, materialization_requests) = materialization_request_channel();
     let mediation = DnsMediationSession::establish(
         &runtime.directory,
+        executables,
         DnsBlockRuntimeScope::TestEvidence.dns_scope(),
         plan.runtime_hostname_policy.clone(),
         Some(materialization_submitter),
@@ -5560,8 +5714,18 @@ fn mountinfo_has_required_options(contents: &str, target: &str) -> bool {
     })
 }
 
-fn fixed_command(path: &str, arguments: &[&str]) -> Result<(), DnsMediationError> {
-    let mut child = Command::new(path)
+fn fixed_command(
+    executables: &TrustedExecutableSet,
+    executable: TrustedExecutable,
+    arguments: &[&str],
+) -> Result<(), DnsMediationError> {
+    executables
+        .verify_all()
+        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+    let mut command = executables
+        .command(executable)
+        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+    let mut child = command
         .args(arguments)
         .env_clear()
         .env("LC_ALL", "C")
