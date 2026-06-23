@@ -88,6 +88,7 @@ pub struct AcceptedLocalControlInventoryV2 {
     pub root_container_processes: Vec<AcceptedRootContainerProcessV2>,
     pub tcp_listeners: Vec<AcceptedTcpListenerV2>,
     pub unix_listeners: Vec<AcceptedUnixListenerV2>,
+    pub standard_lockdown_removable_unix_listener_name_sha256: &'static str,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -484,6 +485,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV2 {
                         instances: 1,
                     },
                 ],
+                standard_lockdown_removable_unix_listener_name_sha256: "2a5962ed41259a31b1587bcae589fcee6b9d6767ef064ac317e6d398b96a81f2",
             },
         },
     }
@@ -764,6 +766,10 @@ mod tests {
         assert_eq!(
             inventory.unix_listeners[5].owners,
             vec![SYSTEMD_OWNER, DBUS_OWNER]
+        );
+        assert_eq!(
+            inventory.standard_lockdown_removable_unix_listener_name_sha256,
+            "2a5962ed41259a31b1587bcae589fcee6b9d6767ef064ac317e6d398b96a81f2"
         );
 
         let accepted_json = serde_json::to_value(&requirement.accepted).unwrap();

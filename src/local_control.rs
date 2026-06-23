@@ -485,9 +485,10 @@ fn verify_complete_local_control_observation(
 }
 
 pub fn verify_no_additive_local_control_observation(
-    accepted: &LocalControlSnapshot,
+    accepted_inventory: &AcceptedLocalControlInventoryV2,
     observed: &LocalControlObservation,
 ) -> Result<(), LocalControlVerificationError> {
+    let accepted = accepted_local_control_snapshot(accepted_inventory)?;
     verify_complete_local_control_observation(observed)?;
     let snapshot = &observed.snapshot;
     let containers_are_subset = root_container_processes_are_subset(
@@ -506,10 +507,25 @@ pub fn verify_no_additive_local_control_observation(
     }
 
     let reviewed_containers = &accepted.root_container_processes;
+    let mut accepted_unix_projection =
+        non_container_unix_projection(&accepted.unix_listeners, reviewed_containers);
+    accepted_unix_projection.retain(|listener| {
+        let removable = accepted_inventory.standard_lockdown_removable_unix_listener_name_sha256
+            == listener.name_sha256.as_str();
+        let remains = snapshot
+            .unix_listeners
+            .iter()
+            .any(|observed| same_unix_key(listener, observed));
+        let reviewed_container_owner_remains = listener
+            .owners
+            .iter()
+            .any(|owner| is_reviewed_container_owner(owner, &snapshot.root_container_processes));
+        !removable || remains || reviewed_container_owner_remains
+    });
     if non_container_tcp_projection(&snapshot.tcp_listeners, reviewed_containers)
         != non_container_tcp_projection(&accepted.tcp_listeners, reviewed_containers)
         || non_container_unix_projection(&snapshot.unix_listeners, reviewed_containers)
-            != non_container_unix_projection(&accepted.unix_listeners, reviewed_containers)
+            != accepted_unix_projection
     {
         return Err(verification_error(
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed),
@@ -718,6 +734,39 @@ fn same_owner_key(left: &LocalControlOwner, right: &LocalControlOwner) -> bool {
         && left.unified_cgroup == right.unified_cgroup
 }
 
+fn standard_lockdown_removals_are_valid(
+    accepted: &AcceptedLocalControlInventoryV2,
+    unix_listeners: &[UnixListener],
+    reviewed_containers: &[RootContainerProcess],
+) -> bool {
+    let name_sha256 = accepted.standard_lockdown_removable_unix_listener_name_sha256;
+    if name_sha256.len() != 64
+        || !name_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return false;
+    }
+    let mut matching = unix_listeners
+        .iter()
+        .filter(|listener| listener.name_sha256 == name_sha256);
+    let Some(listener) = matching.next() else {
+        return false;
+    };
+    matching.next().is_none()
+        && listener.socket_type == UnixSocketType::Stream
+        && listener.name_kind == UnixNameKind::Filesystem
+        && listener.instances == 1
+        && listener
+            .owners
+            .iter()
+            .any(|owner| is_reviewed_container_owner(owner, reviewed_containers))
+        && listener
+            .owners
+            .iter()
+            .any(|owner| !is_reviewed_container_owner(owner, reviewed_containers))
+}
+
 pub fn accepted_local_control_snapshot(
     accepted: &AcceptedLocalControlInventoryV2,
 ) -> Result<LocalControlSnapshot, LocalControlVerificationError> {
@@ -787,6 +836,11 @@ pub fn accepted_local_control_snapshot(
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         })
         || contains_duplicate_unix_key(&unix_listeners)
+        || !standard_lockdown_removals_are_valid(
+            accepted,
+            &unix_listeners,
+            &root_container_processes,
+        )
     {
         return Err(invalid_accepted_fingerprint());
     }
@@ -2730,6 +2784,18 @@ mod tests {
         }
     }
 
+    fn assert_unreviewed_standard_reduction(
+        accepted: &AcceptedLocalControlInventoryV2,
+        observed: &LocalControlObservation,
+    ) {
+        let error = verify_no_additive_local_control_observation(accepted, observed).unwrap_err();
+        assert_eq!(
+            error.kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
+        );
+        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+    }
+
     fn empty_private() -> PrivateSnapshot {
         PrivateSnapshot {
             bounds_exceeded: BTreeSet::new(),
@@ -3315,7 +3381,9 @@ mod tests {
 
     #[test]
     fn standard_lockdown_allows_only_reviewed_container_reductions() {
-        let accepted = accepted_observation().snapshot;
+        let accepted_inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
         let mut reduced = accepted_observation();
         reduced.snapshot.root_container_processes.clear();
         let dockerd_listener = reduced
@@ -3332,17 +3400,11 @@ mod tests {
         dockerd_listener
             .owners
             .retain(|owner| owner.executable_basename != "dockerd");
-        verify_no_additive_local_control_observation(&accepted, &reduced).unwrap();
+        verify_no_additive_local_control_observation(&accepted_inventory, &reduced).unwrap();
 
         let mut missing_tcp = accepted_observation();
         missing_tcp.snapshot.tcp_listeners.remove(0);
-        let error =
-            verify_no_additive_local_control_observation(&accepted, &missing_tcp).unwrap_err();
-        assert_eq!(
-            error.kind,
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
-        );
-        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+        assert_unreviewed_standard_reduction(&accepted_inventory, &missing_tcp);
 
         let mut missing_non_container_owner = accepted_observation();
         missing_non_container_owner
@@ -3358,17 +3420,26 @@ mod tests {
             .unwrap()
             .owners
             .retain(|owner| owner.executable_basename == "multipathd");
-        let error =
-            verify_no_additive_local_control_observation(&accepted, &missing_non_container_owner)
-                .unwrap_err();
-        assert_eq!(
-            error.kind,
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
-        );
-        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+        assert_unreviewed_standard_reduction(&accepted_inventory, &missing_non_container_owner);
 
-        let mut missing_mixed_container_listener = accepted_observation();
-        let dockerd_listener = missing_mixed_container_listener
+        let mut missing_non_tagged_listener = accepted_observation();
+        let listener = missing_non_tagged_listener
+            .snapshot
+            .unix_listeners
+            .iter()
+            .position(|listener| {
+                listener.name_sha256
+                    == "caf0d5ac99f3b95f921556138b2adbf4ceb0e8d48c61ef23d5180aa480b45743"
+            })
+            .unwrap();
+        missing_non_tagged_listener
+            .snapshot
+            .unix_listeners
+            .remove(listener);
+        assert_unreviewed_standard_reduction(&accepted_inventory, &missing_non_tagged_listener);
+
+        let mut missing_explicitly_removable_listener = accepted_observation();
+        let dockerd_listener = missing_explicitly_removable_listener
             .snapshot
             .unix_listeners
             .iter()
@@ -3379,20 +3450,23 @@ mod tests {
                     .any(|owner| owner.executable_basename == "dockerd")
             })
             .unwrap();
-        missing_mixed_container_listener
+        missing_explicitly_removable_listener
             .snapshot
             .unix_listeners
             .remove(dockerd_listener);
-        let error = verify_no_additive_local_control_observation(
-            &accepted,
-            &missing_mixed_container_listener,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.kind,
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
+        assert_unreviewed_standard_reduction(
+            &accepted_inventory,
+            &missing_explicitly_removable_listener,
         );
-        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
+        missing_explicitly_removable_listener
+            .snapshot
+            .root_container_processes
+            .retain(|process| process.executable_basename != "dockerd");
+        verify_no_additive_local_control_observation(
+            &accepted_inventory,
+            &missing_explicitly_removable_listener,
+        )
+        .unwrap();
 
         let mut missing_mixed_container_co_owner = accepted_observation();
         missing_mixed_container_co_owner
@@ -3408,16 +3482,10 @@ mod tests {
             .unwrap()
             .owners
             .retain(|owner| owner.executable_basename == "dockerd");
-        let error = verify_no_additive_local_control_observation(
-            &accepted,
+        assert_unreviewed_standard_reduction(
+            &accepted_inventory,
             &missing_mixed_container_co_owner,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.kind,
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed)
         );
-        assert_eq!(error.code, "local_control_inventory_unreviewed_reduction");
 
         reduced.snapshot.tcp_listeners.push(TcpListener {
             family: InternetAddressFamily::Ipv4,
@@ -3428,7 +3496,7 @@ mod tests {
             instances: 1,
         });
         assert_eq!(
-            verify_no_additive_local_control_observation(&accepted, &reduced)
+            verify_no_additive_local_control_observation(&accepted_inventory, &reduced)
                 .unwrap_err()
                 .kind,
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
@@ -3437,7 +3505,9 @@ mod tests {
 
     #[test]
     fn standard_lockdown_rejects_split_endpoint_instance_amplification() {
-        let accepted = accepted_observation().snapshot;
+        let accepted_inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
         let mut split = accepted_observation();
         let index = split
             .snapshot
@@ -3454,7 +3524,7 @@ mod tests {
         split.snapshot.unix_listeners.push(second);
 
         assert_eq!(
-            verify_no_additive_local_control_observation(&accepted, &split)
+            verify_no_additive_local_control_observation(&accepted_inventory, &split)
                 .unwrap_err()
                 .kind,
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
@@ -3472,6 +3542,56 @@ mod tests {
 
         assert_eq!(
             accepted_local_control_snapshot(&inventory)
+                .unwrap_err()
+                .kind,
+            LocalControlVerificationErrorKind::InvalidAcceptedFingerprint
+        );
+    }
+
+    #[test]
+    fn accepted_fingerprint_rejects_invalid_standard_lockdown_removals() {
+        let accepted = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+
+        let mut non_container = accepted.clone();
+        non_container.standard_lockdown_removable_unix_listener_name_sha256 =
+            "caf0d5ac99f3b95f921556138b2adbf4ceb0e8d48c61ef23d5180aa480b45743";
+        assert_eq!(
+            accepted_local_control_snapshot(&non_container)
+                .unwrap_err()
+                .kind,
+            LocalControlVerificationErrorKind::InvalidAcceptedFingerprint
+        );
+
+        let mut unknown = accepted.clone();
+        unknown.standard_lockdown_removable_unix_listener_name_sha256 =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(
+            accepted_local_control_snapshot(&unknown).unwrap_err().kind,
+            LocalControlVerificationErrorKind::InvalidAcceptedFingerprint
+        );
+
+        let mut malformed = accepted.clone();
+        malformed.standard_lockdown_removable_unix_listener_name_sha256 = "";
+        assert_eq!(
+            accepted_local_control_snapshot(&malformed)
+                .unwrap_err()
+                .kind,
+            LocalControlVerificationErrorKind::InvalidAcceptedFingerprint
+        );
+
+        let mut non_mixed = accepted;
+        let removable = non_mixed.standard_lockdown_removable_unix_listener_name_sha256;
+        non_mixed
+            .unix_listeners
+            .iter_mut()
+            .find(|listener| listener.name_sha256 == removable)
+            .unwrap()
+            .owners
+            .retain(|owner| owner.executable_basename == "dockerd");
+        assert_eq!(
+            accepted_local_control_snapshot(&non_mixed)
                 .unwrap_err()
                 .kind,
             LocalControlVerificationErrorKind::InvalidAcceptedFingerprint

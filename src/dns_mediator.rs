@@ -1927,13 +1927,17 @@ fn establish_local_control_baseline(
     mediation: &DnsMediationSession,
     posture: LockdownPosture,
 ) -> Result<LocalControlSnapshot, DnsMediationError> {
-    let accepted = accepted_local_control_inventory()?;
+    let accepted_inventory = hosted_runner_fingerprint_requirement()
+        .accepted
+        .local_control_inventory;
     let observed = observe_local_control(&mediation.routing.executables, &mediation.fence_owner);
     match posture {
         LockdownPosture::StandardBlock => {
-            verify_no_additive_local_control_observation(&accepted, &observed)
+            verify_no_additive_local_control_observation(&accepted_inventory, &observed)
         }
         LockdownPosture::UnsafePreserve | LockdownPosture::Audit => {
+            let accepted = accepted_local_control_snapshot(&accepted_inventory)
+                .map_err(local_control_error)?;
             verify_local_control_observation(&accepted, &observed)
         }
     }

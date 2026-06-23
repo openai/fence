@@ -160,16 +160,20 @@ wildcard IPv4/IPv6 TCP port `22` listeners, and ten domain-separated Unix
 listener identities with reviewed owner sets and multiplicities.
 
 Production re-observes that inventory before mutation. Standard block may only
-remove accepted container processes or owners, then pins the verified reduction
-as its resident baseline; audit and degraded block require the full exact
-reference. The baseline is checked again before readiness and every five
-seconds afterward. Relative filesystem socket names, incomplete ownership,
-unavailable or unreviewed root identity, collection bounds, additive endpoints,
-and post-ready drift fail closed. Filesystem reachability probes are limited to
-possible root-control candidates, capped at forty, and share a five-second
-deadline so nonroot socket volume cannot create unbounded privileged probes.
-Hosted rejection evidence covers an unexpected pre-ready root listener and a
-separate post-ready listener that makes resident health permanently critical.
+remove accepted container processes or owners, plus the exact
+fingerprint-tagged Docker Unix listener after its reviewed `dockerd` owner has
+exited and the accepted socket unit is stopped. If that listener remains, its
+non-container owners and multiplicity remain exact. Fence then pins the
+verified reduction as its resident baseline; audit and degraded block require
+the full exact reference. The baseline is checked again before readiness and
+every five seconds afterward. Relative filesystem socket names, incomplete
+ownership, unavailable or unreviewed root identity, collection bounds,
+unreviewed reductions, additive endpoints, and post-ready drift fail closed.
+Filesystem reachability probes are limited to possible root-control candidates,
+capped at forty, and share a five-second deadline so nonroot socket volume
+cannot create unbounded privileged probes. Hosted rejection evidence covers an
+unexpected pre-ready root listener and a separate post-ready listener that
+makes resident health permanently critical.
 
 ### In-memory pre-ready rollback and no-restore commit
 
