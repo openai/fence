@@ -13,6 +13,7 @@ fi
 
 require_cmd node
 require_cmd sudo
+require_cmd systemctl
 if [[ ! -x /usr/sbin/nft ]]; then
   die "Action setup-failure evidence requires /usr/sbin/nft"
 fi
@@ -81,4 +82,44 @@ if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1
   die "Action wildcard setup-failure evidence unexpectedly created inet fence_v0"
 fi
 
-echo -e "${GREEN}Action setup-failure evidence verified:${OFF} invalid slug and wildcard rejected before mutation"
+runtime_failure_invocation="action-runtime-failure"
+runtime_failure_unit="fence-$runtime_failure_invocation.service"
+if [[ "$(systemctl show "$runtime_failure_unit" --property=LoadState --value)" != "not-found" ]]; then
+  die "Action runtime-failure evidence requires an unused transient service name"
+fi
+: >"$state"
+: >"$summary"
+: >"$stdout"
+: >"$stderr"
+if INPUT_CONFIG='{"schema_version":1,"mode":"block","invocation_id":"action-runtime-failure","platform_profile":"unsupported","allowlist":[]}' \
+  GITHUB_STATE="$state" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/main.cts >"$stdout" 2>"$stderr"; then
+  die "Action setup unexpectedly accepted an unsupported source profile"
+fi
+
+grep -q "Fence resident service exited before readiness" "$stderr"
+grep -q "Fence resident error code: invalid_platform_profile" "$stdout"
+if grep -q "readiness was not emitted before the timeout" "$stderr"; then
+  die "Action runtime failure waited for the full readiness timeout"
+fi
+if [[ -e "/run/fence/$runtime_failure_invocation" || -e "/run/fence-launcher/$runtime_failure_invocation" ]]; then
+  die "Action runtime-failure evidence left provisional runtime state"
+fi
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action runtime-failure evidence unexpectedly created inet fence_v0"
+fi
+if ! sudo --non-interactive /usr/bin/true; then
+  die "Action runtime-failure evidence unexpectedly disabled passwordless sudo"
+fi
+runtime_failure_status="$(systemctl show "$runtime_failure_unit" \
+  --property=LoadState \
+  --property=ActiveState \
+  --property=Result \
+  --property=ExecMainStatus)"
+grep -qx "LoadState=loaded" <<<"$runtime_failure_status"
+grep -qx "ActiveState=failed" <<<"$runtime_failure_status"
+grep -qx "Result=exit-code" <<<"$runtime_failure_status"
+grep -qx "ExecMainStatus=1" <<<"$runtime_failure_status"
+
+echo -e "${GREEN}Action setup-failure evidence verified:${OFF} invalid wrapper inputs and source profile fail before mutation"

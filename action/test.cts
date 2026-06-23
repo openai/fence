@@ -36,7 +36,11 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
-const { run } = require("./main.cts");
+const {
+  fenceErrorCodeFromJournal,
+  run,
+  terminalServiceStatus,
+} = require("./main.cts");
 
 function residentHealth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -449,6 +453,53 @@ test("emits bounded warning and error workflow commands", () => {
     captureStderr(() => actionLog.error("Fence setup failed\n100%")),
     "::error::Fence setup failed 100%25\n",
   );
+});
+
+test("recognizes terminal service state and only bounded structured Fence error codes", () => {
+  assert.equal(
+    terminalServiceStatus([
+      "LoadState=loaded",
+      "ActiveState=failed",
+      "SubState=failed",
+      "Result=exit-code",
+      "ExecMainCode=exited",
+      "ExecMainStatus=1",
+      "MainPID=0",
+    ].join("\n")),
+    "LoadState=loaded; ActiveState=failed; SubState=failed; Result=exit-code; ExecMainCode=exited; ExecMainStatus=1; MainPID=0",
+  );
+  assert.equal(
+    terminalServiceStatus("LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\n"),
+    undefined,
+  );
+  assert.equal(
+    terminalServiceStatus("LoadState=not-found\nActiveState=inactive\nSubState=dead\n"),
+    "LoadState=not-found; ActiveState=inactive; SubState=dead",
+  );
+
+  const structuredFailure = JSON.stringify({
+    schema_version: 1,
+    command: "run",
+    status: "error",
+    fence_version: "0.6.0",
+    error: {
+      code: "invalid_platform_profile",
+      message: "protected lifecycle setup failed",
+    },
+  });
+  assert.equal(
+    fenceErrorCodeFromJournal(`systemd service message\n${structuredFailure}\n`),
+    "invalid_platform_profile",
+  );
+  for (const invalid of [
+    JSON.stringify({ schema_version: 1, command: "run", status: "success", error: { code: "unsafe" } }),
+    JSON.stringify({ schema_version: 1, command: "other", status: "error", error: { code: "unsafe" } }),
+    JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code: "INVALID" } }),
+    `{${"x".repeat(4096)}}`,
+    "not JSON",
+  ]) {
+    assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
+  }
 });
 
 test("derives only bounded fixed runtime paths", () => {

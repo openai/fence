@@ -34,7 +34,7 @@ Production runtime intake accepts only `/run/fence/<invocation-id>/config.json`,
 - No network calls during `script/bootstrap`, `script/test`, `script/test-package-smoke`, `script/test-action-wrapper`, `script/validate-action-bundle`, `script/lint`, `script/build`, or `script/server`.
 - `script/test-lockdown` is intentionally restricted to disposable GitHub-hosted Linux evidence jobs because its successful block and degraded scenarios disable host access without restore.
 - `script/test-protected-run` is intentionally restricted to disposable GitHub-hosted Linux integration jobs because it launches a production lifecycle and leaves owned host network state plus DNS mediation resident without restore; standard block and standard broad-domain opt-out block also disable sudo/container controls, degraded block disables sudo while preserving containers, and audit preserves sudo/containers while applying non-blocking observation rules.
-- `script/test-action-setup-failure` and `script/test-action-tamper` are intentionally restricted to disposable GitHub-hosted Linux Action-acceptance jobs. The former proves malformed wrapper input fails before mutation. The latter launches the bundled audit lifecycle, deletes owned network state after readiness, proves resident critical drift, invokes the post hook expecting failure, and never restores access.
+- `script/test-action-setup-failure` and `script/test-action-tamper` are intentionally restricted to disposable GitHub-hosted Linux Action-acceptance jobs. The former proves malformed wrapper input fails before mutation and that a source-side configuration rejection is reported promptly through a retained failed transient unit without mutating controls. The latter launches the bundled audit lifecycle, deletes owned network state after readiness, proves resident critical drift, invokes the post hook expecting failure, and never restores access.
 - `script/update` is the only normal Cargo dependency update path and is intentionally online-only.
 - `script/vendor-rust` is the only normal Rust distribution lock refresh path and is intentionally online-only.
 - `script/prepare-rust` is the only normal Rust installation path. It is intentionally online, checksum-gated, and must validate `.cargo/tooling/rust-toolchain.lock.toml` before invoking `rustup`.
@@ -237,7 +237,8 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-setup-failure`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
-  - Invokes the dependency-free Action launcher with a malformed invocation slug and proves rejection occurs before Action state, runtime directories, or owned nftables state are created.
+  - Invokes the dependency-free Action launcher with malformed invocation and wildcard inputs and proves rejection occurs before Action state, runtime directories, or owned nftables state are created.
+  - Passes one bounded unsupported profile through the raw-config wrapper boundary, proves the bundled source agent rejects it before control mutation, and requires the launcher to retain the failed transient unit, fail before the readiness timeout, and emit only the structured Fence error code from the unit journal.
 
 - `script/test-action-tamper`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
