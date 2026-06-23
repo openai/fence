@@ -150,6 +150,9 @@ patterns share an eight-name lifetime authorization budget. These names
 materialize lazily after matching DNS queries and do not delay readiness.
 Fence validates DNS structure rather than registrable-domain ownership, so use
 broad or shared suffixes only as explicit egress and DNS-data-channel choices.
+Derived DNS aliases are accepted only when every alias belongs to one acyclic
+response chain rooted at the hostname that was queried. An unrelated alias or
+address owner fails closed without creating later hostname authorization.
 
 ## How It Works 🔧
 

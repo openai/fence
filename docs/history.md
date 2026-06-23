@@ -73,6 +73,9 @@ See [`v0.md`](v0.md) for normative behavior and
 - DNS, privileged file handling, subprocess deadlines, response binding,
   first-connection ordering, and evidence propagation received focused
   hardening.
+- Derived DNS authorization moved from process-wide answer-owner matching to a
+  response-local chain rooted at the echoed question, with atomic validation
+  and queried-root policy retention.
 - The logical policy now merges platform and user hostname transports,
   prehydrates exact roots, refreshes them during the resident lifecycle, and
   keeps transient addresses out of the logical hash.
