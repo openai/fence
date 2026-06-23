@@ -782,7 +782,7 @@ if scenario == "audit":
         "parent_executable_basenames",
     })
     observation = json.loads(host_observation_path.read_text(encoding="utf-8"))
-    require(observation["schema_version"] == 3)
+    require(observation["schema_version"] == 4)
     azure_agent = observation["systemd"]["azure_platform_agent"]
     require(azure_agent["name"] == "walinuxagent.service")
     require(azure_agent["active_state"] == "active")

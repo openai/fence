@@ -34,7 +34,7 @@ if [[ -z "${GITHUB_OUTPUT:-}" ]]; then
 fi
 
 "$bundle" check-support >"$support"
-python3 -E "$DIR/script/lib/action_bundle_host.py" \
+python3 -B -E "$DIR/script/lib/action_bundle_host.py" \
   "$observation" \
   "$support" \
   "$transitions" \

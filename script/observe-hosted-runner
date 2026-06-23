@@ -24,7 +24,8 @@ if ! [[ "$runner_principal" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
 fi
 
 # Observe only fixed security-relevant surfaces. Do not emit file contents,
-# environment values, process arguments, workload identifiers, or socket data.
+# environment values, process arguments, workload identifiers, raw socket
+# names, or local listener addresses.
 # The only mutations are an exclusive empty-file create/delete probe in the
 # enumerated command and sudo-policy ancestor directories plus one bounded
 # runner-readable evidence file under the runner-provided temporary root.
@@ -32,9 +33,13 @@ observation_path="$RUNNER_TEMP/fence-hosted-runner-observation.json"
 if [[ -e "$observation_path" ]]; then
   die "hosted-runner observation requires an absent evidence path"
 fi
-sudo --non-interactive /usr/bin/python3 -E - "$runner_principal" "$observation_path" <<'PY'
+sudo --non-interactive /usr/bin/python3 -B -E - \
+  "$runner_principal" \
+  "$observation_path" \
+  "$DIR/script/lib/host_observation.py" <<'PY'
 import grp
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -43,58 +48,45 @@ import pwd
 import re
 import secrets
 import stat
-import subprocess
 import sys
 
-MAX_OUTPUT_BYTES = 256 * 1024
+helper_path = pathlib.Path(sys.argv[3])
+helper_spec = importlib.util.spec_from_file_location(
+    "fence_host_observation", helper_path
+)
+if helper_spec is None or helper_spec.loader is None:
+    raise SystemExit("hosted-runner observation helper is unavailable")
+helper = importlib.util.module_from_spec(helper_spec)
+helper_spec.loader.exec_module(helper)
+observe_local_control_inventory = helper.observe_local_control_inventory
+validate_local_control_inventory = helper.validate_local_control_inventory
+validate_schema4_observation = helper.validate_schema4_observation
+bounded_command_output = helper.bounded_command_output
+bounded_directory_entries = helper.bounded_directory_entries
+bounded_file_lines = helper.bounded_file_lines
+bounded_read = helper._bounded_read
+bounded_waitpid = helper.bounded_waitpid
+canonical_sudo_sources = helper.canonical_sudo_sources
+public_fixed_canonical_target = helper.public_fixed_canonical_target
+public_host_identity = helper.public_host_identity
+public_resolver_target = helper.public_resolver_target
+public_runner_group_name = helper.public_runner_group_name
+public_socket_identity = helper.public_socket_identity
+public_sudo_source_name = helper.public_sudo_source_name
+public_sudo_source_target = helper.public_sudo_source_target
+public_unit_state = helper.public_unit_state
+
+MAX_OUTPUT_BYTES = helper.MAX_SCHEMA4_OUTPUT_BYTES
 MAX_POLICY_SOURCE_BYTES = 256 * 1024
-MAX_POLICY_SOURCES = 64
-MAX_AZURE_PLATFORM_AGENT_PROCESSES = 16
-FIXED_PATHS = [
-    "/usr/bin/docker",
-    "/usr/bin/id",
-    "/usr/bin/mount",
-    "/usr/bin/stat",
-    "/usr/bin/sudo",
-    "/usr/bin/systemctl",
-    "/usr/bin/systemd-run",
-    "/usr/bin/true",
-    "/usr/bin/umount",
-    "/usr/sbin/visudo",
-    "/usr/sbin/nft",
-]
-FIXED_ANCESTOR_DIRECTORIES = [
-    "/",
-    "/etc",
-    "/etc/sudoers.d",
-    "/usr",
-    "/usr/bin",
-    "/usr/sbin",
-]
-FIXED_UNITS = [
-    "docker.service",
-    "docker.socket",
-    "containerd.service",
-    "containerd.socket",
-    "walinuxagent.service",
-]
-FIXED_SOCKETS = [
-    "/var/run/docker.sock",
-    "/run/docker.sock",
-    "/run/containerd/containerd.sock",
-]
-REPORTABLE_CANONICAL_ROOTS = [
-    pathlib.Path("/bin"),
-    pathlib.Path("/etc"),
-    pathlib.Path("/sbin"),
-    pathlib.Path("/usr"),
-]
-PROBE_RESULTS = {
-    "created_and_removed",
-    "created_and_root_removed",
-    "denied",
-    "unavailable",
-}
+MAX_CGROUP_PROCS_BYTES = 16 * 1024
+MAX_OS_RELEASE_BYTES = 4096
+MAX_POLICY_SOURCES = helper.MAX_SCHEMA4_POLICY_SOURCES
+MAX_AZURE_PLATFORM_AGENT_PROCESSES = helper.MAX_SCHEMA4_AZURE_PROCESSES
+FIXED_PATHS = list(helper.SCHEMA4_REQUIRED_PATHS)
+FIXED_ANCESTOR_DIRECTORIES = list(helper.SCHEMA4_ANCESTOR_DIRECTORIES)
+FIXED_UNITS = list(helper.SCHEMA4_FIXED_UNITS)
+FIXED_SOCKETS = list(helper.SCHEMA4_FIXED_SOCKETS)
+PROBE_RESULTS = helper.SCHEMA4_PROBE_RESULTS
 
 
 def fail(message):
@@ -102,20 +94,7 @@ def fail(message):
 
 
 def command_output(args):
-    try:
-        result = subprocess.run(
-            args,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env={"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/usr/sbin:/bin:/sbin"},
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode not in (0, 1, 3, 4):
-        return None
-    return result.stdout[:4096]
+    return bounded_command_output(args, maximum=4096, timeout=5)
 
 
 def metadata_type(mode):
@@ -174,18 +153,6 @@ def group_class(identifier, identity):
     return "other"
 
 
-def bounded_canonical_target(path):
-    candidate = pathlib.Path(path)
-    if candidate == pathlib.Path("/"):
-        return "/"
-    for root in REPORTABLE_CANONICAL_ROOTS:
-        if candidate == root or root in candidate.parents:
-            rendered = str(candidate)
-            if len(rendered) <= 256 and all(ord(character) >= 32 for character in rendered):
-                return rendered
-    return "outside_fixed_system_roots"
-
-
 def drop_to_runner(identity):
     os.setgroups(identity["group_ids"])
     os.setresgid(identity["gid"], identity["gid"], identity["gid"])
@@ -201,7 +168,9 @@ def runner_access(path, mode, identity):
         except OSError:
             os._exit(2)
         os._exit(0 if allowed else 1)
-    _, status = os.waitpid(pid, 0)
+    status = bounded_waitpid(pid, timeout=5)
+    if status is None:
+        return None
     if not os.WIFEXITED(status):
         return None
     code = os.WEXITSTATUS(status)
@@ -224,7 +193,7 @@ def metadata_observation(path, identity):
         "path": path,
         "present": True,
         "path_type": metadata_type(path_metadata.st_mode),
-        "canonical_target": bounded_canonical_target(canonical),
+        "canonical_target": public_fixed_canonical_target(canonical, path),
         "target_type": metadata_type(target_metadata.st_mode),
         "owner_class": owner_class(target_metadata.st_uid, identity),
         "group_class": group_class(target_metadata.st_gid, identity),
@@ -265,40 +234,48 @@ def synthetic_create_delete_probe(directory, identity):
         else:
             return "unavailable"
 
-        pid = os.fork()
-        if pid == 0:
-            created = False
-            try:
-                drop_to_runner(identity)
-                probe_fd = os.open(
-                    probe_name,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=directory_fd,
-                )
-                created = True
-                os.close(probe_fd)
-                os.unlink(probe_name, dir_fd=directory_fd)
-            except PermissionError:
-                os._exit(12 if created else 10)
-            except OSError:
-                os._exit(12 if created else 11)
-            os._exit(0)
-
-        _, status = os.waitpid(pid, 0)
-        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 11
         root_removed = False
         try:
-            os.unlink(probe_name, dir_fd=directory_fd)
-            root_removed = True
-        except FileNotFoundError:
-            pass
-        except OSError:
-            fail("hosted-runner observation could not remove its synthetic probe")
+            pid = os.fork()
+            if pid == 0:
+                created = False
+                try:
+                    drop_to_runner(identity)
+                    probe_fd = os.open(
+                        probe_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    created = True
+                    os.close(probe_fd)
+                    os.unlink(probe_name, dir_fd=directory_fd)
+                except PermissionError:
+                    os._exit(12 if created else 10)
+                except OSError:
+                    os._exit(12 if created else 11)
+                os._exit(0)
+
+            status = bounded_waitpid(pid, timeout=5)
+            code = (
+                os.WEXITSTATUS(status)
+                if status is not None and os.WIFEXITED(status)
+                else 11
+            )
+        finally:
+            try:
+                os.unlink(probe_name, dir_fd=directory_fd)
+                root_removed = True
+            except FileNotFoundError:
+                pass
+            except OSError:
+                fail(
+                    "hosted-runner observation could not remove its synthetic probe"
+                )
 
         if root_removed:
             return "created_and_root_removed"
@@ -338,12 +315,6 @@ def runner_nopasswd_markers(contents, principal, groups):
     return sorted(markers)
 
 
-def bounded_policy_name(name):
-    if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", name):
-        return name
-    return "unreportable_name"
-
-
 def regular_file_observation(path, principal, identity):
     candidate = pathlib.Path(path)
     try:
@@ -359,8 +330,8 @@ def regular_file_observation(path, principal, identity):
             return None
         canonical = candidate.resolve(strict=True)
         common = {
-            "name": bounded_policy_name(candidate.name),
-            "canonical_target": bounded_canonical_target(canonical),
+            "name": public_sudo_source_name(candidate.name),
+            "canonical_target": public_sudo_source_target(canonical),
             "target_type": "regular",
             "owner_class": owner_class(metadata.st_uid, identity),
             "group_class": group_class(metadata.st_gid, identity),
@@ -403,9 +374,11 @@ def unit_state(unit):
     )
     values = {
         "name": unit,
-        "load_state": "unobserved",
-        "active_state": "unobserved",
-        "unit_file_state": "unobserved",
+        "load_state": public_unit_state(unit, "load_state", "unobserved"),
+        "active_state": public_unit_state(unit, "active_state", "unobserved"),
+        "unit_file_state": public_unit_state(
+            unit, "unit_file_state", "unobserved"
+        ),
     }
     if output is not None:
         for line in output.splitlines():
@@ -416,7 +389,9 @@ def unit_state(unit):
                 "UnitFileState": "unit_file_state",
             }.get(key)
             if output_key is not None:
-                values[output_key] = value[:64]
+                values[output_key] = public_unit_state(
+                    unit, output_key, value[:64]
+                )
     return values
 
 
@@ -485,10 +460,18 @@ def azure_platform_agent_observation(identity):
     observation = {
         "name": unit,
         "status": "observed",
-        "load_state": fields.get("LoadState", "unobserved")[:64],
-        "active_state": fields.get("ActiveState", "unobserved")[:64],
+        "load_state": public_unit_state(
+            unit, "load_state", fields.get("LoadState", "unobserved")[:64]
+        ),
+        "active_state": public_unit_state(
+            unit, "active_state", fields.get("ActiveState", "unobserved")[:64]
+        ),
         "sub_state": fields.get("SubState", "unobserved")[:64],
-        "unit_file_state": fields.get("UnitFileState", "unobserved")[:64],
+        "unit_file_state": public_unit_state(
+            unit,
+            "unit_file_state",
+            fields.get("UnitFileState", "unobserved")[:64],
+        ),
         "configured_user_class": configured_user_class,
         "control_group": control_group,
         "main_pid": main_pid,
@@ -498,12 +481,23 @@ def azure_platform_agent_observation(identity):
 
     cgroup_processes = pathlib.Path("/sys/fs/cgroup") / control_group.removeprefix("/") / "cgroup.procs"
     try:
-        raw_pids = cgroup_processes.read_text(encoding="utf-8").splitlines()
-    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        raw_pids, lines_truncated = bounded_file_lines(
+            cgroup_processes,
+            MAX_CGROUP_PROCS_BYTES,
+            MAX_AZURE_PLATFORM_AGENT_PROCESSES + 1,
+        )
+    except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
+        observation["process_status"] = "unavailable"
+        return observation
+    if not all(value.isdecimal() for value in raw_pids):
         observation["process_status"] = "unavailable"
         return observation
     process_ids = sorted({int(value) for value in raw_pids if value.isdecimal()})
-    observation["processes_truncated"] = len(process_ids) > MAX_AZURE_PLATFORM_AGENT_PROCESSES
+    observation["processes_truncated"] = (
+        lines_truncated
+        or len(raw_pids) > MAX_AZURE_PLATFORM_AGENT_PROCESSES
+        or len(process_ids) > MAX_AZURE_PLATFORM_AGENT_PROCESSES
+    )
     processes = [
         process
         for pid in process_ids[:MAX_AZURE_PLATFORM_AGENT_PROCESSES]
@@ -548,8 +542,8 @@ def socket_state(path):
         "present": True,
         "type": kind,
         "mode": format(mode, "04o"),
-        "owner": owner[:64],
-        "group": group[:64],
+        "owner": public_socket_identity(path, "owner", owner[:64]),
+        "group": public_socket_identity(path, "group", group[:64]),
     }
 
 
@@ -565,7 +559,7 @@ def resolver_layout():
         "status": "observed",
         "path": str(path),
         "is_symlink": stat.S_ISLNK(metadata.st_mode),
-        "canonical_target": str(canonical)[:256],
+        "canonical_target": public_resolver_target(canonical),
         "target_type": "regular" if stat.S_ISREG(target.st_mode) else "unexpected_type",
         "target_mode": format(stat.S_IMODE(target.st_mode), "04o"),
         "target_uid": target.st_uid,
@@ -605,7 +599,11 @@ def validate_metadata_fields(item):
 
 
 def validate_result(result):
-    if result.get("schema_version") != 3:
+    try:
+        validate_schema4_observation(result)
+    except ValueError as error:
+        fail(f"hosted-runner schema 4 observation is invalid: {error}")
+    if result.get("schema_version") != 4:
         fail("hosted-runner observation schema mismatch")
     required_paths = result.get("required_paths")
     if not isinstance(required_paths, list) or [
@@ -681,6 +679,10 @@ def validate_result(result):
         for field in ("executable_device", "executable_inode"):
             if not isinstance(process.get(field), int) or isinstance(process[field], bool):
                 fail("hosted-runner observation Azure platform agent child identity is invalid")
+    try:
+        validate_local_control_inventory(result.get("local_control_inventory"))
+    except ValueError as error:
+        fail(f"hosted-runner local control observation is invalid: {error}")
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
         fail("hosted-runner observation exceeds its output bound")
@@ -701,14 +703,21 @@ try:
 except OSError:
     drop_in_root_metadata = None
 if drop_in_root_metadata is not None and stat.S_ISDIR(drop_in_root_metadata.st_mode):
-    for candidate in sorted(drop_in_root.iterdir()):
-        if len(sudo_sources) >= MAX_POLICY_SOURCES:
-            policy_sources_truncated = True
-            break
+    remaining_sources = max(0, MAX_POLICY_SOURCES - len(sudo_sources))
+    try:
+        candidates, policy_sources_truncated = bounded_directory_entries(
+            drop_in_root, remaining_sources
+        )
+    except OSError:
+        candidates = []
+        policy_sources_truncated = True
+    for candidate in candidates:
         hashed = regular_file_observation(candidate, sys.argv[1], identity)
         if hashed is not None:
             hashed["path_class"] = "drop_in"
             sudo_sources.append(hashed)
+
+sudo_sources = canonical_sudo_sources(sudo_sources)
 
 docker_ps = command_output(["/usr/bin/docker", "ps", "--quiet"])
 docker_workload_count = (
@@ -717,24 +726,45 @@ docker_workload_count = (
 
 os_identity = {"id": "unknown", "version_id": "unknown"}
 try:
-    for line in pathlib.Path("/etc/os-release").read_text(encoding="utf-8").splitlines():
+    os_release = bounded_read("/etc/os-release", MAX_OS_RELEASE_BYTES).decode(
+        "utf-8", errors="strict"
+    )
+    for line in os_release.splitlines():
         key, _, value = line.partition("=")
         if key in {"ID", "VERSION_ID"}:
             os_identity[key.lower()] = value.strip().strip('"')[:64]
-except (FileNotFoundError, UnicodeDecodeError):
+except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
     pass
 
 result = {
-    "schema_version": 3,
+    "schema_version": 4,
     "observation": "hosted_runner_fingerprint_candidate",
     "status": "observation_only_no_protection",
     "protected_target": "github_hosted_ubuntu_24_04_x86_64",
     "host": {
-        "os_id": os_identity["id"],
-        "os_version_id": os_identity["version_id"],
-        "architecture": platform.machine(),
-        "runner_principal": sys.argv[1],
-        "runner_groups": identity["group_names"],
+        "os_id": public_host_identity(
+            os_identity["id"],
+            helper.SCHEMA4_REVIEWED_OS_ID,
+            helper.UNREVIEWED_OS_ID,
+        ),
+        "os_version_id": public_host_identity(
+            os_identity["version_id"],
+            helper.SCHEMA4_REVIEWED_OS_VERSION_ID,
+            helper.UNREVIEWED_OS_VERSION_ID,
+        ),
+        "architecture": public_host_identity(
+            platform.machine(),
+            helper.SCHEMA4_REVIEWED_ARCHITECTURE,
+            helper.UNREVIEWED_ARCHITECTURE,
+        ),
+        "runner_principal": public_host_identity(
+            sys.argv[1],
+            helper.SCHEMA4_REVIEWED_RUNNER_PRINCIPAL,
+            helper.UNREVIEWED_RUNNER_PRINCIPAL,
+        ),
+        "runner_groups": sorted(
+            {public_runner_group_name(name) for name in identity["group_names"]}
+        ),
     },
     "required_paths": [
         command_path_observation(path, identity) for path in FIXED_PATHS
@@ -758,7 +788,12 @@ result = {
         "sockets": [socket_state(path) for path in FIXED_SOCKETS],
         "docker_running_workload_count": docker_workload_count,
     },
-    "next_step": "review_permission_invariants_before_any_enforcement_change",
+    "local_control_inventory": observe_local_control_inventory(
+        filesystem_socket_access=lambda path: runner_access(
+            path, os.W_OK, identity
+        )
+    ),
+    "next_step": "review_closed_host_invariants_before_any_enforcement_change",
 }
 encoded = validate_result(result)
 output_path = pathlib.Path(sys.argv[2])
