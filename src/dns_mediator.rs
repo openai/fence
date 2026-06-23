@@ -7997,14 +7997,6 @@ mod tests {
                     target: "edge.example".to_owned(),
                     ttl_seconds: 60,
                 }],
-                addresses: Vec::new(),
-            },
-            DnsAnswerRecords {
-                aliases: vec![DnsCnameAnswer {
-                    owner: "github.com".to_owned(),
-                    target: "edge.example".to_owned(),
-                    ttl_seconds: 60,
-                }],
                 addresses: vec![address("github.com")],
             },
             DnsAnswerRecords {
