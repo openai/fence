@@ -30,6 +30,10 @@ without suppressing runner health traffic. Fence does not make readiness depend
 on that optional endpoint resolving before startup. Those allowed GitHub
 domains are still places later workflow code can send data.
 
+Before readiness, required exact hostnames retry only transient or addressless
+DNS rounds, at most three attempts under one shared ten-second startup budget.
+Malformed or integrity-invalid DNS responses are not retried.
+
 GitHub uploads job logs and summaries to a per-run Azure storage account.
 Fence authorizes at most four exact results-storage hostnames, and only when
 the DNS request comes from the pinned GitHub runner process. It does not allow
