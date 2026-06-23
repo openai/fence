@@ -550,19 +550,6 @@ mod tests {
         assert_eq!(transitions["schema_version"], 1);
         let transitions = transitions["transitions"].as_array().unwrap();
         assert!(transitions.is_empty());
-        for transition in transitions {
-            let source = requirement
-                .accepted
-                .sudo_policy_sources
-                .iter()
-                .find(|source| {
-                    transition["path_class"] == source.path_class
-                        && transition["name"] == source.name
-                })
-                .unwrap();
-            let digest = transition["sha256"].as_str().unwrap();
-            assert!(digest == source.sha256 || source.alternate_sha256.contains(&digest));
-        }
     }
 
     #[test]
