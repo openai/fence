@@ -74,7 +74,6 @@ def project_schema4_observation_to_schema1(observation, accepted):
         raise ClassificationError(
             f"host schema 4 observation is invalid: {error}"
         ) from error
-    inventory = observation["local_control_inventory"]
     require(
         observation["sudo"]["policy_sources_truncated"] is False,
         "host sudo policy observation is truncated",
@@ -85,20 +84,6 @@ def project_schema4_observation_to_schema1(observation, accepted):
             for source in observation["sudo"]["policy_source_hashes"]
         ),
         "host sudo policy observation is oversized",
-    )
-    require(
-        inventory["status"] == "stable",
-        "host local control observation is unavailable",
-    )
-    require(
-        inventory["stable"] is True,
-        "host local control observation is unstable",
-    )
-    require(
-        inventory["snapshot"]["scan_status"] == "within_bounds"
-        and inventory["snapshot"]["reachability_complete"] is True
-        and inventory["snapshot"]["ownership_complete"] is True,
-        "host local control observation is incomplete",
     )
 
     required_paths = index_by(observation["required_paths"], "path")
@@ -909,8 +894,8 @@ class ClassificationTests(unittest.TestCase):
                 "owners": [
                     {
                         "uid": 0,
-                        "executable_basename": "exampled",
-                        "canonical_executable": UNREVIEWED_EXECUTABLE_PATH,
+                        "executable_basename": "systemd",
+                        "canonical_executable": "/usr/lib/systemd/systemd",
                         "unified_cgroup": "/init.scope",
                         "processes": 1,
                     }
@@ -924,47 +909,53 @@ class ClassificationTests(unittest.TestCase):
             "bundle_compatible",
         )
 
-    def test_schema4_projection_rejects_unavailable_new_evidence(self):
-        observation, support, transitions = fixture()
-        inventory = observation["local_control_inventory"]
-        inventory["status"] = "unavailable"
-        inventory["snapshot"]["scan_status"] = "unavailable"
-        inventory["snapshot"]["unavailable_inputs"] = [
-            "proc",
-            "socket_ownership",
-            "unix_reachability",
-        ]
-        inventory["snapshot"]["reachability_complete"] = False
-        inventory["snapshot"]["ownership_complete"] = False
-        with self.assertRaises(ClassificationError):
-            classify(observation, support, transitions)
+    def test_schema4_local_inventory_status_is_observation_only(self):
+        def unavailable(inventory):
+            inventory["status"] = "unavailable"
+            inventory["snapshot"].update(
+                {
+                    "scan_status": "unavailable",
+                    "unavailable_inputs": [
+                        "proc",
+                        "socket_ownership",
+                        "unix_reachability",
+                    ],
+                    "reachability_complete": False,
+                    "ownership_complete": False,
+                }
+            )
 
-    def test_schema4_projection_requires_complete_untruncated_evidence(self):
-        mutations = {
-            "unstable inventory": lambda observation: observation[
-                "local_control_inventory"
-            ].update({"status": "unstable", "stable": False, "attempts": 3}),
-            "bounded inventory": lambda observation: (
-                observation["local_control_inventory"].update(
-                    {"status": "bounds_exceeded"}
-                ),
-                observation["local_control_inventory"]["snapshot"].update(
-                    {
-                        "scan_status": "bounds_exceeded",
-                        "bounds_exceeded": ["tcp_listeners"],
-                    }
-                ),
-            ),
-            "truncated sudo sources": lambda observation: observation["sudo"].update(
-                {"policy_sources_truncated": True}
-            ),
-        }
-        for label, mutate in mutations.items():
+        def unstable(inventory):
+            inventory.update({"status": "unstable", "stable": False, "attempts": 3})
+
+        def bounds_exceeded(inventory):
+            inventory["status"] = "bounds_exceeded"
+            inventory["snapshot"].update(
+                {
+                    "scan_status": "bounds_exceeded",
+                    "bounds_exceeded": ["tcp_listeners"],
+                }
+            )
+
+        for label, mutate in {
+            "unavailable": unavailable,
+            "unstable": unstable,
+            "bounds exceeded": bounds_exceeded,
+        }.items():
             with self.subTest(label=label):
                 observation, support, transitions = fixture()
-                mutate(observation)
-                with self.assertRaises(ClassificationError):
-                    classify(observation, support, transitions)
+                mutate(observation["local_control_inventory"])
+                validate_schema4_observation(observation)
+                self.assertEqual(
+                    classify(observation, support, transitions)["classification"],
+                    "bundle_compatible",
+                )
+
+    def test_schema4_projection_requires_complete_legacy_evidence(self):
+        observation, support, transitions = fixture()
+        observation["sudo"]["policy_sources_truncated"] = True
+        with self.assertRaises(ClassificationError):
+            classify(observation, support, transitions)
 
         observation, support, transitions = fixture()
         source = observation["sudo"]["policy_source_hashes"][0]
@@ -990,8 +981,8 @@ class ClassificationTests(unittest.TestCase):
                     "owners": [
                         {
                             "uid": 0,
-                            "executable_basename": "exampled",
-                            "canonical_executable": UNREVIEWED_EXECUTABLE_PATH,
+                            "executable_basename": "systemd",
+                            "canonical_executable": "/usr/lib/systemd/systemd",
                             "unified_cgroup": "/init.scope",
                             "processes": observation_limits()["processes"] + 1,
                         }
@@ -1028,6 +1019,26 @@ class ClassificationTests(unittest.TestCase):
                 mutate(observation)
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
+
+    def test_schema4_projection_rejects_noncanonical_sudo_source_order(self):
+        observation, _, _ = fixture()
+        runner = observation["sudo"]["policy_source_hashes"][0]
+        observation["sudo"]["policy_source_hashes"].insert(
+            0,
+            {
+                **runner,
+                "path_class": "main_policy",
+                "name": "sudoers",
+                "sha256": "b" * 64,
+                "canonical_target": "/etc/sudoers",
+                "contains_nopasswd_directive": False,
+                "runner_nopasswd_markers": [],
+            },
+        )
+        validate_schema4_observation(observation)
+        observation["sudo"]["policy_source_hashes"].reverse()
+        with self.assertRaises(ValueError):
+            validate_schema4_observation(observation)
 
     def test_schema4_projection_rejects_malformed_legacy_evidence(self):
         observation, support, transitions = fixture()

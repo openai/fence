@@ -36,7 +36,7 @@ PUBLIC_COUNTER_MAXIMUMS = {
 }
 STABILITY_ATTEMPTS = 3
 STABILITY_INTERVAL_SECONDS = 0.05
-TCP_TABLE_HEADER = (
+TCP4_TABLE_HEADER = (
     "sl",
     "local_address",
     "rem_address",
@@ -50,6 +50,24 @@ TCP_TABLE_HEADER = (
     "timeout",
     "inode",
 )
+TCP6_TABLE_HEADER = (
+    "sl",
+    "local_address",
+    "remote_address",
+    "st",
+    "tx_queue",
+    "rx_queue",
+    "tr",
+    "tm->when",
+    "retrnsmt",
+    "uid",
+    "timeout",
+    "inode",
+)
+TCP_TABLE_HEADERS = {
+    "ipv4": TCP4_TABLE_HEADER,
+    "ipv6": TCP6_TABLE_HEADER,
+}
 UNIX_TABLE_HEADER = (
     b"Num",
     b"RefCount",
@@ -204,22 +222,27 @@ DERIVED_UNAVAILABLE_REASONS = {
 }
 
 UNREVIEWED_EXECUTABLE_PATH = "unreviewed_executable_path"
+UNREVIEWED_CGROUP = "unreviewed_cgroup"
 REVIEWED_EXECUTABLE_PATHS = frozenset(
     {
         "/usr/bin/containerd",
+        "/usr/bin/dbus-daemon",
         "/usr/bin/dockerd",
         "/usr/lib/systemd/systemd",
         "/usr/lib/systemd/systemd-journald",
         "/usr/lib/systemd/systemd-networkd",
         "/usr/lib/systemd/systemd-resolved",
         "/usr/lib/systemd/systemd-udevd",
+        "/usr/sbin/multipathd",
     }
 )
 REVIEWED_CGROUPS = {
     "/",
     "/init.scope",
     "/system.slice/containerd.service",
+    "/system.slice/dbus.service",
     "/system.slice/docker.service",
+    "/system.slice/multipathd.service",
     "/system.slice/systemd-journald.service",
     "/system.slice/systemd-networkd.service",
     "/system.slice/systemd-resolved.service",
@@ -445,21 +468,26 @@ def _reviewed_executable_path(path):
     return UNREVIEWED_EXECUTABLE_PATH
 
 
-def _unified_cgroup(process_root):
+def _classified_cgroup(process_root):
     try:
-        contents = _bounded_read(process_root / "cgroup", 4096).decode(
+        encoded = _bounded_read(process_root / "cgroup", 4096)
+        contents = encoded.decode(
             "utf-8", errors="strict"
         )
     except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
-        return None
+        return UNREVIEWED_CGROUP, None, False
+    fingerprint = hashlib.sha256(b"fence-cgroup-v1\0" + encoded).hexdigest()
+    unified = []
     for line in contents.splitlines():
         try:
             hierarchy, controllers, path = line.split(":", 2)
         except ValueError:
-            continue
+            return UNREVIEWED_CGROUP, fingerprint, False
         if hierarchy == "0" and controllers == "":
-            return path if path in REVIEWED_CGROUPS else None
-    return None
+            unified.append(path)
+    if len(unified) != 1 or unified[0] not in REVIEWED_CGROUPS:
+        return UNREVIEWED_CGROUP, fingerprint, False
+    return unified[0], fingerprint, True
 
 
 def _process_start_time(process_root):
@@ -491,6 +519,9 @@ def _process_observation(process_root):
         "executable_inode": executable_metadata.st_ino,
         "executable_basename": basename,
         "canonical_executable": _reviewed_executable_path(executable_path),
+        "_executable_path_fingerprint": hashlib.sha256(
+            b"fence-executable-path-v1\0" + os.fsencode(executable_path)
+        ).hexdigest(),
     }
 
 
@@ -513,6 +544,7 @@ def _same_process(first, second):
             "executable_inode",
             "executable_basename",
             "canonical_executable",
+            "_executable_path_fingerprint",
         )
     )
 
@@ -531,7 +563,11 @@ def _public_owner(identity):
 
 def _owner_key(identity):
     public = _public_owner(identity)
-    return tuple(public[key] for key in sorted(public))
+    return (
+        *(public[key] for key in sorted(public)),
+        identity.get("_executable_path_fingerprint"),
+        identity.get("_cgroup_fingerprint"),
+    )
 
 
 def _socket_inode(target):
@@ -541,11 +577,11 @@ def _socket_inode(target):
     return int(match.group(1))
 
 
-def _scan_process_owners(proc_root):
+def _scan_process_owners(proc_root, relevant_listener_inodes):
     bounds = set()
     unavailable = set()
     owners = {}
-    nonroot_owned_inodes = set()
+    unresolved_owner_inodes = set()
     unresolved_root_inodes = set()
     containers = []
     processes_seen = 0
@@ -582,7 +618,7 @@ def _scan_process_owners(proc_root):
             unavailable.add("process_identity")
             continue
         processes_seen += 1
-        before_cgroup = _unified_cgroup(process_root_path) if before["uid"] == 0 else None
+        before_cgroup = _classified_cgroup(process_root_path)
         socket_inodes = set()
         try:
             with os.scandir(process_root_path / "fd") as descriptors:
@@ -604,12 +640,20 @@ def _scan_process_owners(proc_root):
                         unavailable.add("process_fd_readlink")
                         continue
                     inode = _socket_inode(target)
-                    if inode is not None:
+                    if inode is not None and inode in relevant_listener_inodes:
                         socket_inodes.add(inode)
         except FileNotFoundError:
             continue
         except OSError:
             unavailable.add("process_fd_scan")
+            continue
+
+        is_root_container = before["uid"] == 0 and before[
+            "executable_basename"
+        ] in {"containerd", "dockerd"}
+        if not socket_inodes and not is_root_container:
+            if "total_fds" in bounds:
+                break
             continue
 
         try:
@@ -618,47 +662,67 @@ def _scan_process_owners(proc_root):
             continue
         except (OSError, UnicodeDecodeError, ValueError):
             unavailable.add("process_identity_drift")
+            unresolved_owner_inodes.update(socket_inodes)
             if before["uid"] == 0:
                 unresolved_root_inodes.update(socket_inodes)
             continue
-        after_cgroup = _unified_cgroup(process_root_path) if after["uid"] == 0 else None
+        after_cgroup = _classified_cgroup(process_root_path)
         if not _same_process(before, after):
             unavailable.add("process_identity_drift")
+            unresolved_owner_inodes.update(socket_inodes)
             if before["uid"] == 0 or after["uid"] == 0:
                 unresolved_root_inodes.update(socket_inodes)
             continue
 
-        if before["uid"] != 0:
-            nonroot_owned_inodes.update(socket_inodes)
-        else:
-            identity = {
-                "uid": 0,
-                "executable_basename": before["executable_basename"],
-                "canonical_executable": before["canonical_executable"],
-                "unified_cgroup": before_cgroup,
-            }
-            if before_cgroup is None or after_cgroup != before_cgroup:
-                if socket_inodes or before["executable_basename"] in {
-                    "containerd",
-                    "dockerd",
-                }:
-                    unavailable.add("cgroup_identity")
-                unresolved_root_inodes.update(socket_inodes)
-            else:
-                pin = _process_pin(pid, before)
-                for inode in socket_inodes:
-                    key = _owner_key(identity)
-                    owner = owners.setdefault(inode, {}).setdefault(
-                        key, {**_public_owner(identity), "_process_pins": set()}
-                    )
-                    owner["_process_pins"].add(pin)
-                if before["executable_basename"] in {"containerd", "dockerd"}:
-                    containers.append(
-                        {
-                            **_public_owner(identity),
-                            "_process_pin": pin,
-                        }
-                    )
+        cgroup_matches = before_cgroup == after_cgroup
+        cgroup_reviewed = before_cgroup[2] and cgroup_matches
+        executable_reviewed = (
+            before["canonical_executable"] != UNREVIEWED_EXECUTABLE_PATH
+        )
+        identity_complete = cgroup_reviewed and executable_reviewed
+        if not cgroup_reviewed:
+            unavailable.add("cgroup_identity")
+        if not executable_reviewed:
+            unavailable.add("process_identity")
+        identity = {
+            "uid": before["uid"],
+            "executable_basename": before["executable_basename"],
+            "canonical_executable": before["canonical_executable"],
+            "unified_cgroup": before_cgroup[0],
+            "_executable_path_fingerprint": before[
+                "_executable_path_fingerprint"
+            ],
+            "_cgroup_fingerprint": before_cgroup[1],
+        }
+        pin = _process_pin(pid, before)
+        for inode in socket_inodes:
+            key = _owner_key(identity)
+            owner = owners.setdefault(inode, {}).setdefault(
+                key,
+                {
+                    **_public_owner(identity),
+                    "_executable_path_fingerprint": identity[
+                        "_executable_path_fingerprint"
+                    ],
+                    "_cgroup_fingerprint": identity["_cgroup_fingerprint"],
+                    "_identity_complete": True,
+                    "_process_pins": set(),
+                },
+            )
+            owner["_identity_complete"] &= identity_complete
+            owner["_process_pins"].add(pin)
+        if is_root_container:
+            containers.append(
+                {
+                    **_public_owner(identity),
+                    "_executable_path_fingerprint": identity[
+                        "_executable_path_fingerprint"
+                    ],
+                    "_cgroup_fingerprint": identity["_cgroup_fingerprint"],
+                    "_identity_complete": identity_complete,
+                    "_process_pin": pin,
+                }
+            )
         if "total_fds" in bounds:
             break
 
@@ -668,6 +732,8 @@ def _scan_process_owners(proc_root):
             item["executable_basename"],
             item["canonical_executable"],
             item["unified_cgroup"],
+            item.get("_executable_path_fingerprint") or "",
+            item.get("_cgroup_fingerprint") or "",
             item["_process_pin"],
         ),
     )
@@ -676,7 +742,7 @@ def _scan_process_owners(proc_root):
         container_processes = container_processes[:MAX_CONTAINER_PROCESSES]
     return (
         owners,
-        nonroot_owned_inodes,
+        unresolved_owner_inodes,
         unresolved_root_inodes,
         container_processes,
         bounds,
@@ -689,7 +755,7 @@ def _scan_process_owners(proc_root):
 def _bounded_owners(owners_by_inode, inode, bounds):
     values = [
         {
-            **{key: value for key, value in owner.items() if key != "_process_pins"},
+            **owner,
             "_process_pins": sorted(owner["_process_pins"]),
             "processes": len(owner["_process_pins"]),
         }
@@ -698,16 +764,20 @@ def _bounded_owners(owners_by_inode, inode, bounds):
     values = sorted(
         values,
         key=lambda item: (
+            item["uid"],
             item["executable_basename"],
             item["canonical_executable"],
             item["unified_cgroup"],
+            item.get("_executable_path_fingerprint") or "",
+            item.get("_cgroup_fingerprint") or "",
             item["processes"],
         ),
     )
-    if len(values) > MAX_SOCKET_OWNERS:
+    truncated = len(values) > MAX_SOCKET_OWNERS
+    if truncated:
         bounds.add("socket_owners")
         values = values[:MAX_SOCKET_OWNERS]
-    return values
+    return values, truncated
 
 
 def _reported_unix_listener(row, owners, ownership_complete):
@@ -722,16 +792,59 @@ def _reported_unix_listener(row, owners, ownership_complete):
     }
 
 
+def _excluded_unix_listener(
+    row, owners, ownership_complete, access_state, root_control_candidate
+):
+    return {
+        "_socket_inode": row["inode"],
+        "socket_type": row["socket_type"],
+        "name_kind": row["name_kind"],
+        "name_sha256": row["name_sha256"],
+        "access_state": access_state,
+        "root_control_candidate": root_control_candidate,
+        "owners": owners,
+        "ownership_complete": ownership_complete,
+    }
+
+
+def _private_owner_stability_key(owner):
+    return (
+        owner["uid"],
+        owner["executable_basename"],
+        owner["canonical_executable"],
+        owner["unified_cgroup"],
+        owner.get("_executable_path_fingerprint") or "",
+        owner.get("_cgroup_fingerprint") or "",
+        owner["_identity_complete"],
+        tuple(owner["_process_pins"]),
+        owner["processes"],
+    )
+
+
+def _excluded_unix_sort_key(listener):
+    return (
+        listener["socket_type"],
+        listener["name_kind"],
+        listener["name_sha256"],
+        listener["access_state"],
+        listener["root_control_candidate"],
+        listener["ownership_complete"],
+        listener["_socket_inode"],
+        tuple(_private_owner_stability_key(owner) for owner in listener["owners"]),
+    )
+
+
 def _socket_ownership_complete(
     inode,
     owners,
-    nonroot_owned_inodes,
-    unresolved_root_inodes,
+    owners_truncated,
+    unresolved_owner_inodes,
 ):
     return (
         bool(owners)
-        and inode not in nonroot_owned_inodes
-        and inode not in unresolved_root_inodes
+        and not owners_truncated
+        and inode not in unresolved_owner_inodes
+        and all(owner["_identity_complete"] for owner in owners)
     )
 
 
@@ -824,8 +937,10 @@ def _bind_class(address):
 def parse_tcp_table(contents, family):
     listeners = []
     malformed = 0
+    if family not in TCP_TABLE_HEADERS:
+        raise ValueError("TCP table family is invalid")
     lines = contents.decode("ascii", errors="strict").splitlines()
-    if not lines or tuple(lines[0].split()) != TCP_TABLE_HEADER:
+    if not lines or tuple(lines[0].split()) != TCP_TABLE_HEADERS[family]:
         raise ValueError("TCP table header is invalid")
     for line in lines[1:]:
         fields = line.split()
@@ -876,7 +991,9 @@ def _filesystem_socket_state(raw_name, runner_access):
         return "unknown", "unavailable"
     try:
         metadata = os.stat(raw_name, follow_symlinks=False)
-    except (FileNotFoundError, OSError, ValueError):
+    except FileNotFoundError:
+        return "unknown", "absent_unreachable"
+    except (OSError, ValueError):
         return "unknown", "unavailable"
     if not stat.S_ISSOCK(metadata.st_mode):
         return "unknown", "not_socket"
@@ -891,22 +1008,9 @@ def _filesystem_socket_state(raw_name, runner_access):
     return owner_class, "unavailable"
 
 
-def _collect_snapshot(
-    proc_root=pathlib.Path("/proc"), filesystem_socket_access=None
-):
-    (
-        owners,
-        nonroot_owned_inodes,
-        unresolved_root_inodes,
-        container_processes,
-        bounds,
-        process_unavailable,
-        _,
-        _,
-    ) = _scan_process_owners(proc_root)
-    unavailable = set(process_unavailable)
+def _read_listener_tables(proc_root):
+    unavailable = set()
     malformed_rows = 0
-
     try:
         unix_rows, malformed = parse_unix_table(
             _bounded_read(proc_root / "net/unix", MAX_PROC_NET_TABLE_BYTES)
@@ -916,22 +1020,83 @@ def _collect_snapshot(
         unavailable.add("unix_table")
         unix_rows = []
 
+    tcp_rows = []
+    for filename, family in (("tcp", "ipv4"), ("tcp6", "ipv6")):
+        try:
+            rows, malformed = parse_tcp_table(
+                _bounded_read(proc_root / f"net/{filename}", MAX_PROC_NET_TABLE_BYTES),
+                family,
+            )
+            malformed_rows += malformed
+            tcp_rows.extend(rows)
+        except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
+            unavailable.add(f"{family}_table")
+    return unix_rows, tcp_rows, malformed_rows, unavailable
+
+
+def _collect_snapshot(
+    proc_root=pathlib.Path("/proc"), filesystem_socket_access=None
+):
+    unix_rows, tcp_rows, malformed_rows, table_unavailable = _read_listener_tables(
+        proc_root
+    )
+    relevant_listener_inodes = {
+        row["inode"] for row in unix_rows if row["name_kind"] != "unnamed"
+    } | {row["inode"] for row in tcp_rows}
+    (
+        owners,
+        unresolved_owner_inodes,
+        unresolved_root_inodes,
+        container_processes,
+        bounds,
+        process_unavailable,
+        _,
+        _,
+    ) = _scan_process_owners(proc_root, relevant_listener_inodes)
+    unavailable = set(table_unavailable) | set(process_unavailable)
+
     unix_listeners = []
+    unreachable_unix = []
+    unresolved_unix_private = []
     unresolved_unix = 0
     inaccessible_root_filesystem = 0
     for row in unix_rows:
-        row_owners = _bounded_owners(owners, row["inode"], bounds)
+        row_owners, owners_truncated = _bounded_owners(
+            owners, row["inode"], bounds
+        )
         ownership_complete = _socket_ownership_complete(
             row["inode"],
             row_owners,
-            nonroot_owned_inodes,
-            unresolved_root_inodes,
+            owners_truncated,
+            unresolved_owner_inodes,
         )
+        has_root_owner = any(owner["uid"] == 0 for owner in row_owners)
         if row["name_kind"] == "abstract":
-            if not row_owners:
-                if row["inode"] in nonroot_owned_inodes:
-                    continue
+            if row["inode"] in unresolved_root_inodes and not has_root_owner:
                 unresolved_unix += 1
+                unresolved_unix_private.append(
+                    _excluded_unix_listener(
+                        row,
+                        row_owners,
+                        ownership_complete,
+                        "abstract_owner_unresolved",
+                        True,
+                    )
+                )
+                continue
+            if not row_owners:
+                unresolved_unix += 1
+                unresolved_unix_private.append(
+                    _excluded_unix_listener(
+                        row,
+                        row_owners,
+                        ownership_complete,
+                        "abstract_owner_unresolved",
+                        False,
+                    )
+                )
+                continue
+            if not has_root_owner:
                 continue
             unix_listeners.append(
                 _reported_unix_listener(row, row_owners, ownership_complete)
@@ -944,21 +1109,42 @@ def _collect_snapshot(
             row["raw_name"], filesystem_socket_access
         )
         root_identity = (
-            bool(row_owners)
+            has_root_owner
             or row["inode"] in unresolved_root_inodes
             or file_owner_class == "root"
         )
-        if access_state == "unreachable" and root_identity:
-            inaccessible_root_filesystem += 1
+        if access_state in {"unreachable", "absent_unreachable"}:
+            unreachable_unix.append(
+                _excluded_unix_listener(
+                    row,
+                    row_owners,
+                    ownership_complete,
+                    access_state,
+                    root_identity,
+                )
+            )
+            if root_identity:
+                inaccessible_root_filesystem += 1
             continue
         if access_state != "reachable":
             unresolved_unix += 1
+            unresolved_unix_private.append(
+                _excluded_unix_listener(
+                    row,
+                    row_owners,
+                    ownership_complete,
+                    access_state,
+                    root_identity,
+                )
+            )
             continue
         if not root_identity:
             continue
         unix_listeners.append(
             _reported_unix_listener(row, row_owners, ownership_complete)
         )
+    unreachable_unix.sort(key=_excluded_unix_sort_key)
+    unresolved_unix_private.sort(key=_excluded_unix_sort_key)
     unix_listeners.sort(
         key=lambda item: (
             item["socket_type"],
@@ -972,42 +1158,35 @@ def _collect_snapshot(
         unix_listeners = unix_listeners[:MAX_UNIX_LISTENERS]
 
     tcp_listeners = []
-    for filename, family in (("tcp", "ipv4"), ("tcp6", "ipv6")):
-        try:
-            rows, malformed = parse_tcp_table(
-                _bounded_read(proc_root / f"net/{filename}", MAX_PROC_NET_TABLE_BYTES),
-                family,
-            )
-            malformed_rows += malformed
-        except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
-            unavailable.add(f"{family}_table")
+    for row in tcp_rows:
+        row_owners, owners_truncated = _bounded_owners(
+            owners, row["inode"], bounds
+        )
+        has_root_owner = any(owner["uid"] == 0 for owner in row_owners)
+        root_identity = (
+            row["socket_uid"] == 0
+            or has_root_owner
+            or row["inode"] in unresolved_root_inodes
+        )
+        if not root_identity:
             continue
-        for row in rows:
-            row_owners = _bounded_owners(owners, row["inode"], bounds)
-            root_identity = (
-                row["socket_uid"] == 0
-                or bool(row_owners)
-                or row["inode"] in unresolved_root_inodes
-            )
-            if not root_identity:
-                continue
-            ownership_complete = _socket_ownership_complete(
-                row["inode"],
-                row_owners,
-                nonroot_owned_inodes,
-                unresolved_root_inodes,
-            )
-            tcp_listeners.append(
-                {
-                    "_socket_inode": row["inode"],
-                    "_socket_uid": row["socket_uid"],
-                    "family": row["family"],
-                    "bind_class": row["bind_class"],
-                    "port": row["port"],
-                    "owners": row_owners,
-                    "ownership_complete": ownership_complete,
-                }
-            )
+        ownership_complete = _socket_ownership_complete(
+            row["inode"],
+            row_owners,
+            owners_truncated,
+            unresolved_owner_inodes,
+        )
+        tcp_listeners.append(
+            {
+                "_socket_inode": row["inode"],
+                "_socket_uid": row["socket_uid"],
+                "family": row["family"],
+                "bind_class": row["bind_class"],
+                "port": row["port"],
+                "owners": row_owners,
+                "ownership_complete": ownership_complete,
+            }
+        )
     tcp_listeners.sort(
         key=lambda item: (
             item["family"],
@@ -1026,6 +1205,8 @@ def _collect_snapshot(
         "malformed_row_count": malformed_rows,
         "unresolved_unix_listener_count": unresolved_unix,
         "inaccessible_root_filesystem_listener_count": inaccessible_root_filesystem,
+        "_unreachable_unix": unreachable_unix,
+        "_unresolved_unix": unresolved_unix_private,
         "root_container_processes": container_processes,
         "unix_listeners": unix_listeners,
         "tcp_listeners": tcp_listeners,
@@ -1044,6 +1225,7 @@ def _public_owner_record(owner):
 
 def _owner_sort_key(owner):
     return (
+        owner["uid"],
         owner["executable_basename"],
         owner["canonical_executable"],
         owner["unified_cgroup"],
@@ -1154,9 +1336,21 @@ def _summarize_public_snapshot(snapshot):
     if not reachability_complete:
         unavailable.add("unix_reachability")
     ownership_failures = ACQUISITION_UNAVAILABLE_REASONS | {"malformed_rows"}
+    identities_reviewed = all(
+        _owner_identity_reviewed(process)
+        for process in snapshot["root_container_processes"]
+    ) and all(
+        _owner_identity_reviewed(owner)
+        for listener in [
+            *snapshot["unix_listeners"],
+            *snapshot["tcp_listeners"],
+        ]
+        for owner in listener["owners"]
+    )
     ownership_complete = (
         reachability_complete
         and unavailable.isdisjoint(ownership_failures)
+        and identities_reviewed
         and all(
             listener["ownership_complete"]
             for listener in [
@@ -1280,6 +1474,13 @@ def _is_optional_bool(value):
 
 def _reviewed_reported_path(value):
     return value == UNREVIEWED_EXECUTABLE_PATH or value in REVIEWED_EXECUTABLE_PATHS
+
+
+def _owner_identity_reviewed(owner):
+    return (
+        owner["canonical_executable"] in REVIEWED_EXECUTABLE_PATHS
+        and owner["unified_cgroup"] in REVIEWED_CGROUPS
+    )
 
 
 def _is_unreviewed_name(value):
@@ -1728,7 +1929,12 @@ def _validate_owner(owner):
         "unified_cgroup",
         "processes",
     }
-    if not isinstance(owner, dict) or set(owner) != expected or owner["uid"] != 0:
+    if (
+        not isinstance(owner, dict)
+        or set(owner) != expected
+        or not _is_integer(owner["uid"])
+        or owner["uid"] > 0xFFFFFFFF
+    ):
         raise ValueError("local control owner identity is invalid")
     if not isinstance(owner["executable_basename"], str) or not re.fullmatch(
         r"(?:[A-Za-z0-9._+-]{1,128}|unreportable)",
@@ -1738,7 +1944,7 @@ def _validate_owner(owner):
     executable = owner["canonical_executable"]
     if not _reviewed_reported_path(executable):
         raise ValueError("local control owner executable is invalid")
-    if owner["unified_cgroup"] not in REVIEWED_CGROUPS:
+    if owner["unified_cgroup"] not in REVIEWED_CGROUPS | {UNREVIEWED_CGROUP}:
         raise ValueError("local control owner cgroup is invalid")
     if (
         not _is_integer(owner["processes"], 1)
@@ -1837,7 +2043,10 @@ def _validate_public_snapshot(snapshot):
                 "processes": process["instances"],
             }
         )
-        if process["executable_basename"] not in {"containerd", "dockerd"}:
+        if (
+            process["uid"] != 0
+            or process["executable_basename"] not in {"containerd", "dockerd"}
+        ):
             raise ValueError("local control container process name is invalid")
         container_keys.append(
             (
@@ -1891,7 +2100,10 @@ def _validate_public_snapshot(snapshot):
         ):
             raise ValueError("local control Unix listener value is invalid")
         _validate_owner_list(listener["owners"])
-        if listener["ownership_complete"] and not listener["owners"]:
+        if listener["ownership_complete"] and (
+            not listener["owners"]
+            or not all(_owner_identity_reviewed(owner) for owner in listener["owners"])
+        ):
             raise ValueError("local control Unix listener ownership is invalid")
         unix_keys.append(
             (
@@ -1933,7 +2145,10 @@ def _validate_public_snapshot(snapshot):
         ):
             raise ValueError("local control TCP listener value is invalid")
         _validate_owner_list(listener["owners"])
-        if listener["ownership_complete"] and not listener["owners"]:
+        if listener["ownership_complete"] and (
+            not listener["owners"]
+            or not all(_owner_identity_reviewed(owner) for owner in listener["owners"])
+        ):
             raise ValueError("local control TCP listener ownership is invalid")
         tcp_keys.append(
             (
@@ -2017,16 +2232,28 @@ def validate_local_control_inventory(inventory):
 
 class HostObservationTests(unittest.TestCase):
     @staticmethod
-    def _tcp_header():
-        return (" ".join(TCP_TABLE_HEADER) + "\n").encode()
+    def _tcp_header(family="ipv4"):
+        return (" ".join(TCP_TABLE_HEADERS[family]) + "\n").encode()
 
     @staticmethod
-    def _private_owner(pin=(10, 100, 1, 2)):
+    def _private_owner(
+        pin=(10, 100, 1, 2),
+        uid=0,
+        basename="systemd",
+        executable="/usr/lib/systemd/systemd",
+        cgroup="/init.scope",
+        identity_complete=True,
+        executable_path_fingerprint="a" * 64,
+        cgroup_fingerprint="b" * 64,
+    ):
         return {
-            "uid": 0,
-            "executable_basename": "rootd",
-            "canonical_executable": UNREVIEWED_EXECUTABLE_PATH,
-            "unified_cgroup": "/init.scope",
+            "uid": uid,
+            "executable_basename": basename,
+            "canonical_executable": executable,
+            "unified_cgroup": cgroup,
+            "_executable_path_fingerprint": executable_path_fingerprint,
+            "_cgroup_fingerprint": cgroup_fingerprint,
+            "_identity_complete": identity_complete,
             "_process_pins": [pin],
             "processes": 1,
         }
@@ -2039,6 +2266,8 @@ class HostObservationTests(unittest.TestCase):
             "malformed_row_count": 0,
             "unresolved_unix_listener_count": 0,
             "inaccessible_root_filesystem_listener_count": 0,
+            "_unreachable_unix": [],
+            "_unresolved_unix": [],
             "root_container_processes": [],
             "unix_listeners": [],
             "tcp_listeners": [],
@@ -2059,7 +2288,7 @@ class HostObservationTests(unittest.TestCase):
             if name == "tcp":
                 return tcp
             if name == "tcp6":
-                return self._tcp_header()
+                return self._tcp_header("ipv6")
             return unix
 
         with mock.patch.object(
@@ -2070,14 +2299,24 @@ class HostObservationTests(unittest.TestCase):
             return _collect_snapshot(pathlib.Path("/proc"))
 
     @staticmethod
-    def _process_observation_fixture(start=100, device=1, inode=2):
+    def _process_observation_fixture(
+        start=100,
+        device=1,
+        inode=2,
+        uid=0,
+        basename="systemd",
+        executable="/usr/lib/systemd/systemd",
+    ):
         return {
-            "uid": 0,
+            "uid": uid,
             "start_time_ticks": start,
             "executable_device": device,
             "executable_inode": inode,
-            "executable_basename": "rootd",
-            "canonical_executable": UNREVIEWED_EXECUTABLE_PATH,
+            "executable_basename": basename,
+            "canonical_executable": executable,
+            "_executable_path_fingerprint": hashlib.sha256(
+                b"fence-executable-path-v1\0" + os.fsencode(executable)
+            ).hexdigest(),
         }
 
     def test_unix_names_and_header_are_bounded(self):
@@ -2135,7 +2374,7 @@ class HostObservationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_tcp_table(table.split(b"\n", 1)[1], "ipv4")
         ipv6, malformed = parse_tcp_table(
-            self._tcp_header()
+            self._tcp_header("ipv6")
             + b"0: 00000000000000000000000000000000:01BB "
             + b"00000000000000000000000000000000:0000 0A "
             + b"00000000:00000000 00:00000000 00000000 0 0 43\n",
@@ -2143,15 +2382,33 @@ class HostObservationTests(unittest.TestCase):
         )
         self.assertEqual(malformed, 0)
         self.assertEqual((ipv6[0]["bind_class"], ipv6[0]["port"]), ("wildcard", 443))
+        with self.assertRaises(ValueError):
+            parse_tcp_table(self._tcp_header(), "ipv6")
 
     def test_tcp_root_inclusion_and_owner_completeness(self):
         owner = self._private_owner()
-        base_scan = ({42: {("rootd",): owner}}, set(), set(), [], set(), set(), 1, 1)
+        base_scan = ({42: {("root",): owner}}, set(), set(), [], set(), set(), 1, 1)
         public = _public_snapshot(self._collect_tcp(base_scan, socket_uid=1001))
         self.assertEqual(public["scan_status"], "within_bounds")
         self.assertTrue(public["tcp_listeners"][0]["ownership_complete"])
 
-        nonroot_only = ({}, {42}, set(), [], set(), set(), 1, 1)
+        nonroot_owner = self._private_owner(
+            pin=(11, 101, 1, 3),
+            uid=101,
+            basename="dbus-daemon",
+            executable="/usr/bin/dbus-daemon",
+            cgroup="/system.slice/dbus.service",
+        )
+        nonroot_only = (
+            {42: {("nonroot",): nonroot_owner}},
+            set(),
+            set(),
+            [],
+            set(),
+            set(),
+            1,
+            1,
+        )
         self.assertEqual(
             _public_snapshot(self._collect_tcp(nonroot_only, socket_uid=1001))[
                 "tcp_listeners"
@@ -2159,12 +2416,55 @@ class HostObservationTests(unittest.TestCase):
             [],
         )
 
-        for nonroot, unresolved in (({42}, set()), (set(), {42})):
-            scan = ({42: {("rootd",): owner}}, nonroot, unresolved, [], set(), set(), 2, 2)
-            public = _public_snapshot(self._collect_tcp(scan))
-            self.assertEqual(public["scan_status"], "unavailable")
-            self.assertFalse(public["tcp_listeners"][0]["ownership_complete"])
-            self.assertIn("socket_ownership", public["unavailable_inputs"])
+        coholders = (
+            {42: {("root",): owner, ("nonroot",): nonroot_owner}},
+            set(),
+            set(),
+            [],
+            set(),
+            set(),
+            2,
+            2,
+        )
+        public = _public_snapshot(self._collect_tcp(coholders))
+        self.assertTrue(public["tcp_listeners"][0]["ownership_complete"])
+        self.assertEqual(
+            [item["uid"] for item in public["tcp_listeners"][0]["owners"]],
+            [0, 101],
+        )
+
+        unreviewed = self._private_owner(
+            pin=(12, 102, 1, 4),
+            executable=UNREVIEWED_EXECUTABLE_PATH,
+            cgroup=UNREVIEWED_CGROUP,
+            identity_complete=False,
+        )
+        scan = (
+            {42: {("root",): owner, ("unreviewed",): unreviewed}},
+            set(),
+            set(),
+            [],
+            set(),
+            {"cgroup_identity"},
+            2,
+            2,
+        )
+        public = _public_snapshot(self._collect_tcp(scan))
+        self.assertFalse(public["tcp_listeners"][0]["ownership_complete"])
+        self.assertIn("socket_ownership", public["unavailable_inputs"])
+
+        scan = (
+            {42: {("root",): owner}},
+            {42},
+            {42},
+            [],
+            set(),
+            {"process_identity_drift"},
+            2,
+            2,
+        )
+        public = _public_snapshot(self._collect_tcp(scan))
+        self.assertFalse(public["tcp_listeners"][0]["ownership_complete"])
 
         root_uid_without_owner = ({}, set(), set(), [], set(), set(), 1, 1)
         public = _public_snapshot(self._collect_tcp(root_uid_without_owner))
@@ -2186,7 +2486,7 @@ class HostObservationTests(unittest.TestCase):
                 "_process_observation",
                 side_effect=[before, after],
             ):
-                result = _scan_process_owners(proc_root)
+                result = _scan_process_owners(proc_root, {42})
             self.assertIn("process_identity_drift", result[5])
             self.assertEqual(result[2], {42})
 
@@ -2202,7 +2502,7 @@ class HostObservationTests(unittest.TestCase):
                 "_process_observation",
                 return_value=before,
             ), mock.patch.object(os, "scandir", side_effect=failed_fd_scan):
-                result = _scan_process_owners(proc_root)
+                result = _scan_process_owners(proc_root, {42})
             self.assertIn("process_fd_scan", result[5])
 
             with mock.patch.object(
@@ -2210,7 +2510,7 @@ class HostObservationTests(unittest.TestCase):
                 "_process_observation",
                 side_effect=[before, before],
             ), mock.patch.object(os, "readlink", side_effect=PermissionError("denied")):
-                result = _scan_process_owners(proc_root)
+                result = _scan_process_owners(proc_root, {42})
             self.assertIn("process_fd_readlink", result[5])
 
             (process_root / "cgroup").write_text(
@@ -2221,9 +2521,19 @@ class HostObservationTests(unittest.TestCase):
                 "_process_observation",
                 side_effect=[before, before],
             ):
-                result = _scan_process_owners(proc_root)
+                result = _scan_process_owners(proc_root, set())
+            self.assertNotIn("cgroup_identity", result[5])
+
+            with mock.patch.object(
+                os.sys.modules[__name__],
+                "_process_observation",
+                side_effect=[before, before],
+            ):
+                result = _scan_process_owners(proc_root, {42})
             self.assertIn("cgroup_identity", result[5])
-            self.assertEqual(result[2], {42})
+            owner = next(iter(result[0][42].values()))
+            self.assertFalse(owner["_identity_complete"])
+            self.assertEqual(owner["unified_cgroup"], UNREVIEWED_CGROUP)
 
     def test_process_identity_uses_the_proc_executable_object_without_resolving_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2269,6 +2579,87 @@ class HostObservationTests(unittest.TestCase):
             )
             self.assertFalse(
                 _reviewed_reported_path("/usr/bin/arbitrary-host-specific-daemon")
+            )
+
+    def test_reviewed_service_owner_candidates_are_exact(self):
+        self.assertEqual(
+            _reviewed_executable_path(pathlib.Path("/usr/sbin/multipathd")),
+            "/usr/sbin/multipathd",
+        )
+        self.assertEqual(
+            _reviewed_executable_path(pathlib.Path("/usr/bin/dbus-daemon")),
+            "/usr/bin/dbus-daemon",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            process_root = pathlib.Path(directory)
+            for cgroup in (
+                "/system.slice/multipathd.service",
+                "/system.slice/dbus.service",
+            ):
+                (process_root / "cgroup").write_text(
+                    f"0::{cgroup}\n", encoding="utf-8"
+                )
+                classified, fingerprint, reviewed = _classified_cgroup(process_root)
+                self.assertEqual(classified, cgroup)
+                self.assertRegex(fingerprint, r"^[0-9a-f]{64}$")
+                self.assertTrue(reviewed)
+
+            private_cgroup = "/system.slice/unreviewed.service"
+            (process_root / "cgroup").write_text(
+                f"0::{private_cgroup}\n", encoding="utf-8"
+            )
+            classified = _classified_cgroup(process_root)
+            self.assertEqual(classified[0], UNREVIEWED_CGROUP)
+            self.assertFalse(classified[2])
+            self.assertNotIn(private_cgroup, repr(classified))
+
+    def test_process_scan_maps_reviewed_root_and_nonroot_coholders(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = pathlib.Path(directory)
+            fixtures = (
+                (
+                    "100",
+                    "/system.slice/multipathd.service",
+                    self._process_observation_fixture(
+                        uid=0,
+                        basename="multipathd",
+                        executable="/usr/sbin/multipathd",
+                    ),
+                ),
+                (
+                    "101",
+                    "/system.slice/dbus.service",
+                    self._process_observation_fixture(
+                        uid=101,
+                        basename="dbus-daemon",
+                        executable="/usr/bin/dbus-daemon",
+                    ),
+                ),
+            )
+            observations = []
+            for pid, cgroup, observation in fixtures:
+                process_root = proc_root / pid
+                (process_root / "fd").mkdir(parents=True)
+                (process_root / "fd" / "3").symlink_to("socket:[42]")
+                (process_root / "cgroup").write_text(
+                    f"0::{cgroup}\n", encoding="utf-8"
+                )
+                observations.extend((observation, observation))
+
+            with mock.patch.object(
+                os.sys.modules[__name__],
+                "_process_observation",
+                side_effect=observations,
+            ):
+                result = _scan_process_owners(proc_root, {42})
+            self.assertEqual(result[5], set())
+            owners, truncated = _bounded_owners(result[0], 42, set())
+            self.assertFalse(truncated)
+            self.assertTrue(
+                _socket_ownership_complete(42, owners, truncated, result[1])
+            )
+            self.assertEqual(
+                [owner["uid"] for owner in _public_owners(owners)], [0, 101]
             )
 
     def test_public_host_strings_are_reviewed_or_reduced(self):
@@ -2330,10 +2721,12 @@ class HostObservationTests(unittest.TestCase):
             ),
             UNREVIEWED_SOCKET_OWNER,
         )
+
     def test_process_disappearance_is_discarded_without_unavailable_state(self):
         with tempfile.TemporaryDirectory() as directory:
             proc_root = pathlib.Path(directory)
             (proc_root / "123" / "fd").mkdir(parents=True)
+            (proc_root / "123" / "fd" / "3").symlink_to("socket:[42]")
             before = self._process_observation_fixture()
             real_scandir = os.scandir
 
@@ -2347,7 +2740,7 @@ class HostObservationTests(unittest.TestCase):
                 "_process_observation",
                 return_value=before,
             ), mock.patch.object(os, "scandir", side_effect=disappeared):
-                result = _scan_process_owners(proc_root)
+                result = _scan_process_owners(proc_root, {42})
             self.assertEqual(result[5], set())
 
             with mock.patch.object(
@@ -2355,12 +2748,16 @@ class HostObservationTests(unittest.TestCase):
                 "_process_observation",
                 side_effect=[before, FileNotFoundError("gone")],
             ):
-                result = _scan_process_owners(proc_root)
+                result = _scan_process_owners(proc_root, {42})
             self.assertEqual(result[5], set())
 
     def test_private_identity_controls_stability_but_is_never_public(self):
         first_owner = self._private_owner(pin=(10, 100, 1, 2))
-        stable_owner = self._private_owner(pin=(11, 101, 1, 2))
+        stable_owner = self._private_owner(
+            pin=(11, 101, 1, 2),
+            executable_path_fingerprint="c" * 64,
+            cgroup_fingerprint="d" * 64,
+        )
         first = self._private_snapshot(
             root_container_processes=[
                 {
@@ -2430,6 +2827,8 @@ class HostObservationTests(unittest.TestCase):
             "_socket_inode",
             "_socket_uid",
             "_process_pin",
+            "_executable_path_fingerprint",
+            "_cgroup_fingerprint",
             "start_time_ticks",
             "executable_device",
             "executable_inode",
@@ -2683,6 +3082,133 @@ os._exit(0 if started.exists() else 2)
                 _filesystem_socket_state(b"/run/example.sock", lambda _: False),
                 ("root", "unreachable"),
             )
+
+        with mock.patch.object(os, "stat", side_effect=FileNotFoundError("gone")):
+            self.assertEqual(
+                _filesystem_socket_state(b"/run/example.sock", lambda _: True),
+                ("unknown", "absent_unreachable"),
+            )
+
+        unix = (
+            b"Num RefCount Protocol Flags Type St Inode Path\n"
+            b"0: 2 0 00010000 0001 01 42 /run/example.sock\n"
+        )
+
+        def bounded_read(path, _maximum):
+            name = pathlib.Path(path).name
+            if name == "unix":
+                return unix
+            if name == "tcp":
+                return self._tcp_header()
+            return self._tcp_header("ipv6")
+
+        owner = self._private_owner()
+        scan = ({42: {("root",): owner}}, set(), set(), [], set(), set(), 1, 1)
+        with mock.patch.object(
+            os.sys.modules[__name__], "_scan_process_owners", return_value=scan
+        ), mock.patch.object(
+            os.sys.modules[__name__], "_bounded_read", side_effect=bounded_read
+        ), mock.patch.object(os, "stat", side_effect=FileNotFoundError("gone")):
+            absent = _collect_snapshot(pathlib.Path("/proc"))
+
+        self.assertEqual(absent["unresolved_unix_listener_count"], 0)
+        self.assertEqual(absent["inaccessible_root_filesystem_listener_count"], 1)
+        self.assertEqual(absent["_unreachable_unix"][0]["access_state"], "absent_unreachable")
+        self.assertNotIn("/run/example.sock", repr(absent["_unreachable_unix"]))
+
+        with mock.patch.object(
+            os.sys.modules[__name__], "_scan_process_owners", return_value=scan
+        ), mock.patch.object(
+            os.sys.modules[__name__], "_bounded_read", side_effect=bounded_read
+        ), mock.patch.object(os, "stat", return_value=metadata):
+            reachable = _collect_snapshot(
+                pathlib.Path("/proc"), filesystem_socket_access=lambda _: True
+            )
+        self.assertNotEqual(absent, reachable)
+        self.assertEqual(len(_public_snapshot(reachable)["unix_listeners"]), 1)
+
+    def test_abstract_listener_without_an_owner_is_unresolved(self):
+        unix = (
+            b"Num RefCount Protocol Flags Type St Inode Path\n"
+            b"0: 2 0 00010000 0001 01 42 @example\n"
+        )
+
+        def bounded_read(path, _maximum):
+            name = pathlib.Path(path).name
+            if name == "unix":
+                return unix
+            if name == "tcp":
+                return self._tcp_header()
+            return self._tcp_header("ipv6")
+
+        empty_scan = ({}, set(), set(), [], set(), set(), 1, 0)
+        with mock.patch.object(
+            os.sys.modules[__name__], "_scan_process_owners", return_value=empty_scan
+        ), mock.patch.object(
+            os.sys.modules[__name__], "_bounded_read", side_effect=bounded_read
+        ):
+            private = _collect_snapshot(pathlib.Path("/proc"))
+
+        self.assertEqual(private["unresolved_unix_listener_count"], 1)
+        public = _public_snapshot(private)
+        self.assertEqual(public["scan_status"], "unavailable")
+        self.assertFalse(public["reachability_complete"])
+        self.assertEqual(public["unix_listeners"], [])
+
+    def test_excluded_unix_identity_remains_private_and_controls_stability(self):
+        metadata = mock.Mock(st_mode=stat.S_IFSOCK | 0o660, st_uid=0)
+
+        def collect(inode, pin):
+            unix = (
+                b"Num RefCount Protocol Flags Type St Inode Path\n"
+                + f"0: 2 0 00010000 0001 01 {inode} /run/example.sock\n".encode()
+            )
+
+            def bounded_read(path, _maximum):
+                name = pathlib.Path(path).name
+                if name == "unix":
+                    return unix
+                if name == "tcp":
+                    return self._tcp_header()
+                return self._tcp_header("ipv6")
+
+            owner = self._private_owner(pin=pin)
+            scan = (
+                {inode: {("root",): owner}},
+                set(),
+                set(),
+                [],
+                set(),
+                set(),
+                1,
+                1,
+            )
+            with mock.patch.object(
+                os.sys.modules[__name__], "_scan_process_owners", return_value=scan
+            ), mock.patch.object(
+                os.sys.modules[__name__], "_bounded_read", side_effect=bounded_read
+            ), mock.patch.object(os, "stat", return_value=metadata):
+                return _collect_snapshot(
+                    pathlib.Path("/proc"), filesystem_socket_access=lambda _: False
+                )
+
+        first = collect(42, (10, 100, 1, 2))
+        changed_inode = collect(43, (10, 100, 1, 2))
+        changed_owner = collect(42, (11, 101, 1, 2))
+        self.assertEqual(_public_snapshot(first), _public_snapshot(changed_inode))
+        self.assertEqual(_public_snapshot(first), _public_snapshot(changed_owner))
+        self.assertNotEqual(first, changed_inode)
+        self.assertNotEqual(first, changed_owner)
+
+        for changed in (changed_inode, changed_owner):
+            samples = iter((first, changed, changed, changed))
+            inventory = observe_local_control_inventory(
+                sample=lambda: next(samples), sleeper=lambda _: None
+            )
+            self.assertEqual(inventory["attempts"], 2)
+            encoded = json.dumps(inventory, sort_keys=True)
+            self.assertNotIn("_socket_inode", encoded)
+            self.assertNotIn("_process_pins", encoded)
 
 
 def main(arguments):
