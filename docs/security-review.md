@@ -188,15 +188,20 @@ attempt is rejected.
 
 ### Source-before-bundle host compatibility
 
-An immutable bundled agent can temporarily predate a newly reviewed hosted-runner
-sudo-policy digest even though source-built integration already accepts and
-tests that host shape. Action acceptance now compares the bounded live
-observation against the bundle's serialized `check-support` fingerprint before
-destructive activation. It skips activation only when every fixed executable,
-resolver, sudo source, principal, group, unit, socket, and workload fact matches
-and the sole mismatch is an exact source-reviewed digest in the checked-in
-transition file. Unknown drift fails. After the refreshed bundle includes the
-digest, the same classifier automatically requires normal bundled activation.
+The published bundle exposes fingerprint schema `2`. Action acceptance
+recursively validates the bounded schema-`4` live observation and compares
+every enforced executable, ancestor, effective-access, resolver, sudo source,
+principal, group, unit, socket, workload, and local-control fact before
+destructive activation. The current transition set is empty, so the bundle
+must activate normally.
+
+A future immutable bundle may temporarily predate one newly reviewed
+hosted-runner sudo-policy digest even though source-built integration already
+accepts and tests that host shape. The classifier may skip activation only when
+all non-digest schema-`2` facts match and every mismatched digest is explicitly
+listed in the checked-in transition file. Malformed, incomplete, and unknown
+drift fails. After a refreshed bundle includes the digest, classification
+automatically returns to normal bundled activation.
 
 ### Invocation slug consistency
 

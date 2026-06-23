@@ -229,7 +229,9 @@ to TCP port `443`.
 
 Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support
-claim. Pin Fence to a full immutable commit SHA, not `@main`.
+claim. A separate daily fixed-label canary fails on fingerprint drift or a
+skipped bundle activation and verifies the zero-input standard lifecycle on
+the supported runner. Pin Fence to a full immutable commit SHA, not `@main`.
 
 Fence rejects activation when fixed privileged commands, their reviewed path
 ancestors, sudo policy, or the bounded root TCP/Unix and container inventory do

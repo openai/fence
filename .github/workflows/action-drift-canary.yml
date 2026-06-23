@@ -1,0 +1,58 @@
+name: action drift canary
+
+on:
+  schedule:
+    - cron: "23 13 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: action-drift-canary-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: fixed ubuntu-24.04 zero-input canary
+    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: classify bundled Action host compatibility
+        id: bundle-host
+        run: script/classify-action-bundle-host
+
+      - name: require bundled Action activation
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
+      - name: activate bundled Fence agent with strict defaults
+        uses: ./
+
+      - name: verify zero-input Action lifecycle
+        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
