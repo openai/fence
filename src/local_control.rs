@@ -516,10 +516,15 @@ pub fn verify_no_additive_local_control_observation(
             .unix_listeners
             .iter()
             .any(|observed| same_unix_key(listener, observed));
-        let reviewed_container_owner_remains = listener
-            .owners
+        let reviewed_container_owner_remains = accepted
+            .unix_listeners
             .iter()
-            .any(|owner| is_reviewed_container_owner(owner, &snapshot.root_container_processes));
+            .find(|accepted| same_unix_key(listener, accepted))
+            .is_some_and(|accepted| {
+                accepted.owners.iter().any(|owner| {
+                    is_reviewed_container_owner(owner, &snapshot.root_container_processes)
+                })
+            });
         !removable || remains || reviewed_container_owner_remains
     });
     if non_container_tcp_projection(&snapshot.tcp_listeners, reviewed_containers)
