@@ -4605,6 +4605,7 @@ fn validate_dns_response_lineage(
     }
 
     let mut edges = BTreeMap::<String, DnsCnameAnswer>::new();
+    let retains_lineage = !records.addresses.is_empty();
     for alias in &records.aliases {
         if alias.ttl_seconds == 0 || alias.owner == alias.target {
             return Err(DnsResponseValidationError::Invalid);
@@ -4643,7 +4644,8 @@ fn validate_dns_response_lineage(
             .ok()
             .filter(|ttl| *ttl > 0)
             .ok_or(DnsResponseValidationError::Invalid)?;
-        if !state.active.contains_key(&alias.target)
+        if retains_lineage
+            && !state.active.contains_key(&alias.target)
             && new_authorization_names.insert(alias.target.clone())
             && state
                 .active
@@ -4653,22 +4655,39 @@ fn validate_dns_response_lineage(
         {
             return Err(DnsResponseValidationError::Capacity);
         }
-        authorizations.push((
-            alias.target.clone(),
-            ActiveCnameAuthorization {
-                source_hostname: current,
-                origins: policy.0.clone(),
-                transports: policy.1.clone(),
-                requires_runner_provenance,
-                observed_ttl_seconds,
-                depth,
-                expires_at: expiry,
-            },
-        ));
+        if retains_lineage {
+            authorizations.push((
+                alias.target.clone(),
+                ActiveCnameAuthorization {
+                    source_hostname: current,
+                    origins: policy.0.clone(),
+                    transports: policy.1.clone(),
+                    requires_runner_provenance,
+                    observed_ttl_seconds,
+                    depth,
+                    expires_at: expiry,
+                },
+            ));
+        }
         current = alias.target;
     }
-    if !edges.is_empty() || (!records.aliases.is_empty() && records.addresses.is_empty()) {
+    if !edges.is_empty() {
         return Err(DnsResponseValidationError::Invalid);
+    }
+
+    // A resolver can return a fully rooted CNAME chain without an address for
+    // the requested family. Validate the complete chain and treat it as NODATA,
+    // retain none of it because no terminal address proved a materializable
+    // response-local lineage.
+    if records.addresses.is_empty() {
+        return Ok(ValidatedDnsResponse {
+            authorizations: Vec::new(),
+            materializations: Vec::new(),
+            policy,
+            requires_runner_provenance,
+            root_authorization,
+            valid_until: None,
+        });
     }
 
     let mut materializations = Vec::new();
@@ -5580,7 +5599,16 @@ mod tests {
     }
 
     fn response_with_cname(name: &str, target: &str, ttl_seconds: u32) -> Vec<u8> {
-        let mut bytes = query(name, 1);
+        response_with_cname_for_type(name, 1, target, ttl_seconds)
+    }
+
+    fn response_with_cname_for_type(
+        name: &str,
+        query_type: u16,
+        target: &str,
+        ttl_seconds: u32,
+    ) -> Vec<u8> {
+        let mut bytes = query(name, query_type);
         bytes[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
         bytes[6..8].copy_from_slice(&1_u16.to_be_bytes());
         bytes.extend_from_slice(&[0xc0, 0x0c]);
@@ -6139,6 +6167,41 @@ mod tests {
         );
         assert_eq!(recorder.policy_classification(target), "outside_policy");
         let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn rooted_cname_nodata_never_seeds_authorization_state() {
+        let policy = test_hostname_policy(false);
+        let target = "nodata-edge.example";
+        let response = response_with_cname("github.com", target, 60);
+
+        let (submitter, requests) = materialization_request_channel();
+        let (block, block_report) = test_recorder_with_policy(
+            DnsEvidenceScope::ProtectedHostBlock,
+            Some(submitter),
+            policy.clone(),
+        );
+        assert_eq!(
+            block.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+        assert!(block.cname_authorizations.lock().unwrap().active.is_empty());
+        assert_eq!(
+            block.forward_query(target, 1, None).unwrap(),
+            DnsQueryAuthorization::Refused(None),
+        );
+
+        let (audit, audit_report) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+        assert_eq!(
+            audit.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        assert!(audit.cname_authorizations.lock().unwrap().active.is_empty());
+
+        let _ = fs::remove_file(block_report);
+        let _ = fs::remove_file(audit_report);
     }
 
     #[test]
@@ -8053,6 +8116,20 @@ mod tests {
         assert!(response.authorizations.is_empty());
         assert!(response.materializations.is_empty());
 
+        let cname_nodata = response_with_cname("github.com", "edge.example", 60);
+        let records = parse_complete_dns_response(&cname_nodata, "github.com", 1).unwrap();
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &records,
+            &CnameAuthorizationState::default(),
+            Instant::now(),
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+        assert!(response.authorizations.is_empty());
+        assert!(response.materializations.is_empty());
+        assert!(response.valid_until.is_none());
+
         let mut authority_cname = negative;
         authority_cname[8..10].copy_from_slice(&1_u16.to_be_bytes());
         append_test_cname_answer(&mut authority_cname, "github.com", "edge.example", 60);
@@ -8468,6 +8545,29 @@ mod tests {
             prehydration_error_code(&error),
             "dns_block_prehydration_failed"
         );
+
+        let materializations = materializations_from_bootstrap_query_results(
+            "github.com",
+            now,
+            &policy,
+            [
+                (
+                    1,
+                    Ok(response_with_address("github.com", 1, 60, &[192, 0, 2, 10])),
+                ),
+                (
+                    28,
+                    Ok(response_with_cname_for_type(
+                        "github.com",
+                        28,
+                        "nodata-edge.example",
+                        60,
+                    )),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(materializations.len(), 1);
 
         let error = materializations_from_bootstrap_query_results(
             "github.com",

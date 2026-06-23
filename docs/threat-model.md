@@ -144,7 +144,8 @@ GitHub profile requires a new threat-model review.
   Derived CNAME targets may leave the configured suffix only through one
   bounded response-local chain rooted at the queried concrete name. Every
   returned address owner must be the terminal name, and the derived policy
-  remains the queried root's policy (`src/hostname_policy.rs`,
+  remains the queried root's policy. A rooted CNAME response without address
+  records retains no derived authorization (`src/hostname_policy.rs`,
   `src/dns_mediator.rs`).
 - **Pinned runner -> additional GitHub results storage:** Fence accepts up to
   four other exact results-storage names only when their host DNS sockets belong

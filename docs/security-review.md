@@ -171,7 +171,9 @@ directly allowed. Conflicts, cycles, unrelated records, invalid TTL or depth,
 and capacity failures reject the whole block-mode response without committing
 partial state. In block mode, valid derived authorization is committed only
 after the address rules are applied and verified. Audit may forward invalid
-upstream data but does not retain authorization from it.
+upstream data but does not retain authorization from it. A fully rooted CNAME
+response with no address records is forwarded as address-family NODATA and
+retains no derived authorization in either mode.
 
 ### Runner-bound results-storage authorization
 
