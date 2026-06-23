@@ -8495,7 +8495,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert!(matches!(error, PrehydrationError::Transient(_)));
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
         assert_eq!(
             prehydration_error_code(&error),
             "dns_block_prehydration_failed"
