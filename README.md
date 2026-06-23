@@ -161,12 +161,16 @@ address owner fails closed without creating later hostname authorization.
    read-only mount.
 3. The Action writes a small root-owned config under `/run/fence/`.
 4. The bundled Fence agent starts through `sudo` and `systemd`.
-5. Fence checks that the runner matches the supported GitHub-hosted Linux shape.
+5. Fence checks the supported GitHub-hosted Linux shape, including fixed
+   privileged executables, effective runner access to their paths and sudo
+   policy, and the reviewed local root-control inventory.
 6. In default `block` mode, Fence allows GitHub workflow traffic plus your
    `allowlist`, blocks other outbound network access, turns off passwordless
    sudo, and disables Docker/container access.
-7. Fence keeps running until the runner is destroyed and records local evidence.
-   Network findings may include bounded, best-effort local process attribution.
+7. Fence keeps running until the runner is destroyed, rechecks the local
+   root-control inventory with the other controls every five seconds, and
+   records local evidence. Network findings may include bounded, best-effort
+   local process attribution.
 8. The protected post-job hook prints a compact **Fence Summary** with control
    results and observed network activity, then fails the job if Fence sees
    critical drift.
@@ -226,6 +230,15 @@ to TCP port `443`.
 Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
 `ubuntu-latest` canary is useful signal, but it does not expand the support
 claim. Pin Fence to a full immutable commit SHA, not `@main`.
+
+Fence rejects activation when fixed privileged commands, their reviewed path
+ancestors, sudo policy, or the bounded root TCP/Unix and container inventory do
+not match the reviewed runner shape. Standard block permits only the expected
+removal of measured container-control state before readiness, then treats any
+later inventory change as critical drift. These checks rely on Fence running
+first on the trusted hosted image; they do not authenticate a command that was
+already modified by a compromised root or platform component before Fence
+started.
 
 Fence does not upload telemetry. When it records a blocked or would-block
 connection, it may add the local process ID, executable basename, actor class,

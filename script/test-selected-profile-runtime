@@ -5,11 +5,11 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -gt 1 ]]; then
-  die "usage: script/test-selected-profile-runtime [healthy|worker-failure]"
+  die "usage: script/test-selected-profile-runtime [healthy|local-control-drift|worker-failure]"
 fi
 scenario="${1:-healthy}"
-if [[ "$scenario" != "healthy" && "$scenario" != "worker-failure" ]]; then
-  die "selected-profile runtime scenario must be healthy or worker-failure"
+if [[ "$scenario" != "healthy" && "$scenario" != "local-control-drift" && "$scenario" != "worker-failure" ]]; then
+  die "selected-profile runtime scenario must be healthy, local-control-drift, or worker-failure"
 fi
 
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
@@ -77,9 +77,11 @@ fi
 # This applies the planner-selected profile on a disposable runner and
 # intentionally leaves controls resident so the platform conclusion tests the
 # test-only runtime realization.
-worker_failure_environment=()
+scenario_environment=()
 if [[ "$scenario" == "worker-failure" ]]; then
-  worker_failure_environment+=(--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INJECT_WORKER_FAILURE=1)
+  scenario_environment+=(--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INJECT_WORKER_FAILURE=1)
+elif [[ "$scenario" == "local-control-drift" ]]; then
+  scenario_environment+=(--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INJECT_LOCAL_CONTROL_DRIFT=1)
 fi
 sudo /usr/bin/systemd-run \
   --quiet \
@@ -90,7 +92,7 @@ sudo /usr/bin/systemd-run \
   "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_UNIT=$unit" \
   "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_ROOT=$runtime_root" \
   "--setenv=FENCE_SELECTED_PROFILE_RUNTIME_INVOCATION=$invocation" \
-  "${worker_failure_environment[@]}" \
+  "${scenario_environment[@]}" \
   "${test_binaries[0]}" --ignored --exact selected_profile_runtime_worker --nocapture
 
 python3 -E - "$report" "$dns_report" "$ready" "$production_ready" "$scenario" <<'PY'
@@ -123,7 +125,7 @@ while time.monotonic() < deadline:
         resident_status = report.get("resident_health", {}).get("status")
         if (
             report.get("setup_status") == "resident_selected_profile_runtime_test_only"
-            and (scenario != "worker-failure" or resident_status == "critical")
+            and (scenario == "healthy" or resident_status == "critical")
         ):
             break
     time.sleep(0.1)
@@ -160,7 +162,7 @@ require(report["materialization_status"] == "bounded_ttl_exact_host_user_wildcar
 require(len(report["materialized_allowances"]) >= 1)
 require(all(item["protocol"] == "tcp" and item["port"] == 443 for item in report["materialized_allowances"]))
 resident = report["resident_health"]
-require(resident["status"] == ("critical" if scenario == "worker-failure" else "healthy"))
+require(resident["status"] == ("healthy" if scenario == "healthy" else "critical"))
 require(resident["resident_pid"] > 0)
 require(resident["verification_sequence"] >= 1)
 require(resident["last_successful_verification_unix_milliseconds"] > 0)
@@ -269,6 +271,8 @@ require("resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinati
 require("root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"])
 if scenario == "worker-failure":
     require(any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]))
+elif scenario == "local-control-drift":
+    require(any(item["code"] == "local_control_inventory_unavailable" for item in report["critical_findings"]))
 else:
     require(report["critical_findings"] == [])
 require(not production_path.exists())
@@ -341,6 +345,11 @@ if scenario == "worker-failure":
     require(report["resident_health"]["verification_sequence"] == 1)
     require(any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]))
     require(any(item["status"] == "failed" for item in report["resident_health"]["workers"]))
+elif scenario == "local-control-drift":
+    require(report["resident_health"]["status"] == "critical")
+    require(report["resident_health"]["verification_sequence"] == 1)
+    require(any(item["code"] == "local_control_inventory_unavailable" for item in report["critical_findings"]))
+    require(all(item["status"] == "running" for item in report["resident_health"]["workers"]))
 else:
     require(report["critical_findings"] == [])
     require(report["resident_health"]["status"] == "healthy")
@@ -348,7 +357,7 @@ else:
 require(dns["blocked_non_profile_query_count"] >= 4)
 require(dns["results_storage_request_rejections"] >= 1)
 require(dns["results_storage_attribution_failures"] == 0)
-if scenario == "worker-failure":
+if scenario != "healthy":
     require(dns["resident_health"]["status"] == "critical")
 else:
     require(dns["resident_health"]["verification_sequence"] >= 2)

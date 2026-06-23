@@ -2,7 +2,7 @@
 
 Status: security-claim source for the v0 protected target
 Audience: workflow authors, maintainers, adopters, and security reviewers
-Last reviewed: 2026-06-18
+Last reviewed: 2026-06-23
 
 This model must be reviewed before changing the supported runner class,
 platform profile, trusted launcher, privilege controls, evidence trust model,
@@ -55,6 +55,10 @@ Assumptions that materially define the model:
 - Fence runs before checkout, setup, or other untrusted workflow steps.
 - The runner is an ephemeral GitHub-hosted `ubuntu-24.04` x64 host job that
   matches the reviewed fingerprint.
+- The reviewed hosted image and privileged platform processes have not
+  modified a trusted executable and restored its accepted metadata before
+  Fence captures it. Fence provides forward executable identity from capture;
+  it does not authenticate pre-capture file contents.
 - Later workflow code may execute arbitrary commands as the unprivileged
   `runner` user and may possess workflow credentials or sensitive source.
 - The Linux kernel, GitHub runner control plane, GitHub-hosted image supply
@@ -95,9 +99,12 @@ GitHub profile requires a new threat-model review.
 - **Network boundary:** a generated native `inet` ruleset, local DNS mediator,
   pinned `Runner.Worker` identity, and NFLOG reader implement and verify host egress policy
   (`src/nft.rs`, `src/nft_backend.rs`, `src/nflog.rs`).
-- **Privilege boundary:** hosted-runner fingerprint checks, passwordless-sudo
-  relocation, and Docker/containerd stop and runtime masking remove ordinary
-  root-equivalent bypass paths (`src/hosted_runner.rs`, `src/lockdown.rs`).
+- **Privilege boundary:** schema-`2` hosted-runner fingerprint checks,
+  descriptor-pinned privileged commands, ACL-aware effective-access probes,
+  in-memory passwordless-sudo rollback state, Docker/containerd stop and
+  runtime masking, and the bounded local root-control inventory remove ordinary
+  root-equivalent bypass paths (`src/hosted_runner.rs`,
+  `src/trusted_executable.rs`, `src/local_control.rs`, `src/lockdown.rs`).
 - **Evidence boundary:** root-owned readiness and reports, resident health,
   bounded findings, and the protected post hook provide local evidence without
   restoring controls (`src/runtime.rs`, `src/findings.rs`, `action/post.cts`).
@@ -117,10 +124,12 @@ GitHub profile requires a new threat-model review.
   launch one root service. Configuration and launcher files are copied to fixed
   root-owned paths; arbitrary executable paths and shell evaluation are not
   accepted (`action/main.cts`, `src/lifecycle.rs`).
-- **Root agent -> Linux host controls:** fixed absolute commands and typed
-  generated rules mutate only reviewed sudo, container, resolver, and owned
-  `nftables` state. Subprocess output and execution time are bounded
-  (`src/lockdown.rs`, `src/nft_backend.rs`, `src/dns_mediator.rs`).
+- **Root agent -> Linux host controls:** captured executable descriptors and
+  typed generated rules mutate only reviewed sudo, container, resolver, and
+  owned `nftables` state. The runner cannot write the captured paths, their
+  reviewed ancestors, or accepted sudo sources; subprocess output and
+  execution time are bounded (`src/trusted_executable.rs`, `src/lockdown.rs`,
+  `src/nft_backend.rs`, `src/dns_mediator.rs`).
 - **Workflow process -> DNS mediator:** a reviewed read-only resolver mount
   sends host UDP/TCP DNS directly to Fence so caller sockets remain visible;
   Docker uses its separate local route. Block mode canonicalizes and forwards
@@ -194,6 +203,7 @@ flowchart TD
 | Checked-out source and build outputs | Exfiltration or modification can compromise proprietary source or published artifacts. | C, I |
 | Effective network policy | A missing or broader rule changes the core protection claim. | I, A |
 | Sudo and container lockdown | Either path can restore root-equivalent authority and bypass network controls. | I |
+| Trusted executable and local root-control identity | A replaced privileged command or additive root listener can invalidate the host-control claim. | I |
 | Resident agent and protected Action runtime | Replacement can forge evidence, disable monitoring, or restore access. | I, A |
 | Local readiness and report evidence | Operators and the post hook use it to decide whether the job remained protected. | I, A |
 | Release agent and bundle provenance | A substituted binary compromises every adopting workflow. | I |
@@ -236,7 +246,9 @@ flowchart TD
 | NFLOG netlink socket | Owned kernel log group | Kernel -> agent | Fixed group/prefix, 64-byte copy bound, duplicate/trailing attribute rejection. | `src/nflog.rs::extract_logged_prefix` |
 | `/proc` attribution | Internal finding tuple | Agent -> kernel process metadata | Fixed queue and scan caps; ambiguous ownership is not guessed. | `src/attribution.rs::ProcAttributor` |
 | `nft` subprocess | Generated program and structured state | Agent -> kernel firewall | Fixed binary/args, bounded IO/time, JSON verification, singleton owned table. | `src/nft_backend.rs::NativeNftBackend` |
-| Sudo/container controls | Fixed files, units, and sockets | Agent -> host privilege state | Fingerprint-gated, narrow relocation/masking, pre-ready rollback only. | `src/lockdown.rs::SystemLockdownControl` |
+| Trusted executable set | Twelve fixed command paths | Agent -> privileged host execution | No-follow descriptor capture, exact metadata/device/inode revalidation, ACL-aware effective access, no raw-path fallback. | `src/trusted_executable.rs::TrustedExecutableSet` |
+| Local root-control inventory | Bounded `/proc` TCP/Unix and container state | Agent -> host privilege state | Stable complete schema-`2` match before mutation, container-only reductions plus one exact fingerprint-tagged removable Docker listener during standard lockdown, exact resident baseline. | `src/local_control.rs::observe_local_control_inventory` |
+| Sudo/container controls | Fixed files, units, sockets, and one sudo source | Agent -> host privilege state | Fingerprint-gated, in-memory pre-ready rollback, exact removal/restoration checks, runtime masking, irreversible post-ready commit. | `src/lockdown.rs::SystemLockdownControl` |
 | Runtime evidence files | Root writes, runner reads | Agent -> post hook | No-follow fixed paths, exclusive readiness, atomic reports, owner/mode checks. | `src/runtime.rs::ProductionRuntimeStore` |
 | Protected post hook | GitHub post-job invocation | Runner -> evidence validator | Writable self-bind guards on renameable ancestors, read-only mounted source, device/inode and digest records, live PID, and fresh report validation. | `action/post.cts::main` |
 | Release and bundle update | Merge-triggered release and maintainer script | Source -> distributed binary | Pinned actions, protected environment, checksums, non-draft immutable releases, resolved tags, and attestations bound to the main-branch source and signer commit. | `.github/workflows/release.yml`, `script/update-action-bundle` |
@@ -249,8 +261,10 @@ flowchart TD
    firewall permits it because Fence does not inspect TLS/HTTP semantics.
 2. **Regain root and rewrite policy:** later code uses a residual sudo or
    container-control path, modifies `inet fence_v0`, and opens arbitrary
-   egress. Fence prevents readiness unless the reviewed paths are disabled, but
-   unrecognized hosted-image drift remains the key prerequisite.
+   egress. Fence prevents readiness unless trusted path access, the closed
+   root-control inventory, and the measured privilege paths verify; later
+   inventory drift is critical. Pre-capture image or privileged-platform
+   compromise remains the key prerequisite.
 3. **Exploit DNS authorization:** later code requests an allowed suffix or
    triggers a CNAME/address transition that broadens usable IP space, then
    sends data to another service sharing an authorized address. Fence bounds
@@ -288,7 +302,7 @@ flowchart TD
 
 | Threat ID | Threat source | Prerequisites | Threat action | Impact | Impacted assets | Existing controls (evidence) | Gaps | Recommended mitigations | Detection ideas | Likelihood | Impact severity | Priority |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| TM-001 | Malicious workflow process | Residual root-equivalent path or unsupported host drift | Regain privilege and change firewall or agent state | Arbitrary egress and forged evidence | Credentials, policy, reports | Fingerprint gate and verified sudo/container lockdown (`src/hosted_runner.rs`, `src/lockdown.rs`) | New runner layouts can invalidate assumptions | Keep fail-closed fingerprint updates reviewable; add support only with hosted proof | Critical lockdown finding and support mismatch | Medium | High | High |
+| TM-001 | Malicious workflow process | Residual root-equivalent path, additive root control, or unsupported host drift | Regain privilege and change firewall or agent state | Arbitrary egress and forged evidence | Credentials, policy, reports | Schema-`2` fingerprint, descriptor-pinned commands, ACL-aware path checks, exact pre-mutation local-control inventory, container-only reductions plus one exact fingerprint-tagged removable Docker listener during standard lockdown, resident baseline, and verified sudo/container controls (`src/hosted_runner.rs`, `src/trusted_executable.rs`, `src/local_control.rs`, `src/lockdown.rs`) | Pre-capture same-inode/content modification, dynamic loader/shared-library compromise, malicious root/platform processes, and new runner layouts remain trusted or unsupported | Keep fail-closed fingerprint updates reviewable; add support only with same-image and destructive hosted proof | Pre-ready support failure or terminal critical local-control/lockdown finding | Low | High | High |
 | TM-002 | Malicious workflow process | Access to an approved GitHub, exact user, or wildcard-derived destination | Exfiltrate sensitive data through allowed HTTPS or DNS behavior | Credential/source disclosure | Credentials, source | Exact profile roots, opt-out for broad platform roots, exact-depth wildcard grammar, shared eight-name lifetime cap, typed transports, and disclosed limits (`src/hostname_policy.rs`, `README.md`) | Core GitHub reporting, wildcard query labels, CNAME delegation, and shared IPs remain channels | Keep wildcard use explicit, use least-privilege job tokens, and prefer exact names where practical | DNS/finding summary, wildcard admission/rejection evidence, and audit-mode tuning | High | High | High |
 | TM-003 | Malicious workflow process or DNS response | Authorized exact name, wildcard match, CNAME, or address rotation | Expand usable addresses or race first connection | Policy broadening or unexpected denial | Effective policy, job availability | Canonical A/AAAA queries, response-local linear CNAME validation rooted at the echoed question, terminal address-owner checks, exact label-depth matching, shared name/depth/TTL caps, queried-root policy retention, and owner-coordinated atomic authorization plus verified materialization (`src/dns_mediator.rs`) | IP authorization cannot prove TLS service identity; no public-suffix ownership validation is performed | Preserve response-local lineage, ordered owner-side revalidation, exact-depth matching, lifetime admission bounds, and complete apply-and-verify gating | DNS evidence counters, wildcard admissions, materialized allowances, and critical backend findings | Medium | High | High |
 | TM-004 | Malicious workflow process | Writable launcher/post/binary, renameable registered-path ancestor, or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, writable self-bind ancestor guards, read-only runtime bind mount, device/inode and digest records, no-follow files, live PID/freshness checks, schema-`5` wildcard-evidence validation, and hosted tamper coverage (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | Kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact path-guard/runtime manifests, worker set, freshness bounds, atomic schema adoption, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
@@ -336,6 +350,8 @@ because attribution is not an enforcement input. Kernel compromise would be
 | `src/nflog.rs` | Parses the bounded kernel event wire format and rejects ambiguous attributes. | TM-008, TM-009 |
 | `src/findings.rs` | Reduces packet prefixes to approved report metadata and keeps local tuples internal. | TM-008, TM-009 |
 | `src/attribution.rs` | Scans bounded `/proc` state, pins `Runner.Worker`, attributes DNS sockets, and defines the local metadata privacy boundary. | TM-008, TM-009, TM-010 |
-| `src/lockdown.rs` | Removes and verifies sudo and container bypass paths. | TM-001 |
+| `src/trusted_executable.rs` | Captures and revalidates the fixed privileged executable set and descriptor-only execution boundary. | TM-001 |
+| `src/local_control.rs` | Acquires and verifies the bounded root TCP/Unix and container-control inventory before readiness and during resident checks. | TM-001, TM-005, TM-008 |
+| `src/lockdown.rs` | Enforces ACL-aware path invariants, removes and verifies sudo/container bypass paths, and owns pre-ready rollback state. | TM-001 |
 | `.github/workflows/release.yml` | Connects reviewed source to immutable checksummed and attested release assets. | TM-007 |
 | `script/update-action-bundle` | Installs the committed runtime binary only after release and attestation verification. | TM-007 |

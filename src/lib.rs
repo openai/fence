@@ -15,6 +15,8 @@ pub mod hostname_policy;
 #[doc(hidden)]
 pub mod lifecycle;
 #[cfg(target_os = "linux")]
+mod local_control;
+#[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub mod lockdown;
 #[cfg(target_os = "linux")]
@@ -31,6 +33,8 @@ pub mod resolver;
 #[doc(hidden)]
 pub mod runtime;
 pub mod support;
+#[cfg(target_os = "linux")]
+mod trusted_executable;
 
 use serde::Serialize;
 
