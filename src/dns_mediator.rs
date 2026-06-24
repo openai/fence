@@ -3161,6 +3161,7 @@ fn dns_block_test_limitations(allow_dynamic_githubapp_suffix: bool) -> Vec<&'sta
         "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
         "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
+        "azure_instance_metadata_tcp_80_remains_an_egress_channel",
         "dynamic_owned_table_replacement_resets_network_counters",
         "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
         "process_arguments_full_paths_and_environment_are_not_retained",
@@ -3221,6 +3222,7 @@ fn protected_block_shared_limitations(allow_dynamic_githubapp_suffix: bool) -> V
         "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
         "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
+        "azure_instance_metadata_tcp_80_remains_an_egress_channel",
         "dynamic_owned_table_replacement_resets_network_counters",
         "local_process_attribution_is_bounded_best_effort_and_not_telemetry",
         "process_arguments_full_paths_and_environment_are_not_retained",
@@ -5557,6 +5559,7 @@ fn evidence_from_state_and_authorizations(
                 "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
                 "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
                 "root_resident_dns_upstream_channel_remains_an_egress_limitation",
+                "azure_instance_metadata_tcp_80_remains_an_egress_channel",
             ],
             DnsEvidenceScope::ProtectedHostBlock => protected_dns_scope_limitations(
                 false,
@@ -5596,6 +5599,7 @@ fn protected_dns_scope_limitations(
         "approved_workflow_bootstrap_https_destinations_remain_egress_channels",
         "resolved_workflow_bootstrap_ip_addresses_may_serve_additional_destinations",
         "root_resident_dns_upstream_channel_remains_an_egress_limitation",
+        "azure_instance_metadata_tcp_80_remains_an_egress_channel",
     ];
     limitations.extend(githubapp_profile_limitations(
         allow_dynamic_githubapp_suffix,
