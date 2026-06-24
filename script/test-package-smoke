@@ -226,10 +226,21 @@ require(result["command"] == "render-plan", "plan command field mismatch")
 require(result["status"] == "success", "plan response status mismatch")
 require(result["fence_version"] == sys.argv[2], "plan envelope version mismatch")
 require(data["implementation_phase"] == "v0", "plan phase mismatch")
-require(data["policy_hash_schema_version"] == 8, "plan policy hash schema mismatch")
+require(data["policy_hash_schema_version"] == 9, "plan policy hash schema mismatch")
 require(
-    data["platform_profile"]["id"] == "github_hosted_workflow_bootstrap_v4",
+    data["platform_profile"]["id"] == "github_hosted_workflow_bootstrap_v5",
     "plan platform profile mismatch",
+)
+require(
+    data["platform_profile"]["dns_mediated_compatibility"]
+    ["shared_platform_service_permissions"]
+    == [{
+        "subject": "host_and_forwarded_traffic",
+        "destination": "169.254.169.254",
+        "protocol": "tcp",
+        "port": 80,
+    }],
+    "plan shared platform service mismatch",
 )
 require(re.fullmatch(r"[0-9a-f]{64}", data["policy_hash"]), "invalid policy hash")
 require(re.fullmatch(r"[0-9a-f]{64}", data["ruleset_hash"]), "invalid ruleset hash")
@@ -249,6 +260,11 @@ require(
     "owned table preview mismatch",
 )
 require(data["network_enforcement_preview"]["nflog"]["group"] == 4242, "nflog group mismatch")
+require(
+    "ip daddr 169.254.169.254 tcp dport 80 accept comment \"fence:instance_metadata_platform\""
+    in data["network_enforcement_preview"]["ruleset"],
+    "plan instance metadata rule mismatch",
+)
 PY
 
 sentinel="$temporary_directory/nonexistent-run-config.json"

@@ -2,7 +2,8 @@ use crate::config::{Mode, Protocol};
 use crate::findings::ConnectionFinding;
 use crate::plan::EffectiveAllowance;
 use crate::platform_profile::{
-    AZURE_WIRESERVER_ADDRESS, AZURE_WIRESERVER_ROOT_UID, AZURE_WIRESERVER_TCP_PORTS,
+    AZURE_INSTANCE_METADATA_ADDRESS, AZURE_INSTANCE_METADATA_TCP_PORT, AZURE_WIRESERVER_ADDRESS,
+    AZURE_WIRESERVER_ROOT_UID, AZURE_WIRESERVER_TCP_PORTS,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
@@ -147,6 +148,12 @@ pub enum OwnedRule {
     WireServerPlatform {
         chain: String,
         uid: u32,
+        destination: String,
+        protocol: String,
+        port: u16,
+    },
+    InstanceMetadataPlatform {
+        chain: String,
         destination: String,
         protocol: String,
         port: u16,
@@ -446,6 +453,12 @@ fn build_rules(
                 port,
             }),
         );
+        rules.push(OwnedRule::InstanceMetadataPlatform {
+            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            destination: AZURE_INSTANCE_METADATA_ADDRESS.to_owned(),
+            protocol: "tcp".to_owned(),
+            port: AZURE_INSTANCE_METADATA_TCP_PORT,
+        });
     }
     rules.extend(allowances.iter().map(|allowance| OwnedRule::Allowance {
         chain: NFT_CLASSIFY_CHAIN.to_owned(),
@@ -552,6 +565,18 @@ fn render_rule(program: &mut String, rule: &OwnedRule) {
             writeln!(
                 program,
                 "add rule {NFT_FAMILY} {NFT_TABLE} {chain} meta skuid {uid} ip daddr {destination} {protocol} dport {port} accept comment \"fence:wireserver_platform\""
+            )
+            .unwrap();
+        }
+        OwnedRule::InstanceMetadataPlatform {
+            chain,
+            destination,
+            protocol,
+            port,
+        } => {
+            writeln!(
+                program,
+                "add rule {NFT_FAMILY} {NFT_TABLE} {chain} ip daddr {destination} {protocol} dport {port} accept comment \"fence:instance_metadata_platform\""
             )
             .unwrap();
         }
@@ -673,7 +698,15 @@ mod tests {
         assert!(program.contains(
             "meta skuid 0 ip daddr 168.63.129.16 tcp dport 32526 accept comment \"fence:wireserver_platform\""
         ));
-        assert!(!program.contains("169.254.169.254"));
+        assert_eq!(
+            program
+                .matches("comment \"fence:instance_metadata_platform\"")
+                .count(),
+            1
+        );
+        assert!(program.contains(
+            "ip daddr 169.254.169.254 tcp dport 80 accept comment \"fence:instance_metadata_platform\""
+        ));
         assert!(
             replacement.starts_with("delete table inet fence_v0\ncreate table inet fence_v0\n")
         );
@@ -707,12 +740,29 @@ mod tests {
                 (0, "168.63.129.16", "tcp", 32526)
             ]
         );
+        assert!(expected.rules.iter().any(|rule| matches!(
+            rule,
+            OwnedRule::InstanceMetadataPlatform {
+                chain,
+                destination,
+                protocol,
+                port: 80,
+            } if chain == NFT_CLASSIFY_CHAIN
+                && destination == "169.254.169.254"
+                && protocol == "tcp"
+        )));
         let audit = render_dns_mediated_ruleset(Mode::Audit, &[]);
         assert_eq!(
             audit
                 .matches("comment \"fence:wireserver_platform\"")
                 .count(),
             2
+        );
+        assert_eq!(
+            audit
+                .matches("comment \"fence:instance_metadata_platform\"")
+                .count(),
+            1
         );
     }
 
@@ -748,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_mediated_verification_rejects_missing_or_broadened_wireserver_rules() {
+    fn dns_mediated_verification_rejects_missing_or_broadened_platform_rules() {
         let expected = expected_dns_mediated_owned_state(Mode::Block, &[]);
         let mut missing = expected.clone();
         missing
@@ -780,6 +830,26 @@ mod tests {
             .clone();
         duplicated.rules.push(duplicate);
         assert!(verify_owned_state(&expected, &duplicated).is_err());
+
+        let mut missing_metadata = expected.clone();
+        missing_metadata
+            .rules
+            .retain(|rule| !matches!(rule, OwnedRule::InstanceMetadataPlatform { .. }));
+        assert!(verify_owned_state(&expected, &missing_metadata).is_err());
+
+        let mut broadened_metadata = expected.clone();
+        let index = broadened_metadata
+            .rules
+            .iter()
+            .position(|rule| matches!(rule, OwnedRule::InstanceMetadataPlatform { .. }))
+            .unwrap();
+        broadened_metadata.rules[index] = OwnedRule::InstanceMetadataPlatform {
+            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            destination: AZURE_INSTANCE_METADATA_ADDRESS.to_owned(),
+            protocol: "tcp".to_owned(),
+            port: 443,
+        };
+        assert!(verify_owned_state(&expected, &broadened_metadata).is_err());
     }
 
     #[test]

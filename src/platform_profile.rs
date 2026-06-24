@@ -1,9 +1,11 @@
 use serde::Serialize;
 
-pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID: &str = "github_hosted_workflow_bootstrap_v4";
+pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID: &str = "github_hosted_workflow_bootstrap_v5";
 pub const AZURE_WIRESERVER_ADDRESS: &str = "168.63.129.16";
 pub const AZURE_WIRESERVER_ROOT_UID: u32 = 0;
 pub const AZURE_WIRESERVER_TCP_PORTS: [u16; 2] = [80, 32526];
+pub const AZURE_INSTANCE_METADATA_ADDRESS: &str = "169.254.169.254";
+pub const AZURE_INSTANCE_METADATA_TCP_PORT: u16 = 80;
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN: &str =
     "*.actions.githubusercontent.com";
 pub const GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_GITHUBAPP_SUFFIX_PATTERN: &str = "*.githubapp.com";
@@ -61,12 +63,21 @@ pub struct RootPlatformServicePermission {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct SharedPlatformServicePermission {
+    pub subject: &'static str,
+    pub destination: &'static str,
+    pub protocol: &'static str,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct DnsMediatedCompatibilityPlan {
     pub realization_status: &'static str,
     pub ruleset_preview_scope: &'static str,
     pub upstream_dns_policy: &'static str,
     pub upstream_dns: &'static str,
     pub root_platform_service_permissions: Vec<RootPlatformServicePermission>,
+    pub shared_platform_service_permissions: Vec<SharedPlatformServicePermission>,
     pub bootstrap_hostnames: Vec<&'static str>,
     pub exact_compatibility_hostnames: Vec<&'static str>,
     pub bounded_actions_suffix_pattern: &'static str,
@@ -120,6 +131,12 @@ pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
                 port,
             })
             .collect(),
+        shared_platform_service_permissions: vec![SharedPlatformServicePermission {
+            subject: "host_and_forwarded_traffic",
+            destination: AZURE_INSTANCE_METADATA_ADDRESS,
+            protocol: "tcp",
+            port: AZURE_INSTANCE_METADATA_TCP_PORT,
+        }],
         bootstrap_hostnames: github_hosted_workflow_bootstrap_hostnames(
             disable_broad_github_domains,
         ),
@@ -173,7 +190,7 @@ mod tests {
 
         assert_eq!(
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
-            "github_hosted_workflow_bootstrap_v4"
+            "github_hosted_workflow_bootstrap_v5"
         );
         assert_eq!(
             profile.bootstrap_hostnames,
@@ -228,6 +245,19 @@ mod tests {
             }
         );
         assert_eq!(profile.root_platform_service_permissions[1].port, 32526);
+        assert_eq!(
+            profile.shared_platform_service_permissions,
+            opt_out.shared_platform_service_permissions
+        );
+        assert_eq!(
+            profile.shared_platform_service_permissions,
+            [SharedPlatformServicePermission {
+                subject: "host_and_forwarded_traffic",
+                destination: "169.254.169.254",
+                protocol: "tcp",
+                port: 80,
+            }]
+        );
         assert!(is_optional_github_hosted_workflow_bootstrap_hostname(
             "hosted-compute-watchdog-prod-eus-01.githubapp.com"
         ));

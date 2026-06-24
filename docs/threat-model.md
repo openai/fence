@@ -10,7 +10,7 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree and released Action define the schema-`8` policy and schema-`5`
+The source tree and released Action define the schema-`9` policy and schema-`5`
 runtime-evidence contract. The bundle remains governed by
 `action/bundle-manifest.json` and the wrapper schema constants; the wrapper
 rejects older evidence, stale verification state, malformed wildcard evidence,
@@ -29,13 +29,7 @@ reduces arbitrary outbound access; it does not eliminate exfiltration because
 approved GitHub destinations, DNS behavior, exact and wildcard user allowlist
 entries, and shared destination IP addresses remain usable channels.
 
-The versioned platform contract separately permits UID `0` host traffic to
-Azure WireServer at exact destination `168.63.129.16` on TCP `80` and `32526`.
-This is not workflow-wide HTTP access: unprivileged and forwarded traffic does
-not match, and Azure IMDS at `169.254.169.254` remains outside policy. Any
-root-owned host process can use the two ports, so standard block depends on its
-verified sudo/container lockdown; degraded block and audit do not claim that
-containment boundary.
+The versioned platform contract separately permits UID `0` host traffic to Azure WireServer at exact destination `168.63.129.16` on TCP `80` and `32526`. Unprivileged and forwarded traffic does not match those rules. The contract also permits host and forwarded traffic to Azure IMDS at exact destination `169.254.169.254` on TCP `80`; later workflow code can use that endpoint as an egress channel. Any root-owned host process can use the two WireServer ports, so standard block depends on its verified sudo/container lockdown; degraded block and audit do not claim that containment boundary.
 
 ## Scope and assumptions
 

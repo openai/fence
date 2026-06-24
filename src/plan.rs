@@ -22,7 +22,7 @@ use std::time::Duration;
 
 pub const PER_HOST_DNS_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOTAL_DNS_BUDGET: Duration = Duration::from_secs(30);
-pub const POLICY_HASH_SCHEMA_VERSION: u32 = 8;
+pub const POLICY_HASH_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -331,7 +331,7 @@ fn effective_from_ip(address: IpAddr, allowance: &NormalizedAllowance) -> Effect
 
 fn platform_requested_allowances(profile: PlatformProfile) -> Vec<NormalizedAllowance> {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV4 => Vec::new(),
+        PlatformProfile::GithubHostedWorkflowBootstrapV5 => Vec::new(),
     }
 }
 
@@ -374,7 +374,7 @@ fn platform_plan(
     frozen_resolution_results: Vec<ResolutionResult>,
 ) -> PlatformProfilePlan {
     match profile {
-        PlatformProfile::GithubHostedWorkflowBootstrapV4 => {
+        PlatformProfile::GithubHostedWorkflowBootstrapV5 => {
             let mut limitations = vec![
                 "dns_mediated_runtime_materialization_requires_trusted_launcher",
                 "rendered_ruleset_is_base_policy_before_runtime_dns_materialization",
@@ -387,6 +387,7 @@ fn platform_plan(
                 "post_ready_codeload_traffic_is_not_authorized",
                 "runner_authorized_results_storage_accounts_remain_egress_channels",
                 "root_owned_azure_wireserver_tcp_ports_remain_egress_channels",
+                "azure_instance_metadata_tcp_80_remains_an_egress_channel",
             ];
             if disable_broad_github_domains {
                 limitations.push("broad_github_compatibility_destinations_disabled");
@@ -630,7 +631,7 @@ mod tests {
         )
         .unwrap();
         let explicit = build_plan(
-            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v4","allowlist":[]}"#),
+            parse(r#"{"schema_version":1,"mode":"block","invocation_id":"explicit","platform_profile":"github_hosted_workflow_bootstrap_v5","allowlist":[]}"#),
             &resolver(vec![]),
         )
         .unwrap();
@@ -644,7 +645,7 @@ mod tests {
             &resolver(vec![]),
         )
         .unwrap();
-        assert_eq!(default.policy_hash_schema_version, 8);
+        assert_eq!(default.policy_hash_schema_version, 9);
         assert_eq!(
             default.platform_profile.id,
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID
@@ -699,6 +700,17 @@ mod tests {
         assert_eq!(dns.root_platform_service_permissions[0].protocol, "tcp");
         assert_eq!(dns.root_platform_service_permissions[0].port, 80);
         assert_eq!(dns.root_platform_service_permissions[1].port, 32526);
+        assert_eq!(dns.shared_platform_service_permissions.len(), 1);
+        assert_eq!(
+            dns.shared_platform_service_permissions[0].subject,
+            "host_and_forwarded_traffic"
+        );
+        assert_eq!(
+            dns.shared_platform_service_permissions[0].destination,
+            "169.254.169.254"
+        );
+        assert_eq!(dns.shared_platform_service_permissions[0].protocol, "tcp");
+        assert_eq!(dns.shared_platform_service_permissions[0].port, 80);
         assert_eq!(
             dns.root_platform_service_permissions,
             opt_out
@@ -707,6 +719,15 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .root_platform_service_permissions
+        );
+        assert_eq!(
+            dns.shared_platform_service_permissions,
+            opt_out
+                .platform_profile
+                .dns_mediated_compatibility
+                .as_ref()
+                .unwrap()
+                .shared_platform_service_permissions
         );
         assert_eq!(default.policy_hash, explicit.policy_hash);
         assert_eq!(default.policy_hash, explicit_false.policy_hash);
@@ -731,12 +752,9 @@ mod tests {
                 .ruleset
                 .contains("meta skuid 0 ip daddr 168.63.129.16 tcp dport 32526 accept")
         );
-        assert!(
-            !default
-                .network_enforcement_preview
-                .ruleset
-                .contains("169.254.169.254")
-        );
+        assert!(default.network_enforcement_preview.ruleset.contains(
+            "ip daddr 169.254.169.254 tcp dport 80 accept comment \"fence:instance_metadata_platform\""
+        ));
         let opt_out_dns = opt_out
             .platform_profile
             .dns_mediated_compatibility
@@ -776,6 +794,12 @@ mod tests {
             !opt_out.platform_profile.limitations.contains(
                 &"bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation"
             )
+        );
+        assert!(
+            default
+                .platform_profile
+                .limitations
+                .contains(&"azure_instance_metadata_tcp_80_remains_an_egress_channel")
         );
     }
 
