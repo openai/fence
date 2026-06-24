@@ -193,6 +193,94 @@ required_fragments = [
 for fragment in required_fragments:
     require(fragment in aggregate, "Action acceptance aggregate must fail closed")
 require(aggregate.count("exit 1") == 1, "Action acceptance aggregate must reject unsuccessful jobs")
+
+canary_path = root / ".github/workflows/action-drift-canary.yml"
+require(canary_path.is_file(), "Action drift canary workflow is missing")
+canary = canary_path.read_text(encoding="utf-8")
+trigger_marker = "\non:\n"
+permissions_marker = "\npermissions:\n"
+defaults_marker = "\ndefaults:\n"
+concurrency_marker = "\nconcurrency:\n"
+jobs_marker = "\njobs:\n"
+for marker in [
+    trigger_marker,
+    permissions_marker,
+    defaults_marker,
+    concurrency_marker,
+    jobs_marker,
+]:
+    require(canary.count(marker) == 1, "Action drift canary top-level contract is invalid")
+triggers = canary.split(trigger_marker, 1)[1].split(permissions_marker, 1)[0]
+permissions = canary.split(permissions_marker, 1)[1].split(defaults_marker, 1)[0]
+concurrency = canary.split(concurrency_marker, 1)[1].split(jobs_marker, 1)[0]
+require(
+    triggers == '  schedule:\n    - cron: "23 13 * * *"\n  workflow_dispatch:\n',
+    "Action drift canary triggers must remain fixed",
+)
+require(permissions == "  contents: read\n", "Action drift canary permissions must be read-only")
+require(
+    concurrency == "  group: action-drift-canary-${{ github.sha }}\n  cancel-in-progress: false\n",
+    "Action drift canary concurrency must be commit-scoped and non-cancelling",
+)
+canary_fragments = [
+    "runs-on: ubuntu-24.04",
+    "uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+    "persist-credentials: false",
+    "run: script/validate-locks --ci",
+    "run: script/test-action-wrapper",
+    "run: script/observe-hosted-runner",
+    "id: bundle-host",
+    "run: script/classify-action-bundle-host",
+]
+for fragment in canary_fragments:
+    require(fragment in canary, "Action drift canary contract is incomplete")
+
+require(canary.count("runs-on: ubuntu-24.04") == 1, "Action drift canary must use one fixed runner")
+require(canary.count("uses: ./") == 1, "Action drift canary must activate the bundle exactly once")
+require(
+    canary.count("script/test-action-acceptance standard") == 1,
+    "Action drift canary must validate one standard lifecycle",
+)
+
+for forbidden in [
+    "continue-on-error",
+    "actions/upload-artifact",
+    "journalctl",
+    "systemctl status",
+    "ubuntu-latest",
+]:
+    require(forbidden not in canary, "Action drift canary contains a forbidden escape path")
+require(
+    re.search(r"(?m)^[ \t]+if:[ \t]*", canary) is None,
+    "Action drift canary steps must be unconditional",
+)
+
+guard_marker = "\n      - name: require bundled Action activation\n"
+activation_marker = "\n      - name: activate bundled Fence agent with strict defaults\n"
+verification_marker = "\n      - name: verify zero-input Action lifecycle\n"
+require(canary.count(guard_marker) == 1, "Action drift canary classifier guard must be unique")
+require(canary.count(activation_marker) == 1, "Action drift canary activation step must be unique")
+require(canary.count(verification_marker) == 1, "Action drift canary lifecycle step must be unique")
+guard = canary.split(guard_marker, 1)[1].split(activation_marker, 1)[0]
+activation = canary.split(activation_marker, 1)[1].split(verification_marker, 1)[0]
+verification = canary.split(verification_marker, 1)[1]
+expected_guard = (
+    "        env:\n"
+    "          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}\n"
+    "          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}\n"
+    "        run: |\n"
+    '          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then\n'
+    '            echo "::error::bundled Action host classification did not authorize activation"\n'
+    "            exit 1\n"
+    "          fi\n"
+)
+require(guard == expected_guard, "Action drift canary classifier guard must fail closed")
+require(activation == "        uses: ./\n", "Action drift canary activation must use zero inputs")
+require(
+    verification
+    == '        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"\n',
+    "Action drift canary lifecycle validation must be unconditional",
+)
 PY
 
   if PYTHONOPTIMIZE=1 python3 -E - <<'PY' >/dev/null 2>&1

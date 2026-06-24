@@ -496,7 +496,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_v2_preserves_reviewed_host_facts_and_sudo_transitions() {
+    fn fingerprint_v2_preserves_reviewed_host_facts_without_an_active_transition() {
         let requirement = hosted_runner_fingerprint_requirement();
 
         assert_eq!(requirement.schema_version, 2);
@@ -549,20 +549,7 @@ mod tests {
         .unwrap();
         assert_eq!(transitions["schema_version"], 1);
         let transitions = transitions["transitions"].as_array().unwrap();
-        assert_eq!(transitions.len(), 1);
-        for transition in transitions {
-            let source = requirement
-                .accepted
-                .sudo_policy_sources
-                .iter()
-                .find(|source| {
-                    transition["path_class"] == source.path_class
-                        && transition["name"] == source.name
-                })
-                .unwrap();
-            let digest = transition["sha256"].as_str().unwrap();
-            assert!(digest == source.sha256 || source.alternate_sha256.contains(&digest));
-        }
+        assert!(transitions.is_empty());
     }
 
     #[test]

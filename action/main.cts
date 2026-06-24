@@ -24,6 +24,7 @@ const {
   validateReadOnlyActionMount,
   validateReady,
   validateReport,
+  validateResidentUnitStatus,
 } = require("./lib.cts");
 
 const ACTION_ROOT = __dirname;
@@ -108,13 +109,87 @@ function compactServiceStatus(output: string): string {
     .join("; ");
 }
 
-function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
-  if (!paths || !serviceLaunchAttempted) {
-    return;
+function parseServiceProperties(output: string): Record<string, string> {
+  const properties: Record<string, string> = {};
+  for (const line of output.split(/\r?\n/)) {
+    const separator = line.indexOf("=");
+    if (separator <= 0) {
+      continue;
+    }
+    const name = line.slice(0, separator);
+    const value = line.slice(separator + 1);
+    if (
+      !new Set([
+        "ActiveState",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "LoadState",
+        "MainPID",
+        "Result",
+        "SubState",
+      ]).has(name) ||
+      name in properties ||
+      value.length > 128 ||
+      /[^A-Za-z0-9_.:-]/.test(value)
+    ) {
+      continue;
+    }
+    properties[name] = value;
   }
-  const status = capture("/usr/bin/systemctl", [
+  return properties;
+}
+
+function terminalServiceStatus(output: string): string | undefined {
+  const properties = parseServiceProperties(output);
+  const terminal =
+    properties.LoadState === "not-found" ||
+    properties.ActiveState === "failed" ||
+    (properties.ActiveState === "inactive" && properties.SubState === "dead");
+  if (!terminal) {
+    return undefined;
+  }
+  return [
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "Result",
+    "ExecMainCode",
+    "ExecMainStatus",
+    "MainPID",
+  ]
+    .filter((name) => name in properties)
+    .map((name) => `${name}=${properties[name]}`)
+    .join("; ");
+}
+
+function fenceErrorCodeFromJournal(output: string): string | undefined {
+  for (const line of output.split(/\r?\n/).reverse()) {
+    if (line.length === 0 || line.length > 4096) {
+      continue;
+    }
+    try {
+      const document = JSON.parse(line);
+      const code = document?.error?.code;
+      if (
+        document?.schema_version === 1 &&
+        document?.command === "run" &&
+        document?.status === "error" &&
+        typeof code === "string" &&
+        /^[a-z][a-z0-9_]{0,63}$/.test(code)
+      ) {
+        return code;
+      }
+    } catch {
+      // Unit journals also contain systemd messages; only exact Fence JSON is accepted.
+    }
+  }
+  return undefined;
+}
+
+function captureServiceStatus(unit: string): ReturnType<typeof capture> {
+  return capture("/usr/bin/systemctl", [
     "show",
-    paths.unit,
+    unit,
     "--no-pager",
     "--property=LoadState",
     "--property=ActiveState",
@@ -124,6 +199,13 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
     "--property=ExecMainStatus",
     "--property=MainPID",
   ]);
+}
+
+function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
+  if (!paths || !serviceLaunchAttempted) {
+    return;
+  }
+  const status = captureServiceStatus(paths.unit);
   const compactStatus = compactServiceStatus(`${status.stdout}\n${status.stderr}`);
   if (compactStatus.length > 0) {
     log.warning(`Fence service state for ${paths.unit}: ${compactStatus}`);
@@ -140,10 +222,14 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
     "--unit",
     paths.unit,
     "--lines",
-    "80",
+    "20",
     "--output",
-    "short-monotonic",
+    "cat",
   ]);
+  const errorCode = fenceErrorCodeFromJournal(journal.stdout);
+  if (errorCode !== undefined) {
+    log.warning(`Fence resident error code: ${errorCode}`);
+  }
   log.debugGroup("Fence debug: service journal", [
     `unit=${paths.unit}`,
     `status=${journal.status}`,
@@ -388,7 +474,7 @@ function appendState(name: string, value: string): void {
   fs.appendFileSync(state, `${name}=${value}\n`, { encoding: "utf8" });
 }
 
-function waitForReady(paths: { ready: string; report: string }): any {
+function waitForReady(paths: { ready: string; report: string; unit: string }): any {
   const deadline = Date.now() + READY_TIMEOUT_MS;
   log.debugGroup("Fence debug: readiness", [
     `timeout_ms=${READY_TIMEOUT_MS}`,
@@ -404,6 +490,18 @@ function waitForReady(paths: { ready: string; report: string }): any {
       );
       const ready = readJsonBounded(paths.ready, 64 * 1024, "Fence readiness");
       validateReady(ready, report);
+      const service = capture("/usr/bin/systemctl", [
+        "show",
+        paths.unit,
+        "--no-pager",
+        "--property=ActiveState",
+        "--property=MainPID",
+        "--property=SubState",
+      ]);
+      if (service.error || service.status !== 0) {
+        throw new Error("Fence resident service status is unavailable after readiness");
+      }
+      validateResidentUnitStatus(service.stdout, report.resident_health.resident_pid);
       log.debugGroup("Fence debug: readiness verified", [
         `mode=${report.mode}`,
         `status=${report.status}`,
@@ -414,6 +512,13 @@ function waitForReady(paths: { ready: string; report: string }): any {
         `critical_findings=${Array.isArray(report.critical_findings) ? report.critical_findings.length : "unknown"}`,
       ]);
       return report;
+    }
+    const service = captureServiceStatus(paths.unit);
+    if (!service.error && service.status === 0) {
+      const terminalStatus = terminalServiceStatus(service.stdout);
+      if (terminalStatus !== undefined) {
+        throw new Error(`Fence resident service exited before readiness: ${terminalStatus}`);
+      }
     }
     sleep(POLL_INTERVAL_MS);
   }
@@ -471,7 +576,6 @@ function main(): void {
   const serviceArgs = [
     "/usr/bin/systemd-run",
     "--quiet",
-    "--collect",
     "--property=Type=exec",
     "--unit",
     paths.unit,
@@ -503,4 +607,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, run };
+module.exports = { fenceErrorCodeFromJournal, main, run, terminalServiceStatus };

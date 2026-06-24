@@ -1,10 +1,4 @@
 {
   "schema_version": 1,
-  "transitions": [
-    {
-      "name": "90-cloud-init-users",
-      "path_class": "drop_in",
-      "sha256": "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d"
-    }
-  ]
+  "transitions": []
 }
