@@ -65,14 +65,14 @@ const report = {
   status: "protected_host_block",
   mode: "block",
   readiness_status: "ready",
-  platform_profile_id: "github_hosted_workflow_bootstrap_v4",
-  profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v4",
+  platform_profile_id: "github_hosted_workflow_bootstrap_v5",
+  profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
   network_verification_status: "verified",
   setup_status: "resident_protected",
   protection_available: true,
   sudo_status: "disabled_verified",
   container_status: "disabled_verified",
-  policy_hash_schema_version: 8,
+  policy_hash_schema_version: 9,
   policy_hash: "a".repeat(64),
   base_ruleset_hash: "b".repeat(64),
   ruleset_hash: "c".repeat(64),
@@ -167,7 +167,7 @@ test("validates explicit and zero-input inline configurations", () => {
       invocationId: "custom-run",
       mode: "block",
       containerPolicy: "unsafe_preserve",
-      platformProfile: "github_hosted_workflow_bootstrap_v4",
+      platformProfile: "github_hosted_workflow_bootstrap_v5",
       disableBroadGithubDomains: "true",
       allowlist: [
         "# comments are ignored",
@@ -207,7 +207,7 @@ test("validates explicit and zero-input inline configurations", () => {
         { destination_type: "cidr", destination: "2001:db8::/64", protocol: "tcp", port: 443 },
       ],
       container_policy: "unsafe_preserve",
-      platform_profile: "github_hosted_workflow_bootstrap_v4",
+      platform_profile: "github_hosted_workflow_bootstrap_v5",
       disable_broad_github_domains: true,
     }),
   );
@@ -230,7 +230,7 @@ test("validates explicit and zero-input inline configurations", () => {
   for (const nativeInput of [
     { invocationId: "native-run" },
     { containerPolicy: "disable" },
-    { platformProfile: "github_hosted_workflow_bootstrap_v4" },
+    { platformProfile: "github_hosted_workflow_bootstrap_v5" },
     { disableBroadGithubDomains: "true" },
     { allowlist: "example.com" },
   ]) {
@@ -336,7 +336,7 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
   assert.equal(details.mode, "block");
   assert.equal(details.source, "native inputs");
   assert.equal(details.containerPolicy, "disable");
-  assert.equal(details.platformProfile, "github_hosted_workflow_bootstrap_v4");
+  assert.equal(details.platformProfile, "github_hosted_workflow_bootstrap_v5");
   assert.equal(details.disableBroadGithubDomains, false);
   assert.equal(details.allowlistCount, 1);
   assert.deepEqual(details.allowlistDestinations, ["hostname:api.example.com:tcp:443"]);
@@ -849,8 +849,8 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
-    platform_profile_id: "github_hosted_workflow_bootstrap_v4",
-    profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v4",
+    platform_profile_id: "github_hosted_workflow_bootstrap_v5",
+    profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
     policy_hash_schema_version: report.policy_hash_schema_version,
     policy_hash: report.policy_hash,
     base_ruleset_hash: report.base_ruleset_hash,
@@ -861,8 +861,8 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
-    platform_profile_id: "github_hosted_workflow_bootstrap_v4",
-    profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v4",
+    platform_profile_id: "github_hosted_workflow_bootstrap_v5",
+    profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
     policy_hash_schema_version: report.policy_hash_schema_version,
     policy_hash: report.policy_hash,
     base_ruleset_hash: report.base_ruleset_hash,

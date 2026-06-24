@@ -100,11 +100,11 @@ const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.wi
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
 const MAX_USER_WILDCARD_AUTHORIZATIONS = 8;
 const MAX_USER_WILDCARD_PREFIX_LABELS = 2;
-const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v4";
+const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v5";
 const PROFILE_REALIZATIONS = new Map([
-  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_provenance_v4"],
+  [REVIEWED_PLATFORM_PROFILE, "github_hosted_workflow_bootstrap_dns_provenance_v5"],
 ]);
-const POLICY_HASH_SCHEMA_VERSION = 8;
+const POLICY_HASH_SCHEMA_VERSION = 9;
 const RUNTIME_EVIDENCE_SCHEMA_VERSION = 5;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;

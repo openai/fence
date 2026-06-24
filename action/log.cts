@@ -120,7 +120,7 @@ function configLogDetails(rawConfig: string, usingDefault: boolean): ConfigLogDe
         : "disable",
     platformProfile: typeof parsed.platform_profile === "string"
       ? parsed.platform_profile
-      : "github_hosted_workflow_bootstrap_v4",
+      : "github_hosted_workflow_bootstrap_v5",
     disableBroadGithubDomains: parsed.disable_broad_github_domains === true,
     allowlistCount: allowlist.length,
     allowlistDestinations: allowlist.map(formatAllowlistEntry).filter((value: unknown) => typeof value === "string"),
