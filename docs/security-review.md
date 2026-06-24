@@ -298,10 +298,7 @@ compile TypeScript at workflow runtime. See Node's
 - [Azure documents `168.63.129.16`](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16)
   as its fixed platform virtual address for DNS, VM-agent, and health
   communication. Fence permits its root-resident DNS mediator to reach UDP `53`
-  and UID `0` host traffic to reach WireServer TCP `80` and `32526`. The latter
-  is a dedicated platform-service rule class, not a workflow or user allowance.
-  Unprivileged and forwarded traffic does not match it, and Azure IMDS at
-  `169.254.169.254` remains blocked.
+  and UID `0` host traffic to reach WireServer TCP `80` and `32526`. The latter is a dedicated platform-service rule class, not a workflow or user allowance. Unprivileged and forwarded traffic does not match it. A separate shared platform rule permits host and forwarded traffic to Azure IMDS at `169.254.169.254` on TCP `80` only.
 - Any root-owned host process can use the two WireServer ports. Standard block
   relies on verified sudo and container lockdown to prevent later workflow code
   from obtaining UID `0`; degraded block and audit already disclaim ordinary

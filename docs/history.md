@@ -107,5 +107,6 @@ See [`v0.md`](v0.md) for normative behavior and
   WireServer ports. The next profile version added exact UID `0` TCP `80` and
   `32526` rules for `168.63.129.16` as a dedicated platform-service class while
   leaving workflow traffic and Azure IMDS blocked.
+- A later profile revision added an exact shared TCP `80` rule for Azure IMDS at `169.254.169.254`, with structural active-state verification and an updated logical policy-hash schema. No other IMDS port is part of the platform contract.
 
 Future release details belong in GitHub Releases rather than this document.

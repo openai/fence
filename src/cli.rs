@@ -292,6 +292,10 @@ mod tests {
                 "retired-workflow-bootstrap-v3.json",
                 "github_hosted_workflow_bootstrap_v3",
             ),
+            (
+                "retired-workflow-bootstrap-v4.json",
+                "github_hosted_workflow_bootstrap_v4",
+            ),
         ] {
             let config = root.join(name);
             std::fs::write(
@@ -344,7 +348,7 @@ mod tests {
         assert!(
             output
                 .json
-                .contains("\"id\":\"github_hosted_workflow_bootstrap_v4\"")
+                .contains("\"id\":\"github_hosted_workflow_bootstrap_v5\"")
         );
         assert!(
             output

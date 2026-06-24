@@ -546,6 +546,9 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
         "fence:allowance" => parse_allowance_rule(chain, expressions),
         "fence:dns_mediator_upstream" => parse_dns_mediator_upstream_rule(chain, expressions),
         "fence:wireserver_platform" => parse_wireserver_platform_rule(chain, expressions),
+        "fence:instance_metadata_platform" => {
+            parse_instance_metadata_platform_rule(chain, expressions)
+        }
         "fence:violation" if is_exact_jump_rule(expressions, NFT_VIOLATION_CHAIN) => {
             Ok(OwnedRule::ViolationDispatch { chain })
         }
@@ -644,6 +647,37 @@ fn parse_wireserver_platform_rule(
     Ok(OwnedRule::WireServerPlatform {
         chain,
         uid: crate::platform_profile::AZURE_WIRESERVER_ROOT_UID,
+        destination,
+        protocol,
+        port,
+    })
+}
+
+fn parse_instance_metadata_platform_rule(
+    chain: String,
+    expressions: &[Value],
+) -> Result<OwnedRule, BackendError> {
+    if expressions.len() != 3 || !is_exact_verdict(&expressions[2], "accept") {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "instance metadata platform rule does not have the exact expected expression shape",
+        ));
+    }
+    let (address_family, destination) = extract_destination(&expressions[..1])?;
+    let (protocol, port) = extract_transport(&expressions[1..2])?;
+    if chain != NFT_CLASSIFY_CHAIN
+        || address_family != "ip"
+        || destination != crate::platform_profile::AZURE_INSTANCE_METADATA_ADDRESS
+        || protocol != "tcp"
+        || port != crate::platform_profile::AZURE_INSTANCE_METADATA_TCP_PORT
+    {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "instance metadata platform rule does not match its fixed destination",
+        ));
+    }
+    Ok(OwnedRule::InstanceMetadataPlatform {
+        chain,
         destination,
         protocol,
         port,
@@ -1311,6 +1345,67 @@ mod tests {
             parse_wireserver_platform_rule(
                 NFT_CLASSIFY_CHAIN.to_owned(),
                 &expressions.as_array().unwrap()[..3]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_only_exact_shared_instance_metadata_platform_rule() {
+        let expressions = json!([
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "169.254.169.254"}},
+            {"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": 80}},
+            {"accept": null}
+        ]);
+        assert!(matches!(
+            parse_instance_metadata_platform_rule(
+                NFT_CLASSIFY_CHAIN.to_owned(),
+                expressions.as_array().unwrap()
+            )
+            .unwrap(),
+            OwnedRule::InstanceMetadataPlatform { port: 80, .. }
+        ));
+        let serialized = json!({
+            "chain": NFT_CLASSIFY_CHAIN,
+            "comment": "fence:instance_metadata_platform",
+            "expr": expressions.clone(),
+        });
+        assert!(matches!(
+            parse_rule(&serialized).unwrap(),
+            OwnedRule::InstanceMetadataPlatform { port: 80, .. }
+        ));
+
+        for (index, replacement) in [
+            (
+                0,
+                json!({"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "168.63.129.16"}}),
+            ),
+            (
+                1,
+                json!({"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "op": "==", "right": 80}}),
+            ),
+            (
+                1,
+                json!({"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": 443}}),
+            ),
+        ] {
+            let mut bad = expressions.as_array().unwrap().clone();
+            bad[index] = replacement;
+            assert!(
+                parse_instance_metadata_platform_rule(NFT_CLASSIFY_CHAIN.to_owned(), &bad).is_err()
+            );
+        }
+        assert!(
+            parse_instance_metadata_platform_rule(
+                NFT_OUTPUT_CHAIN.to_owned(),
+                expressions.as_array().unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            parse_instance_metadata_platform_rule(
+                NFT_CLASSIFY_CHAIN.to_owned(),
+                &expressions.as_array().unwrap()[..2]
             )
             .is_err()
         );

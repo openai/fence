@@ -438,9 +438,9 @@ require(report["mode"] == expected["mode"])
 require(report["setup_status"] == expected["resident"])
 require(report["readiness_status"] == expected["ready"])
 require(report["protection_available"] is expected["protection_available"])
-require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
-require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
-require(report["policy_hash_schema_version"] == 8)
+require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v5")
+require(report["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v5")
+require(report["policy_hash_schema_version"] == 9)
 require(re.fullmatch(r"[0-9a-f]{64}", report["policy_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["base_ruleset_hash"]))
 require(re.fullmatch(r"[0-9a-f]{64}", report["ruleset_hash"]))
@@ -469,9 +469,9 @@ require(ready["status"] == expected["ready"])
 require(ready["runtime_evidence_schema_version"] == 5)
 require(ready["mode"] == expected["mode"])
 require(ready["protection_available"] is expected["protection_available"])
-require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
-require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
-require(ready["policy_hash_schema_version"] == 8)
+require(ready["platform_profile_id"] == "github_hosted_workflow_bootstrap_v5")
+require(ready["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v5")
+require(ready["policy_hash_schema_version"] == 9)
 require(ready["policy_hash"] == report["policy_hash"])
 require(ready["base_ruleset_hash"] == report["base_ruleset_hash"])
 require(ready["resident_health"]["resident_pid"] == resident["resident_pid"])
@@ -479,8 +479,8 @@ require(dns["status"] == expected["status"])
 require(dns["runtime_evidence_schema_version"] == 5)
 require(dns["mode"] == expected["mode"])
 require(dns["protection_available"] is expected["protection_available"])
-require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v4")
-require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v4")
+require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v5")
+require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v5")
 require(dns["proxy_policy_status"] == (
     "audit_forwards_while_simulating_name_authorization"
     if scenario == "audit"
@@ -520,6 +520,7 @@ else:
     require("runner_authorized_results_storage_accounts_remain_egress_channels" in report["limitations"])
     require("static_results_storage_compatibility_account_remains_an_egress_channel" in report["limitations"])
     require("root_resident_dns_upstream_channel_remains_an_egress_limitation" in report["limitations"])
+    require("azure_instance_metadata_tcp_80_remains_an_egress_channel" in report["limitations"])
     if scenario == "standard-opt-out":
         require("dynamic_githubapp_suffix_authorization_disabled" in report["limitations"])
     else:
@@ -586,7 +587,6 @@ else:
 for address, port in [
     ("168.63.129.16", 80),
     ("168.63.129.16", 32526),
-    ("169.254.169.254", 80),
 ]:
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(2)
@@ -598,6 +598,15 @@ for address, port in [
         raise SystemExit(f"workflow process unexpectedly connected to {address}:{port}")
     finally:
         sock.close()
+
+metadata = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+metadata.settimeout(2)
+try:
+    metadata.connect(("169.254.169.254", 80))
+except OSError as error:
+    raise SystemExit(f"workflow process could not connect to 169.254.169.254:80: {error}")
+finally:
+    metadata.close()
 PY
 fi
 

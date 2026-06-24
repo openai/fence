@@ -91,7 +91,7 @@ fn renders_deterministic_plan_without_creating_runtime_state() {
     assert_eq!(first, second);
     assert_eq!(first["data"]["application_status"], "not_applied");
     assert_eq!(first["data"]["verification_status"], "not_verified");
-    assert_eq!(first["data"]["policy_hash_schema_version"], 8);
+    assert_eq!(first["data"]["policy_hash_schema_version"], 9);
     assert_eq!(
         first["data"]["network_enforcement_preview"]["owned_table"]["name"],
         "fence_v0"
@@ -124,8 +124,8 @@ fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
     let profile = &response["data"]["platform_profile"];
     let dns = &profile["dns_mediated_compatibility"];
 
-    assert_eq!(response["data"]["policy_hash_schema_version"], 8);
-    assert_eq!(profile["id"], "github_hosted_workflow_bootstrap_v4");
+    assert_eq!(response["data"]["policy_hash_schema_version"], 9);
+    assert_eq!(profile["id"], "github_hosted_workflow_bootstrap_v5");
     assert_eq!(profile["selection_status"], "default_bounded_dns_mediated");
     assert_eq!(
         dns["realization_status"],
@@ -157,6 +157,15 @@ fn renders_default_bounded_workflow_bootstrap_profile_without_activation() {
             }
         ])
     );
+    assert_eq!(
+        dns["shared_platform_service_permissions"],
+        serde_json::json!([{
+            "subject": "host_and_forwarded_traffic",
+            "destination": "169.254.169.254",
+            "protocol": "tcp",
+            "port": 80
+        }])
+    );
     assert_eq!(runtime_path.exists(), existed_before);
 }
 
@@ -173,7 +182,7 @@ fn renders_wildcard_hostname_policy_without_resolving_it() {
     let response = success_json(&["render-plan", "--config", path.to_str().unwrap()]);
     let data = &response["data"];
 
-    assert_eq!(data["policy_hash_schema_version"], 8);
+    assert_eq!(data["policy_hash_schema_version"], 9);
     assert_eq!(data["frozen_resolution_results"], serde_json::json!([]));
     assert_eq!(data["effective_policy"], serde_json::json!([]));
     assert_eq!(
@@ -268,6 +277,10 @@ fn retired_platform_profiles_are_structured_errors() {
         (
             "retired-workflow-bootstrap-v3.json",
             "github_hosted_workflow_bootstrap_v3",
+        ),
+        (
+            "retired-workflow-bootstrap-v4.json",
+            "github_hosted_workflow_bootstrap_v4",
         ),
     ] {
         let config = config_file(
