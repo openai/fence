@@ -481,7 +481,7 @@ test("recognizes terminal service state and only bounded structured Fence error 
     schema_version: 1,
     command: "run",
     status: "error",
-    fence_version: "0.6.0",
+    fence_version: "0.6.1",
     error: {
       code: "invalid_platform_profile",
       message: "protected lifecycle setup failed",
