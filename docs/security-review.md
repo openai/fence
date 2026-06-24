@@ -107,14 +107,7 @@ a bounded regular file.
 
 ### Exact hosted sudo-policy variants
 
-Fresh hosted evidence showed a second exact digest for the fixed
-`90-cloud-init-users` sudo-policy source. Four independent hosted VMs matched
-that digest while ten matched the previously accepted variant; after excluding
-non-enforced volatile device, inode, PID, and start-time identifiers, the
-bounded observations were otherwise identical. The fingerprint accepts the
-new digest only as an additional exact value and retains the same source name,
-regular-file, ownership, mode, non-writability, marker, unit, socket, resolver,
-principal, and group checks.
+Fresh hosted evidence has shown additional exact digests for the fixed `90-cloud-init-users` sudo-policy source. During a later mixed image rollout, three independent hosted VMs on the new image matched one additional digest while a separate older-image control retained an already accepted variant; after excluding non-enforced volatile device, inode, PID, and start-time identifiers, the complete bounded observations were otherwise identical. The fingerprint accepts each observed digest only as an additional exact value and retains the same source name, regular-file, ownership, mode, non-writability, marker, unit, socket, resolver, principal, group, and local-control checks.
 
 ### Effective sudo and trusted-path access
 
@@ -188,20 +181,7 @@ attempt is rejected.
 
 ### Source-before-bundle host compatibility
 
-The published bundle exposes fingerprint schema `2`. Action acceptance
-recursively validates the bounded schema-`4` live observation and compares
-every enforced executable, ancestor, effective-access, resolver, sudo source,
-principal, group, unit, socket, workload, and local-control fact before
-destructive activation. The current transition set is empty, so the bundle
-must activate normally.
-
-A future immutable bundle may temporarily predate one newly reviewed
-hosted-runner sudo-policy digest even though source-built integration already
-accepts and tests that host shape. The classifier may skip activation only when
-all non-digest schema-`2` facts match and every mismatched digest is explicitly
-listed in the checked-in transition file. Malformed, incomplete, and unknown
-drift fails. After a refreshed bundle includes the digest, classification
-automatically returns to normal bundled activation.
+The published bundle exposes fingerprint schema `2`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, sudo source, principal, group, unit, socket, workload, and local-control fact before destructive activation. The checked-in bundle temporarily predates one newly source-accepted hosted-runner sudo-policy digest. The current source accepts that host shape, and source-built integration must prove normal activation before merge. The classifier may skip old-bundle activation only when all non-digest schema-`2` facts match and every mismatched digest is explicitly listed in the checked-in transition file. Malformed, incomplete, and unknown drift fails. The refreshed bundle must include the digest, remove the transition, and restore normal bundled activation before consumer handoff.
 
 ### Invocation slug consistency
 

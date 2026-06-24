@@ -33,8 +33,7 @@ See [`v0.md`](v0.md) for normative behavior and
 - Root-owned runtime storage, transient `systemd` supervision, five-second
   resident verification, readiness ordering, and pre-ready rollback were
   proved before public activation.
-- Later hosted evidence added a second exact reviewed digest for the fixed
-  cloud-init sudo-policy source without broadening any other fingerprint fact.
+- Later hosted evidence added additional exact accepted digests for the fixed cloud-init sudo-policy source without broadening any other fingerprint fact.
 - A bounded Action-acceptance classifier removed the source-before-bundle
   release deadlock while continuing to reject every unreviewed host drift.
 - The subsequent attested Action bundle refresh adopted profile v4, policy-hash

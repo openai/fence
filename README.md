@@ -238,14 +238,7 @@ claim. A separate daily fixed-label canary fails on fingerprint drift or a
 skipped bundle activation and verifies the zero-input standard lifecycle on
 the supported runner. Pin Fence to a full immutable commit SHA, not `@main`.
 
-Fence rejects activation when fixed privileged commands, their reviewed path
-ancestors, sudo policy, or the bounded root TCP/Unix and container inventory do
-not match the reviewed runner shape. Standard block permits only the expected
-removal of measured container-control state before readiness, then treats any
-later inventory change as critical drift. These checks rely on Fence running
-first on the trusted hosted image; they do not authenticate a command that was
-already modified by a compromised root or platform component before Fence
-started.
+Fence rejects activation when fixed privileged commands, their reviewed path ancestors, sudo-policy source identities, metadata, and exact accepted content digests, or the bounded root TCP/Unix and container inventory do not match the reviewed runner shape. Standard block permits only the expected removal of measured container-control state before readiness, then treats any later inventory change as critical drift. These checks rely on Fence running first on the trusted hosted image; they do not authenticate a command that was already modified by a compromised root or platform component before Fence started.
 
 Fence does not upload telemetry. When it records a blocked or would-block
 connection, it may add the local process ID, executable basename, actor class,

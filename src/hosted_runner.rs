@@ -304,6 +304,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV2 {
                     alternate_sha256: vec![
                         "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
                         "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d",
+                        "6183596cbb737cdcd4559ec8b04cf30e8e7cbe132184a5412500cafa225342e8",
                     ],
                     runner_nopasswd_markers: vec![],
                 },
@@ -496,7 +497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_v2_preserves_reviewed_host_facts_without_an_active_transition() {
+    fn fingerprint_v2_preserves_reviewed_host_facts_with_an_active_sudo_transition() {
         let requirement = hosted_runner_fingerprint_requirement();
 
         assert_eq!(requirement.schema_version, 2);
@@ -532,6 +533,7 @@ mod tests {
             vec![
                 "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
                 "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d",
+                "6183596cbb737cdcd4559ec8b04cf30e8e7cbe132184a5412500cafa225342e8",
             ]
         );
         assert_eq!(
@@ -549,7 +551,20 @@ mod tests {
         .unwrap();
         assert_eq!(transitions["schema_version"], 1);
         let transitions = transitions["transitions"].as_array().unwrap();
-        assert!(transitions.is_empty());
+        assert_eq!(transitions.len(), 1);
+        for transition in transitions {
+            let source = requirement
+                .accepted
+                .sudo_policy_sources
+                .iter()
+                .find(|source| {
+                    transition["path_class"] == source.path_class
+                        && transition["name"] == source.name
+                })
+                .unwrap();
+            let digest = transition["sha256"].as_str().unwrap();
+            assert!(digest == source.sha256 || source.alternate_sha256.contains(&digest));
+        }
     }
 
     #[test]
