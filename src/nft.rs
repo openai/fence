@@ -838,14 +838,17 @@ mod tests {
         assert!(verify_owned_state(&expected, &missing_metadata).is_err());
 
         let mut broadened_metadata = expected.clone();
-        let metadata = broadened_metadata
+        let index = broadened_metadata
             .rules
-            .iter_mut()
-            .find(|rule| matches!(rule, OwnedRule::InstanceMetadataPlatform { .. }))
+            .iter()
+            .position(|rule| matches!(rule, OwnedRule::InstanceMetadataPlatform { .. }))
             .unwrap();
-        if let OwnedRule::InstanceMetadataPlatform { port, .. } = metadata {
-            *port = 443;
-        }
+        broadened_metadata.rules[index] = OwnedRule::InstanceMetadataPlatform {
+            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            destination: AZURE_INSTANCE_METADATA_ADDRESS.to_owned(),
+            protocol: "tcp".to_owned(),
+            port: 443,
+        };
         assert!(verify_owned_state(&expected, &broadened_metadata).is_err());
     }
 
