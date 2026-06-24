@@ -144,6 +144,8 @@ const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
 const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
 const DOCKER_DAEMON_PATH: &str = "/etc/docker/daemon.json";
 const DNS_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+const STARTUP_PREHYDRATION_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_PREHYDRATION_MAX_ATTEMPTS: usize = 3;
 const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
@@ -3253,9 +3255,15 @@ impl PrehydrationError {
 fn prehydrate_exact_hostnames(
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
+    let deadline = Instant::now() + STARTUP_PREHYDRATION_TIMEOUT;
     let mut materializations = Vec::new();
-    for entry in &hostname_policy.exact {
-        match prehydrate_exact_hostname(entry, hostname_policy) {
+    for entry in startup_prehydration_entries(hostname_policy) {
+        let result = if is_optional_platform_hostname_entry(entry) {
+            prehydrate_exact_hostname(entry, hostname_policy)
+        } else {
+            prehydrate_exact_hostname_for_startup(entry, hostname_policy, deadline)
+        };
+        match result {
             Ok(hostname_materializations) => materializations.extend(hostname_materializations),
             Err(PrehydrationError::Transient(_)) if is_optional_platform_hostname_entry(entry) => {}
             Err(error) => return Err(error),
@@ -3275,21 +3283,103 @@ fn is_optional_platform_hostname_entry(entry: &ExactHostnamePolicy) -> bool {
         && entry.origins.as_slice() == [HostnamePolicyOrigin::Platform]
 }
 
+fn startup_prehydration_entries(
+    hostname_policy: &RuntimeHostnamePolicy,
+) -> impl Iterator<Item = &ExactHostnamePolicy> {
+    let required = hostname_policy
+        .exact
+        .iter()
+        .filter(|entry| !is_optional_platform_hostname_entry(entry));
+    let optional = hostname_policy
+        .exact
+        .iter()
+        .filter(|entry| is_optional_platform_hostname_entry(entry));
+    required.chain(optional)
+}
+
+fn prehydrate_exact_hostname_for_startup(
+    entry: &ExactHostnamePolicy,
+    hostname_policy: &RuntimeHostnamePolicy,
+    deadline: Instant,
+) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
+    prehydrate_exact_hostname_for_startup_with_query(
+        entry,
+        hostname_policy,
+        deadline,
+        query_fixed_upstream_for_prehydration_with_timeout,
+    )
+}
+
+fn prehydrate_exact_hostname_for_startup_with_query<F>(
+    entry: &ExactHostnamePolicy,
+    hostname_policy: &RuntimeHostnamePolicy,
+    deadline: Instant,
+    mut query: F,
+) -> Result<Vec<PendingMaterialization>, PrehydrationError>
+where
+    F: FnMut(&str, u16, Duration) -> Result<Vec<u8>, PrehydrationQueryError>,
+{
+    let mut last_transient = None;
+    for _ in 0..STARTUP_PREHYDRATION_MAX_ATTEMPTS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let result =
+            prehydrate_exact_hostname_with_query(entry, hostname_policy, |hostname, query_type| {
+                let timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(DNS_FORWARD_TIMEOUT);
+                if timeout.is_zero() {
+                    Err(PrehydrationQueryError::Transient)
+                } else {
+                    query(hostname, query_type, timeout)
+                }
+            });
+        match result {
+            Ok(materializations) => return Ok(materializations),
+            Err(PrehydrationError::Fatal(error)) => {
+                return Err(PrehydrationError::Fatal(error));
+            }
+            Err(PrehydrationError::Transient(error)) => last_transient = Some(error),
+        }
+    }
+    Err(PrehydrationError::Transient(last_transient.unwrap_or_else(
+        || {
+            DnsMediationError::new(
+                "dns_block_prehydration_failed",
+                "fixed DNS-mediated bootstrap prehydration exceeded its startup deadline",
+            )
+        },
+    )))
+}
+
 fn prehydrate_exact_hostname(
     entry: &ExactHostnamePolicy,
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
+    prehydrate_exact_hostname_with_query(
+        entry,
+        hostname_policy,
+        query_fixed_upstream_for_prehydration,
+    )
+}
+
+fn prehydrate_exact_hostname_with_query<F>(
+    entry: &ExactHostnamePolicy,
+    hostname_policy: &RuntimeHostnamePolicy,
+    mut query: F,
+) -> Result<Vec<PendingMaterialization>, PrehydrationError>
+where
+    F: FnMut(&str, u16) -> Result<Vec<u8>, PrehydrationQueryError>,
+{
     let hostname = &entry.hostname;
     let materializations = materializations_from_bootstrap_query_results(
         hostname,
         Instant::now(),
         hostname_policy,
-        [1_u16, 28_u16].map(|query_type| {
-            (
-                query_type,
-                query_fixed_upstream_for_prehydration(hostname, query_type),
-            )
-        }),
+        [1_u16, 28_u16]
+            .into_iter()
+            .map(|query_type| (query_type, query(hostname, query_type))),
     )?;
     if materializations.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
         return Err(PrehydrationError::Fatal(DnsMediationError::new(
@@ -3421,6 +3511,18 @@ fn query_fixed_upstream_for_prehydration(
     hostname: &str,
     query_type: u16,
 ) -> Result<Vec<u8>, PrehydrationQueryError> {
+    query_fixed_upstream_for_prehydration_with_timeout(hostname, query_type, DNS_FORWARD_TIMEOUT)
+}
+
+fn query_fixed_upstream_for_prehydration_with_timeout(
+    hostname: &str,
+    query_type: u16,
+    timeout: Duration,
+) -> Result<Vec<u8>, PrehydrationQueryError> {
+    let timeout = timeout.min(DNS_FORWARD_TIMEOUT);
+    if timeout.is_zero() {
+        return Err(PrehydrationQueryError::Transient);
+    }
     let query = canonical_dns_query(hostname, query_type, 0x0100).ok_or_else(|| {
         PrehydrationQueryError::Fatal(DnsMediationError::new(
             "dns_block_prehydration_failed",
@@ -3429,10 +3531,10 @@ fn query_fixed_upstream_for_prehydration(
     })?;
     let upstream = UdpSocket::bind("0.0.0.0:0").map_err(|_| PrehydrationQueryError::Transient)?;
     upstream
-        .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
+        .set_read_timeout(Some(timeout))
         .map_err(|_| PrehydrationQueryError::Transient)?;
     upstream
-        .set_write_timeout(Some(DNS_FORWARD_TIMEOUT))
+        .set_write_timeout(Some(timeout))
         .map_err(|_| PrehydrationQueryError::Transient)?;
     upstream
         .connect(UPSTREAM_DNS)
@@ -4869,7 +4971,7 @@ fn validate_dns_response_lineage(
     let mut edges = BTreeMap::<String, DnsCnameAnswer>::new();
     let retains_lineage = !records.addresses.is_empty();
     for alias in &records.aliases {
-        if alias.ttl_seconds == 0 || alias.owner == alias.target {
+        if alias.owner == alias.target {
             return Err(DnsResponseValidationError::Invalid);
         }
         match edges.entry(alias.owner.clone()) {
@@ -4897,8 +4999,10 @@ fn validate_dns_response_lineage(
         if !forbidden.insert(alias.target.clone()) {
             return Err(DnsResponseValidationError::Invalid);
         }
-        let edge_expiry =
-            now + Duration::from_secs(u64::from(alias.ttl_seconds.min(MAX_DYNAMIC_TTL_SECONDS)));
+        let edge_expiry = now
+            + Duration::from_secs(u64::from(
+                alias.ttl_seconds.clamp(1, MAX_DYNAMIC_TTL_SECONDS),
+            ));
         lineage_expiry =
             Some(lineage_expiry.map_or(edge_expiry, |existing| existing.min(edge_expiry)));
         let expiry = lineage_expiry.ok_or(DnsResponseValidationError::Invalid)?;
@@ -8217,7 +8321,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_address_ttl_caps_derived_authorization_lifetime() {
+    fn zero_ttl_address_or_cname_caps_derived_authorization_lifetime() {
         let now = Instant::now();
         let records = DnsAnswerRecords {
             aliases: vec![DnsCnameAnswer {
@@ -8240,6 +8344,71 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 1);
+        assert_eq!(
+            response.authorizations[0].1.expires_at,
+            now + Duration::from_secs(1)
+        );
+        assert_eq!(response.materializations[0].ttl_seconds, 1);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(1)));
+
+        let zero_middle_edge = DnsAnswerRecords {
+            aliases: vec![
+                DnsCnameAnswer {
+                    owner: "github.com".to_owned(),
+                    target: "first.example".to_owned(),
+                    ttl_seconds: 60,
+                },
+                DnsCnameAnswer {
+                    owner: "first.example".to_owned(),
+                    target: "terminal.example".to_owned(),
+                    ttl_seconds: 0,
+                },
+            ],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "terminal.example".to_owned(),
+                address: "192.0.2.37".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &zero_middle_edge,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
+        assert_eq!(response.authorizations.len(), 2);
+        assert!(
+            response
+                .authorizations
+                .iter()
+                .all(|(_, authorization)| authorization.observed_ttl_seconds == 1)
+        );
+        assert_eq!(response.materializations[0].ttl_seconds, 1);
+        assert_eq!(response.valid_until, Some(now + Duration::from_secs(1)));
+
+        let zero_cname = DnsAnswerRecords {
+            aliases: vec![DnsCnameAnswer {
+                owner: "github.com".to_owned(),
+                target: "short-lived.example".to_owned(),
+                ttl_seconds: 0,
+            }],
+            addresses: vec![DnsAddressAnswer {
+                hostname: "short-lived.example".to_owned(),
+                address: "192.0.2.36".parse().unwrap(),
+                ttl_seconds: 60,
+            }],
+        };
+        let response = validate_dns_response_lineage(
+            "github.com",
+            &zero_cname,
+            &CnameAuthorizationState::default(),
+            now,
+            &test_hostname_policy(false),
+        )
+        .unwrap();
         assert_eq!(response.authorizations[0].1.observed_ttl_seconds, 1);
         assert_eq!(
             response.authorizations[0].1.expires_at,
@@ -8715,14 +8884,6 @@ mod tests {
                     ttl_seconds: 60,
                 }],
                 addresses: vec![address("github.com")],
-            },
-            DnsAnswerRecords {
-                aliases: vec![DnsCnameAnswer {
-                    owner: "github.com".to_owned(),
-                    target: "edge.example".to_owned(),
-                    ttl_seconds: 0,
-                }],
-                addresses: vec![address("edge.example")],
             },
             DnsAnswerRecords {
                 aliases: vec![DnsCnameAnswer {
@@ -9404,6 +9565,22 @@ mod tests {
             &policy,
         )
         .unwrap();
+        let zero_ttl_cname_materializations = pending_materializations_from_bootstrap_response(
+            "github.com",
+            1,
+            &response_with_cname_and_address(
+                "github.com",
+                "zero-ttl-edge.example.net",
+                0,
+                120,
+                &[192, 0, 2, 21],
+            ),
+            now,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(zero_ttl_cname_materializations.len(), 1);
+        assert_eq!(zero_ttl_cname_materializations[0].ttl_seconds, 1);
         assert_eq!(
             pending_materializations_from_bootstrap_response(
                 "github.com",
@@ -9633,6 +9810,198 @@ mod tests {
             prehydration_error_code(&error),
             "dns_block_prehydration_failed"
         );
+    }
+
+    #[test]
+    fn startup_prehydration_retries_only_transient_failures_within_fixed_bounds() {
+        let policy = test_hostname_policy(false);
+        let entry = policy.exact_entry("github.com").unwrap().clone();
+        let mut watchdog = policy
+            .exact
+            .iter()
+            .find(|entry| is_optional_github_hosted_workflow_bootstrap_hostname(&entry.hostname))
+            .unwrap()
+            .clone();
+        assert!(is_optional_platform_hostname_entry(&watchdog));
+        let ordered = startup_prehydration_entries(&policy).collect::<Vec<_>>();
+        assert!(
+            ordered[..ordered.len() - 1]
+                .iter()
+                .all(|entry| !is_optional_platform_hostname_entry(entry))
+        );
+        assert!(is_optional_platform_hostname_entry(ordered.last().unwrap()));
+
+        watchdog.origins.push(HostnamePolicyOrigin::User);
+        assert!(!is_optional_platform_hostname_entry(&watchdog));
+        let mut user_required_policy = policy.clone();
+        *user_required_policy
+            .exact
+            .iter_mut()
+            .find(|entry| is_optional_github_hosted_workflow_bootstrap_hostname(&entry.hostname))
+            .unwrap() = watchdog;
+        assert!(
+            startup_prehydration_entries(&user_required_policy)
+                .all(|entry| !is_optional_platform_hostname_entry(entry))
+        );
+
+        assert!(matches!(
+            query_fixed_upstream_for_prehydration_with_timeout("github.com", 1, Duration::ZERO),
+            Err(PrehydrationQueryError::Transient)
+        ));
+        let deadline = Instant::now() + STARTUP_PREHYDRATION_TIMEOUT;
+        let mut retry_calls = 0;
+        let materializations = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |hostname, query_type, timeout| {
+                retry_calls += 1;
+                assert_eq!(hostname, "github.com");
+                assert!(!timeout.is_zero());
+                assert!(timeout <= DNS_FORWARD_TIMEOUT);
+                if retry_calls <= 2 || query_type == 28 {
+                    Err(PrehydrationQueryError::Transient)
+                } else {
+                    Ok(response_with_address("github.com", 1, 60, &[192, 0, 2, 10]))
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(retry_calls, 4);
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(
+            materializations[0].address,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))
+        );
+
+        let mut addressless_calls = 0;
+        let materializations = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |_, query_type, _| {
+                addressless_calls += 1;
+                if addressless_calls <= 2 {
+                    Ok(response_with_cname_for_type(
+                        "github.com",
+                        query_type,
+                        "nodata-edge.example",
+                        60,
+                    ))
+                } else if query_type == 1 {
+                    Ok(response_with_address("github.com", 1, 60, &[192, 0, 2, 11]))
+                } else {
+                    Err(PrehydrationQueryError::Transient)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(addressless_calls, 4);
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(
+            materializations[0].address,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11))
+        );
+
+        let mut zero_ttl_cname_calls = 0;
+        let materializations = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |_, query_type, _| {
+                zero_ttl_cname_calls += 1;
+                if query_type == 1 {
+                    Ok(response_with_cname_and_address(
+                        "github.com",
+                        "zero-ttl-edge.example.net",
+                        0,
+                        60,
+                        &[192, 0, 2, 13],
+                    ))
+                } else {
+                    Err(PrehydrationQueryError::Transient)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(zero_ttl_cname_calls, 2);
+        assert_eq!(materializations.len(), 1);
+        assert_eq!(materializations[0].ttl_seconds, 1);
+
+        let mut transient_calls = 0;
+        let error = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |_, _, _| {
+                transient_calls += 1;
+                Err(PrehydrationQueryError::Transient)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(transient_calls, STARTUP_PREHYDRATION_MAX_ATTEMPTS * 2);
+        assert!(matches!(error, PrehydrationError::Transient(_)));
+
+        let mut fatal_calls = 0;
+        let error = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |_, query_type, _| {
+                fatal_calls += 1;
+                if query_type == 1 {
+                    Err(PrehydrationQueryError::Fatal(DnsMediationError::new(
+                        "dns_block_prehydration_failed",
+                        "invalid fixed response",
+                    )))
+                } else {
+                    Err(PrehydrationQueryError::Transient)
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(fatal_calls, 1);
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
+
+        let mut invalid_response_calls = 0;
+        let error = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            deadline,
+            |_, query_type, _| {
+                invalid_response_calls += 1;
+                if query_type == 1 {
+                    Ok(response_with_unrelated_address(
+                        "github.com",
+                        1,
+                        "unrelated.example.net",
+                        &[192, 0, 2, 12],
+                    ))
+                } else {
+                    Err(PrehydrationQueryError::Transient)
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(invalid_response_calls, 1);
+        assert!(matches!(error, PrehydrationError::Fatal(_)));
+
+        let mut expired_calls = 0;
+        let expired_deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = prehydrate_exact_hostname_for_startup_with_query(
+            &entry,
+            &policy,
+            expired_deadline,
+            |_, _, _| {
+                expired_calls += 1;
+                Err(PrehydrationQueryError::Transient)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(expired_calls, 0);
+        assert!(matches!(error, PrehydrationError::Transient(_)));
     }
 
     #[test]
