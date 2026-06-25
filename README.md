@@ -22,6 +22,8 @@ Add Fence as the first step in a supported GitHub-hosted Linux job:
 That one line starts Fence in `block` mode with an empty user `allowlist`.
 Fence currently supports GitHub-hosted `ubuntu-24.04` x64 host jobs.
 
+Choose `<commit-sha>` from the `action_commit` field in the release's `action-release.json` asset. The `main` branch is source-only and intentionally does not contain a runnable production bundle. Each release-specific `vX.Y.Z` tag points to a signed generated distribution commit containing the reviewed wrapper plus the exact validated agent bundle, but consumers should still pin that distribution commit's full 40-character SHA instead of the tag.
+
 By default, Fence allows the GitHub domains needed for Actions job reporting.
 It also allows `github.com`, `api.github.com`,
 `release-assets.githubusercontent.com`, and the exact GitHub-hosted runner
@@ -40,7 +42,7 @@ Fence authorizes at most four exact results-storage hostnames, and only when
 the DNS request comes from the pinned GitHub runner process. It does not allow
 the general `*.blob.core.windows.net` domain.
 
-The hosted VM also depends on Azure platform services. The v5 profile permits only UID `0` host traffic to WireServer at `168.63.129.16` on TCP ports `80` and `32526`, separately from the user `allowlist` and GitHub workflow destinations. Unprivileged workflow traffic and forwarded container traffic do not match those rules. The profile also permits host and forwarded traffic to Azure IMDS at `169.254.169.254` on TCP `80`; no other IMDS port is allowed. The checked-in Action enforces the same contract through its attested bundled agent.
+The hosted VM also depends on Azure platform services. The v5 profile permits only UID `0` host traffic to WireServer at `168.63.129.16` on TCP ports `80` and `32526`, separately from the user `allowlist` and GitHub workflow destinations. Unprivileged workflow traffic and forwarded container traffic do not match those rules. The profile also permits host and forwarded traffic to Azure IMDS at `169.254.169.254` on TCP `80`; no other IMDS port is allowed. The released Action enforces the same contract through its attested bundled agent.
 
 ## Examples 🧪
 
@@ -226,11 +228,15 @@ runner-authorized results-storage account also becomes a reachable destination
 for the rest of the job; Fence records that authorization locally and limits it
 to TCP port `443`.
 
-Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The
-`ubuntu-latest` canary is useful signal, but it does not expand the support
-claim. A separate daily fixed-label canary fails on fingerprint drift or a
-skipped bundle activation and verifies the zero-input standard lifecycle on
-the supported runner. Pin Fence to a full immutable commit SHA, not `@main`.
+Fence supports only GitHub-hosted `ubuntu-24.04` x64 host jobs today. The `ubuntu-latest` canary is useful signal, but it does not expand the support claim. A separate daily fixed-label canary fails on fingerprint drift or a skipped bundle activation and verifies the zero-input standard lifecycle on the supported runner. Pin Fence to the full immutable `action_commit` SHA reported by the release, not `@main` or a version tag.
+
+## Release Provenance 🔏
+
+A reviewed pull request containing the code change and `Cargo.toml`/`Cargo.lock` version bump is the only human release authorization. After that pull request merges, the release workflow treats the signed merge commit as source commit `M`, builds and attests the Linux x64 artifact from `M`, and creates a GitHub-signed child distribution commit `D` whose sole parent is `M`. The only files added by `D` are `action/bin/fence` and the schema-`4` `action/bundle-manifest.json`.
+
+The release workflow runs the complete Action acceptance matrix and fixed-runner canary against `D` before publishing an immutable `vX.Y.Z` release whose tag targets `D`. The release's `action-release.json` asset maps the version, source commit `M`, distribution commit `D`, artifact digest, manifest schema, and release-workflow identity. Release assets remain attested to the reviewed source commit `M`; the generated commit records that source and signer digest without attempting to contain its own SHA.
+
+Fence never downloads the agent or policy at Action runtime. The committed bundle bytes are checksum-validated, copied into the protected root-owned launcher directory with executable mode, and launched only from that protected copy. Releases through `v0.6.3` retain their historical tag semantics; the generated distribution-commit model applies beginning with the first later release.
 
 Fence rejects activation when fixed privileged commands, their reviewed path ancestors, sudo-policy source identities, metadata, and exact accepted content digests, or the bounded root TCP/Unix and container inventory do not match the reviewed runner shape. Standard block permits only the expected removal of measured container-control state before readiness, then treats any later inventory change as critical drift. These checks rely on Fence running first on the trusted hosted image; they do not authenticate a command that was already modified by a compromised root or platform component before Fence started.
 
@@ -265,6 +271,8 @@ script/test
 script/lint
 script/build
 ```
+
+`script/assemble-action-bundle` is the offline-only path for constructing a production-shaped Action tree from an explicit artifact, version, source SHA, and output root. It verifies those inputs and writes only below the requested output root; it does not fetch a release, agent, attestation, or policy. Pull-request validation uses this path to test an ephemeral candidate without adding generated bundle files to `main`.
 
 Preparation downloads only the manifest, host components, and requested target
 libraries named in the checked-in Rust distribution lock. Each download is

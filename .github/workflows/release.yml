@@ -9,141 +9,224 @@ on:
 
 permissions: {}
 
+concurrency:
+  group: release
+  queue: max
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   prepare:
-    if: github.repository == 'grantbirki/fence'
+    if: github.repository == 'GrantBirki/fence'
     permissions:
       contents: read
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.version.outputs.version }}
-      version_tag: ${{ steps.version.outputs.version_tag }}
-      should_release: ${{ steps.version.outputs.should_release }}
-      source_date_epoch: ${{ steps.version.outputs.source_date_epoch }}
+      version: ${{ steps.release.outputs.version }}
+      version_tag: ${{ steps.release.outputs.version_tag }}
+      release_channel: ${{ steps.release.outputs.release_channel }}
+      should_release: ${{ steps.release.outputs.should_release }}
+      source_commit: ${{ steps.release.outputs.source_commit }}
+      source_date_epoch: ${{ steps.release.outputs.source_date_epoch }}
 
     steps:
-      - name: checkout
+      - name: checkout source commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
-      - name: validate locks
-        run: script/validate-locks --ci
+      - name: validate source state
+        run: |
+          script/validate-locks --ci
+          if [[ -e action/bin/fence || -e action/bundle-manifest.json ]]; then
+            echo "main must remain source-only; generated Action bundle files are release outputs" >&2
+            exit 1
+          fi
 
-      - name: determine version + tag
-        id: version
+      - name: determine release version and state
+        id: release
+        env:
+          BEFORE_COMMIT: ${{ github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          git fetch --tags --force
-
-          parse_package_version() {
-            awk '
-              function strip_comment(line, out, i, c, in_string, escaped) {
-                out = ""
-                in_string = 0
-                escaped = 0
-                for (i = 1; i <= length(line); i++) {
-                  c = substr(line, i, 1)
-                  if (escaped) {
-                    out = out c
-                    escaped = 0
-                    continue
-                  }
-                  if (c == "\\" && in_string) {
-                    out = out c
-                    escaped = 1
-                    continue
-                  }
-                  if (c == "\"") {
-                    in_string = !in_string
-                  }
-                  if (c == "#" && !in_string) {
-                    break
-                  }
-                  out = out c
-                }
-                return out
-              }
-
-              {
-                line = strip_comment($0)
-                if (line ~ /^[[:space:]]*\[[[:space:]]*package[[:space:]]*\][[:space:]]*$/) {
-                  in_package = 1
-                  next
-                }
-                if (line ~ /^[[:space:]]*\[/) {
-                  if (in_package) {
-                    exit
-                  }
-                  next
-                }
-                if (in_package && line ~ /^[[:space:]]*version[[:space:]]*=/) {
-                  if (match(line, /"[^"]+"/)) {
-                    print substr(line, RSTART + 1, RLENGTH - 2)
-                    exit
-                  }
-                }
-              }
-            ' "$1"
-          }
-
-          version="$(parse_package_version Cargo.toml)"
-          if [[ -z "$version" ]]; then
-            echo "could not parse version from Cargo.toml" >&2
+          if ! [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ "$(git rev-parse HEAD)" != "$SOURCE_COMMIT" ]]; then
+            echo "release source must be the exact full push commit" >&2
             exit 1
           fi
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "invalid package version in Cargo.toml: $version" >&2
-            exit 1
-          fi
-          version_tag="v${version}"
-          source_date_epoch="$(git log -1 --format=%ct HEAD)"
 
-          should_release="false"
-          if git cat-file -e "${{ github.event.before }}:Cargo.toml" 2>/dev/null; then
-            previous="$(git show "${{ github.event.before }}:Cargo.toml" | parse_package_version -)"
-            if [[ "$previous" != "$version" ]]; then
-              should_release="true"
-            fi
+          commit_metadata="$RUNNER_TEMP/source-commit.json"
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${SOURCE_COMMIT}" > "$commit_metadata"
+          python3 - "$SOURCE_COMMIT" "$commit_metadata" <<'PY'
+          import json
+          import sys
+
+          source, metadata_path = sys.argv[1:]
+          with open(metadata_path, encoding="utf-8") as handle:
+              commit = json.load(handle)
+          if commit.get("sha") != source:
+              raise SystemExit("source commit metadata mismatch")
+          verification = commit.get("commit", {}).get("verification", {})
+          if verification.get("verified") is not True:
+              raise SystemExit("release source commit must have a valid GitHub signature")
+          PY
+
+          previous_path="$RUNNER_TEMP/previous-Cargo.toml"
+          if git cat-file -e "${BEFORE_COMMIT}:Cargo.toml" 2>/dev/null; then
+            git show "${BEFORE_COMMIT}:Cargo.toml" > "$previous_path"
           else
-            echo "No prior Cargo.toml exists; establishing the initial version baseline without publishing a release."
+            : > "$previous_path"
           fi
+          release_list_path="$RUNNER_TEMP/published-releases.json"
+          gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$release_list_path"
 
-          if ! git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -qx "Cargo.toml"; then
-            should_release="false"
-          fi
+          python3 -B -E - Cargo.toml Cargo.lock "$previous_path" "$release_list_path" "$SOURCE_COMMIT" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
 
-          if git rev-parse "$version_tag" >/dev/null 2>&1; then
-            should_release="false"
-          fi
+          cargo_path, lock_path, previous_path, releases_path, source_commit, output_path = sys.argv[1:]
+          sys.path.insert(0, str(pathlib.Path("script/lib").resolve()))
+          from action_release import (
+              package_manifest_identity,
+              release_channel,
+              validate_release_order,
+              validate_root_versions,
+          )
 
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "version_tag=${version_tag}" >> "$GITHUB_OUTPUT"
-          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
-          echo "source_date_epoch=${source_date_epoch}" >> "$GITHUB_OUTPUT"
+          _, version = validate_root_versions(cargo_path, lock_path)
+          _, previous_version = package_manifest_identity(previous_path)
+          should_release = isinstance(previous_version, str) and previous_version != version
 
-          if [[ "$should_release" != "true" ]]; then
-            echo "No version bump detected; skipping release."
-            exit 0
-          fi
+          if should_release:
+              with open(releases_path, encoding="utf-8") as handle:
+                  pages = json.load(handle)
+              validate_release_order(version, pages)
+
+          channel = release_channel(version)
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"version={version}\n")
+              output.write(f"version_tag=v{version}\n")
+              output.write(f"release_channel={channel}\n")
+              output.write(f"should_release={'true' if should_release else 'false'}\n")
+              output.write(f"source_commit={source_commit}\n")
+          PY
+
+          source_date_epoch="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
+
+  wait-required-checks:
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: prepare
+    permissions:
+      checks: read
+      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+
+    steps:
+      - name: require all protected source checks on the exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          source_commit = os.environ["SOURCE_COMMIT"]
+          token = os.environ["GH_TOKEN"]
+          required = {
+              "build",
+              "coverage",
+              "lint (macos-14)",
+              "lint (ubuntu-24.04)",
+              "acceptance",
+              "action acceptance",
+              "integration",
+              "test (macos-14)",
+              "test (ubuntu-24.04)",
+          }
+          url = f"https://api.github.com/repos/{repository}/commits/{source_commit}/check-runs?per_page=100"
+          request = urllib.request.Request(
+              url,
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "User-Agent": "fence-release-check-gate",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          for attempt in range(120):
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  body = response.read(2 * 1024 * 1024 + 1)
+              if len(body) > 2 * 1024 * 1024:
+                  raise SystemExit("check-run response exceeded its fixed bound")
+              document = json.loads(body)
+              latest = {}
+              for check in document.get("check_runs", []):
+                  name = check.get("name")
+                  app = check.get("app") or {}
+                  if (
+                      name in required
+                      and check.get("head_sha") == source_commit
+                      and app.get("id") == 15368
+                      and app.get("slug") == "github-actions"
+                  ):
+                      if name not in latest or check.get("id", 0) > latest[name].get("id", 0):
+                          latest[name] = check
+              failed = sorted(
+                  name for name, check in latest.items()
+                  if check.get("status") == "completed" and check.get("conclusion") != "success"
+              )
+              if failed:
+                  raise SystemExit(f"required source checks failed closed: {', '.join(failed)}")
+              successful = {
+                  name for name, check in latest.items()
+                  if check.get("status") == "completed" and check.get("conclusion") == "success"
+              }
+              missing = sorted(required - successful)
+              if not missing:
+                  print(f"all nine required checks passed on {source_commit}")
+                  break
+              print(f"waiting for required checks: {', '.join(missing)}", flush=True)
+              if attempt == 119:
+                  raise SystemExit("timed out waiting for required source checks")
+              time.sleep(30)
+          PY
 
   build-linux-x64:
-    if: needs.prepare.outputs.should_release == 'true' && github.repository == 'grantbirki/fence'
-    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, wait-required-checks]
     permissions:
       contents: read
     runs-on: ubuntu-24.04
-    env:
-      BUILD_VERSION: ${{ needs.prepare.outputs.version_tag }}
-      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+    outputs:
+      artifact_name: ${{ steps.output.outputs.artifact_name }}
+      binary_name: ${{ steps.output.outputs.binary_name }}
+      artifact_sha256: ${{ steps.output.outputs.artifact_sha256 }}
 
     steps:
-      - name: checkout
+      - name: checkout source commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: require exact build checkout
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
 
       - name: validate locks
         run: script/validate-locks --ci
@@ -154,246 +237,1149 @@ jobs:
       - name: bootstrap
         run: script/bootstrap
 
-      - name: build Linux x64 release
-        run: script/build --release --targets "x86_64-unknown-linux-gnu"
-
-      - name: upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
-        with:
-          name: dist-linux-x64
-          path: dist/
-          retention-days: 5
-          if-no-files-found: error
-
-  release:
-    if: needs.prepare.outputs.should_release == 'true' && github.repository == 'grantbirki/fence'
-    needs: [prepare, build-linux-x64]
-    permissions:
-      contents: write
-    environment: release
-    concurrency:
-      group: release-${{ needs.prepare.outputs.version_tag }}
-      cancel-in-progress: false
-    runs-on: ubuntu-24.04
-    env:
-      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
-    outputs:
-      artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
-
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
-        with:
-          name: dist-linux-x64
-          path: dist/agent
-
-      - name: merge release artifacts
-        run: |
-          set -euo pipefail
-          rm -rf dist/merged
-          mkdir -p dist/merged
-
-          find dist/agent -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | while IFS= read -r -d '' file; do
-            cp "$file" dist/merged/
-          done
-
-          staging="dist/merged/staging"
-          rm -rf "$staging"
-          mkdir -p "$staging"
-
-          for file in dist/merged/*; do
-            case "$(basename "$file")" in
-              checksums.txt|*.tar.gz|staging) continue ;;
-            esac
-            if [[ -f "$file" ]]; then
-              base="$(basename "$file")"
-              binary_name="${base%%_v*}"
-              if [[ -z "$binary_name" || "$binary_name" == "$base" ]]; then
-                binary_name="$base"
-              fi
-              stage_dir="$staging/$base"
-              mkdir -p "$stage_dir"
-              cp "$file" "$stage_dir/$binary_name"
-              chmod +x "$stage_dir/$binary_name"
-              (
-                cd "$stage_dir"
-                tar --sort=name \
-                  --mtime="@${SOURCE_DATE_EPOCH}" \
-                  --owner=0 \
-                  --group=0 \
-                  --numeric-owner \
-                  -czf "../../${base}.tar.gz" .
-              )
-            fi
-          done
-          rm -rf "$staging"
-
-          (
-            cd dist/merged
-            if command -v shasum >/dev/null 2>&1; then
-              find . -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | sort -z | xargs -0 shasum -a 256 > checksums.txt
-            else
-              find . -maxdepth 1 -type f ! -name 'checksums.txt' -print0 | sort -z | xargs -0 sha256sum > checksums.txt
-            fi
-          )
-
-      - name: show artifact sizes
-        run: |
-          set -euo pipefail
-          echo "Release artifacts (dist/merged):"
-          ls -lah dist/merged
-
-      - name: publish immutable release with assets
+      - name: build Linux x64 release once
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+          BUILD_VERSION: ${{ needs.prepare.outputs.version_tag }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+        run: script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$RUNNER_TEMP/fence-release-dist"
+
+      - name: record exact release artifact
+        id: output
+        env:
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
         run: |
           set -euo pipefail
-          tag="$RELEASE_TAG"
-          mapfile -d '' files < <(find dist/merged -maxdepth 1 -type f -print0)
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "No release files found in dist/merged"
+          binary_name="fence_${VERSION_TAG}_linux-amd64"
+          artifact="$RUNNER_TEMP/fence-release-dist/$binary_name"
+          if [[ ! -f "$artifact" || -L "$artifact" || ! -x "$artifact" ]]; then
+            echo "expected release artifact is missing or invalid: $artifact" >&2
             exit 1
           fi
-          release_args=(--title "$tag" --notes "Release $tag" --target "${{ github.sha }}")
-          if [[ "$tag" == *-* ]]; then
-            release_args+=(--prerelease)
-          fi
-          gh release create "$tag" "${files[@]}" "${release_args[@]}"
+          artifact_sha256="$(sha256sum "$artifact" | awk '{print $1}')"
+          echo "artifact_name=release-binary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "binary_name=$binary_name" >> "$GITHUB_OUTPUT"
+          echo "artifact_sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
 
-      - name: upload artifact
+      - name: upload exact Linux x64 artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
-        id: upload-artifact
         with:
-          name: dist
-          path: dist/merged/
+          name: ${{ steps.output.outputs.artifact_name }}
+          path: ${{ runner.temp }}/fence-release-dist/${{ steps.output.outputs.binary_name }}
           retention-days: 5
           if-no-files-found: error
 
-  sign:
-    needs: release
-    runs-on: ubuntu-24.04
+  create-candidate:
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, build-linux-x64]
     permissions:
-      id-token: write
-      attestations: write
-      contents: read
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
-        with:
-          artifact-ids: ${{ needs.release.outputs.artifact-id }}
-          path: "dist/"
-
-      - name: attest build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # pin@v4.1.0
-        with:
-          subject-path: "dist/"
-
-  verify:
-    permissions:
-      contents: read
+      actions: read
+      contents: write
+    environment: release
     runs-on: ubuntu-24.04
-    needs: [prepare, release, sign]
+    outputs:
+      action_commit: ${{ steps.candidate.outputs.action_commit }}
+      candidate_branch: ${{ steps.candidate.outputs.candidate_branch }}
+      candidate_branch_created: ${{ steps.candidate.outputs.candidate_branch_created }}
+      candidate_created: ${{ steps.candidate.outputs.candidate_created }}
+      candidate_verified: ${{ steps.candidate.outputs.candidate_verified }}
+      existing_release: ${{ steps.candidate.outputs.existing_release }}
+      state_run_attempt: ${{ steps.candidate.outputs.state_run_attempt }}
+
     steps:
-      - name: verify published release assets
+      - name: checkout source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: require exact candidate source checkout
         env:
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.event.repository.name }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
-          SOURCE_COMMIT: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+
+      - name: download exact Linux x64 artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.build-linux-x64.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-binary
+
+      - name: create or reuse signed distribution commit
+        id: candidate
+        env:
+          ARTIFACT_SHA256: ${{ needs.build-linux-x64.outputs.artifact_sha256 }}
+          BINARY_NAME: ${{ needs.build-linux-x64.outputs.binary_name }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.release_channel }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
         run: |
           set -euo pipefail
+          echo "state_run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          artifact="$RUNNER_TEMP/release-binary/$BINARY_NAME"
+          candidate_root="$RUNNER_TEMP/distribution-candidate"
+          script/assemble-action-bundle \
+            --artifact "$artifact" \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output-root "$candidate_root"
+          script/validate-action-bundle --root "$candidate_root"
+          if [[ "$(sha256sum "$artifact" | awk '{print $1}')" != "$ARTIFACT_SHA256" ]]; then
+            echo "downloaded build artifact digest changed" >&2
+            exit 1
+          fi
 
-          tag="$RELEASE_TAG"
-          release_metadata="$(gh release view "$tag" --repo "${OWNER}/${REPO}" --json tagName,targetCommitish,isPrerelease,isDraft,isImmutable)"
-          python3 - "$tag" "$SOURCE_COMMIT" "$release_metadata" <<'PY'
+          branch="release-candidate/${VERSION_TAG}"
+          candidate_branch=""
+          candidate_branch_created=false
+          candidate_created=false
+          action_commit=""
+          existing_release=false
+          draft_commit=""
+          mapping_path=""
+          release_probe="$RUNNER_TEMP/release-probe.json"
+          release_state="$(python3 -B -E script/lib/action_release.py probe-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --version-tag "$VERSION_TAG" \
+            --output "$release_probe")"
+          case "$release_state" in
+            published)
+              existing_release=true
+              mapping_dir="$RUNNER_TEMP/existing-release-mapping"
+              mkdir -p "$mapping_dir"
+              gh release download "$VERSION_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --pattern action-release.json \
+                --dir "$mapping_dir"
+              mapping_path="$mapping_dir/action-release.json"
+              ;;
+            draft)
+              draft_commit="$(python3 - "$release_probe" <<'PY'
           import json
           import re
           import sys
-
-          tag, source_commit, raw_release = sys.argv[1:]
-          release = json.loads(raw_release)
-          if release["tagName"] != tag:
-              raise SystemExit("published release tag mismatch")
-          if release["targetCommitish"] != source_commit or not re.fullmatch(r"[0-9a-f]{40}", source_commit):
-              raise SystemExit("published release source commit mismatch")
-          if release["isDraft"] is not False:
-              raise SystemExit("published release must not be a draft")
-          if release["isImmutable"] is not True:
-              raise SystemExit("published release must be immutable")
-          if release["isPrerelease"] is not ("-" in tag):
-              raise SystemExit("published release channel mismatch")
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              release = json.load(handle)
+          target = release.get("target_commitish")
+          if not isinstance(target, str) or not re.fullmatch(r"[0-9a-f]{40}", target):
+              raise SystemExit("draft release target must be an exact distribution commit")
+          print(target)
           PY
+              )"
+              ;;
+            absent)
+              ;;
+            *)
+              echo "unsupported release probe state: $release_state" >&2
+              exit 1
+              ;;
+          esac
 
-          tag_commit="$(gh api "repos/${OWNER}/${REPO}/commits/${tag}" --jq '.sha')"
-          if [[ "$tag_commit" != "$SOURCE_COMMIT" ]]; then
-            echo "published release tag does not resolve to the source commit" >&2
+          tag_refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${VERSION_TAG}")"
+          tag_exists="$(python3 - "$tag_refs" "refs/tags/$VERSION_TAG" <<'PY'
+          import json
+          import sys
+          refs = [item for item in json.loads(sys.argv[1]) if item.get("ref") == sys.argv[2]]
+          if len(refs) > 1:
+              raise SystemExit("duplicate exact release tag refs")
+          print("true" if refs else "false")
+          PY
+          )"
+          tag_commit=""
+          if [[ "$tag_exists" == "true" ]]; then
+            tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
+          fi
+
+          branch_refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/heads/${branch}")"
+          branch_head="$(python3 - "$branch_refs" "refs/heads/$branch" <<'PY'
+          import json
+          import sys
+          refs = [item for item in json.loads(sys.argv[1]) if item.get("ref") == sys.argv[2]]
+          if len(refs) > 1:
+              raise SystemExit("duplicate exact candidate refs")
+          print(refs[0]["object"]["sha"] if refs else "")
+          PY
+          )"
+
+          verified_branch="release-verified/${VERSION_TAG}"
+          verified_refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/heads/${verified_branch}")"
+          verified_head="$(python3 - "$verified_refs" "refs/heads/$verified_branch" <<'PY'
+          import json
+          import sys
+          refs = [item for item in json.loads(sys.argv[1]) if item.get("ref") == sys.argv[2]]
+          if len(refs) > 1:
+              raise SystemExit("duplicate exact verification marker refs")
+          print(refs[0]["object"]["sha"] if refs else "")
+          PY
+          )"
+
+          verification_succeeded=""
+          if [[ "$existing_release" == "true" && -n "$branch_head" && -z "$verified_head" ]]; then
+            verification_succeeded="$(python3 - "$GITHUB_REPOSITORY" "$SOURCE_COMMIT" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          repository, source_commit, current_run, current_attempt_raw = sys.argv[1:]
+          try:
+              current_attempt = int(current_attempt_raw)
+          except ValueError:
+              raise SystemExit("current release run attempt is invalid") from None
+          if current_attempt < 1:
+              raise SystemExit("current release run attempt is invalid")
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "User-Agent": "fence-release-history",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def get_json(url):
+              request = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      body = response.read(4 * 1024 * 1024 + 1)
+              except urllib.error.HTTPError as error:
+                  raise SystemExit(f"release-history probe failed with HTTP {error.code}") from None
+              except (OSError, urllib.error.URLError) as error:
+                  raise SystemExit(f"release-history probe was indeterminate: {error}") from None
+              if len(body) > 4 * 1024 * 1024:
+                  raise SystemExit("release-history response exceeded its fixed bound")
+              return json.loads(body)
+
+          query = urllib.parse.urlencode({"head_sha": source_commit, "event": "push", "per_page": 100})
+          runs = get_json(
+              f"https://api.github.com/repos/{repository}/actions/workflows/release.yml/runs?{query}"
+          ).get("workflow_runs", [])
+          prior_runs = [
+              run for run in runs
+              if run.get("head_sha") == source_commit
+              and run.get("event") == "push"
+          ]
+          if len(prior_runs) > 20:
+              raise SystemExit("release verification history exceeded its fixed run bound")
+          verification_succeeded = False
+          publication_attempted = False
+          attempt_queries = 0
+          for run in prior_runs:
+              run_attempt = run.get("run_attempt")
+              if not isinstance(run_attempt, int) or run_attempt < 1:
+                  raise SystemExit("release workflow history is missing its run attempt")
+              last_attempt = current_attempt - 1 if str(run.get("id")) == current_run else run_attempt
+              for attempt in range(1, last_attempt + 1):
+                  attempt_queries += 1
+                  if attempt_queries > 20:
+                      raise SystemExit("release verification history exceeded its fixed attempt bound")
+                  jobs = get_json(
+                      f"https://api.github.com/repos/{repository}/actions/runs/{run['id']}/attempts/{attempt}/jobs?per_page=100"
+                  )
+                  job_list = jobs.get("jobs", [])
+                  if jobs.get("total_count") != len(job_list):
+                      raise SystemExit("release verification attempt exceeded one bounded page")
+                  for job in job_list:
+                      name = job.get("name")
+                      conclusion = job.get("conclusion")
+                      if name == "verify-release" and conclusion == "success":
+                          verification_succeeded = True
+                      if name == "verify-release" and conclusion not in (None, "skipped"):
+                          publication_attempted = True
+                      if name == "publish" and conclusion not in (None, "skipped"):
+                          publication_attempted = True
+          if verification_succeeded:
+              print("true")
+          elif publication_attempted:
+              print("false")
+          else:
+              raise SystemExit("release verification history is indeterminate")
+          PY
+            )"
+          fi
+
+          python3 - "$existing_release" "$mapping_path" "$tag_commit" "$branch_head" "$verified_head" "$draft_commit" "$verification_succeeded" "$RUNNER_TEMP/release-state.json" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          release_exists, mapping_path, tag_commit, candidate_head, verified_head, draft_commit, verification_succeeded, output = sys.argv[1:]
+          mapping = None
+          if mapping_path:
+              mapping = json.loads(pathlib.Path(mapping_path).read_text(encoding="utf-8"))
+          state = {
+              "release_exists": release_exists == "true",
+              "release_mapping": mapping,
+              "tag_commit": tag_commit or None,
+              "candidate_head": candidate_head or None,
+              "draft_commit": draft_commit or None,
+              "verification_succeeded": None if not verification_succeeded else verification_succeeded == "true",
+              "verified_head": verified_head or None,
+          }
+          pathlib.Path(output).write_text(json.dumps(state), encoding="utf-8")
+          PY
+          resolved_state="$(python3 -B -E script/lib/action_release.py classify-state \
+            --state "$RUNNER_TEMP/release-state.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --artifact-name "$BINARY_NAME" \
+            --artifact-sha256 "$ARTIFACT_SHA256")"
+          release_state="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["state"])' "$resolved_state")"
+          action_commit="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["action_commit"] or "")' "$resolved_state")"
+
+          case "$release_state" in
+            complete)
+              if [[ -n "$branch_head" ]]; then
+                candidate_branch="$branch"
+              fi
+              ;;
+            tag|draft)
+              if [[ -z "$branch_head" ]]; then
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                  -f ref="refs/heads/$branch" \
+                  -f sha="$action_commit" >/dev/null
+                candidate_branch_created=true
+              fi
+              candidate_branch="$branch"
+              echo "candidate_branch=$candidate_branch" >> "$GITHUB_OUTPUT"
+              echo "candidate_branch_created=$candidate_branch_created" >> "$GITHUB_OUTPUT"
+              ;;
+            candidate)
+              candidate_branch="$branch"
+              ;;
+            new|candidate-source)
+              if [[ "$release_state" == "new" ]]; then
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                  -f ref="refs/heads/$branch" \
+                  -f sha="$SOURCE_COMMIT" >/dev/null
+              fi
+              candidate_branch="$branch"
+              candidate_branch_created=true
+              echo "candidate_branch=$candidate_branch" >> "$GITHUB_OUTPUT"
+              echo "candidate_branch_created=true" >> "$GITHUB_OUTPUT"
+              python3 - "$candidate_root" "$GITHUB_REPOSITORY" "$branch" "$SOURCE_COMMIT" "$VERSION_TAG" "$RUNNER_TEMP/create-commit.json" <<'PY'
+          import base64
+          import json
+          import pathlib
+          import sys
+
+          root, repository, branch, source_commit, version_tag, output = sys.argv[1:]
+          root_path = pathlib.Path(root)
+          additions = []
+          for relative in ("action/bin/fence", "action/bundle-manifest.json"):
+              contents = base64.b64encode((root_path / relative).read_bytes()).decode("ascii")
+              additions.append({"path": relative, "contents": contents})
+          request = {
+              "query": "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              "variables": {
+                  "input": {
+                      "branch": {"repositoryNameWithOwner": repository, "branchName": branch},
+                      "expectedHeadOid": source_commit,
+                      "message": {"headline": f"Bundle Fence {version_tag} Action"},
+                      "fileChanges": {"additions": additions},
+                  }
+              },
+          }
+          pathlib.Path(output).write_text(json.dumps(request), encoding="utf-8")
+          PY
+              response="$(gh api graphql --input "$RUNNER_TEMP/create-commit.json")"
+              action_commit="$(python3 - "$response" <<'PY'
+          import json
+          import sys
+          response = json.loads(sys.argv[1])
+          commit = response.get("data", {}).get("createCommitOnBranch", {}).get("commit", {}).get("oid")
+          if not isinstance(commit, str):
+              raise SystemExit("GraphQL commit creation returned no commit")
+          print(commit)
+          PY
+              )"
+              candidate_created=true
+              echo "action_commit=$action_commit" >> "$GITHUB_OUTPUT"
+              echo "candidate_created=true" >> "$GITHUB_OUTPUT"
+              ;;
+            withdrawn)
+              echo "release $VERSION_TAG is withdrawn after failed post-publication verification; publish a corrected new version" >&2
+              exit 1
+              ;;
+            *)
+              echo "unsupported release state: $release_state" >&2
+              exit 1
+              ;;
+          esac
+
+          if ! [[ "$action_commit" =~ ^[0-9a-f]{40}$ ]] || [[ "$action_commit" == "$SOURCE_COMMIT" ]]; then
+            echo "distribution commit identity is invalid" >&2
+            exit 1
+          fi
+          echo "action_commit=$action_commit" >> "$GITHUB_OUTPUT"
+          echo "existing_release=$existing_release" >> "$GITHUB_OUTPUT"
+          echo "candidate_branch=$candidate_branch" >> "$GITHUB_OUTPUT"
+          echo "candidate_branch_created=$candidate_branch_created" >> "$GITHUB_OUTPUT"
+          echo "candidate_created=$candidate_created" >> "$GITHUB_OUTPUT"
+
+          verified=false
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          for attempt in 1 2 3 4 5 6; do
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${action_commit}" > "$RUNNER_TEMP/distribution-commit-rest.json"
+            gh api graphql \
+              -f query='query($owner: String!, $repository: String!, $oid: GitObjectID!) { repository(owner: $owner, name: $repository) { object(oid: $oid) { ... on Commit { oid signature { isValid wasSignedByGitHub } } } } }' \
+              -F owner="$owner" \
+              -F repository="$repository" \
+              -F oid="$action_commit" > "$RUNNER_TEMP/distribution-commit-graphql.json"
+            if python3 -B -E script/lib/action_release.py verify-commit \
+              --rest "$RUNNER_TEMP/distribution-commit-rest.json" \
+              --graphql "$RUNNER_TEMP/distribution-commit-graphql.json" \
+              --source-commit "$SOURCE_COMMIT" \
+              --action-commit "$action_commit"
+            then
+              verified=true
+              break
+            fi
+            sleep 2
+          done
+          if [[ "$verified" != "true" ]]; then
+            echo "distribution commit signature, parent, or exact diff is invalid" >&2
             exit 1
           fi
 
-          rm -rf release-download
-          mkdir -p release-download
-          gh release download "$tag" --repo "${OWNER}/${REPO}" --dir release-download
+          if [[ -n "$candidate_branch" ]]; then
+            git fetch --no-tags origin "refs/heads/${candidate_branch}"
+          else
+            git fetch --no-tags origin "refs/tags/${VERSION_TAG}"
+          fi
+          if [[ "$(git rev-parse 'FETCH_HEAD^{commit}')" != "$action_commit" ]]; then
+            echo "fetched distribution ref does not resolve to the selected commit" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-list --parents -n 1 "$action_commit")" != "$action_commit $SOURCE_COMMIT" ]]; then
+            echo "distribution commit must have exactly the reviewed source parent" >&2
+            exit 1
+          fi
+          diff_paths="$(git diff-tree --no-commit-id --name-status -r "$action_commit" | LC_ALL=C sort)"
+          expected_paths="$(printf 'A\taction/bin/fence\nA\taction/bundle-manifest.json' | LC_ALL=C sort)"
+          if [[ "$diff_paths" != "$expected_paths" ]]; then
+            echo "distribution commit contains files outside the generated bundle" >&2
+            exit 1
+          fi
+          tree_modes="$(git ls-tree "$action_commit" action/bin/fence action/bundle-manifest.json | awk '{print $1 " " $4}' | LC_ALL=C sort)"
+          expected_modes="$(printf '100644 action/bin/fence\n100644 action/bundle-manifest.json' | LC_ALL=C sort)"
+          if [[ "$tree_modes" != "$expected_modes" ]]; then
+            echo "distribution files must be regular non-executable Git blobs" >&2
+            exit 1
+          fi
 
-          (
-            cd release-download
-            if command -v shasum >/dev/null 2>&1; then
-              shasum -a 256 -c checksums.txt
-            else
-              sha256sum -c checksums.txt
-            fi
+          checkout_root="$RUNNER_TEMP/distribution-checkout"
+          git worktree add --detach "$checkout_root" "$action_commit"
+          script/validate-action-bundle --root "$checkout_root"
+          cmp "$artifact" "$checkout_root/action/bin/fence"
+          cmp "$candidate_root/action/bundle-manifest.json" "$checkout_root/action/bundle-manifest.json"
+          python3 - "$checkout_root/action/bundle-manifest.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          expected = {
+              "release_tag": os.environ["VERSION_TAG"],
+              "release_channel": os.environ["RELEASE_CHANNEL"],
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "source_ref": "refs/heads/main",
+              "artifact_name": os.environ["BINARY_NAME"],
+              "artifact_sha256": os.environ["ARTIFACT_SHA256"],
+              "bundle_path": "action/bin/fence",
+              "signer_workflow": f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/release.yml",
+              "signer_digest": os.environ["SOURCE_COMMIT"],
+          }
+          for field, value in expected.items():
+              if manifest.get(field) != value:
+                  raise SystemExit(f"distribution manifest mismatch: {field}")
+          PY
+          echo "candidate_verified=true" >> "$GITHUB_OUTPUT"
+
+  candidate-action-acceptance:
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, create-candidate]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/action-acceptance.yml
+    with:
+      action_ref: ${{ needs.create-candidate.outputs.action_commit }}
+      candidate_kind: distribution
+
+  candidate-drift-canary:
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, create-candidate]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/action-drift-canary.yml
+    with:
+      action_ref: ${{ needs.create-candidate.outputs.action_commit }}
+
+  prepare-assets:
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, build-linux-x64, create-candidate, candidate-action-acceptance, candidate-drift-canary]
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_name: ${{ steps.metadata.outputs.artifact_name }}
+
+    steps:
+      - name: checkout source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: require exact asset source checkout
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+
+      - name: download exact Linux x64 artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.build-linux-x64.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-binary
+
+      - name: assemble immutable release assets
+        id: metadata
+        env:
+          ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
+          ARTIFACT_SHA256: ${{ needs.build-linux-x64.outputs.artifact_sha256 }}
+          BINARY_NAME: ${{ needs.build-linux-x64.outputs.binary_name }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.source_date_epoch }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          asset_root="$RUNNER_TEMP/release-assets"
+          stage_root="$RUNNER_TEMP/release-tar-stage"
+          mkdir -p "$asset_root" "$stage_root"
+          cp "$RUNNER_TEMP/release-binary/$BINARY_NAME" "$asset_root/$BINARY_NAME"
+          chmod 0755 "$asset_root/$BINARY_NAME"
+          cp "$asset_root/$BINARY_NAME" "$stage_root/fence"
+          chmod 0755 "$stage_root/fence"
+          tar \
+            --sort=name \
+            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$stage_root" \
+            -czf "$asset_root/${BINARY_NAME}.tar.gz" \
+            fence
+          python3 - "$asset_root/action-release.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+
+          mapping = {
+              "schema_version": 1,
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "version": os.environ["VERSION"],
+              "release_tag": os.environ["VERSION_TAG"],
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "action_commit": os.environ["ACTION_COMMIT"],
+              "artifact_name": os.environ["BINARY_NAME"],
+              "artifact_sha256": os.environ["ARTIFACT_SHA256"],
+              "bundle_manifest_schema_version": 4,
+              "signer_workflow": f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/release.yml",
+              "signer_digest": os.environ["SOURCE_COMMIT"],
+          }
+          if not re.fullmatch(r"[0-9a-f]{40}", mapping["action_commit"]):
+              raise SystemExit("Action mapping commit is invalid")
+          pathlib.Path(os.sys.argv[1]).write_text(
+              json.dumps(mapping, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
           )
+          PY
+          python3 -B -E script/lib/action_release.py validate-mapping \
+            --mapping "$asset_root/action-release.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --action-commit "$ACTION_COMMIT" \
+            --artifact-name "$BINARY_NAME" \
+            --artifact-sha256 "$ARTIFACT_SHA256" >/dev/null
+          (
+            cd "$asset_root"
+            sha256sum "$BINARY_NAME" "${BINARY_NAME}.tar.gz" action-release.json > checksums.txt
+            sha256sum -c checksums.txt
+          )
+          echo "artifact_name=release-assets-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
 
-          find release-download -type f ! -name checksums.txt -print0 | while IFS= read -r -d '' file; do
-            echo "Verifying file: $file"
+      - name: upload complete release asset set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: ${{ runner.temp }}/release-assets/
+          retention-days: 5
+          if-no-files-found: error
+
+  attest-assets:
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, create-candidate, prepare-assets]
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: download complete release asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-assets.outputs.artifact_name }}
+          path: release-assets
+
+      - name: attest final release assets
+        if: needs.create-candidate.outputs.existing_release != 'true'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # pin@v4.1.0
+        with:
+          subject-path: release-assets/*
+
+      - name: verify final release asset attestations before publication
+        if: needs.create-candidate.outputs.existing_release != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 1 -type f -print0 | while IFS= read -r -d '' file; do
             gh attestation verify \
               "$file" \
-              --repo "${OWNER}/${REPO}" \
-              --signer-workflow "${OWNER}/${REPO}/.github/workflows/release.yml" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
               --signer-digest "$SOURCE_COMMIT" \
               --source-digest "$SOURCE_COMMIT" \
               --source-ref refs/heads/main \
               --deny-self-hosted-runners >/dev/null
           done
 
-  release-summary:
-    permissions: {}
-    runs-on: ubuntu-24.04
-    needs: [prepare, release, verify]
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
-        with:
-          artifact-ids: ${{ needs.release.outputs.artifact-id }}
-          path: "dist/"
+      - name: defer existing immutable release to complete verification
+        if: needs.create-candidate.outputs.existing_release == 'true'
+        run: echo "Existing release will be checked without publishing new attestations."
 
-      - name: show homebrew inputs
+  publish:
+    name: publish
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, create-candidate, prepare-assets, attest-assets]
+    permissions:
+      contents: write
+    environment: release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: require exact publication source checkout
         env:
-          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
-          RELEASE_TAG: ${{ needs.prepare.outputs.version_tag }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+
+      - name: download attested release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-assets.outputs.artifact_name }}
+          path: release-assets
+
+      - name: publish or recognize exact immutable release
+        env:
+          ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.release_channel }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
         run: |
           set -euo pipefail
-          version="$RELEASE_VERSION"
-          tag="$RELEASE_TAG"
-          purple=$'\033[0;35m'
-          off=$'\033[0m'
-          echo "Release version: ${version}"
-          echo "Release tag: ${tag}"
-          echo "Commit: ${{ github.sha }}"
-          echo
-          if [[ ! -f dist/checksums.txt ]]; then
-            echo "checksums.txt not found"
+          if [[ "$STATE_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo "release state was classified by a different workflow attempt; use Re-run all jobs" >&2
             exit 1
           fi
-          echo "Homebrew sha256 (tarballs for this release):"
-          tarball_count=0
-          while read -r sha file; do
-            if [[ "$file" == *.tar.gz ]]; then
-              printf "sha256 %b%s%b  %s\n" "$purple" "$sha" "$off" "$file"
-              tarball_count=$((tarball_count + 1))
-            fi
-          done < dist/checksums.txt
+          mapfile -d '' assets < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
+          if [[ ${#assets[@]} -ne 4 ]]; then
+            echo "release must contain exactly four prepared assets" >&2
+            exit 1
+          fi
 
-          if [[ "$tarball_count" -eq 0 ]]; then
-            echo "no tarballs found in dist/checksums.txt"
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Release $VERSION_TAG"
+            echo
+            echo "Reviewed source commit: \`$SOURCE_COMMIT\`"
+            echo "Complete Action commit: \`$ACTION_COMMIT\`"
+            echo
+            echo '```yaml'
+            echo "- uses: GrantBirki/fence@$ACTION_COMMIT"
+            echo '```'
+          } > "$notes"
+
+          release_probe="$RUNNER_TEMP/publication-release-probe.json"
+          release_state="$(python3 -B -E script/lib/action_release.py probe-release \
+            --repository "$GITHUB_REPOSITORY" \
+            --version-tag "$VERSION_TAG" \
+            --output "$release_probe")"
+          if [[ "$release_state" == "published" ]]; then
+            tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
+            if [[ "$tag_commit" != "$ACTION_COMMIT" ]]; then
+              echo "existing release tag conflicts with the validated Action commit" >&2
+              exit 1
+            fi
+            echo "Existing release will be accepted only after complete post-publication verification."
+            exit 0
+          fi
+          if [[ "$release_state" == "draft" ]]; then
+            draft_id="$(python3 -B -E script/lib/action_release.py validate-draft \
+              --metadata "$release_probe" \
+              --notes "$notes" \
+              --asset-root release-assets \
+              --version "${VERSION_TAG#v}" \
+              --action-commit "$ACTION_COMMIT" \
+              --release-channel "$RELEASE_CHANNEL")"
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_id}"
+            post_delete_probe="$RUNNER_TEMP/post-delete-release-probe.json"
+            post_delete_state="$(python3 -B -E script/lib/action_release.py probe-release \
+              --repository "$GITHUB_REPOSITORY" \
+              --version-tag "$VERSION_TAG" \
+              --output "$post_delete_probe")"
+            if [[ "$post_delete_state" != "absent" ]]; then
+              echo "draft release still exists after deletion" >&2
+              exit 1
+            fi
+          elif [[ "$release_state" != "absent" ]]; then
+            echo "unsupported publication release state: $release_state" >&2
             exit 1
           fi
+
+          release_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --title "$VERSION_TAG"
+            --notes-file "$notes"
+            --target "$ACTION_COMMIT"
+          )
+          tag_refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${VERSION_TAG}")"
+          tag_exists="$(python3 - "$tag_refs" "refs/tags/$VERSION_TAG" <<'PY'
+          import json
+          import sys
+          refs = [item for item in json.loads(sys.argv[1]) if item.get("ref") == sys.argv[2]]
+          if len(refs) > 1:
+              raise SystemExit("duplicate exact release tag refs")
+          print("true" if refs else "false")
+          PY
+          )"
+          if [[ "$tag_exists" == "true" ]]; then
+            tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
+            if [[ "$tag_commit" != "$ACTION_COMMIT" ]]; then
+              echo "existing tag conflicts with the validated Action commit" >&2
+              exit 1
+            fi
+            release_args+=(--verify-tag)
+          fi
+          if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "$VERSION_TAG" "${assets[@]}" "${release_args[@]}"
+
+  verify-release:
+    name: verify-release
+    if: needs.prepare.outputs.should_release == 'true'
+    needs: [prepare, build-linux-x64, create-candidate, prepare-assets, publish]
+    permissions:
+      attestations: read
+      contents: read
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: require current-attempt release classification
+        env:
+          STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
+        run: |
+          if [[ "$STATE_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo "release state was classified by a different workflow attempt; use Re-run all jobs" >&2
+            exit 1
+          fi
+
+      - name: checkout exact distribution commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ needs.create-candidate.outputs.action_commit }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: download prepared release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-assets.outputs.artifact_name }}
+          path: expected-assets
+
+      - name: verify immutable published release end to end
+        env:
+          ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
+          ARTIFACT_SHA256: ${{ needs.build-linux-x64.outputs.artifact_sha256 }}
+          BINARY_NAME: ${{ needs.build-linux-x64.outputs.binary_name }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_CHANNEL: ${{ needs.prepare.outputs.release_channel }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          metadata=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            metadata="$(gh release view "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,targetCommitish,isPrerelease,isDraft,isImmutable,body)"
+            if python3 - "$metadata" <<'PY'
+          import json
+          import sys
+          release = json.loads(sys.argv[1])
+          raise SystemExit(0 if release.get("isImmutable") is True else 1)
+          PY
+            then
+              break
+            fi
+            if [[ "$attempt" == 12 ]]; then
+              echo "published release did not become immutable" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          python3 - "$metadata" <<'PY'
+          import json
+          import os
+          import sys
+
+          release = json.loads(sys.argv[1])
+          if release.get("tagName") != os.environ["VERSION_TAG"]:
+              raise SystemExit("published release tag mismatch")
+          if release.get("targetCommitish") != os.environ["ACTION_COMMIT"]:
+              raise SystemExit("published release target mismatch")
+          if release.get("isDraft") is not False or release.get("isImmutable") is not True:
+              raise SystemExit("published release must be non-draft and immutable")
+          expected_prerelease = os.environ["RELEASE_CHANNEL"] == "prerelease"
+          if release.get("isPrerelease") is not expected_prerelease:
+              raise SystemExit("published release channel mismatch")
+          expected_pin = f"- uses: GrantBirki/fence@{os.environ['ACTION_COMMIT']}"
+          if expected_pin not in str(release.get("body", "")).splitlines():
+              raise SystemExit("published release notes are missing the verified full-SHA pin")
+          PY
+
+          tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
+          if [[ "$tag_commit" != "$ACTION_COMMIT" ]]; then
+            echo "immutable release tag does not resolve to the Action commit" >&2
+            exit 1
+          fi
+          commit_metadata="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${ACTION_COMMIT}")"
+          python3 - "$SOURCE_COMMIT" "$commit_metadata" <<'PY'
+          import json
+          import sys
+          source, raw = sys.argv[1:]
+          commit = json.loads(raw)
+          if [parent.get("sha") for parent in commit.get("parents", [])] != [source]:
+              raise SystemExit("published Action commit parent mismatch")
+          if commit.get("commit", {}).get("verification", {}).get("verified") is not True:
+              raise SystemExit("published Action commit signature is invalid")
+          files = {(item.get("filename"), item.get("status")) for item in commit.get("files", [])}
+          if files != {("action/bin/fence", "added"), ("action/bundle-manifest.json", "added")}:
+              raise SystemExit("published Action commit diff mismatch")
+          PY
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          signature_metadata="$(gh api graphql \
+            -f query='query($owner: String!, $repository: String!, $oid: GitObjectID!) { repository(owner: $owner, name: $repository) { object(oid: $oid) { ... on Commit { oid signature { isValid wasSignedByGitHub } } } } }' \
+            -F owner="$owner" \
+            -F repository="$repository" \
+            -F oid="$ACTION_COMMIT")"
+          python3 - "$ACTION_COMMIT" "$signature_metadata" <<'PY'
+          import json
+          import sys
+          action_commit, raw = sys.argv[1:]
+          commit = json.loads(raw).get("data", {}).get("repository", {}).get("object", {})
+          signature = commit.get("signature") or {}
+          if commit.get("oid") != action_commit:
+              raise SystemExit("published Action commit GraphQL identity mismatch")
+          if signature.get("isValid") is not True or signature.get("wasSignedByGitHub") is not True:
+              raise SystemExit("published Action commit was not validly signed by GitHub")
+          PY
+
+          script/validate-action-bundle
+          if [[ "$(git rev-list --parents -n 1 HEAD)" != "$ACTION_COMMIT $SOURCE_COMMIT" ]]; then
+            echo "checked-out Action commit does not have the exact source parent" >&2
+            exit 1
+          fi
+
+          mkdir -p published-assets
+          gh release download "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" --dir published-assets
+          expected_names="$(find expected-assets -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+          published_names="$(find published-assets -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+          if [[ "$expected_names" != "$published_names" ]]; then
+            echo "published release asset set differs from the attested set" >&2
+            exit 1
+          fi
+          while IFS= read -r name; do
+            cmp "expected-assets/$name" "published-assets/$name"
+          done <<< "$expected_names"
+          (
+            cd published-assets
+            sha256sum -c checksums.txt
+          )
+          if [[ "$(sha256sum "published-assets/$BINARY_NAME" | awk '{print $1}')" != "$ARTIFACT_SHA256" ]]; then
+            echo "published binary digest mismatch" >&2
+            exit 1
+          fi
+          cmp "published-assets/$BINARY_NAME" action/bin/fence
+
+          mapped_action="$(python3 -B -E script/lib/action_release.py validate-mapping \
+            --mapping published-assets/action-release.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --action-commit "$ACTION_COMMIT" \
+            --artifact-name "$BINARY_NAME" \
+            --artifact-sha256 "$ARTIFACT_SHA256")"
+          if [[ "$mapped_action" != "$ACTION_COMMIT" ]]; then
+            echo "published Action mapping commit mismatch" >&2
+            exit 1
+          fi
+
+          find published-assets -maxdepth 1 -type f -print0 | while IFS= read -r -d '' file; do
+            gh attestation verify \
+              "$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$SOURCE_COMMIT" \
+              --source-digest "$SOURCE_COMMIT" \
+              --source-ref refs/heads/main \
+              --deny-self-hosted-runners >/dev/null
+          done
+
+  cleanup-candidate:
+    if: ${{ always() && needs.prepare.outputs.should_release == 'true' }}
+    needs: [prepare, create-candidate, publish, verify-release]
+    permissions:
+      contents: write
+    environment: release
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: checkout source commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: require exact cleanup source checkout
+        env:
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+
+      - name: delete only the exact temporary candidate ref
+        env:
+          ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
+          CANDIDATE_BRANCH: ${{ needs.create-candidate.outputs.candidate_branch }}
+          CANDIDATE_BRANCH_CREATED: ${{ needs.create-candidate.outputs.candidate_branch_created }}
+          CANDIDATE_CREATED: ${{ needs.create-candidate.outputs.candidate_created }}
+          CANDIDATE_VERIFIED: ${{ needs.create-candidate.outputs.candidate_verified }}
+          EXISTING_RELEASE: ${{ needs.create-candidate.outputs.existing_release }}
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
+          VERIFY_RESULT: ${{ needs.verify-release.result }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$STATE_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo "release state was classified by a different workflow attempt; use Re-run all jobs" >&2
+            exit 1
+          fi
+          expected_branch="release-candidate/${VERSION_TAG}"
+          verified_branch="release-verified/${VERSION_TAG}"
+          if [[ -n "$CANDIDATE_BRANCH" && "$CANDIDATE_BRANCH" != "$expected_branch" ]]; then
+            echo "temporary candidate branch name is unexpected; refusing mutation" >&2
+            exit 1
+          fi
+          branch="${CANDIDATE_BRANCH:-$expected_branch}"
+
+          exact_ref_head() {
+            local name="$1"
+            local refs
+            refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/heads/${name}")"
+            python3 - "$refs" "refs/heads/$name" <<'PY'
+          import json
+          import sys
+          refs = [item for item in json.loads(sys.argv[1]) if item.get("ref") == sys.argv[2]]
+          if len(refs) > 1:
+              raise SystemExit("duplicate exact release workflow refs")
+          print(refs[0]["object"]["sha"] if refs else "")
+          PY
+          }
+
+          delete_ref_with_lease() {
+            local name="$1"
+            local expected="$2"
+            local auth
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            echo "::add-mask::$auth"
+            GIT_CONFIG_COUNT=1 \
+              GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+              GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              GIT_TERMINAL_PROMPT=0 \
+              git push \
+                --porcelain \
+                --force-with-lease="refs/heads/${name}:${expected}" \
+                origin \
+                ":refs/heads/${name}"
+          }
+
+          if [[ "$EXISTING_RELEASE" == "true" && "$VERIFY_RESULT" != "success" ]]; then
+            echo "Existing release did not re-verify; retaining any recovery refs without changing prior release state."
+            exit 0
+          fi
+
+          release_state=absent
+          if [[ "$EXISTING_RELEASE" != "true" && "$VERIFY_RESULT" != "success" ]]; then
+            if [[ "$PUBLISH_RESULT" == "success" ]]; then
+              release_state=published
+            else
+              cleanup_probe="$RUNNER_TEMP/cleanup-release-probe.json"
+              release_state="$(python3 -B -E script/lib/action_release.py probe-release \
+                --repository "$GITHUB_REPOSITORY" \
+                --version-tag "$VERSION_TAG" \
+                --output "$cleanup_probe")"
+            fi
+          fi
+
+          if [[ "$release_state" == "draft" ]]; then
+            echo "Interrupted publication left a draft release; retaining the exact candidate for a guarded rerun."
+            exit 0
+          fi
+          if [[ "$release_state" != "absent" && "$release_state" != "published" ]]; then
+            echo "unsupported cleanup release state: $release_state" >&2
+            exit 1
+          fi
+
+          if [[ "$release_state" == "published" ]]; then
+            if ! [[ "$ACTION_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "published release cannot be marked withdrawn without its exact Action commit" >&2
+              exit 1
+            fi
+            tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
+            if [[ "$tag_commit" != "$ACTION_COMMIT" ]]; then
+              echo "published release tag conflicts with the expected Action commit" >&2
+              exit 1
+            fi
+            head="$(exact_ref_head "$branch")"
+            if [[ -z "$head" ]]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f ref="refs/heads/$branch" \
+                -f sha="$ACTION_COMMIT" >/dev/null
+            elif [[ "$head" != "$ACTION_COMMIT" ]]; then
+              echo "withdrawn candidate ref conflicts with the expected Action commit" >&2
+              exit 1
+            fi
+            echo "Release $VERSION_TAG is withdrawn; retained $branch at $ACTION_COMMIT as the fail-closed marker."
+            exit 0
+          fi
+
+          verified_head=""
+          if [[ "$VERIFY_RESULT" == "success" ]]; then
+            if ! [[ "$ACTION_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "verified release is missing its exact Action commit" >&2
+              exit 1
+            fi
+            verified_head="$(exact_ref_head "$verified_branch")"
+            if [[ -n "$CANDIDATE_BRANCH" && -z "$verified_head" ]]; then
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f ref="refs/heads/$verified_branch" \
+                -f sha="$ACTION_COMMIT" >/dev/null
+              verified_head="$ACTION_COMMIT"
+            elif [[ -n "$verified_head" && "$verified_head" != "$ACTION_COMMIT" ]]; then
+              echo "release verification marker moved unexpectedly; refusing cleanup" >&2
+              exit 1
+            fi
+          fi
+
+          if [[ -n "$CANDIDATE_BRANCH" ]]; then
+            expected_head=""
+            if [[ "$CANDIDATE_CREATED" == "true" || "$CANDIDATE_VERIFIED" == "true" ]]; then
+              expected_head="$ACTION_COMMIT"
+            elif [[ "$CANDIDATE_BRANCH_CREATED" == "true" ]]; then
+              expected_head="$SOURCE_COMMIT"
+            fi
+            if ! [[ "$expected_head" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "Temporary candidate branch was not fully verified; refusing deletion."
+              exit 0
+            fi
+            head="$(exact_ref_head "$CANDIDATE_BRANCH")"
+            if [[ -z "$head" ]]; then
+              echo "Temporary candidate branch is already absent."
+            elif [[ "$head" != "$expected_head" ]]; then
+              echo "temporary candidate branch moved unexpectedly; refusing deletion" >&2
+              exit 1
+            else
+              delete_ref_with_lease "$CANDIDATE_BRANCH" "$expected_head"
+            fi
+          else
+            echo "No temporary candidate branch was used."
+          fi
+
+          if [[ -n "$verified_head" ]]; then
+            current_verified_head="$(exact_ref_head "$verified_branch")"
+            if [[ "$current_verified_head" != "$ACTION_COMMIT" ]]; then
+              echo "release verification marker moved unexpectedly; refusing deletion" >&2
+              exit 1
+            fi
+            delete_ref_with_lease "$verified_branch" "$ACTION_COMMIT"
+          fi
+
+  finalize-release:
+    if: ${{ success() && needs.prepare.outputs.should_release == 'true' }}
+    needs: [prepare, create-candidate, verify-release, cleanup-candidate]
+    permissions: {}
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: report verified consumer pin
+        env:
+          ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+          STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
+          VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
+        run: |
+          set -euo pipefail
+          if [[ "$STATE_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" ]]; then
+            echo "release state was classified by a different workflow attempt; use Re-run all jobs" >&2
+            exit 1
+          fi
+          if ! [[ "$ACTION_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "final release Action commit is invalid" >&2
+            exit 1
+          fi
+          {
+            echo "## Fence $VERSION_TAG release"
+            echo
+            echo "Reviewed source commit: \`$SOURCE_COMMIT\`"
+            echo
+            echo "Verified Action commit: \`$ACTION_COMMIT\`"
+            echo
+            echo '```yaml'
+            echo "- uses: GrantBirki/fence@$ACTION_COMMIT"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Action commit: $ACTION_COMMIT"
+          echo "- uses: GrantBirki/fence@$ACTION_COMMIT"

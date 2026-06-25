@@ -32,14 +32,11 @@ applied and verified.
 
 ## Release Provenance
 
-Release builds upload Linux x64 artifacts, generate GitHub artifact
-attestations in a dedicated least-privilege job, re-download immutable release
-assets, verify checksums, and bind each attestation to the repository release
-workflow at the release source commit on `refs/heads/main`. The committed
-Action binary is installed only through the online maintainer refresh script,
-which also requires a non-draft immutable release and a tag resolving to that
-source commit before writing the reviewed offline manifest. See GitHub's
-[artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
+Protected `main` is source-only and intentionally omits the production Action binary and manifest. A reviewed change plus matching version bump is the sole human release authorization. The release workflow builds the Linux x64 artifact once from signed source merge `M`, generates attestations bound to `M` and `refs/heads/main` in a dedicated least-privilege job, and uses the offline `script/assemble-action-bundle` path to create a production-shaped candidate without downloading an agent, policy, or attestation.
+
+GitHub's commit API creates signed distribution commit `D` as a one-parent child of `M`; its exact diff is the mode-`0644` binary and schema-`4` provenance manifest. The workflow verifies the signature, parent, diff, manifest identity, and byte equality, then runs complete fixed-runner Action acceptance and the strict drift canary against exact `D`. Only after those gates and final-asset attestation verification pass does the immutable `vX.Y.Z` tag target `D`. The `action-release.json` release asset binds the public version, `M`, `D`, artifact digest, manifest schema, and signer identity, and consumers pin the full `action_commit` SHA.
+
+Post-publication verification re-downloads the assets, verifies checksums and source-bound attestations, and rechecks `vX.Y.Z -> D`, signed `D -> M`, the exact generated diff, mapping, and bundled bytes before reporting the consumer SHA. The protected release environment is main-only and has no separate required reviewer, so a second publication approval cannot bypass or replace the reviewed version merge. The Action still performs no runtime agent or policy download. Releases through `v0.6.3` retain their historical tag semantics. See GitHub's [artifact attestation documentation](https://docs.github.com/en/actions/how-tos/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds).
 
 ## Findings Addressed
 
@@ -181,7 +178,7 @@ attempt is rejected.
 
 ### Source-before-bundle host compatibility
 
-The published bundle exposes fingerprint schema `2`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, sudo source, principal, group, unit, socket, workload, and local-control fact before destructive activation. The current transition set is empty, so the bundle must activate normally. A future immutable bundle may temporarily predate one newly source-accepted hosted-runner sudo-policy digest even though source-built integration already accepts and tests that host shape. The classifier may skip activation only when all non-digest schema-`2` facts match and every mismatched digest is explicitly listed in the checked-in transition file. Malformed, incomplete, and unknown drift fails. After a refreshed bundle includes the digest, classification automatically returns to normal bundled activation.
+The ephemeral source-built candidate and published distribution bundle expose fingerprint schema `2`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, sudo source, principal, group, unit, socket, workload, and local-control fact before destructive activation. The candidate, release validation, and fixed-runner canary require normal activation and do not accept a classifier skip. Malformed, incomplete, mismatched, and unknown drift fails.
 
 ### Invocation slug consistency
 

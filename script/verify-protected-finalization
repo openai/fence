@@ -115,7 +115,29 @@ if len(body) > 1024 * 1024:
     raise SystemExit("protected finalization job metadata exceeded its fixed bound")
 document = json.loads(body)
 
-jobs = {job.get("name"): job for job in document.get("jobs", []) if isinstance(job, dict)}
+jobs = {}
+for job in document.get("jobs", []):
+    if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+        continue
+    observed_name = job["name"]
+    matches = [
+        expected
+        for expected in expected_jobs
+        if observed_name == expected or observed_name.endswith(f" / {expected}")
+    ]
+    if not matches:
+        continue
+    if len(matches) != 1:
+        raise SystemExit(f"protected finalization job name was ambiguous: {observed_name}")
+    canonical_name = matches[0]
+    if observed_name != canonical_name:
+        prefix = observed_name[: -(len(canonical_name) + 3)]
+        if not prefix or len(prefix) > 128 or any(ord(character) < 0x20 for character in prefix):
+            raise SystemExit(f"protected finalization reusable-workflow prefix was invalid: {observed_name}")
+    if canonical_name in jobs:
+        raise SystemExit(f"protected finalization job was duplicated: {canonical_name}")
+    jobs[canonical_name] = job
+
 missing = sorted(expected_jobs - jobs.keys())
 if missing:
     raise SystemExit(f"protected finalization jobs were not observable: {', '.join(missing)}")

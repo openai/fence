@@ -7,6 +7,16 @@ on:
   pull_request:
     branches:
       - main
+  workflow_call:
+    inputs:
+      action_ref:
+        description: Full commit SHA containing the Action tree to validate.
+        required: true
+        type: string
+      candidate_kind:
+        description: Either source (assemble a temporary bundle) or distribution (use the committed bundle).
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -17,12 +27,118 @@ defaults:
 
 concurrency:
   # A stranded protected host job may be unable to receive cancellation.
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.action_ref || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  prepare-candidate:
+    name: prepare Action candidate
+    runs-on: ubuntu-24.04
+    outputs:
+      action_ref: ${{ steps.candidate.outputs.action_ref }}
+      source_candidate: ${{ steps.candidate.outputs.source_candidate }}
+      artifact_name: ${{ steps.candidate.outputs.artifact_name }}
+
+    steps:
+      - name: select candidate
+        id: candidate
+        env:
+          INPUT_ACTION_REF: ${{ inputs.action_ref }}
+          INPUT_CANDIDATE_KIND: ${{ inputs.candidate_kind }}
+        run: |
+          set -euo pipefail
+          action_ref="${INPUT_ACTION_REF:-${GITHUB_SHA}}"
+          candidate_kind="${INPUT_CANDIDATE_KIND:-source}"
+          if ! [[ "$action_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Action candidate must be identified by a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          case "$candidate_kind" in
+            source) source_candidate=true ;;
+            distribution) source_candidate=false ;;
+            *)
+              echo "candidate_kind must be source or distribution" >&2
+              exit 1
+              ;;
+          esac
+          echo "action_ref=$action_ref" >> "$GITHUB_OUTPUT"
+          echo "source_candidate=$source_candidate" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=action-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: checkout candidate source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ steps.candidate.outputs.action_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: require exact checkout
+        env:
+          ACTION_REF: ${{ steps.candidate.outputs.action_ref }}
+        run: test "$(git rev-parse HEAD)" = "$ACTION_REF"
+
+      - name: validate source locks
+        run: script/validate-locks --ci
+
+      - name: require source-only candidate
+        if: steps.candidate.outputs.source_candidate == 'true'
+        run: |
+          if [[ -e action/bin/fence || -e action/bundle-manifest.json ]]; then
+            echo "source candidates must not contain generated Action bundle files" >&2
+            exit 1
+          fi
+
+      - name: prepare rust
+        if: steps.candidate.outputs.source_candidate == 'true'
+        run: script/prepare-rust
+
+      - name: bootstrap
+        if: steps.candidate.outputs.source_candidate == 'true'
+        run: script/bootstrap
+
+      - name: build and assemble source candidate
+        if: steps.candidate.outputs.source_candidate == 'true'
+        env:
+          ACTION_REF: ${{ steps.candidate.outputs.action_ref }}
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as handle:
+              print(tomllib.load(handle)["package"]["version"])
+          PY
+          )"
+          export BUILD_VERSION="v${version}"
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$ACTION_REF")"
+          dist_root="$RUNNER_TEMP/fence-action-candidate-dist"
+          candidate_root="$RUNNER_TEMP/fence-action-candidate"
+          script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$dist_root"
+          artifact="$dist_root/fence_v${version}_linux-amd64"
+          script/assemble-action-bundle \
+            --artifact "$artifact" \
+            --version "$version" \
+            --source-commit "$ACTION_REF" \
+            --output-root "$candidate_root"
+          script/validate-action-bundle --root "$candidate_root"
+
+      - name: validate committed distribution candidate
+        if: steps.candidate.outputs.source_candidate != 'true'
+        run: script/validate-action-bundle
+
+      - name: upload assembled Action bundle
+        if: steps.candidate.outputs.source_candidate == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
+        with:
+          name: ${{ steps.candidate.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/fence-action-candidate/action/bin/fence
+            ${{ runner.temp }}/fence-action-candidate/action/bundle-manifest.json
+          retention-days: 1
+          if-no-files-found: error
+
   action:
     name: action ${{ matrix.scenario }}
+    needs: prepare-candidate
     strategy:
       fail-fast: false
       matrix:
@@ -65,7 +181,15 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
 
       - name: validate locks
         run: script/validate-locks --ci
@@ -80,8 +204,17 @@ jobs:
         id: bundle-host
         run: script/classify-action-bundle-host
 
+      - name: require bundled Action activation
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
       - name: activate bundled Fence agent
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         uses: ./
         with:
           mode: ${{ matrix.mode }}
@@ -91,11 +224,11 @@ jobs:
           allowlist: ${{ matrix.allowlist }}
 
       - name: verify Action lifecycle
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         run: script/test-action-acceptance "${{ matrix.scenario }}" "${{ matrix.invocation_id }}"
 
   zero-input:
     name: action zero-input standard
+    needs: prepare-candidate
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -103,7 +236,15 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
 
       - name: validate locks
         run: script/validate-locks --ci
@@ -118,16 +259,25 @@ jobs:
         id: bundle-host
         run: script/classify-action-bundle-host
 
+      - name: require bundled Action activation
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
       - name: activate bundled Fence agent with strict defaults
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         uses: ./
 
       - name: verify zero-input Action lifecycle
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
   nested-layout:
     name: action nested registered path
+    needs: prepare-candidate
     timeout-minutes: 8
     runs-on: ubuntu-24.04
 
@@ -135,8 +285,16 @@ jobs:
       - name: checkout into nested Action path
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           path: target/action-layout/owner/project/revision
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: target/action-layout/owner/project/revision/action
 
       - name: validate locks
         working-directory: target/action-layout/owner/project/revision
@@ -155,20 +313,30 @@ jobs:
         working-directory: target/action-layout/owner/project/revision
         run: script/classify-action-bundle-host
 
+      - name: require bundled Action activation
+        working-directory: target/action-layout/owner/project/revision
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
       - name: activate bundled Fence agent from nested path
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         uses: ./target/action-layout/owner/project/revision
         with:
           mode: audit
           invocation_id: action-nested-layout
 
       - name: verify nested Action lifecycle
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         working-directory: target/action-layout/owner/project/revision
         run: script/test-action-acceptance audit action-nested-layout
 
   setup-failure:
     name: action setup failure evidence
+    needs: prepare-candidate
     timeout-minutes: 5
     runs-on: ubuntu-24.04
 
@@ -176,7 +344,15 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
 
       - name: validate locks
         run: script/validate-locks --ci
@@ -192,6 +368,7 @@ jobs:
 
   tamper:
     name: action registered-path and post-ready tamper evidence
+    needs: prepare-candidate
     timeout-minutes: 5
     runs-on: ubuntu-24.04
 
@@ -199,7 +376,15 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
 
       - name: validate locks
         run: script/validate-locks --ci
@@ -214,12 +399,22 @@ jobs:
         id: bundle-host
         run: script/classify-action-bundle-host
 
+      - name: require bundled Action activation
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
       - name: deny registered-path replacement and fail the post hook on drift
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         run: script/test-action-tamper
 
   action-finalization:
     name: action finalization ${{ matrix.replica }}
+    needs: prepare-candidate
     strategy:
       fail-fast: false
       matrix:
@@ -231,7 +426,15 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
 
       - name: validate locks
         run: script/validate-locks --ci
@@ -246,15 +449,24 @@ jobs:
         id: bundle-host
         run: script/classify-action-bundle-host
 
+      - name: require bundled Action activation
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
       - name: activate bundled Fence agent without post-ready warming
-        if: steps.bundle-host.outputs.run_bundle == 'true'
         uses: ./
         with:
           invocation_id: action-finalization-${{ matrix.replica }}
 
   verify-action-finalization:
     name: verify Action finalization
-    needs: [action-finalization]
+    needs: [prepare-candidate, action-finalization]
     timeout-minutes: 5
     runs-on: ubuntu-24.04
     permissions:
@@ -265,6 +477,7 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
 
       - name: verify terminal jobs and downloadable logs
@@ -274,13 +487,14 @@ jobs:
 
   acceptance:
     name: action acceptance
-    needs: [action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]
+    needs: [prepare-candidate, action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]
     if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-24.04
 
     steps:
       - name: confirm bundled Action acceptance
         env:
+          PREPARE_RESULT: ${{ needs.prepare-candidate.result }}
           ACTION_RESULT: ${{ needs.action.result }}
           ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}
           NESTED_LAYOUT_RESULT: ${{ needs.nested-layout.result }}
@@ -289,6 +503,7 @@ jobs:
           FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}
         run: |
           for result in \
+            "$PREPARE_RESULT" \
             "$ACTION_RESULT" \
             "$ZERO_INPUT_RESULT" \
             "$NESTED_LAYOUT_RESULT" \

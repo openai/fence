@@ -24,6 +24,7 @@ const {
   runtimePaths,
   summaryLines,
   validateBundle,
+  validatedActionRuntimeSnapshot,
   validateActionPathGuardMount,
   validateInlineConfig,
   validateLauncherIntegrity,
@@ -38,6 +39,7 @@ const {
 const actionLog = require("./log.cts");
 const {
   fenceErrorCodeFromJournal,
+  residentServiceArgs,
   run,
   terminalServiceStatus,
 } = require("./main.cts");
@@ -84,13 +86,10 @@ const report = {
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
   const digest = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
   return {
-    schema_version: 3,
+    schema_version: 4,
     repository: "GrantBirki/fence",
     release_tag: "v0.1.0-alpha.3",
     release_channel: "prerelease",
-    release_is_draft: false,
-    release_is_immutable: true,
-    release_tag_commit: "a".repeat(40),
     release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0-alpha.3",
     source_commit: "a".repeat(40),
     source_ref: "refs/heads/main",
@@ -99,7 +98,6 @@ function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
     signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
     bundle_path: "action/bin/fence",
     artifact_sha256: digest,
-    attestation_verified: true,
     ...overrides,
   };
 }
@@ -518,6 +516,23 @@ test("derives only bounded fixed runtime paths", () => {
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
 });
 
+test("launches only the protected root-owned agent copy", () => {
+  const paths = runtimePaths("action-test");
+  const args = residentServiceArgs(paths);
+  assert.deepEqual(args, [
+    "/usr/bin/systemd-run",
+    "--quiet",
+    "--property=Type=exec",
+    "--unit",
+    "fence-action-test.service",
+    "/run/fence-launcher/action-test/action/bin/fence",
+    "run",
+    "--config",
+    "/run/fence/action-test/config.json",
+  ]);
+  assert.equal(args.includes(path.join(__dirname, "bin", "fence")), false);
+});
+
 test("binds launcher integrity to the exact Action runtime file set", () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-runtime-"));
   try {
@@ -525,7 +540,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
     for (const relativePath of ACTION_RUNTIME_FILES) {
       const file = path.join(temporary, relativePath);
       fs.writeFileSync(file, `runtime:${relativePath}`, "utf8");
-      fs.chmodSync(file, relativePath === "bin/fence" ? 0o755 : 0o644);
+      fs.chmodSync(file, 0o644);
     }
     const files = actionRuntimeFileDigests(temporary);
     assert.equal(files.length, ACTION_RUNTIME_FILES.length);
@@ -591,6 +606,43 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
     fs.symlinkSync(path.join(temporary, "real-bin"), path.join(temporary, "bin"));
     assert.throws(() => actionRuntimeFileDigests(temporary), /binary directory/);
   } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("rejects an Action runtime that changes while its bundle is validated", () => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-snapshot-"));
+  const originalReadFileSync = fs.readFileSync;
+  try {
+    fs.mkdirSync(path.join(temporary, "bin"));
+    const binary = path.join(temporary, "bin", "fence");
+    const manifest = path.join(temporary, "bundle-manifest.json");
+    const post = path.join(temporary, "post.cts");
+    for (const relativePath of ACTION_RUNTIME_FILES) {
+      if (relativePath !== "bin/fence" && relativePath !== "bundle-manifest.json") {
+        fs.writeFileSync(path.join(temporary, relativePath), `runtime:${relativePath}`, "utf8");
+      }
+    }
+    fs.writeFileSync(binary, "fence-test-binary", "utf8");
+    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary)), "utf8");
+
+    const snapshot = validatedActionRuntimeSnapshot(temporary);
+    assert.equal(snapshot.manifest.schema_version, 4);
+    assert.equal(snapshot.files.length, ACTION_RUNTIME_FILES.length);
+
+    let manifestReads = 0;
+    fs.readFileSync = ((file: fs.PathOrFileDescriptor, ...args: any[]) => {
+      if (String(file) === manifest && ++manifestReads === 2) {
+        fs.writeFileSync(post, "changed-during-validation", "utf8");
+      }
+      return originalReadFileSync(file, ...args);
+    }) as typeof fs.readFileSync;
+    assert.throws(
+      () => validatedActionRuntimeSnapshot(temporary),
+      /changed while it was being validated/,
+    );
+  } finally {
+    fs.readFileSync = originalReadFileSync;
     fs.rmSync(temporary, { recursive: true, force: true });
   }
 });
@@ -1595,7 +1647,7 @@ test("rejects the retired status-only profile identity", () => {
   );
 });
 
-test("validates immutable attested bundle metadata and binary identity", () => {
+test("validates generated release bundle metadata and binary identity", () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-test-"));
   try {
     const binary = path.join(temporary, "fence");
@@ -1605,59 +1657,59 @@ test("validates immutable attested bundle metadata and binary identity", () => {
     const manifestLink = path.join(temporary, "bundle-link.json");
     fs.writeFileSync(binary, "fence-test-binary", "utf8");
     fs.writeFileSync(wrongBinary, "wrong-fence-test-binary", "utf8");
-    fs.chmodSync(binary, 0o755);
-    fs.chmodSync(wrongBinary, 0o755);
+    fs.chmodSync(binary, 0o644);
+    fs.chmodSync(wrongBinary, 0o644);
 
-    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary)), "utf8");
+    const prereleaseManifest = manifestFor(binary);
+    fs.writeFileSync(manifest, JSON.stringify(prereleaseManifest), "utf8");
     validateBundle(manifest, binary);
-    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, {
+    const stableManifest = manifestFor(binary, {
       release_tag: "v0.1.0",
       release_channel: "stable",
       release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
       source_commit: "b".repeat(40),
-      release_tag_commit: "b".repeat(40),
       signer_digest: "b".repeat(40),
       artifact_name: "fence_v0.1.0_linux-amd64",
-    })), "utf8");
+    });
+    fs.writeFileSync(manifest, JSON.stringify(stableManifest), "utf8");
     validateBundle(manifest, binary);
-    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, {
-      release_tag: "v0.1.0",
-      release_channel: "prerelease",
-      release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
-      source_commit: "b".repeat(40),
-      release_tag_commit: "b".repeat(40),
-      signer_digest: "b".repeat(40),
-      artifact_name: "fence_v0.1.0_linux-amd64",
-    })), "utf8");
-    assert.throws(() => validateBundle(manifest, binary), /contract/);
-    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, {
-      release_tag: "v0.1.0",
-      release_channel: "stable",
-      release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
-      source_commit: "b".repeat(40),
-      release_tag_commit: "b".repeat(40),
-      signer_digest: "b".repeat(40),
-      artifact_name: "fence_v0.1.0_linux-amd64",
-    })), "utf8");
-    for (const invalidProvenance of [
-      { release_is_draft: true },
-      { release_is_immutable: false },
-      { source_ref: "refs/heads/topic" },
-      { signer_digest: "c".repeat(40) },
-      { release_tag_commit: "d".repeat(40) },
-    ]) {
-      fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, invalidProvenance)), "utf8");
-      assert.throws(() => validateBundle(manifest, binary), /contract/);
+
+    const missingRepository = { ...stableManifest };
+    delete missingRepository.repository;
+    const invalidReleaseIdentity = (version: string): Record<string, unknown> => ({
+      ...stableManifest,
+      release_tag: `v${version}`,
+      release_channel: version.includes("-") ? "prerelease" : "stable",
+      release_url: `https://github.com/GrantBirki/fence/releases/tag/v${version}`,
+      artifact_name: `fence_v${version}_linux-amd64`,
+    });
+    const invalidManifests: Array<[string, Record<string, unknown>]> = [
+      ["missing required field", missingRepository],
+      ["unknown field", { ...stableManifest, action_commit: "c".repeat(40) }],
+      ["retired self-reference", { ...stableManifest, release_tag_commit: "d".repeat(40) }],
+      ["retired attestation assertion", { ...stableManifest, attestation_verified: true }],
+      ["wrong schema", { ...stableManifest, schema_version: 3 }],
+      ["wrong release channel", { ...stableManifest, release_channel: "prerelease" }],
+      ["leading-zero major", invalidReleaseIdentity("01.2.3")],
+      ["leading-zero minor", invalidReleaseIdentity("1.02.3")],
+      ["leading-zero patch", invalidReleaseIdentity("1.2.03")],
+      ["leading-zero numeric prerelease", invalidReleaseIdentity("1.2.3-01")],
+      ["build metadata", invalidReleaseIdentity("1.2.3+build.1")],
+      ["mismatched artifact version", { ...stableManifest, artifact_name: "fence_v9.9.9_linux-amd64" }],
+      ["mismatched release URL", { ...stableManifest, release_url: "https://github.com/GrantBirki/fence/releases/tag/v9.9.9" }],
+      ["malformed source commit", { ...stableManifest, source_commit: "B".repeat(40) }],
+      ["wrong source ref", { ...stableManifest, source_ref: "refs/heads/topic" }],
+      ["wrong signer digest", { ...stableManifest, signer_digest: "c".repeat(40) }],
+      ["wrong signer workflow", { ...stableManifest, signer_workflow: "GrantBirki/fence/.github/workflows/other.yml" }],
+      ["wrong bundle path", { ...stableManifest, bundle_path: "action/bin/other" }],
+      ["malformed artifact digest", { ...stableManifest, artifact_sha256: "not-a-sha256" }],
+    ];
+    for (const [description, invalidManifest] of invalidManifests) {
+      fs.writeFileSync(manifest, JSON.stringify(invalidManifest), "utf8");
+      assert.throws(() => validateBundle(manifest, binary), /contract/, description);
     }
-    fs.writeFileSync(manifest, JSON.stringify(manifestFor(binary, {
-      release_tag: "v0.1.0",
-      release_channel: "stable",
-      release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
-      source_commit: "b".repeat(40),
-      release_tag_commit: "b".repeat(40),
-      signer_digest: "b".repeat(40),
-      artifact_name: "fence_v0.1.0_linux-amd64",
-    })), "utf8");
+
+    fs.writeFileSync(manifest, JSON.stringify(stableManifest), "utf8");
     fs.symlinkSync(binary, binaryLink);
     fs.symlinkSync(manifest, manifestLink);
     assert.throws(() => validateBundle(manifest, wrongBinary), /checksum/);

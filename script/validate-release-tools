@@ -196,12 +196,36 @@ if grep -nE "^[[:space:]]*['\"]?workflow_dispatch['\"]?[[:space:]]*:" "$DIR/.git
   die ".github/workflows/release.yml must not expose workflow_dispatch"
 fi
 
-require_pattern "$DIR/.github/workflows/release.yml" 'gh release download "\$tag" --repo' "release verify job must download release assets with an explicit repository"
+require_pattern "$DIR/.github/workflows/release.yml" 'gh release download "\$VERSION_TAG" --repo "\$GITHUB_REPOSITORY" --dir published-assets' "release verify job must download release assets with an explicit repository"
 require_pattern "$DIR/.github/workflows/release.yml" 'release_args[+]=[(]--prerelease[)]' "release workflow must mark prerelease versions as prereleases"
-require_pattern "$DIR/.github/workflows/release.yml" 'gh release create "\$tag" "\$\{files\[@\]\}" "\$\{release_args\[@\]\}"' "release workflow must create immutable releases with the complete asset list"
+require_pattern "$DIR/.github/workflows/release.yml" 'gh release create "\$VERSION_TAG" "\$\{assets\[@\]\}" "\$\{release_args\[@\]\}"' "release workflow must create immutable releases with the complete asset list"
 if grep -nE 'gh release upload' "$DIR/.github/workflows/release.yml"; then
   die ".github/workflows/release.yml must upload assets through gh release create before immutable publication"
 fi
+require_pattern "$DIR/.github/workflows/release.yml" 'group:[[:space:]]+release' "release workflow must serialize repository releases"
+require_pattern "$DIR/.github/workflows/release.yml" 'queue:[[:space:]]+max' "release workflow must preserve every pending version release"
+require_pattern "$DIR/.github/workflows/release.yml" 'cancel-in-progress:[[:space:]]+false' "release workflow concurrency must not cancel an active release"
+require_pattern "$DIR/.github/workflows/release.yml" 'createCommitOnBranch' "release workflow must create the generated Action commit through GitHub GraphQL"
+require_pattern "$DIR/.github/workflows/release.yml" 'expectedHeadOid' "release workflow must protect generated commit creation with the expected source head"
+require_pattern "$DIR/.github/workflows/release.yml" 'wasSignedByGitHub' "release workflow must require GitHub-signed distribution commits"
+require_pattern "$DIR/.github/workflows/release.yml" 'action-release[.]json' "release workflow must publish the source-to-Action mapping"
+require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py classify-state' "release workflow must use the tested release-state classifier"
+require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py verify-commit' "release workflow must use the tested distribution-commit verifier"
+require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py validate-mapping' "release workflow must use the tested release-mapping verifier"
+require_pattern "$DIR/.github/workflows/release.yml" 'release-verified/[$][{]VERSION_TAG[}]' "release workflow must distinguish verified cleanup recovery from withdrawal"
+require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py probe-release' "release workflow must use one bounded release-state probe"
+require_pattern "$DIR/script/lib/action_release.py" 'release-state probe was indeterminate' "release helper must not interpret API failures as absent releases"
+require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py validate-draft' "release workflow must validate interrupted draft assets before replacement"
+require_pattern "$DIR/script/lib/action_release.py" 'draft release contains conflicting assets' "release helper must reject conflicting interrupted draft assets"
+require_pattern "$DIR/.github/workflows/release.yml" 'force-with-lease=' "release workflow must delete temporary refs through an expected-OID lease"
+require_pattern "$DIR/.github/workflows/release.yml" 'finalize-release:' "release workflow must report the consumer pin only after exact ref cleanup"
+require_pattern "$DIR/.github/workflows/release.yml" 'state_run_attempt:' "release workflow must bind publication to the state-classification attempt"
+if [[ "$(grep -c 'use Re-run all jobs' "$DIR/.github/workflows/release.yml")" -ne 4 ]]; then
+  die "release workflow must reject partial reruns at every publication and finalization boundary"
+fi
+require_pattern "$DIR/.github/workflows/release.yml" 'uses:[[:space:]]+[.]/[.]github/workflows/action-acceptance[.]yml' "release workflow must reuse full Action acceptance against the generated commit"
+require_pattern "$DIR/.github/workflows/release.yml" 'uses:[[:space:]]+[.]/[.]github/workflows/action-drift-canary[.]yml' "release workflow must reuse the strict fixed-runner canary against the generated commit"
+require_pattern "$DIR/.github/workflows/release.yml" 'environment:[[:space:]]+release' "release mutations must remain protected by the release environment"
 require_pattern "$DIR/.github/workflows/build.yml" 'runs-on:[[:space:]]+ubuntu-24[.]04' "build workflow must exercise the supported Ubuntu 24.04 environment"
 require_pattern "$DIR/.github/workflows/build.yml" 'script/prepare-rust' "build workflow must prepare the pinned Rust toolchain explicitly before offline package validation"
 require_pattern "$DIR/.github/workflows/build.yml" 'script/build --release --targets "x86_64-unknown-linux-gnu"' "build workflow must run Linux x64 release-mode packaging"
@@ -211,7 +235,9 @@ require_pattern "$DIR/script/build" 'build_version="v[$][{]package_version[}]"' 
 
 require_pattern "$DIR/.github/workflows/release.yml" 'runs-on:[[:space:]]+ubuntu-24[.]04' "release workflow must run the supported Ubuntu 24.04 environment"
 require_pattern "$DIR/.github/workflows/release.yml" 'script/build --release --targets "x86_64-unknown-linux-gnu"' "release workflow must package the Linux x64 release artifact"
-require_pattern "$DIR/.github/workflows/release.yml" 'name:[[:space:]]+dist-linux-x64' "release workflow must upload the Linux x64 artifact"
+require_pattern "$DIR/.github/workflows/release.yml" 'build-linux-x64:' "release workflow must build the Linux x64 artifact exactly once"
+require_pattern "$DIR/.github/workflows/release.yml" 'name:[[:space:]]+upload exact Linux x64 artifact' "release workflow must upload the exact Linux x64 artifact for reuse"
+require_pattern "$DIR/script/test" 'script/test-action-release' "offline tests must exercise the release state machine"
 
 if grep -nE 'build-macos|dist-macos|aarch64-unknown-linux-gnu|x86_64-apple-darwin|aarch64-apple-darwin|--universal-darwin' "$DIR/.github/workflows/release.yml"; then
   die ".github/workflows/release.yml must publish only the supported Linux x64 artifact"

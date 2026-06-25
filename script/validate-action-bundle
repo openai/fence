@@ -4,38 +4,79 @@ set -euo pipefail
 
 source script/env "$@"
 
-manifest="$DIR/action/bundle-manifest.json"
-binary="$DIR/action/bin/fence"
+allow_source=false
+root="$DIR"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --allow-source)
+      allow_source=true
+      shift
+      ;;
+    --root)
+      [[ $# -ge 2 ]] || die "--root requires a path"
+      root="$2"
+      shift 2
+      ;;
+    *)
+      die "usage: script/validate-action-bundle [--allow-source] [--root <path>]"
+      ;;
+  esac
+done
+
+manifest="$root/action/bundle-manifest.json"
+binary="$root/action/bin/fence"
 
 require_cmd python3
 
-python3 - "$manifest" "$binary" <<'PY'
+manifest_present=false
+binary_present=false
+if [[ -e "$manifest" || -L "$manifest" ]]; then
+  manifest_present=true
+fi
+if [[ -e "$binary" || -L "$binary" ]]; then
+  binary_present=true
+fi
+
+if [[ "$manifest_present" != "$binary_present" ]]; then
+  die "Action bundle must contain both action/bin/fence and action/bundle-manifest.json or neither"
+fi
+if [[ "$manifest_present" == "false" ]]; then
+  if [[ "$allow_source" == "true" ]]; then
+    echo -e "${GREEN}Action bundle source state verified${OFF}"
+    exit 0
+  fi
+  die "Action bundle distribution files are missing"
+fi
+
+python3 -B -E - "$manifest" "$binary" <<'PY'
 import hashlib
 import json
 import pathlib
 import re
-import stat
 import sys
 
 manifest_path = pathlib.Path(sys.argv[1])
 binary_path = pathlib.Path(sys.argv[2])
+for directory in (manifest_path.parent, binary_path.parent):
+    if not directory.is_dir() or directory.is_symlink():
+        raise SystemExit(f"unsafe Action bundle directory: {directory}")
 if not manifest_path.is_file() or manifest_path.is_symlink():
     raise SystemExit(f"missing Action bundle manifest: {manifest_path}")
 if not binary_path.is_file() or binary_path.is_symlink():
     raise SystemExit(f"missing Action bundle binary: {binary_path}")
-if not binary_path.stat().st_mode & stat.S_IXUSR:
-    raise SystemExit(f"Action bundle binary is not executable: {binary_path}")
+if not 0 < binary_path.stat().st_size <= 64 * 1024 * 1024:
+    raise SystemExit(f"Action bundle binary size is invalid: {binary_path}")
 
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+if not isinstance(manifest, dict):
+    raise SystemExit("Action bundle manifest must be a JSON object")
 expected_keys = {
     "schema_version",
     "repository",
     "release_tag",
     "release_channel",
     "release_url",
-    "release_is_draft",
-    "release_is_immutable",
-    "release_tag_commit",
     "source_commit",
     "source_ref",
     "artifact_name",
@@ -43,29 +84,23 @@ expected_keys = {
     "bundle_path",
     "signer_workflow",
     "signer_digest",
-    "attestation_verified",
 }
 if set(manifest) != expected_keys:
     raise SystemExit("Action bundle manifest fields do not match the reviewed schema")
-if manifest["schema_version"] != 3:
-    raise SystemExit("Action bundle manifest schema_version must be 3")
+if manifest["schema_version"] != 4:
+    raise SystemExit("Action bundle manifest schema_version must be 4")
 if manifest["repository"] != "GrantBirki/fence":
     raise SystemExit("Action bundle manifest repository mismatch")
-if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?", manifest["release_tag"]):
+semver_tag = r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?"
+if not re.fullmatch(semver_tag, manifest["release_tag"]):
     raise SystemExit("Action bundle manifest release_tag must identify an immutable semver release")
 expected_release_channel = "prerelease" if "-" in manifest["release_tag"] else "stable"
 if manifest["release_channel"] != expected_release_channel:
     raise SystemExit("Action bundle manifest release channel mismatch")
 if manifest["release_url"] != f"https://github.com/GrantBirki/fence/releases/tag/{manifest['release_tag']}":
     raise SystemExit("Action bundle manifest release URL mismatch")
-if manifest["release_is_draft"] is not False:
-    raise SystemExit("Action bundle manifest must identify a non-draft release")
-if manifest["release_is_immutable"] is not True:
-    raise SystemExit("Action bundle manifest must identify an immutable release")
 if not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
     raise SystemExit("Action bundle manifest source_commit must be a full SHA")
-if manifest["release_tag_commit"] != manifest["source_commit"]:
-    raise SystemExit("Action bundle manifest release tag commit mismatch")
 if manifest["source_ref"] != "refs/heads/main":
     raise SystemExit("Action bundle manifest source ref mismatch")
 if manifest["artifact_name"] != f"fence_{manifest['release_tag']}_linux-amd64":
@@ -78,8 +113,6 @@ if manifest["signer_workflow"] != "GrantBirki/fence/.github/workflows/release.ym
     raise SystemExit("Action bundle signer workflow mismatch")
 if manifest["signer_digest"] != manifest["source_commit"]:
     raise SystemExit("Action bundle signer digest mismatch")
-if manifest["attestation_verified"] is not True:
-    raise SystemExit("Action bundle manifest must record successful attestation verification")
 
 actual = hashlib.sha256(binary_path.read_bytes()).hexdigest()
 if actual != manifest["artifact_sha256"]:
