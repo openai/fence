@@ -5,6 +5,7 @@ set -euo pipefail
 source script/env "$@"
 
 require_cmd python3
+require_cmd cmp
 
 tmpdir="$(make_temp_dir fence-action-bundle-test)"
 cleanup() {
@@ -13,166 +14,208 @@ cleanup() {
 trap cleanup EXIT
 
 source_commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-tag="v1.2.3"
+version="$(toml_value "$DIR/Cargo.toml" version)"
+artifact="$tmpdir/fence_v${version}_linux-amd64"
+candidate_one="$tmpdir/candidate-one"
+candidate_two="$tmpdir/candidate-two"
 
-make_fixture() {
-  local case_name="$1"
-  local fixture="$tmpdir/$case_name/repo"
+printf '%s' "synthetic-action-binary" > "$artifact"
+chmod 0755 "$artifact"
+mkdir -p "$candidate_one/action"
+printf '%s\n' "reviewed-wrapper" > "$candidate_one/action/main.cts"
 
-  mkdir -p \
-    "$fixture/action/bin" \
-    "$fixture/script/lib" \
-    "$fixture/target/tmp" \
-    "$tmpdir/$case_name/bin" \
-    "$tmpdir/$case_name/state"
-  cp script/env script/update-action-bundle script/validate-action-bundle "$fixture/script/"
-  cp script/lib/common.bash "$fixture/script/lib/"
-  cp rust-toolchain.toml "$fixture/"
+script/assemble-action-bundle \
+  --artifact "$artifact" \
+  --version "$version" \
+  --source-commit "$source_commit" \
+  --output-root "$candidate_one"
+script/assemble-action-bundle \
+  --artifact "$artifact" \
+  --version "$version" \
+  --source-commit "$source_commit" \
+  --output-root "$candidate_two"
 
-  cat > "$tmpdir/$case_name/bin/gh" <<'SH'
-#! /usr/bin/env bash
+script/validate-action-bundle --root "$candidate_one"
+cmp "$artifact" "$candidate_one/action/bin/fence"
+cmp "$candidate_one/action/bin/fence" "$candidate_two/action/bin/fence"
+cmp "$candidate_one/action/bundle-manifest.json" "$candidate_two/action/bundle-manifest.json"
+[[ "$(cat "$candidate_one/action/main.cts")" == "reviewed-wrapper" ]] || die "Action bundle assembler modified an unrelated output file"
 
-set -euo pipefail
+python3 -B -E - \
+  "$candidate_one/action/bundle-manifest.json" \
+  "$candidate_one/action/bin/fence" \
+  "$version" \
+  "$source_commit" <<'PY'
+import hashlib
+import json
+import pathlib
+import stat
+import sys
 
-command_name="${1:-}"
-subcommand="${2:-}"
-shift 2
-
-case "$command_name:$subcommand" in
-  release:view)
-    is_draft=false
-    is_immutable=true
-    case "$FAKE_RELEASE_CASE" in
-      draft) is_draft=true ;;
-      mutable) is_immutable=false ;;
-      valid|tag-mismatch) ;;
-      *) exit 64 ;;
-    esac
-    printf '{"isDraft":%s,"isImmutable":%s,"isPrerelease":false,"tagName":"v1.2.3","targetCommitish":"%s","url":"https://github.com/GrantBirki/fence/releases/tag/v1.2.3"}\n' \
-      "$is_draft" "$is_immutable" "$FAKE_SOURCE_COMMIT"
-    ;;
-  api:repos/GrantBirki/fence/commits/v1.2.3)
-    if [[ "$FAKE_RELEASE_CASE" == "tag-mismatch" ]]; then
-      printf '%s\n' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    else
-      printf '%s\n' "$FAKE_SOURCE_COMMIT"
-    fi
-    ;;
-  release:download)
-    destination=""
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --dir)
-          destination="$2"
-          shift 2
-          ;;
-        *) shift ;;
-      esac
-    done
-    [[ -n "$destination" ]] || exit 64
-    printf '%s' "synthetic-action-binary" > "$destination/fence_v1.2.3_linux-amd64"
-    if command -v shasum >/dev/null 2>&1; then
-      digest="$(shasum -a 256 "$destination/fence_v1.2.3_linux-amd64" | awk '{print $1}')"
-    else
-      digest="$(sha256sum "$destination/fence_v1.2.3_linux-amd64" | awk '{print $1}')"
-    fi
-    printf '%s  %s\n' "$digest" "fence_v1.2.3_linux-amd64" > "$destination/checksums.txt"
-    : > "$FAKE_GH_STATE/downloaded"
-    ;;
-  attestation:verify)
-    signer_digest=""
-    source_digest=""
-    source_ref=""
-    signer_workflow=""
-    deny_self_hosted="false"
-    while [[ $# -gt 0 ]]; do
-      case "$1" in
-        --signer-digest) signer_digest="$2"; shift 2 ;;
-        --source-digest) source_digest="$2"; shift 2 ;;
-        --source-ref) source_ref="$2"; shift 2 ;;
-        --signer-workflow) signer_workflow="$2"; shift 2 ;;
-        --deny-self-hosted-runners) deny_self_hosted="true"; shift ;;
-        --repo) shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    [[ "$signer_digest" == "$FAKE_SOURCE_COMMIT" ]] || exit 65
-    [[ "$source_digest" == "$FAKE_SOURCE_COMMIT" ]] || exit 65
-    [[ "$source_ref" == "refs/heads/main" ]] || exit 65
-    [[ "$signer_workflow" == "GrantBirki/fence/.github/workflows/release.yml" ]] || exit 65
-    [[ "$deny_self_hosted" == "true" ]] || exit 65
-    : > "$FAKE_GH_STATE/attestation-verified"
-    ;;
-  *) exit 64 ;;
-esac
-SH
-  chmod 0755 "$tmpdir/$case_name/bin/gh"
-  printf '%s\n' "$fixture"
+manifest_path = pathlib.Path(sys.argv[1])
+binary_path = pathlib.Path(sys.argv[2])
+version, source_commit = sys.argv[3:]
+manifest_text = manifest_path.read_text(encoding="utf-8")
+manifest = json.loads(manifest_text)
+expected = {
+    "artifact_name": f"fence_v{version}_linux-amd64",
+    "artifact_sha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
+    "bundle_path": "action/bin/fence",
+    "release_channel": "prerelease" if "-" in version else "stable",
+    "release_tag": f"v{version}",
+    "release_url": f"https://github.com/GrantBirki/fence/releases/tag/v{version}",
+    "repository": "GrantBirki/fence",
+    "schema_version": 4,
+    "signer_digest": source_commit,
+    "signer_workflow": "GrantBirki/fence/.github/workflows/release.yml",
+    "source_commit": source_commit,
+    "source_ref": "refs/heads/main",
 }
+if manifest != expected:
+    raise SystemExit("assembled Action bundle manifest does not match schema 4")
+if manifest_text != json.dumps(expected, indent=2, sort_keys=True) + "\n":
+    raise SystemExit("assembled Action bundle manifest is not canonical JSON")
+if stat.S_IMODE(binary_path.stat().st_mode) != 0o644:
+    raise SystemExit("assembled Action bundle binary must be a non-executable Git blob")
+PY
 
-run_rejected_case() {
+make_release_identity_state() {
   local case_name="$1"
-  local fixture
-  fixture="$(make_fixture "$case_name")"
+  local release_version="$2"
+  local release_channel="$3"
+  local case_root="$tmpdir/$case_name"
 
-  if (
-    cd "$fixture"
-    CI=true \
-      RUNNER_TEMP="$fixture/target/tmp" \
-      TMPDIR="$fixture/target/tmp" \
-      PATH="$tmpdir/$case_name/bin:$PATH" \
-      FAKE_GH_STATE="$tmpdir/$case_name/state" \
-      FAKE_RELEASE_CASE="$case_name" \
-      FAKE_SOURCE_COMMIT="$source_commit" \
-      script/update-action-bundle "$tag"
-  ) > "$tmpdir/$case_name/output" 2>&1; then
-    die "Action bundle updater accepted invalid release metadata"
-  fi
-  if [[ -e "$tmpdir/$case_name/state/downloaded" ]]; then
-    die "Action bundle updater downloaded an artifact before rejecting invalid release metadata"
-  fi
-}
-
-run_rejected_case draft
-run_rejected_case mutable
-run_rejected_case tag-mismatch
-
-fixture="$(make_fixture valid)"
-(
-  cd "$fixture"
-  CI=true \
-    RUNNER_TEMP="$fixture/target/tmp" \
-    TMPDIR="$fixture/target/tmp" \
-    PATH="$tmpdir/valid/bin:$PATH" \
-    FAKE_GH_STATE="$tmpdir/valid/state" \
-    FAKE_RELEASE_CASE="valid" \
-    FAKE_SOURCE_COMMIT="$source_commit" \
-    script/update-action-bundle "$tag"
-) > "$tmpdir/valid/output" 2>&1
-
-[[ -e "$tmpdir/valid/state/downloaded" ]] || die "Action bundle updater did not download the validated artifact"
-[[ -e "$tmpdir/valid/state/attestation-verified" ]] || die "Action bundle updater did not enforce attestation provenance"
-
-python3 - "$fixture/action/bundle-manifest.json" "$source_commit" <<'PY'
+  cp -R "$candidate_one" "$case_root"
+  python3 -B -E - "$case_root/action/bundle-manifest.json" "$release_version" "$release_channel" <<'PY'
 import json
 import pathlib
 import sys
 
-manifest = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-source_commit = sys.argv[2]
-expected = {
-    "schema_version": 3,
-    "release_is_draft": False,
-    "release_is_immutable": True,
-    "release_tag_commit": source_commit,
-    "source_commit": source_commit,
-    "source_ref": "refs/heads/main",
-    "signer_digest": source_commit,
-    "attestation_verified": True,
-}
-for key, value in expected.items():
-    if manifest.get(key) != value:
-        raise SystemExit(f"generated Action bundle manifest has an invalid {key}")
+path = pathlib.Path(sys.argv[1])
+version, channel = sys.argv[2:]
+manifest = json.loads(path.read_text(encoding="utf-8"))
+manifest.update({
+    "artifact_name": f"fence_v{version}_linux-amd64",
+    "release_channel": channel,
+    "release_tag": f"v{version}",
+    "release_url": f"https://github.com/GrantBirki/fence/releases/tag/v{version}",
+})
+path.write_text(json.dumps(manifest), encoding="utf-8")
 PY
+  script/validate-action-bundle --root "$case_root"
+}
+
+make_release_identity_state stable-identity-state "1.2.3" stable
+make_release_identity_state prerelease-identity-state "1.2.3-rc.1" prerelease
+
+source_state="$tmpdir/source-state"
+binary_only_state="$tmpdir/binary-only-state"
+manifest_only_state="$tmpdir/manifest-only-state"
+mkdir -p "$source_state/action" "$binary_only_state/action/bin" "$manifest_only_state/action"
+script/validate-action-bundle --allow-source --root "$source_state"
+if script/validate-action-bundle --root "$source_state" > "$tmpdir/source-state.output" 2>&1; then
+  die "Action bundle validator accepted a source tree as a distribution tree"
+fi
+cp "$artifact" "$binary_only_state/action/bin/fence"
+cp "$candidate_one/action/bundle-manifest.json" "$manifest_only_state/action/bundle-manifest.json"
+for half_state in "$binary_only_state" "$manifest_only_state"; do
+  if script/validate-action-bundle --allow-source --root "$half_state" > "$tmpdir/half-state.output" 2>&1; then
+    die "Action bundle validator accepted a half-present bundle"
+  fi
+done
+
+checksum_state="$tmpdir/checksum-state"
+cp -R "$candidate_one" "$checksum_state"
+
+expect_manifest_rejected() {
+  local case_name="$1"
+  local operation="$2"
+  local field="$3"
+  local encoded_value="${4:-null}"
+  local case_root="$tmpdir/manifest-$case_name"
+
+  cp -R "$candidate_one" "$case_root"
+  python3 -B -E - \
+    "$case_root/action/bundle-manifest.json" \
+    "$operation" \
+    "$field" \
+    "$encoded_value" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+operation, field, encoded_value = sys.argv[2:]
+manifest = json.loads(path.read_text(encoding="utf-8"))
+if operation == "delete":
+    del manifest[field]
+elif operation == "set":
+    manifest[field] = json.loads(encoded_value)
+else:
+    raise SystemExit("unknown manifest mutation")
+path.write_text(json.dumps(manifest), encoding="utf-8")
+PY
+  if script/validate-action-bundle --root "$case_root" > "$tmpdir/manifest-$case_name.output" 2>&1; then
+    die "Action bundle validator accepted invalid manifest case: $case_name"
+  fi
+}
+
+expect_manifest_rejected missing-field delete repository
+expect_manifest_rejected unknown-field set action_commit '"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+expect_manifest_rejected self-reference set release_tag_commit '"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+expect_manifest_rejected malformed-core-version set release_tag '"v01.2.3"'
+expect_manifest_rejected malformed-prerelease-version set release_tag '"v1.2.3-01"'
+expect_manifest_rejected mismatched-artifact-version set artifact_name '"fence_v9.9.9_linux-amd64"'
+expect_manifest_rejected wrong-source set source_commit '"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
+expect_manifest_rejected wrong-source-ref set source_ref '"refs/heads/topic"'
+expect_manifest_rejected wrong-signer set signer_digest '"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
+expect_manifest_rejected wrong-signer-workflow set signer_workflow '"GrantBirki/fence/.github/workflows/other.yml"'
+expect_manifest_rejected wrong-path set bundle_path '"action/bin/other"'
+expect_manifest_rejected malformed-digest set artifact_sha256 '"not-a-sha256"'
+expect_manifest_rejected mismatched-release-url set release_url '"https://github.com/GrantBirki/fence/releases/tag/v9.9.9"'
+
+printf '%s' "tampered" >> "$checksum_state/action/bin/fence"
+if script/validate-action-bundle --root "$checksum_state" > "$tmpdir/checksum-state.output" 2>&1; then
+  die "Action bundle validator accepted a binary checksum mismatch"
+fi
+
+expect_rejected() {
+  local description="$1"
+  shift
+  if "$@" > "$tmpdir/rejected.output" 2>&1; then
+    die "Action bundle assembler accepted $description"
+  fi
+}
+
+wrong_name="$tmpdir/fence-wrong-name"
+printf '%s' "synthetic-action-binary" > "$wrong_name"
+expect_rejected "an incorrectly named artifact" \
+  script/assemble-action-bundle --artifact "$wrong_name" --version "$version" --source-commit "$source_commit" --output-root "$tmpdir/rejected-name"
+
+mismatched_version="${version%.*}.999"
+mismatched_artifact="$tmpdir/fence_v${mismatched_version}_linux-amd64"
+printf '%s' "synthetic-action-binary" > "$mismatched_artifact"
+expect_rejected "a version that disagrees with Cargo metadata" \
+  script/assemble-action-bundle --artifact "$mismatched_artifact" --version "$mismatched_version" --source-commit "$source_commit" --output-root "$tmpdir/rejected-version"
+expect_rejected "a non-canonical source commit" \
+  script/assemble-action-bundle --artifact "$artifact" --version "$version" --source-commit "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" --output-root "$tmpdir/rejected-commit"
+expect_rejected "an output root outside generated paths" \
+  script/assemble-action-bundle --artifact "$artifact" --version "$version" --source-commit "$source_commit" --output-root "$DIR/action-bundle-outside"
+
+for invalid_version in 01.2.3 1.02.3 1.2.03 1.2.3-01 1.2.3+build.1; do
+  invalid_artifact="$tmpdir/fence_v${invalid_version}_linux-amd64"
+  printf '%s' "synthetic-action-binary" > "$invalid_artifact"
+  expect_rejected "the malformed SemVer $invalid_version" \
+    script/assemble-action-bundle --artifact "$invalid_artifact" --version "$invalid_version" --source-commit "$source_commit" --output-root "$tmpdir/rejected-semver"
+done
+
+unsafe_output="$tmpdir/unsafe-output"
+outside_target="$tmpdir/outside-target"
+mkdir -p "$unsafe_output/action/bin"
+printf '%s' "outside" > "$outside_target"
+ln -s "$outside_target" "$unsafe_output/action/bin/fence"
+expect_rejected "a symlinked output file" \
+  script/assemble-action-bundle --artifact "$artifact" --version "$version" --source-commit "$source_commit" --output-root "$unsafe_output"
+[[ "$(cat "$outside_target")" == "outside" ]] || die "Action bundle assembler wrote through an output symlink"
 
 echo -e "${GREEN}Action bundle provenance verified${OFF}"

@@ -8,6 +8,7 @@ ensure_rust_toolchain
 
 script/validate-release-tools
 script/validate-test-tools
+script/test-action-release
 script/test-rust-toolchain-preparation
 
 case "${1:-}" in

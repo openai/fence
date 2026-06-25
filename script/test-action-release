@@ -1,0 +1,272 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+require_cmd python3
+
+python3 -B -E - "$DIR" <<'PY'
+import copy
+import hashlib
+import importlib.util
+import json
+import pathlib
+import tempfile
+import sys
+
+root = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("action_release", root / "script/lib/action_release.py")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+
+def expect_error(callable_value, message):
+    try:
+        callable_value()
+    except ValueError:
+        return
+    raise SystemExit(message)
+
+
+for valid in ("0.7.0", "1.2.3-rc.1", "1.2.3-alpha.beta", "10.20.30-0"):
+    module.parse_semver(valid)
+for invalid in ("01.2.3", "1.02.3", "1.2.03", "1.2.3-01", "1.2.3+build", "v1.2.3"):
+    expect_error(lambda value=invalid: module.parse_semver(value), f"accepted invalid SemVer: {invalid}")
+if module.release_channel("1.2.3") != "stable" or module.release_channel("1.2.3-rc.1") != "prerelease":
+    raise SystemExit("stable/prerelease classification mismatch")
+if module.compare_semver(module.parse_semver("1.2.3-rc.1"), module.parse_semver("1.2.3")) >= 0:
+    raise SystemExit("SemVer prerelease precedence mismatch")
+if module.compare_semver(module.parse_semver("1.2.4"), module.parse_semver("1.2.3")) <= 0:
+    raise SystemExit("SemVer release precedence mismatch")
+
+if module.select_exact_release([[]], "v0.7.0") != ("absent", None):
+    raise SystemExit("absent release-state selection mismatch")
+draft_release = {"tag_name": "v0.7.0", "draft": True}
+published_release = {"tag_name": "v0.7.0", "draft": False}
+if module.select_exact_release([[draft_release]], "v0.7.0") != ("draft", draft_release):
+    raise SystemExit("draft release-state selection mismatch")
+if module.select_exact_release([[published_release]], "v0.7.0") != ("published", published_release):
+    raise SystemExit("published release-state selection mismatch")
+expect_error(
+    lambda: module.select_exact_release([[draft_release], [published_release]], "v0.7.0"),
+    "accepted duplicate exact release records",
+)
+
+pages = [[
+    {"tag_name": "v0.6.3", "draft": False},
+    {"tag_name": "v0.7.0-rc.1", "draft": False},
+    {"tag_name": "v9.0.0", "draft": True},
+]]
+module.validate_release_order("0.7.0", pages)
+module.validate_release_order("0.7.0-rc.1", pages)
+expect_error(lambda: module.validate_release_order("0.6.4", pages), "accepted a non-monotonic release")
+
+with tempfile.TemporaryDirectory() as directory:
+    temporary = pathlib.Path(directory)
+    cargo = temporary / "Cargo.toml"
+    lock = temporary / "Cargo.lock"
+    cargo.write_text('[package]\nname = "fence"\nversion = "0.7.0"\n', encoding="utf-8")
+    lock.write_text('version = 4\n\n[[package]]\nname = "fence"\nversion = "0.7.0"\n', encoding="utf-8")
+    if module.validate_root_versions(cargo, lock) != ("fence", "0.7.0"):
+        raise SystemExit("root Cargo identity mismatch")
+    lock.write_text('version = 4\n\n[[package]]\nname = "fence"\nversion = "0.6.3"\n', encoding="utf-8")
+    expect_error(lambda: module.validate_root_versions(cargo, lock), "accepted a Cargo.toml/Cargo.lock mismatch")
+
+repository = "GrantBirki/fence"
+version = "0.7.0"
+source = "a" * 40
+action = "b" * 40
+other = "c" * 40
+artifact = "fence_v0.7.0_linux-amd64"
+digest = "d" * 64
+mapping = module.expected_mapping(repository, version, source, action, artifact, digest)
+if module.validate_mapping(mapping, repository, version, source, action, artifact, digest) != action:
+    raise SystemExit("valid release mapping was rejected")
+for field, value in (
+    ("source_commit", other),
+    ("action_commit", other),
+    ("artifact_sha256", "e" * 64),
+    ("artifact_name", "fence_v0.7.1_linux-amd64"),
+    ("signer_digest", other),
+):
+    invalid = copy.deepcopy(mapping)
+    invalid[field] = value
+    expect_error(
+        lambda candidate=invalid: module.validate_mapping(candidate, repository, version, source, action, artifact, digest),
+        f"accepted conflicting release mapping field: {field}",
+    )
+missing = copy.deepcopy(mapping)
+missing.pop("signer_workflow")
+expect_error(lambda: module.validate_mapping(missing, repository, version, source, action, artifact, digest), "accepted missing mapping field")
+
+def state(
+    release_exists=False,
+    release_mapping=None,
+    tag_commit=None,
+    candidate_head=None,
+    verified_head=None,
+    draft_commit=None,
+    verification_succeeded=None,
+):
+    return {
+        "release_exists": release_exists,
+        "release_mapping": release_mapping,
+        "tag_commit": tag_commit,
+        "candidate_head": candidate_head,
+        "draft_commit": draft_commit,
+        "verification_succeeded": verification_succeeded,
+        "verified_head": verified_head,
+    }
+
+cases = (
+    (state(), "new", None),
+    (state(candidate_head=source), "candidate-source", None),
+    (state(candidate_head=action), "candidate", action),
+    (state(tag_commit=action), "tag", action),
+    (state(tag_commit=action, candidate_head=action), "tag", action),
+    (state(draft_commit=action), "draft", action),
+    (state(tag_commit=action, candidate_head=action, draft_commit=action), "draft", action),
+    (state(True, mapping, action, None), "complete", action),
+    (state(True, mapping, action, action, verification_succeeded=False), "withdrawn", action),
+    (state(True, mapping, action, action, verification_succeeded=True), "complete", action),
+    (state(True, mapping, action, action, action), "complete", action),
+    (state(True, mapping, action, None, action), "complete", action),
+)
+for value, expected_state, expected_action in cases:
+    result = module.classify_release_state(value, repository, version, source, artifact, digest)
+    if result != {"state": expected_state, "action_commit": expected_action}:
+        raise SystemExit(f"release state classification mismatch: {value}")
+
+conflicts = (
+    state(True, None, action, None),
+    state(True, mapping, other, None),
+    state(True, mapping, action, other),
+    state(True, mapping, action, action, other),
+    state(True, mapping, action, action),
+    state(True, mapping, action, None, None, action),
+    state(False, mapping, None, None),
+    state(False, None, None, None, action),
+    state(False, None, None, None, None, source),
+    state(False, None, None, None, None, None, True),
+    state(False, None, other, action, None, action),
+    state(False, None, source, None),
+    state(False, None, action, other),
+)
+for value in conflicts:
+    expect_error(
+        lambda candidate=value: module.classify_release_state(candidate, repository, version, source, artifact, digest),
+        f"accepted conflicting release state: {value}",
+    )
+incomplete_state = state()
+incomplete_state.pop("verified_head")
+expect_error(
+    lambda: module.classify_release_state(incomplete_state, repository, version, source, artifact, digest),
+    "accepted release state without verification marker identity",
+)
+
+with tempfile.TemporaryDirectory() as directory:
+    temporary = pathlib.Path(directory)
+    asset_root = temporary / "assets"
+    asset_root.mkdir()
+    notes = temporary / "notes.md"
+    notes.write_text("Release v0.7.0\n", encoding="utf-8")
+    asset_names = (
+        artifact,
+        f"{artifact}.tar.gz",
+        "action-release.json",
+        "checksums.txt",
+    )
+    for index, name in enumerate(asset_names):
+        (asset_root / name).write_bytes(f"asset-{index}".encode())
+
+    def draft_asset(name):
+        path = asset_root / name
+        return {
+            "name": name,
+            "state": "uploaded",
+            "size": path.stat().st_size,
+            "digest": f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+            "uploader": {"login": "github-actions[bot]", "type": "Bot"},
+        }
+
+    draft = {
+        "id": 7,
+        "tag_name": "v0.7.0",
+        "target_commitish": action,
+        "name": "v0.7.0",
+        "body": "Release v0.7.0\n",
+        "draft": True,
+        "prerelease": False,
+        "immutable": False,
+        "published_at": None,
+        "author": {"login": "github-actions[bot]", "type": "Bot"},
+        "assets": [draft_asset(artifact), draft_asset("action-release.json")],
+    }
+    if module.validate_draft_release(draft, notes, asset_root, version, action, "stable") != 7:
+        raise SystemExit("matching interrupted draft was rejected")
+    for description, mutate in (
+        ("target", lambda value: value.update(target_commitish=other)),
+        ("notes", lambda value: value.update(body="different")),
+        ("channel", lambda value: value.update(prerelease=True)),
+        ("author", lambda value: value.update(author={"login": "maintainer", "type": "User"})),
+        ("published state", lambda value: value.update(immutable=True)),
+        ("asset digest", lambda value: value["assets"][0].update(digest="sha256:" + "0" * 64)),
+        ("asset uploader", lambda value: value["assets"][0].update(uploader={"login": "maintainer", "type": "User"})),
+        ("unknown asset", lambda value: value["assets"].append({**draft_asset(artifact), "name": "unknown"})),
+    ):
+        invalid = copy.deepcopy(draft)
+        mutate(invalid)
+        expect_error(
+            lambda candidate=invalid: module.validate_draft_release(
+                candidate,
+                notes,
+                asset_root,
+                version,
+                action,
+                "stable",
+            ),
+            f"accepted conflicting draft {description}",
+        )
+
+rest = {
+    "sha": action,
+    "parents": [{"sha": source}],
+    "files": [
+        {"filename": "action/bin/fence", "status": "added"},
+        {"filename": "action/bundle-manifest.json", "status": "added"},
+    ],
+    "commit": {"verification": {"verified": True}},
+}
+graphql = {
+    "data": {
+        "repository": {
+            "object": {
+                "oid": action,
+                "signature": {"isValid": True, "wasSignedByGitHub": True},
+            }
+        }
+    }
+}
+module.validate_distribution_commit(rest, graphql, source, action)
+invalid_parent = copy.deepcopy(rest)
+invalid_parent["parents"] = [{"sha": other}]
+invalid_diff = copy.deepcopy(rest)
+invalid_diff["files"].append({"filename": "README.md", "status": "modified"})
+invalid_rest_signature = copy.deepcopy(rest)
+invalid_rest_signature["commit"]["verification"]["verified"] = False
+invalid_github_signature = copy.deepcopy(graphql)
+invalid_github_signature["data"]["repository"]["object"]["signature"]["wasSignedByGitHub"] = False
+for description, rest_value, graphql_value in (
+    ("parent", invalid_parent, graphql),
+    ("diff", invalid_diff, graphql),
+    ("REST signature", invalid_rest_signature, graphql),
+    ("GitHub signature", rest, invalid_github_signature),
+):
+    expect_error(
+        lambda left=rest_value, right=graphql_value: module.validate_distribution_commit(left, right, source, action),
+        f"accepted conflicting distribution {description}",
+    )
+
+print("Action release state verified")
+PY

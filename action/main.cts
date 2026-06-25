@@ -17,6 +17,7 @@ const {
   readLauncherIntegrity,
   runtimePaths,
   validateBundle,
+  validatedActionRuntimeSnapshot,
   validateActionPathGuardMount,
   validateInlineConfig,
   validateLauncherIntegrity,
@@ -281,11 +282,12 @@ function createOrValidateRootDirectory(directory: string): void {
 function installProtectedActionRuntime(
   invocationId: string,
   paths: ReturnType<typeof runtimePaths>,
+  sourceFiles: ReturnType<typeof actionRuntimeFileDigests>,
+  sourceManifest: any,
 ): void {
   if (pathEntryExists(paths.launcherDirectory)) {
     throw new Error("Fence launcher invocation directory already exists");
   }
-  const sourceFiles = actionRuntimeFileDigests(ACTION_ROOT);
   createOrValidateRootDirectory("/run/fence-launcher");
   run("/usr/bin/sudo", [
     "/usr/bin/install",
@@ -325,6 +327,13 @@ function installProtectedActionRuntime(
   const protectedFiles = actionRuntimeFileDigests(paths.launcherActionDirectory);
   if (actionRuntimeDigest(sourceFiles) !== actionRuntimeDigest(protectedFiles)) {
     throw new Error("Fence protected Action copy does not match the registered runtime");
+  }
+  const protectedManifest = validateBundle(
+    path.join(paths.launcherActionDirectory, "bundle-manifest.json"),
+    path.join(paths.launcherActionDirectory, "bin", "fence"),
+  );
+  if (JSON.stringify(protectedManifest) !== JSON.stringify(sourceManifest)) {
+    throw new Error("Fence protected Action manifest does not match the validated source runtime");
   }
   const pathGuards = actionPathGuardIdentities(ACTION_ROOT);
   const integrity = launcherIntegrityDocument(
@@ -424,6 +433,20 @@ function serviceRemainsActive(paths: ReturnType<typeof runtimePaths>): boolean {
   }
   const state = status.stdout.trim();
   return state !== "ActiveState=inactive" && state !== "ActiveState=failed";
+}
+
+function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
+  return [
+    "/usr/bin/systemd-run",
+    "--quiet",
+    "--property=Type=exec",
+    "--unit",
+    paths.unit,
+    path.join(paths.launcherActionDirectory, "bin", "fence"),
+    "run",
+    "--config",
+    paths.config,
+  ];
 }
 
 function cleanupLauncherBeforeReadiness(): void {
@@ -529,7 +552,8 @@ function main(): void {
   if (process.platform !== "linux" || process.arch !== "x64") {
     throw new Error("Fence Action supports only Linux x64");
   }
-  const manifest = validateBundle(MANIFEST, BINARY);
+  const sourceRuntime = validatedActionRuntimeSnapshot(ACTION_ROOT);
+  const manifest = sourceRuntime.manifest;
   const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, nativeInputsFromEnvironment(process.env));
   const paths = runtimePaths(config.invocationId);
   diagnosticPaths = paths;
@@ -559,7 +583,12 @@ function main(): void {
   if (pathEntryExists(paths.directory)) {
     throw new Error("Fence runtime invocation directory already exists");
   }
-  installProtectedActionRuntime(config.invocationId, paths);
+  installProtectedActionRuntime(
+    config.invocationId,
+    paths,
+    sourceRuntime.files,
+    manifest,
+  );
   createOrValidateRootDirectory("/run/fence");
   run("/usr/bin/sudo", ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", paths.directory]);
   runtimeDirectoryCreated = true;
@@ -573,19 +602,11 @@ function main(): void {
   appendState("ready_path", paths.ready);
   appendState("launcher_integrity_path", paths.launcherIntegrity);
   log.info("🚀 Starting resident service");
-  const serviceArgs = [
-    "/usr/bin/systemd-run",
-    "--quiet",
-    "--property=Type=exec",
-    "--unit",
-    paths.unit,
-    BINARY,
-    "run",
-    "--config",
-    paths.config,
-  ];
+  const protectedBinary = path.join(paths.launcherActionDirectory, "bin", "fence");
+  const serviceArgs = residentServiceArgs(paths);
   log.debugGroup("Fence debug: service launch", [
     `executable=/usr/bin/sudo`,
+    `protected_binary=${protectedBinary}`,
     `args=${serviceArgs.join(" ")}`,
     `child_timeout_ms=${CHILD_TIMEOUT_MS}`,
   ]);
@@ -607,4 +628,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { fenceErrorCodeFromJournal, main, run, terminalServiceStatus };
+module.exports = { fenceErrorCodeFromJournal, main, residentServiceArgs, run, terminalServiceStatus };

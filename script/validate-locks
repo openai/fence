@@ -180,8 +180,9 @@ marker = "\n  acceptance:\n"
 require(workflow.count(marker) == 1, "Action acceptance aggregate must be unique")
 aggregate = workflow.split(marker, 1)[1]
 required_fragments = [
-    "needs: [action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]",
+    "needs: [prepare-candidate, action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]",
     "if: ${{ always() && !cancelled() }}",
+    "PREPARE_RESULT: ${{ needs.prepare-candidate.result }}",
     "ACTION_RESULT: ${{ needs.action.result }}",
     "ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}",
     "NESTED_LAYOUT_RESULT: ${{ needs.nested-layout.result }}",
@@ -193,6 +194,24 @@ required_fragments = [
 for fragment in required_fragments:
     require(fragment in aggregate, "Action acceptance aggregate must fail closed")
 require(aggregate.count("exit 1") == 1, "Action acceptance aggregate must reject unsuccessful jobs")
+for fragment in [
+    "workflow_call:",
+    "action_ref:",
+    "candidate_kind:",
+    "ref: ${{ steps.candidate.outputs.action_ref }}",
+    "script/assemble-action-bundle",
+    "script/validate-action-bundle --root \"$candidate_root\"",
+    "run: script/validate-action-bundle",
+]:
+    require(fragment in workflow, "Reusable Action acceptance candidate contract is incomplete")
+require(
+    workflow.count("- name: require bundled Action activation") == 5,
+    "Action acceptance must fail closed at every classifier-backed activation boundary",
+)
+require(
+    workflow.count('CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}') == 5,
+    "Action acceptance classifier guards are incomplete",
+)
 
 canary_path = root / ".github/workflows/action-drift-canary.yml"
 require(canary_path.is_file(), "Action drift canary workflow is missing")
@@ -213,13 +232,17 @@ for marker in [
 triggers = canary.split(trigger_marker, 1)[1].split(permissions_marker, 1)[0]
 permissions = canary.split(permissions_marker, 1)[1].split(defaults_marker, 1)[0]
 concurrency = canary.split(concurrency_marker, 1)[1].split(jobs_marker, 1)[0]
-require(
-    triggers == '  schedule:\n    - cron: "23 13 * * *"\n  workflow_dispatch:\n',
-    "Action drift canary triggers must remain fixed",
-)
+for fragment in [
+    '  schedule:\n    - cron: "23 13 * * *"',
+    "  workflow_dispatch:\n    inputs:\n      action_ref:",
+    "  workflow_call:\n    inputs:\n      action_ref:",
+]:
+    require(fragment in triggers, "Action drift canary triggers must remain fixed and reusable")
+for forbidden_trigger in ["  push:", "  pull_request:", "  repository_dispatch:"]:
+    require(forbidden_trigger not in triggers, "Action drift canary contains an unreviewed trigger")
 require(permissions == "  contents: read\n", "Action drift canary permissions must be read-only")
 require(
-    concurrency == "  group: action-drift-canary-${{ github.sha }}\n  cancel-in-progress: false\n",
+    concurrency == "  group: action-drift-canary-${{ inputs.action_ref || github.sha }}\n  cancel-in-progress: false\n",
     "Action drift canary concurrency must be commit-scoped and non-cancelling",
 )
 canary_fragments = [
@@ -227,10 +250,19 @@ canary_fragments = [
     "uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
     "persist-credentials: false",
     "run: script/validate-locks --ci",
+    "run: script/validate-action-bundle",
     "run: script/test-action-wrapper",
     "run: script/observe-hosted-runner",
     "id: bundle-host",
     "run: script/classify-action-bundle-host",
+    "--exclude-pre-releases",
+    "--exclude-drafts",
+    "action-release.json",
+    '"release-candidate/$tag" "release-verified/$tag"',
+    "wasSignedByGitHub",
+    "mapped Action commit parent mismatch",
+    "mapped Action commit diff mismatch",
+    "mapped bundle manifest mismatch",
 ]
 for fragment in canary_fragments:
     require(fragment in canary, "Action drift canary contract is incomplete")
@@ -251,8 +283,9 @@ for forbidden in [
 ]:
     require(forbidden not in canary, "Action drift canary contains a forbidden escape path")
 require(
-    re.search(r"(?m)^[ \t]+if:[ \t]*", canary) is None,
-    "Action drift canary steps must be unconditional",
+    re.findall(r"(?m)^        if:[ \t]*(.+)$", canary)
+    == ["steps.resolve.outputs.mapped_release == 'true'"],
+    "Action drift canary may condition only the mapped-release provenance gate",
 )
 
 guard_marker = "\n      - name: require bundled Action activation\n"
@@ -280,6 +313,43 @@ require(
     verification
     == '        run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"\n',
     "Action drift canary lifecycle validation must be unconditional",
+)
+
+release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+for fragment in [
+    "group: release",
+    "createCommitOnBranch",
+    "expectedHeadOid",
+    "wasSignedByGitHub",
+    "action/bin/fence",
+    "action/bundle-manifest.json",
+    "uses: ./.github/workflows/action-acceptance.yml",
+    "uses: ./.github/workflows/action-drift-canary.yml",
+    "action-release.json",
+    'gh release create "$VERSION_TAG" "${assets[@]}" "${release_args[@]}"',
+    'echo "- uses: GrantBirki/fence@$ACTION_COMMIT"',
+]:
+    require(fragment in release, "One-PR Action release workflow contract is incomplete")
+for required_check in [
+    '"build"',
+    '"coverage"',
+    '"lint (macos-14)"',
+    '"lint (ubuntu-24.04)"',
+    '"acceptance"',
+    '"action acceptance"',
+    '"integration"',
+    '"test (macos-14)"',
+    '"test (ubuntu-24.04)"',
+]:
+    require(required_check in release, "Release workflow is missing a protected source check")
+require("workflow_dispatch:" not in release, "Release workflow must not be manually dispatchable")
+require(release.count("      contents: write") == 3, "Only candidate, publication, and guarded cleanup jobs may write contents")
+require(release.count("    environment: release") == 3, "Every release mutation must use the protected release environment")
+require(release.count("      id-token: write") == 1, "Only release attestation may mint an OIDC token")
+require(release.count("      attestations: write") == 1, "Only the attestation job may write attestations")
+require(
+    release.count("uses: actions/checkout@") == release.count("persist-credentials: false"),
+    "Every release checkout must disable persisted credentials",
 )
 PY
 
@@ -360,7 +430,7 @@ fi
 
 script/validate-release-tools
 script/validate-test-tools
-script/validate-action-bundle
+script/validate-action-bundle --allow-source
 validate_cargo_vendor_surface
 validate_workflow_uses_pinned
 validate_ci_evidence

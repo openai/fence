@@ -2,7 +2,7 @@
 
 Status: security-claim source for the v0 protected target
 Audience: workflow authors, maintainers, adopters, and security reviewers
-Last reviewed: 2026-06-23
+Last reviewed: 2026-06-25
 
 This model must be reviewed before changing the supported runner class,
 platform profile, trusted launcher, privilege controls, evidence trust model,
@@ -10,13 +10,7 @@ or public protection claims. Normative behavior and schemas remain in
 [`v0.md`](v0.md); implementation chronology remains in
 [`history.md`](history.md).
 
-The source tree and released Action define the schema-`9` policy and schema-`5`
-runtime-evidence contract. The bundle remains governed by
-`action/bundle-manifest.json` and the wrapper schema constants; the wrapper
-rejects older evidence, stale verification state, malformed wildcard evidence,
-an incomplete worker set, or a resident PID that does not match the active
-systemd service. Future contract changes must update the attested agent and
-wrapper validators atomically.
+The source tree and released Action define the schema-`9` policy and schema-`5` runtime-evidence contract. Protected `main` is source-only; each published Action is a signed generated distribution commit containing the reviewed wrapper source plus the exact binary and schema-`4` `action/bundle-manifest.json`. The wrapper rejects older evidence, stale verification state, malformed wildcard evidence, an incomplete worker set, or a resident PID that does not match the active systemd service. Future contract changes must update the agent, wrapper validators, tests, and source version atomically in one reviewed pull request.
 
 ## Executive summary
 
@@ -41,8 +35,7 @@ In scope:
   `src/`;
 - protected-host validation in `.github/workflows/integration.yml` and
   `.github/workflows/action-acceptance.yml`;
-- agent and Action-bundle provenance in `.github/workflows/release.yml`,
-  `script/update-action-bundle`, and `script/validate-action-bundle`.
+- agent and Action-bundle provenance in `.github/workflows/release.yml`, `script/assemble-action-bundle`, and `script/validate-action-bundle`.
 
 Assumptions that materially define the model:
 
@@ -102,10 +95,7 @@ GitHub profile requires a new threat-model review.
 - **Evidence boundary:** root-owned readiness and reports, resident health,
   bounded findings, and the protected post hook provide local evidence without
   restoring controls (`src/runtime.rs`, `src/findings.rs`, `action/post.cts`).
-- **Publication boundary:** pinned offline inputs, release checksums, GitHub
-  artifact attestations, and an attestation-verified bundle updater connect
-  reviewed source to the committed Action binary
-  (`.github/workflows/release.yml`, `script/update-action-bundle`).
+- **Publication boundary:** pinned offline inputs, an offline bundle assembler, GitHub-signed one-parent distribution commits, complete candidate acceptance, release checksums, artifact attestations bound to source commit `M`, and the verified `action-release.json` mapping connect reviewed source `M` to published Action commit `D` (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
 
 ### Data flows and trust boundaries
 
@@ -170,10 +160,7 @@ GitHub profile requires a new threat-model review.
   runner-renameable ancestor of the registered Action path, while protected
   mount, device/inode, and runtime-digest checks apply at the wrapper boundary
   (`src/runtime.rs`, `action/post.cts`).
-- **Release workflow -> committed Action bundle:** immutable release assets are
-  checksum- and attestation-verified before the maintainer updater installs the
-  binary and provenance manifest (`.github/workflows/release.yml`,
-  `script/update-action-bundle`).
+- **Release workflow -> distribution commit:** after all protected checks pass on source commit `M`, the workflow builds the artifact once, assembles the bundle offline, and creates signed child `D` with exactly the two generated bundle files. Full Action acceptance, the strict fixed-runner canary, final-asset attestations, and release-state verification must pass before the immutable tag targets `D` and `action-release.json` exposes it to consumers (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
 
 #### Diagram
 
@@ -245,7 +232,7 @@ flowchart TD
 | Sudo/container controls | Fixed files, units, sockets, and one sudo source | Agent -> host privilege state | Fingerprint-gated, in-memory pre-ready rollback, exact removal/restoration checks, runtime masking, irreversible post-ready commit. | `src/lockdown.rs::SystemLockdownControl` |
 | Runtime evidence files | Root writes, runner reads | Agent -> post hook | No-follow fixed paths, exclusive readiness, atomic reports, owner/mode checks. | `src/runtime.rs::ProductionRuntimeStore` |
 | Protected post hook | GitHub post-job invocation | Runner -> evidence validator | Writable self-bind guards on renameable ancestors, read-only mounted source, device/inode and digest records, live PID, and fresh report validation. | `action/post.cts::main` |
-| Release and bundle update | Merge-triggered release and maintainer script | Source -> distributed binary | Pinned actions, protected environment, checksums, non-draft immutable releases, resolved tags, and attestations bound to the main-branch source and signer commit. | `.github/workflows/release.yml`, `script/update-action-bundle` |
+| Release and bundle publication | Merge-triggered release workflow and offline assembler | Source `M` -> distribution `D` -> consumer | Pinned actions, protected-main-only environment, reviewed version merge as sole human authorization, signed one-parent exact-diff commit, complete acceptance/canary gates, checksums, source-bound attestations, immutable tag to `D`, and verified `action-release.json`. | `.github/workflows/release.yml`, `script/assemble-action-bundle` |
 
 ## Top abuse paths
 
@@ -280,10 +267,7 @@ flowchart TD
    removes an owned rule. Five-second structured verification records a
    critical finding; the post hook fails the job, but traffic during the
    verification window remains a residual risk.
-8. **Substitute a release binary:** an attacker changes the bundled executable
-   independently of reviewed source. The updater requires immutable release
-   identity, checksum match, and GitHub build-provenance verification; offline
-   CI revalidates the committed manifest and binary digest.
+8. **Substitute a release binary:** an attacker changes the bundled executable independently of reviewed source. The release workflow reuses one artifact built from `M`, requires `D` to be a signed one-parent child with an exact two-file diff, compares the committed bytes to the artifact, runs complete acceptance and canary gates on `D`, verifies source-bound attestations, and publishes the full-SHA mapping only after final immutable-release verification. Offline CI revalidates the schema-`4` manifest and binary digest.
 9. **Exhaust local evidence work:** later code floods DNS, NFLOG, or attribution
    paths. Fixed queues, sample rates, scan caps, finding caps, and report size
    bounds protect memory, but the attacker can still slow or fail its own job.
@@ -302,7 +286,7 @@ flowchart TD
 | TM-004 | Malicious workflow process | Writable launcher/post/binary, renameable registered-path ancestor, or evidence path | Replace validator or forge healthy evidence | False success after lost controls | Agent, post hook, reports | Root-owned copy, writable self-bind ancestor guards, read-only runtime bind mount, device/inode and digest records, no-follow files, live PID/freshness checks, schema-`5` wildcard-evidence validation, and hosted tamper coverage (`action/main.cts`, `action/post.cts`, `src/runtime.rs`) | Kernel or privileged mount bypass is out of scope; resident verification remains periodic | Keep exact path-guard/runtime manifests, worker set, freshness bounds, atomic schema adoption, and hosted tamper tests | Post-hook integrity or freshness failure | Low | High | Medium |
 | TM-005 | Local process or host drift | Ability to alter owned kernel state after readiness | Remove or replace firewall rules | Temporary or persistent unintended egress | Network policy | Exact structured state verification every five seconds and terminal critical health (`src/nft_backend.rs`, `src/dns_mediator.rs`) | Detection is periodic rather than instantaneous | Keep interval fixed and evaluate event-driven integrity only with bounded complexity | Critical drift finding; Action post failure | Medium | High | High |
 | TM-006 | Workflow author or malicious config producer | Control of Action inputs before launcher validation | Inject paths, nft syntax, oversized policy, or ambiguous JSON | Privileged mutation or resource exhaustion | Host state, availability | Strict JSON, unknown-field rejection, fixed paths, typed entries, fixed limits (`action/lib.cts`, `src/config.rs`) | Raw JSON remains an advanced surface | Preserve schema-`1` strictness; add fields only through reviewed typed models | Structured pre-mutation setup failure | Low | High | Medium |
-| TM-007 | Supply-chain attacker | Ability to alter a release asset, workflow dependency, or bundle refresh | Distribute an agent not built by the reviewed workflow | Fleet-wide compromise | Release agent, downstream workflows | SHA-pinned actions, protected release environment, checksums, non-draft immutable releases, resolved release tags, source-ref/source-commit/signer-digest-bound attestations, offline bundle validation (`.github/workflows/release.yml`, `script/validate-action-bundle`) | Attestation trusts GitHub identity and the reviewed workflow commit | Add SBOM and auditable/reproducible binary work as post-v0 hardening | Release verification job and bundle validation | Low | High | Medium |
+| TM-007 | Supply-chain attacker | Ability to alter a release asset, workflow dependency, candidate commit, or release mapping | Distribute an agent not built by the reviewed workflow | Fleet-wide compromise | Release agent, downstream workflows | SHA-pinned actions, protected-main-only release environment, one reviewed source/version merge, exact one-parent signed `D`, exact two-file diff, complete acceptance/canary gates on `D`, checksums, non-draft immutable release tag targeting `D`, source-ref/source-commit/signer-digest-bound attestations, verified `action-release.json`, and offline bundle validation (`.github/workflows/release.yml`, `script/validate-action-bundle`) | Attestation and commit signing trust GitHub identity and the reviewed workflow commit | Add SBOM and auditable/reproducible binary work as post-v0 hardening | Candidate verification, release verification, bundle validation, and mapped-SHA canary | Low | High | Medium |
 | TM-008 | Malicious workflow process | Ability to generate local load | Saturate DNS, NFLOG, reports, or attribution scans | Job slowdown or failure | Job availability, evidence completeness | Queue/sample/query/scan/report caps and explicit truncation (`src/dns_mediator.rs`, `src/attribution.rs`, `src/findings.rs`) | Fence does not guarantee availability against later code | Keep limits non-configurable in v0; review CPU cost with real workloads | Warning counters, truncation, critical worker health | High | Medium | Medium |
 | TM-009 | Local process race or namespace boundary | Socket disappears, is shared, or is outside the scanned namespace | Produce missing or ambiguous process attribution | Reduced incident context, not control bypass | Local evidence | Unique-owner requirement, bounded statuses, no guessing (`src/attribution.rs`) | Attribution is inherently best effort | Keep attribution advisory; do not gate containment on individual matches | `not_found`, `ambiguous`, and limit statuses | High | Low | Low |
 | TM-010 | Malicious workflow process | The static compatibility account or a runner-authorized results-storage account is reachable | Reuse its resolved HTTPS address or a usable signed URL | Data exfiltration through a required GitHub channel | Credentials, source | One source-defined exact account, strict provenance for all other matching accounts, four-account dynamic cap, TTL bounds, and explicit evidence (`src/platform_profile.rs`, `src/attribution.rs`, `src/dns_mediator.rs`) | Fence cannot inspect TLS semantics or revoke per-request signed URLs | Keep the static exception exact and ensure exact or wildcard user policy cannot bypass pinned-runner provenance for other matching accounts | Authorized-account evidence and DNS counters | Medium | High | High |
@@ -347,6 +331,6 @@ because attribution is not an enforcement input. Kernel compromise would be
 | `src/trusted_executable.rs` | Captures and revalidates the fixed privileged executable set and descriptor-only execution boundary. | TM-001 |
 | `src/local_control.rs` | Acquires and verifies the bounded root TCP/Unix and container-control inventory before readiness and during resident checks. | TM-001, TM-005, TM-008 |
 | `src/lockdown.rs` | Enforces ACL-aware path invariants, removes and verifies sudo/container bypass paths, and owns pre-ready rollback state. | TM-001 |
-| `.github/workflows/release.yml` | Connects reviewed source to immutable checksummed and attested release assets. | TM-007 |
-| `.github/workflows/action-drift-canary.yml` | Detects supported-runner fingerprint drift and refuses a skipped current-bundle activation between repository changes. | TM-001 |
-| `script/update-action-bundle` | Installs the committed runtime binary only after release and attestation verification. | TM-007 |
+| `.github/workflows/release.yml` | Connects reviewed source `M` to signed distribution `D`, validated release assets, and the immutable full-SHA consumer mapping. | TM-007 |
+| `.github/workflows/action-drift-canary.yml` | Resolves a verified release mapping or explicit full SHA, detects supported-runner fingerprint drift, and refuses skipped activation. | TM-001, TM-007 |
+| `script/assemble-action-bundle` | Deterministically assembles the mode-`0644` binary and schema-`4` manifest from explicit local release inputs without network access. | TM-007 |

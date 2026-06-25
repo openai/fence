@@ -116,7 +116,7 @@ const REQUIRED_RESIDENT_WORKERS = [
   "host_udp_dns",
   "process_attribution",
 ];
-const RELEASE_TAG = /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+const RELEASE_TAG = /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_ROOT = "/run/fence";
 const LAUNCHER_RUNTIME_ROOT = "/run/fence-launcher";
@@ -605,9 +605,6 @@ function actionRuntimeFileDigests(actionRoot: string): ActionRuntimeFileDigest[]
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_ACTION_RUNTIME_FILE_BYTES) {
       fail(`Fence Action runtime file is unsafe: ${relativePath}`);
     }
-    if (relativePath === "bin/fence" && (stat.mode & 0o111) === 0) {
-      fail("bundled Fence binary is not executable");
-    }
     return {
       path: relativePath,
       sha256: crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex"),
@@ -1056,7 +1053,12 @@ function validateActionPathGuardMount(
 function validateBundle(manifestPath: string, binaryPath: string): any {
   const manifest = readJsonBounded(manifestPath, 16 * 1024, "bundle manifest");
   const binaryStat = fs.lstatSync(binaryPath);
-  if (!binaryStat.isFile() || binaryStat.isSymbolicLink() || (binaryStat.mode & 0o111) === 0) {
+  if (
+    !binaryStat.isFile() ||
+    binaryStat.isSymbolicLink() ||
+    binaryStat.size === 0 ||
+    binaryStat.size > MAX_ACTION_RUNTIME_FILE_BYTES
+  ) {
     fail("bundled Fence binary is not a regular file");
   }
   if (manifest === null || Array.isArray(manifest) || typeof manifest !== "object") {
@@ -1068,13 +1070,9 @@ function validateBundle(manifestPath: string, binaryPath: string): any {
   const expectedKeys = [
     "artifact_name",
     "artifact_sha256",
-    "attestation_verified",
     "bundle_path",
     "release_channel",
-    "release_is_draft",
-    "release_is_immutable",
     "release_tag",
-    "release_tag_commit",
     "release_url",
     "repository",
     "schema_version",
@@ -1085,22 +1083,18 @@ function validateBundle(manifestPath: string, binaryPath: string): any {
   ];
   if (
     JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(expectedKeys) ||
-    manifest.schema_version !== 3 ||
+    manifest.schema_version !== 4 ||
     manifest.repository !== "GrantBirki/fence" ||
     !RELEASE_TAG.test(manifest.release_tag) ||
     manifest.release_channel !== expectedReleaseChannel ||
-    manifest.release_is_draft !== false ||
-    manifest.release_is_immutable !== true ||
     manifest.release_url !== `https://github.com/GrantBirki/fence/releases/tag/${manifest.release_tag}` ||
     !/^[0-9a-f]{40}$/.test(manifest.source_commit) ||
-    manifest.release_tag_commit !== manifest.source_commit ||
     manifest.source_ref !== "refs/heads/main" ||
     manifest.artifact_name !== `fence_${manifest.release_tag}_linux-amd64` ||
     !SHA256.test(manifest.artifact_sha256) ||
     manifest.signer_digest !== manifest.source_commit ||
     manifest.signer_workflow !== "GrantBirki/fence/.github/workflows/release.yml" ||
-    manifest.bundle_path !== "action/bin/fence" ||
-    manifest.attestation_verified !== true
+    manifest.bundle_path !== "action/bin/fence"
   ) {
     fail("bundle manifest does not match the reviewed Fence release contract");
   }
@@ -1109,6 +1103,21 @@ function validateBundle(manifestPath: string, binaryPath: string): any {
     fail("bundled Fence binary checksum does not match its manifest");
   }
   return manifest;
+}
+
+function validatedActionRuntimeSnapshot(
+  actionRoot: string,
+): { manifest: any; files: ActionRuntimeFileDigest[] } {
+  const before = actionRuntimeFileDigests(actionRoot);
+  const manifest = validateBundle(
+    path.join(actionRoot, "bundle-manifest.json"),
+    path.join(actionRoot, "bin", "fence"),
+  );
+  const after = actionRuntimeFileDigests(actionRoot);
+  if (actionRuntimeDigest(before) !== actionRuntimeDigest(after)) {
+    fail("Fence Action runtime changed while it was being validated");
+  }
+  return { manifest, files: after };
 }
 
 function validateReport(report: any, failOnCritical = true): any {
@@ -2146,6 +2155,7 @@ module.exports = {
   summaryHeading,
   summaryLines,
   validateBundle,
+  validatedActionRuntimeSnapshot,
   validateInlineConfig,
   validateLauncherIntegrity,
   validateActionPathGuardMount,

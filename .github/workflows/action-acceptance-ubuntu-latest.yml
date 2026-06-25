@@ -21,8 +21,88 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  prepare-candidate:
+    name: prepare floating-label Action candidate
+    runs-on: ubuntu-24.04
+    outputs:
+      artifact_name: ${{ steps.candidate.outputs.artifact_name }}
+      action_ref: ${{ steps.candidate.outputs.action_ref }}
+
+    steps:
+      - name: select source commit
+        id: candidate
+        run: |
+          if ! [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Action candidate must be identified by a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          echo "action_ref=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=ubuntu-latest-action-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: checkout source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        with:
+          ref: ${{ steps.candidate.outputs.action_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: require exact checkout
+        env:
+          ACTION_REF: ${{ steps.candidate.outputs.action_ref }}
+        run: test "$(git rev-parse HEAD)" = "$ACTION_REF"
+
+      - name: validate locks
+        run: script/validate-locks --ci
+
+      - name: require source-only candidate
+        run: |
+          if [[ -e action/bin/fence || -e action/bundle-manifest.json ]]; then
+            echo "source candidates must not contain generated Action bundle files" >&2
+            exit 1
+          fi
+
+      - name: prepare rust
+        run: script/prepare-rust
+
+      - name: bootstrap
+        run: script/bootstrap
+
+      - name: build and assemble source candidate
+        env:
+          ACTION_REF: ${{ steps.candidate.outputs.action_ref }}
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as handle:
+              print(tomllib.load(handle)["package"]["version"])
+          PY
+          )"
+          export BUILD_VERSION="v${version}"
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$ACTION_REF")"
+          dist_root="$RUNNER_TEMP/fence-action-candidate-dist"
+          candidate_root="$RUNNER_TEMP/fence-action-candidate"
+          script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$dist_root"
+          script/assemble-action-bundle \
+            --artifact "$dist_root/fence_v${version}_linux-amd64" \
+            --version "$version" \
+            --source-commit "$ACTION_REF" \
+            --output-root "$candidate_root"
+          script/validate-action-bundle --root "$candidate_root"
+
+      - name: upload assembled Action bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
+        with:
+          name: ${{ steps.candidate.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/fence-action-candidate/action/bin/fence
+            ${{ runner.temp }}/fence-action-candidate/action/bundle-manifest.json
+          retention-days: 1
+          if-no-files-found: error
+
   canary:
     name: ubuntu-latest zero-input canary
+    needs: prepare-candidate
     timeout-minutes: 8
     runs-on: ubuntu-latest
 
@@ -30,7 +110,14 @@ jobs:
       - name: checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
+
+      - name: install assembled Action bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
 
       - name: validate locks
         run: script/validate-locks --ci

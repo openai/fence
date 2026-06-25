@@ -1,0 +1,220 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+artifact=""
+version=""
+source_commit=""
+output_root=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --artifact)
+      [[ $# -ge 2 ]] || die "--artifact requires a path"
+      artifact="$2"
+      shift 2
+      ;;
+    --version)
+      [[ $# -ge 2 ]] || die "--version requires a version"
+      version="$2"
+      shift 2
+      ;;
+    --source-commit)
+      [[ $# -ge 2 ]] || die "--source-commit requires a commit SHA"
+      source_commit="$2"
+      shift 2
+      ;;
+    --output-root)
+      [[ $# -ge 2 ]] || die "--output-root requires a path"
+      output_root="$2"
+      shift 2
+      ;;
+    *)
+      die "usage: script/assemble-action-bundle --artifact <path> --version <X.Y.Z[-prerelease]> --source-commit <sha> --output-root <path>"
+      ;;
+  esac
+done
+
+if [[ -z "$artifact" || -z "$version" || -z "$source_commit" || -z "$output_root" ]]; then
+  die "usage: script/assemble-action-bundle --artifact <path> --version <X.Y.Z[-prerelease]> --source-commit <sha> --output-root <path>"
+fi
+
+require_cmd python3
+
+python3 -B -E - \
+  "$DIR" \
+  "$artifact" \
+  "$version" \
+  "$source_commit" \
+  "$output_root" \
+  "$RUNNER_TEMP" \
+  "${TMPDIR:-}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+import tempfile
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+
+def within(path, parent):
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return path != parent
+
+
+def regular_file(path, description):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        raise SystemExit(f"missing {description}: {path}")
+    require(stat.S_ISREG(metadata.st_mode) and not path.is_symlink(), f"{description} must be a regular file")
+
+
+def ensure_directory(path):
+    if path.exists() or path.is_symlink():
+        metadata = path.lstat()
+        require(stat.S_ISDIR(metadata.st_mode) and not path.is_symlink(), f"Action bundle output directory is unsafe: {path}")
+    else:
+        path.mkdir(mode=0o755)
+
+
+def write_atomic(path, data, mode):
+    if path.exists() or path.is_symlink():
+        metadata = path.lstat()
+        require(stat.S_ISREG(metadata.st_mode) and not path.is_symlink(), f"Action bundle output file is unsafe: {path}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def package_manifest_identity(path):
+    section = None
+    values = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+            continue
+        if section != "[package]":
+            continue
+        match = re.fullmatch(r'(name|version)\s*=\s*"([^"]+)"', line)
+        if match:
+            require(match.group(1) not in values, f"duplicate Cargo.toml package {match.group(1)}")
+            values[match.group(1)] = match.group(2)
+    return values.get("name"), values.get("version")
+
+
+def root_lock_versions(path):
+    packages = []
+    current = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if line == "[[package]]":
+            if current is not None:
+                packages.append(current)
+            current = {}
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            if current is not None:
+                packages.append(current)
+                current = None
+            continue
+        if current is None:
+            continue
+        match = re.fullmatch(r'(name|version|source)\s*=\s*"([^"]+)"', line)
+        if match:
+            require(match.group(1) not in current, f"duplicate Cargo.lock package {match.group(1)}")
+            current[match.group(1)] = match.group(2)
+    if current is not None:
+        packages.append(current)
+    return [
+        package.get("version")
+        for package in packages
+        if package.get("name") == "fence" and "source" not in package
+    ]
+
+
+root = pathlib.Path(sys.argv[1]).resolve(strict=True)
+artifact = pathlib.Path(sys.argv[2])
+version, source_commit, output_argument, runner_temp, tmpdir = sys.argv[3:]
+
+semver = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?"
+require(re.fullmatch(semver, version), "Action bundle version must be SemVer without a leading v or build metadata")
+require(re.fullmatch(r"[0-9a-f]{40}", source_commit), "Action bundle source commit must be a full lowercase SHA")
+require(pathlib.Path(output_argument).is_absolute(), "Action bundle output root must be absolute")
+
+regular_file(artifact, "Action bundle artifact")
+expected_artifact_name = f"fence_v{version}_linux-amd64"
+require(artifact.name == expected_artifact_name, f"Action bundle artifact must be named {expected_artifact_name}")
+
+package_name, package_version = package_manifest_identity(root / "Cargo.toml")
+require(package_name == "fence", "Cargo.toml root package must be fence")
+require(package_version == version, "Action bundle version does not match Cargo.toml")
+locked_versions = root_lock_versions(root / "Cargo.lock")
+require(locked_versions == [version], "Action bundle version does not match the root Cargo.lock package")
+
+allowed_roots = {(root / "target").resolve(strict=False)}
+for candidate in (runner_temp, tmpdir):
+    if candidate:
+        allowed_roots.add(pathlib.Path(candidate).resolve(strict=False))
+output_root = pathlib.Path(output_argument).resolve(strict=False)
+require(any(within(output_root, allowed) for allowed in allowed_roots), "Action bundle output root must stay under target, RUNNER_TEMP, or TMPDIR")
+
+ensure_directory(output_root)
+action_directory = output_root / "action"
+binary_directory = action_directory / "bin"
+ensure_directory(action_directory)
+ensure_directory(binary_directory)
+
+artifact_bytes = artifact.read_bytes()
+require(len(artifact_bytes) > 0, "Action bundle artifact must not be empty")
+artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+binary = binary_directory / "fence"
+manifest_path = action_directory / "bundle-manifest.json"
+write_atomic(binary, artifact_bytes, 0o644)
+
+release_tag = f"v{version}"
+manifest = {
+    "artifact_name": expected_artifact_name,
+    "artifact_sha256": artifact_sha256,
+    "bundle_path": "action/bin/fence",
+    "release_channel": "prerelease" if "-" in version else "stable",
+    "release_tag": release_tag,
+    "release_url": f"https://github.com/GrantBirki/fence/releases/tag/{release_tag}",
+    "repository": "GrantBirki/fence",
+    "schema_version": 4,
+    "signer_digest": source_commit,
+    "signer_workflow": "GrantBirki/fence/.github/workflows/release.yml",
+    "source_commit": source_commit,
+    "source_ref": "refs/heads/main",
+}
+write_atomic(
+    manifest_path,
+    (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    0o644,
+)
+PY
+
+script/validate-action-bundle --root "$output_root"
+echo -e "${GREEN}Action bundle assembled:${OFF} fence_v${version}_linux-amd64"

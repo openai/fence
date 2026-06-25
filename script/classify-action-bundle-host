@@ -15,6 +15,9 @@ if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
 fi
 
 require_cmd python3
+if [[ ! -x /usr/bin/install ]]; then
+  die "Action bundle host classification requires /usr/bin/install"
+fi
 
 observation="$RUNNER_TEMP/fence-hosted-runner-observation.json"
 support="$RUNNER_TEMP/fence-action-bundle-support.json"
@@ -26,14 +29,23 @@ for required in "$observation" "$bundle" "$transitions"; do
     die "Action bundle host classification requires $required"
   fi
 done
-if [[ ! -x "$bundle" ]]; then
-  die "Action bundle host classification requires executable $bundle"
-fi
 if [[ -z "${GITHUB_OUTPUT:-}" ]]; then
   die "Action bundle host classification requires GITHUB_OUTPUT"
 fi
 
-"$bundle" check-support >"$support"
+script/validate-action-bundle
+tmpdir="$(make_temp_dir fence-action-bundle-classifier)"
+cleanup() {
+  remove_generated_path "$tmpdir" "temporary Action bundle classifier directory"
+}
+trap cleanup EXIT
+protected_bundle="$tmpdir/action/bin/fence"
+/usr/bin/install -d -m 0755 "$tmpdir/action/bin"
+/usr/bin/install -m 0555 "$bundle" "$protected_bundle"
+/usr/bin/install -m 0444 "$DIR/action/bundle-manifest.json" "$tmpdir/action/bundle-manifest.json"
+script/validate-action-bundle --root "$tmpdir"
+
+"$protected_bundle" check-support >"$support"
 python3 -B -E "$DIR/script/lib/action_bundle_host.py" \
   "$observation" \
   "$support" \

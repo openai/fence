@@ -4,6 +4,17 @@ on:
   schedule:
     - cron: "23 13 * * *"
   workflow_dispatch:
+    inputs:
+      action_ref:
+        description: Optional full Action commit SHA; omission selects the latest stable mapped release.
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      action_ref:
+        description: Full distribution commit SHA to validate before release publication.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,7 +24,7 @@ defaults:
     shell: bash
 
 concurrency:
-  group: action-drift-canary-${{ github.sha }}
+  group: action-drift-canary-${{ inputs.action_ref || github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -23,13 +34,222 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: checkout
+      - name: resolve immutable Action commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_ACTION_REF: ${{ inputs.action_ref }}
+        run: |
+          set -euo pipefail
+          action_ref="${INPUT_ACTION_REF:-}"
+          mapped_release=false
+          if [[ -z "$action_ref" ]]; then
+            metadata="$(gh release list \
+              --repo "$GITHUB_REPOSITORY" \
+              --exclude-drafts \
+              --exclude-pre-releases \
+              --limit 1 \
+              --json tagName,isPrerelease,isDraft,isImmutable)"
+            tag="$(python3 - "$metadata" <<'PY'
+          import json
+          import re
+          import sys
+
+          releases = json.loads(sys.argv[1])
+          if len(releases) != 1:
+              raise SystemExit("no stable mapped Action release is available")
+          release = releases[0]
+          tag = release.get("tagName")
+          if not isinstance(tag, str) or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+              raise SystemExit("latest release is not a stable SemVer release")
+          if release.get("isDraft") is not False or release.get("isPrerelease") is not False:
+              raise SystemExit("latest stable Action release must be published and non-prerelease")
+          if release.get("isImmutable") is not True:
+              raise SystemExit("latest stable Action release is not immutable")
+          print(tag)
+          PY
+            )"
+            mkdir -p "$RUNNER_TEMP/action-release-mapping"
+            gh release download "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern action-release.json \
+              --dir "$RUNNER_TEMP/action-release-mapping"
+            mapping_values="$(python3 - "$RUNNER_TEMP/action-release-mapping/action-release.json" "$GITHUB_REPOSITORY" "$tag" <<'PY'
+          import json
+          import re
+          import sys
+
+          path, repository, tag = sys.argv[1:]
+          with open(path, encoding="utf-8") as handle:
+              mapping = json.load(handle)
+          expected = {
+              "schema_version",
+              "repository",
+              "version",
+              "release_tag",
+              "source_commit",
+              "action_commit",
+              "artifact_name",
+              "artifact_sha256",
+              "bundle_manifest_schema_version",
+              "signer_workflow",
+              "signer_digest",
+          }
+          if set(mapping) != expected:
+              raise SystemExit("release mapping has an unexpected schema")
+          if mapping["schema_version"] != 1 or mapping["bundle_manifest_schema_version"] != 4:
+              raise SystemExit("release mapping schema version mismatch")
+          if str(mapping["repository"]).lower() != repository.lower():
+              raise SystemExit("release mapping repository mismatch")
+          if mapping["release_tag"] != tag or f"v{mapping['version']}" != tag:
+              raise SystemExit("release mapping version mismatch")
+          if mapping["signer_workflow"] != f"{mapping['repository']}/.github/workflows/release.yml":
+              raise SystemExit("release mapping signer workflow mismatch")
+          if mapping["signer_digest"] != mapping["source_commit"]:
+              raise SystemExit("release mapping signer digest mismatch")
+          for field in ("source_commit", "action_commit"):
+              if not re.fullmatch(r"[0-9a-f]{40}", mapping[field]):
+                  raise SystemExit(f"release mapping {field} is invalid")
+          if not re.fullmatch(r"[0-9a-f]{64}", mapping["artifact_sha256"]):
+              raise SystemExit("release mapping artifact digest is invalid")
+          if mapping["artifact_name"] != f"fence_{tag}_linux-amd64":
+              raise SystemExit("release mapping artifact name mismatch")
+          print("|".join((
+              mapping["action_commit"],
+              mapping["source_commit"],
+              mapping["artifact_name"],
+              mapping["artifact_sha256"],
+              mapping["release_tag"],
+          )))
+          PY
+            )"
+            IFS='|' read -r action_ref source_commit artifact_name artifact_sha256 release_tag <<< "$mapping_values"
+            mapped_release=true
+            tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha)"
+            if [[ "$tag_commit" != "$action_ref" ]]; then
+              echo "release tag does not resolve to its mapped Action commit" >&2
+              exit 1
+            fi
+            for marker in "release-candidate/$tag" "release-verified/$tag"; do
+              refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/heads/${marker}")"
+              marker_head="$(python3 - "$refs" "refs/heads/$marker" <<'PY'
+          import json
+          import sys
+          refs = [item for item in json.loads(sys.argv[1]) if item.get("ref") == sys.argv[2]]
+          if len(refs) > 1:
+              raise SystemExit("duplicate exact release marker refs")
+          print(refs[0]["object"]["sha"] if refs else "")
+          PY
+              )"
+              if [[ -n "$marker_head" ]]; then
+                if [[ "$marker_head" != "$action_ref" ]]; then
+                  echo "latest stable release marker conflicts with its mapped Action commit" >&2
+                else
+                  echo "latest stable release is withdrawn or has not finished release cleanup" >&2
+                fi
+                exit 1
+              fi
+            done
+          fi
+          if ! [[ "$action_ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Action canary requires a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          echo "action_ref=$action_ref" >> "$GITHUB_OUTPUT"
+          echo "mapped_release=$mapped_release" >> "$GITHUB_OUTPUT"
+          if [[ "$mapped_release" == "true" ]]; then
+            echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+            echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+            echo "artifact_sha256=$artifact_sha256" >> "$GITHUB_OUTPUT"
+            echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: checkout immutable Action commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
+          ref: ${{ steps.resolve.outputs.action_ref }}
+          fetch-depth: 2
           persist-credentials: false
+
+      - name: require exact checkout
+        env:
+          ACTION_REF: ${{ steps.resolve.outputs.action_ref }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$ACTION_REF"
+          echo "Canary Action commit: $ACTION_REF"
 
       - name: validate locks
         run: script/validate-locks --ci
+
+      - name: validate distribution bundle
+        run: script/validate-action-bundle
+
+      - name: verify mapped release provenance
+        if: steps.resolve.outputs.mapped_release == 'true'
+        env:
+          ACTION_COMMIT: ${{ steps.resolve.outputs.action_ref }}
+          ARTIFACT_NAME: ${{ steps.resolve.outputs.artifact_name }}
+          ARTIFACT_SHA256: ${{ steps.resolve.outputs.artifact_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if [[ "$(sha256sum action/bin/fence | awk '{print $1}')" != "$ARTIFACT_SHA256" ]]; then
+            echo "mapped Action binary digest mismatch" >&2
+            exit 1
+          fi
+          python3 - action/bundle-manifest.json <<'PY'
+          import json
+          import os
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              manifest = json.load(handle)
+          expected = {
+              "release_tag": os.environ["RELEASE_TAG"],
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "source_ref": "refs/heads/main",
+              "artifact_name": os.environ["ARTIFACT_NAME"],
+              "artifact_sha256": os.environ["ARTIFACT_SHA256"],
+              "bundle_path": "action/bin/fence",
+              "signer_workflow": f"{os.environ['GITHUB_REPOSITORY']}/.github/workflows/release.yml",
+              "signer_digest": os.environ["SOURCE_COMMIT"],
+          }
+          for field, value in expected.items():
+              if manifest.get(field) != value:
+                  raise SystemExit(f"mapped bundle manifest mismatch: {field}")
+          PY
+          commit_metadata="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${ACTION_COMMIT}")"
+          python3 - "$SOURCE_COMMIT" "$commit_metadata" <<'PY'
+          import json
+          import sys
+          source_commit, raw = sys.argv[1:]
+          commit = json.loads(raw)
+          if [parent.get("sha") for parent in commit.get("parents", [])] != [source_commit]:
+              raise SystemExit("mapped Action commit parent mismatch")
+          files = {(item.get("filename"), item.get("status")) for item in commit.get("files", [])}
+          if files != {("action/bin/fence", "added"), ("action/bundle-manifest.json", "added")}:
+              raise SystemExit("mapped Action commit diff mismatch")
+          PY
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          signature_metadata="$(gh api graphql \
+            -f query='query($owner: String!, $repository: String!, $oid: GitObjectID!) { repository(owner: $owner, name: $repository) { object(oid: $oid) { ... on Commit { oid signature { isValid wasSignedByGitHub } } } } }' \
+            -F owner="$owner" \
+            -F repository="$repository" \
+            -F oid="$ACTION_COMMIT")"
+          python3 - "$ACTION_COMMIT" "$signature_metadata" <<'PY'
+          import json
+          import sys
+          action_commit, raw = sys.argv[1:]
+          commit = json.loads(raw).get("data", {}).get("repository", {}).get("object", {})
+          signature = commit.get("signature") or {}
+          if commit.get("oid") != action_commit:
+              raise SystemExit("mapped Action commit GraphQL identity mismatch")
+          if signature.get("isValid") is not True or signature.get("wasSignedByGitHub") is not True:
+              raise SystemExit("mapped Action commit was not validly signed by GitHub")
+          PY
 
       - name: test Action wrapper
         run: script/test-action-wrapper

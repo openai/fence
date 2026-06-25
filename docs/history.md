@@ -71,6 +71,12 @@ See [`v0.md`](v0.md) for normative behavior and
   retaining strict JSON as an advanced escape hatch. It also added compact
   progress logs, result-oriented job summaries, and audit allowlist guidance.
 
+## One-PR Action publication
+
+- Releases through `v0.6.3` used the earlier two-stage model: a version/source release was published first, then a later reviewed commit refreshed the checked-in Action binary and manifest. Those historical tags and full-SHA consumer pins remain unchanged.
+- The next release model made protected `main` source-only. A single reviewed change plus version bump authorizes automation to build from source merge `M`, create signed child distribution commit `D` containing only the generated binary and schema-`4` manifest, run full Action acceptance and the fixed-runner canary on `D`, and publish the immutable version tag at `D`.
+- `action-release.json` became the public mapping from version and source `M` to the exact full distribution SHA `D`; consumers continue pinning full commit SHAs, and the Action continues to avoid runtime agent or policy downloads.
+
 ## v0 hardening
 
 - The agent replaced an unmaintained general netlink packet dependency with a
