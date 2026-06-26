@@ -544,6 +544,9 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
             Ok(OwnedRule::ClassifyDispatch { chain })
         }
         "fence:allowance" => parse_allowance_rule(chain, expressions),
+        "fence:dns_mediator_upstream_dispatch" => {
+            parse_dns_mediator_upstream_dispatch_rule(chain, expressions)
+        }
         "fence:dns_mediator_upstream" => parse_dns_mediator_upstream_rule(chain, expressions),
         "fence:wireserver_platform" => parse_wireserver_platform_rule(chain, expressions),
         "fence:instance_metadata_platform" => {
@@ -574,6 +577,37 @@ fn parse_allowance_rule(chain: String, expressions: &[Value]) -> Result<OwnedRul
     Ok(OwnedRule::Allowance {
         chain,
         address_family,
+        destination,
+        protocol,
+        port,
+    })
+}
+
+fn parse_dns_mediator_upstream_dispatch_rule(
+    chain: String,
+    expressions: &[Value],
+) -> Result<OwnedRule, BackendError> {
+    if expressions.len() != 3 || !is_exact_jump_rule(&expressions[2..3], NFT_CLASSIFY_CHAIN) {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "DNS mediator upstream dispatch does not have the exact expected expression shape",
+        ));
+    }
+    let (address_family, destination) = extract_destination(&expressions[..1])?;
+    let (protocol, port) = extract_transport(&expressions[1..2])?;
+    if !matches!(chain.as_str(), NFT_OUTPUT_CHAIN | NFT_FORWARD_CHAIN)
+        || address_family != "ip"
+        || destination != crate::nft::DNS_MEDIATOR_UPSTREAM_ADDRESS
+        || protocol != "udp"
+        || port != crate::nft::DNS_MEDIATOR_UPSTREAM_PORT
+    {
+        return Err(BackendError::new(
+            "unexpected_nft_state",
+            "DNS mediator upstream dispatch does not match its fixed destination",
+        ));
+    }
+    Ok(OwnedRule::DnsMediatorUpstreamDispatch {
+        chain,
         destination,
         protocol,
         port,
@@ -1267,6 +1301,69 @@ mod tests {
                 NftOperation::ApplyProvisional,
                 NftOperation::ApplyProvisional
             ]
+        );
+    }
+
+    #[test]
+    fn parses_only_exact_dns_mediator_upstream_dispatch_rules() {
+        let expressions = json!([
+            {"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "168.63.129.16"}},
+            {"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "op": "==", "right": 53}},
+            {"jump": {"target": NFT_CLASSIFY_CHAIN}}
+        ]);
+
+        for chain in [NFT_OUTPUT_CHAIN, NFT_FORWARD_CHAIN] {
+            assert!(matches!(
+                parse_test_rule(
+                    chain,
+                    "fence:dns_mediator_upstream_dispatch",
+                    expressions.clone(),
+                )
+                .unwrap(),
+                OwnedRule::DnsMediatorUpstreamDispatch {
+                    destination,
+                    protocol,
+                    port: 53,
+                    ..
+                } if destination == "168.63.129.16" && protocol == "udp"
+            ));
+        }
+
+        assert_malformed_rule(
+            NFT_CLASSIFY_CHAIN,
+            "fence:dns_mediator_upstream_dispatch",
+            expressions.clone(),
+        );
+        for (index, replacement) in [
+            (
+                0,
+                json!({"match": {"left": {"payload": {"protocol": "ip", "field": "daddr"}}, "op": "==", "right": "0.0.0.0/0"}}),
+            ),
+            (
+                1,
+                json!({"match": {"left": {"payload": {"protocol": "tcp", "field": "dport"}}, "op": "==", "right": 53}}),
+            ),
+            (
+                1,
+                json!({"match": {"left": {"payload": {"protocol": "udp", "field": "dport"}}, "op": "==", "right": 54}}),
+            ),
+            (2, json!({"jump": {"target": NFT_VIOLATION_CHAIN}})),
+        ] {
+            let mut malformed = expressions.as_array().unwrap().clone();
+            malformed[index] = replacement;
+            assert_malformed_rule(
+                NFT_OUTPUT_CHAIN,
+                "fence:dns_mediator_upstream_dispatch",
+                Value::Array(malformed),
+            );
+        }
+
+        let mut extra = expressions.as_array().unwrap().clone();
+        extra.push(json!({"accept": null}));
+        assert_malformed_rule(
+            NFT_OUTPUT_CHAIN,
+            "fence:dns_mediator_upstream_dispatch",
+            Value::Array(extra),
         );
     }
 

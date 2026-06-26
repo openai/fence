@@ -7,7 +7,9 @@ use fence::findings::FindingCollection;
 use fence::lifecycle::run_resident_test_service;
 use fence::nflog::NflogReader;
 use fence::nft::{
-    NetworkEvidenceCounters, expected_owned_state, render_ruleset, unapplied_test_evidence_model,
+    DNS_MEDIATOR_UPSTREAM_ADDRESS, DNS_MEDIATOR_UPSTREAM_PORT, NetworkEvidenceCounters,
+    expected_dns_mediated_owned_state, expected_owned_state, render_dns_mediated_ruleset,
+    render_ruleset, unapplied_test_evidence_model,
 };
 use fence::nft_backend::{
     IP_BINARY_PATH, NativeNftBackend, SystemNftExecutor, write_test_evidence,
@@ -416,6 +418,15 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
 }
 
 #[test]
+#[ignore = "requires Linux root network namespaces and native nftables"]
+fn dns_mediator_guard_handles_conntrack_principal_transfer_by_mode() {
+    require_root();
+
+    run_dns_mediator_conntrack_reuse_scenario(Mode::Block);
+    run_dns_mediator_conntrack_reuse_scenario(Mode::Audit);
+}
+
+#[test]
 #[ignore = "requires Linux root, transient systemd services, namespaces, and native nftables"]
 fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
     require_root();
@@ -628,6 +639,185 @@ fn forward_hook_proves_routed_block_and_audit_behavior_without_containment_claim
 
 fn backend(namespace: &str) -> NativeNftBackend<SystemNftExecutor> {
     NativeNftBackend::new(SystemNftExecutor::in_test_network_namespace(namespace).unwrap())
+}
+
+fn run_dns_mediator_conntrack_reuse_scenario(mode: Mode) {
+    let topology = PeerTopology::new();
+    let label = match mode {
+        Mode::Block => "block",
+        Mode::Audit => "audit",
+    };
+    let resolver_prefix = format!("{DNS_MEDIATOR_UPSTREAM_ADDRESS}/32");
+    in_namespace(
+        &topology.server,
+        IP_BINARY_PATH,
+        &["addr", "add", &resolver_prefix, "dev", "lo"],
+    );
+    in_namespace(
+        &topology.client,
+        IP_BINARY_PATH,
+        &["route", "add", &resolver_prefix, "via", "192.0.2.2"],
+    );
+
+    let root = evidence_root();
+    fs::create_dir_all(&root).unwrap();
+    let ready = root.join(format!("dns-reuse-{label}-ready"));
+    let received = root.join(format!("dns-reuse-{label}-received"));
+    let mut listener = start_dns_reuse_listener(&topology.server, &ready, &received);
+    wait_for_path(&ready);
+
+    let mut nft = backend(&topology.client);
+    let program = render_dns_mediated_ruleset(mode, &[]);
+    nft.preflight(&program).unwrap();
+    nft.apply_provisional(&program).unwrap();
+    nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &[]))
+        .unwrap();
+    let violations_before = nft.total_violation_packets().unwrap();
+
+    let (root_port, runner_port, outcome) = run_dns_reuse_client(&topology.client, mode);
+    assert_eq!(root_port, runner_port);
+    assert_eq!(
+        outcome,
+        match mode {
+            Mode::Block => "blocked",
+            Mode::Audit => "received",
+        }
+    );
+    assert!(nft.total_violation_packets().unwrap() > violations_before);
+
+    let status = listener.0.wait().unwrap();
+    assert!(status.success());
+    let received = fs::read_to_string(received).unwrap();
+    assert_eq!(
+        received,
+        match mode {
+            Mode::Block => "root",
+            Mode::Audit => "root,runner",
+        }
+    );
+    assert!(nft.rollback_pre_activation().unwrap());
+}
+
+fn start_dns_reuse_listener(namespace: &str, ready: &Path, received: &Path) -> ChildGuard {
+    let script = r#"
+import pathlib, socket, sys
+address, port, ready, received = sys.argv[1], int(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4])
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(3)
+s.bind((address, port))
+ready.write_text("ready", encoding="ascii")
+messages = []
+data, peer = s.recvfrom(64)
+assert data == b"root"
+messages.append("root")
+s.sendto(b"ok", peer)
+try:
+    data, peer = s.recvfrom(64)
+except TimeoutError:
+    pass
+else:
+    assert data == b"runner"
+    messages.append("runner")
+    s.sendto(b"ok", peer)
+received.write_text(",".join(messages), encoding="ascii")
+"#;
+    let child = Command::new(IP_BINARY_PATH)
+        .args([
+            "netns",
+            "exec",
+            namespace,
+            PYTHON,
+            "-c",
+            script,
+            DNS_MEDIATOR_UPSTREAM_ADDRESS,
+            &DNS_MEDIATOR_UPSTREAM_PORT.to_string(),
+            ready.to_str().unwrap(),
+            received.to_str().unwrap(),
+        ])
+        .spawn()
+        .unwrap();
+    ChildGuard(child)
+}
+
+fn run_dns_reuse_client(namespace: &str, mode: Mode) -> (u16, u16, String) {
+    let runner_uid = account_id("-u", "runner");
+    let runner_gid = account_id("-g", "runner");
+    let mode = match mode {
+        Mode::Block => "block",
+        Mode::Audit => "audit",
+    };
+    let script = r#"
+import os, socket, sys
+address, port, runner_uid, runner_gid, mode = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+root = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+root.settimeout(2)
+root.connect((address, port))
+root.send(b"root")
+assert root.recv(2) == b"ok"
+root_address, root_port = root.getsockname()
+assert root_address == "192.0.2.1"
+root.close()
+
+os.setgroups([])
+os.setgid(runner_gid)
+os.setuid(runner_uid)
+runner = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+runner.settimeout(2)
+runner.bind((root_address, root_port))
+runner_port = runner.getsockname()[1]
+assert runner_port == root_port
+outcome = "received"
+try:
+    runner.connect((address, port))
+    runner.send(b"runner")
+    assert runner.recv(2) == b"ok"
+except OSError:
+    outcome = "blocked"
+assert outcome == ("blocked" if mode == "block" else "received")
+print(root_port, runner_port, outcome)
+"#;
+    let port = DNS_MEDIATOR_UPSTREAM_PORT.to_string();
+    let uid = runner_uid.to_string();
+    let gid = runner_gid.to_string();
+    let args = [
+        "netns",
+        "exec",
+        namespace,
+        PYTHON,
+        "-c",
+        script,
+        DNS_MEDIATOR_UPSTREAM_ADDRESS,
+        &port,
+        &uid,
+        &gid,
+        mode,
+    ];
+    let output = run_output(IP_BINARY_PATH, &args);
+    assert!(
+        output.status.success(),
+        "DNS conntrack-reuse client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut fields = stdout.split_whitespace();
+    let root_port = fields.next().unwrap().parse().unwrap();
+    let runner_port = fields.next().unwrap().parse().unwrap();
+    let outcome = fields.next().unwrap().to_owned();
+    assert!(fields.next().is_none());
+    (root_port, runner_port, outcome)
+}
+
+fn account_id(flag: &str, account: &str) -> u32 {
+    let output = run_output("/usr/bin/id", &[flag, account]);
+    assert!(
+        output.status.success(),
+        "required test account is unavailable"
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 fn allowance(destination: &str, protocol: Protocol, port: u16) -> EffectiveAllowance {
