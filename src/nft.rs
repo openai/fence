@@ -138,6 +138,12 @@ pub enum OwnedRule {
         protocol: String,
         port: u16,
     },
+    DnsMediatorUpstreamDispatch {
+        chain: String,
+        destination: String,
+        protocol: String,
+        port: u16,
+    },
     DnsMediatorUpstream {
         chain: String,
         uid: u32,
@@ -410,7 +416,16 @@ fn build_rules(
     dns_mediator_upstream: bool,
 ) -> Vec<OwnedRule> {
     let control = implicit_ipv6_control();
-    let mut rules = vec![
+    let mut rules = Vec::new();
+    if dns_mediator_upstream {
+        rules.push(OwnedRule::DnsMediatorUpstreamDispatch {
+            chain: NFT_OUTPUT_CHAIN.to_owned(),
+            destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
+            protocol: "udp".to_owned(),
+            port: DNS_MEDIATOR_UPSTREAM_PORT,
+        });
+    }
+    rules.extend([
         OwnedRule::Loopback {
             chain: NFT_OUTPUT_CHAIN.to_owned(),
         },
@@ -429,13 +444,23 @@ fn build_rules(
         OwnedRule::ClassifyDispatch {
             chain: NFT_OUTPUT_CHAIN.to_owned(),
         },
+    ]);
+    if dns_mediator_upstream {
+        rules.push(OwnedRule::DnsMediatorUpstreamDispatch {
+            chain: NFT_FORWARD_CHAIN.to_owned(),
+            destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
+            protocol: "udp".to_owned(),
+            port: DNS_MEDIATOR_UPSTREAM_PORT,
+        });
+    }
+    rules.extend([
         OwnedRule::EstablishedRelated {
             chain: NFT_FORWARD_CHAIN.to_owned(),
         },
         OwnedRule::ClassifyDispatch {
             chain: NFT_FORWARD_CHAIN.to_owned(),
         },
-    ];
+    ]);
     if dns_mediator_upstream {
         rules.push(OwnedRule::DnsMediatorUpstream {
             chain: NFT_CLASSIFY_CHAIN.to_owned(),
@@ -539,6 +564,18 @@ fn render_rule(program: &mut String, rule: &OwnedRule) {
             writeln!(
                 program,
                 "add rule {NFT_FAMILY} {NFT_TABLE} {chain} {address_family} daddr {destination} {protocol} dport {port} accept comment \"fence:allowance\""
+            )
+            .unwrap();
+        }
+        OwnedRule::DnsMediatorUpstreamDispatch {
+            chain,
+            destination,
+            protocol,
+            port,
+        } => {
+            writeln!(
+                program,
+                "add rule {NFT_FAMILY} {NFT_TABLE} {chain} ip daddr {destination} {protocol} dport {port} jump {NFT_CLASSIFY_CHAIN} comment \"fence:dns_mediator_upstream_dispatch\""
             )
             .unwrap();
         }
@@ -719,6 +756,31 @@ mod tests {
                 ..
             } if destination == "168.63.129.16"
         )));
+        let dispatches = expected
+            .rules
+            .iter()
+            .filter_map(|rule| match rule {
+                OwnedRule::DnsMediatorUpstreamDispatch {
+                    chain,
+                    destination,
+                    protocol,
+                    port,
+                } => Some((
+                    chain.as_str(),
+                    destination.as_str(),
+                    protocol.as_str(),
+                    *port,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dispatches,
+            vec![
+                (NFT_OUTPUT_CHAIN, "168.63.129.16", "udp", 53),
+                (NFT_FORWARD_CHAIN, "168.63.129.16", "udp", 53),
+            ]
+        );
         let wireserver = expected
             .rules
             .iter()
@@ -767,6 +829,44 @@ mod tests {
     }
 
     #[test]
+    fn dns_mediator_upstream_dispatch_precedes_connection_state_acceptance() {
+        let block = render_dns_mediated_ruleset(Mode::Block, &[]);
+        let output_dispatch = "add rule inet fence_v0 fence_output ip daddr 168.63.129.16 udp dport 53 jump fence_classify comment \"fence:dns_mediator_upstream_dispatch\"";
+        let output_established = "add rule inet fence_v0 fence_output ct state established,related accept comment \"fence:established\"";
+        let forward_dispatch = "add rule inet fence_v0 fence_forward ip daddr 168.63.129.16 udp dport 53 jump fence_classify comment \"fence:dns_mediator_upstream_dispatch\"";
+        let forward_established = "add rule inet fence_v0 fence_forward ct state established,related accept comment \"fence:established\"";
+
+        assert!(block.find(output_dispatch).unwrap() < block.find(output_established).unwrap());
+        assert!(block.find(forward_dispatch).unwrap() < block.find(forward_established).unwrap());
+        assert_eq!(
+            block
+                .matches("comment \"fence:dns_mediator_upstream_dispatch\"")
+                .count(),
+            2
+        );
+
+        let audit = render_dns_mediated_ruleset(Mode::Audit, &[]);
+        assert!(audit.find(output_dispatch).unwrap() < audit.find(output_established).unwrap());
+        assert!(audit.find(forward_dispatch).unwrap() < audit.find(forward_established).unwrap());
+        assert!(audit.contains("counter name fence_total_violations accept"));
+
+        let explicit = render_dns_mediated_ruleset(
+            Mode::Block,
+            &[EffectiveAllowance {
+                destination_type: DestinationType::Ip,
+                destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
+                protocol: Protocol::Udp,
+                port: DNS_MEDIATOR_UPSTREAM_PORT,
+            }],
+        );
+        let root_only = "meta skuid 0 ip daddr 168.63.129.16 udp dport 53 accept comment \"fence:dns_mediator_upstream\"";
+        let allowance = "ip daddr 168.63.129.16 udp dport 53 accept comment \"fence:allowance\"";
+        let violation = "jump fence_violation comment \"fence:violation\"";
+        assert!(explicit.find(root_only).unwrap() < explicit.find(allowance).unwrap());
+        assert!(explicit.find(allowance).unwrap() < explicit.find(violation).unwrap());
+    }
+
+    #[test]
     fn expected_state_is_deterministic_and_verification_detects_drift() {
         let expected = expected_owned_state(Mode::Block, &allowances());
         let identical = expected_owned_state(Mode::Block, &allowances());
@@ -800,6 +900,69 @@ mod tests {
     #[test]
     fn dns_mediated_verification_rejects_missing_or_broadened_platform_rules() {
         let expected = expected_dns_mediated_owned_state(Mode::Block, &[]);
+
+        let mut missing_dispatch = expected.clone();
+        missing_dispatch.rules.retain(|rule| {
+            !matches!(
+                rule,
+                OwnedRule::DnsMediatorUpstreamDispatch { chain, .. }
+                    if chain == NFT_OUTPUT_CHAIN
+            )
+        });
+        assert!(verify_owned_state(&expected, &missing_dispatch).is_err());
+
+        let mut reordered_dispatch = expected.clone();
+        let dispatch_index = reordered_dispatch
+            .rules
+            .iter()
+            .position(|rule| {
+                matches!(
+                    rule,
+                    OwnedRule::DnsMediatorUpstreamDispatch { chain, .. }
+                        if chain == NFT_OUTPUT_CHAIN
+                )
+            })
+            .unwrap();
+        let dispatch = reordered_dispatch.rules.remove(dispatch_index);
+        let established_index = reordered_dispatch
+            .rules
+            .iter()
+            .position(|rule| {
+                matches!(
+                    rule,
+                    OwnedRule::EstablishedRelated { chain } if chain == NFT_OUTPUT_CHAIN
+                )
+            })
+            .unwrap();
+        reordered_dispatch
+            .rules
+            .insert(established_index + 1, dispatch);
+        assert!(verify_owned_state(&expected, &reordered_dispatch).is_err());
+
+        let mut broadened_dispatch = expected.clone();
+        let index = broadened_dispatch
+            .rules
+            .iter()
+            .position(|rule| matches!(rule, OwnedRule::DnsMediatorUpstreamDispatch { .. }))
+            .unwrap();
+        broadened_dispatch.rules[index] = OwnedRule::DnsMediatorUpstreamDispatch {
+            chain: NFT_OUTPUT_CHAIN.to_owned(),
+            destination: "0.0.0.0/0".to_owned(),
+            protocol: "udp".to_owned(),
+            port: 53,
+        };
+        assert!(verify_owned_state(&expected, &broadened_dispatch).is_err());
+
+        let mut duplicated_dispatch = expected.clone();
+        let duplicate = duplicated_dispatch
+            .rules
+            .iter()
+            .find(|rule| matches!(rule, OwnedRule::DnsMediatorUpstreamDispatch { .. }))
+            .unwrap()
+            .clone();
+        duplicated_dispatch.rules.push(duplicate);
+        assert!(verify_owned_state(&expected, &duplicated_dispatch).is_err());
+
         let mut missing = expected.clone();
         missing
             .rules
