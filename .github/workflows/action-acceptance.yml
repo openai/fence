@@ -17,6 +17,11 @@ on:
         description: Either source (assemble a temporary bundle) or distribution (use the committed bundle).
         required: true
         type: string
+      acceptance_runner:
+        description: Reviewed GitHub-hosted runner label for target execution jobs.
+        required: false
+        default: ubuntu-24.04
+        type: string
 
 permissions:
   contents: read
@@ -38,6 +43,7 @@ jobs:
       action_ref: ${{ steps.candidate.outputs.action_ref }}
       source_candidate: ${{ steps.candidate.outputs.source_candidate }}
       artifact_name: ${{ steps.candidate.outputs.artifact_name }}
+      acceptance_runner: ${{ steps.candidate.outputs.acceptance_runner }}
 
     steps:
       - name: select candidate
@@ -45,10 +51,12 @@ jobs:
         env:
           INPUT_ACTION_REF: ${{ inputs.action_ref }}
           INPUT_CANDIDATE_KIND: ${{ inputs.candidate_kind }}
+          INPUT_ACCEPTANCE_RUNNER: ${{ inputs.acceptance_runner }}
         run: |
           set -euo pipefail
           action_ref="${INPUT_ACTION_REF:-${GITHUB_SHA}}"
           candidate_kind="${INPUT_CANDIDATE_KIND:-source}"
+          acceptance_runner="${INPUT_ACCEPTANCE_RUNNER:-ubuntu-24.04}"
           if ! [[ "$action_ref" =~ ^[0-9a-f]{40}$ ]]; then
             echo "Action candidate must be identified by a full lowercase commit SHA" >&2
             exit 1
@@ -61,9 +69,23 @@ jobs:
               exit 1
               ;;
           esac
+          case "$acceptance_runner" in
+            ubuntu-24.04) ;;
+            ubuntu-latest)
+              if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+                echo "ubuntu-latest acceptance must run from refs/heads/main" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "acceptance_runner must be ubuntu-24.04 or ubuntu-latest" >&2
+              exit 1
+              ;;
+          esac
           echo "action_ref=$action_ref" >> "$GITHUB_OUTPUT"
           echo "source_candidate=$source_candidate" >> "$GITHUB_OUTPUT"
           echo "artifact_name=action-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "acceptance_runner=$acceptance_runner" >> "$GITHUB_OUTPUT"
 
       - name: checkout candidate source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
@@ -175,7 +197,7 @@ jobs:
             disable_broad_github_domains: 'false'
             allowlist: ''
     timeout-minutes: 8
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
     steps:
       - name: checkout
@@ -230,7 +252,7 @@ jobs:
     name: action zero-input standard
     needs: prepare-candidate
     timeout-minutes: 8
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
     steps:
       - name: checkout
@@ -279,7 +301,7 @@ jobs:
     name: action nested registered path
     needs: prepare-candidate
     timeout-minutes: 8
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
     steps:
       - name: checkout into nested Action path
@@ -338,7 +360,7 @@ jobs:
     name: action setup failure evidence
     needs: prepare-candidate
     timeout-minutes: 5
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
     steps:
       - name: checkout
@@ -370,7 +392,7 @@ jobs:
     name: action registered-path and post-ready tamper evidence
     needs: prepare-candidate
     timeout-minutes: 5
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
     steps:
       - name: checkout
@@ -420,7 +442,7 @@ jobs:
       matrix:
         replica: [quiet-1, quiet-2, quiet-3]
     timeout-minutes: 8
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
     steps:
       - name: checkout

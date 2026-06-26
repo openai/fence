@@ -131,6 +131,59 @@ def require(condition, message):
     if not condition:
         raise SystemExit(message)
 
+def indented_block(source, header, message):
+    lines = source.splitlines()
+    header_pattern = re.compile(rf"^{re.escape(header)}(?:[ \t]+#.*)?$")
+    matches = [
+        index for index, line in enumerate(lines) if header_pattern.fullmatch(line)
+    ]
+    require(len(matches) == 1, message)
+    start = matches[0]
+    indentation = len(header) - len(header.lstrip())
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        line = lines[index]
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line) - len(line.lstrip()) <= indentation:
+            end = index
+            break
+    return "\n".join(lines[start:end]) + "\n"
+
+def direct_mapping_keys(block, indentation):
+    prefix = " " * indentation
+    keys = re.findall(
+        rf"(?m)^{prefix}([A-Za-z0-9_-]+):[^\n]*$",
+        block,
+    )
+    require(
+        len(keys) == len(set(keys)),
+        "Workflow mappings must not contain duplicate keys",
+    )
+    return keys
+
+def require_exact_mapping_keys(block, indentation, expected, message):
+    keys = direct_mapping_keys(block, indentation)
+    require(
+        len(keys) == len(expected) and set(keys) == set(expected),
+        message,
+    )
+
+def scalar_mapping(block, indentation):
+    prefix = " " * indentation
+    entries = []
+    for match in re.finditer(
+        rf"(?m)^{prefix}([A-Za-z0-9_-]+):[ \t]+(.+?)[ \t]*$",
+        block,
+    ):
+        value = re.sub(r"[ \t]+#.*$", "", match.group(2)).rstrip()
+        entries.append((match.group(1), value))
+    require(
+        len(entries) == len(dict(entries)),
+        "Workflow scalar mappings must not contain duplicate keys",
+    )
+    return dict(entries)
+
 root = pathlib.Path(sys.argv[1])
 validator_paths = [
     "script/test-action-acceptance",
@@ -176,6 +229,16 @@ for relative in validator_paths:
             )
 
 workflow = (root / ".github/workflows/action-acceptance.yml").read_text(encoding="utf-8")
+require_exact_mapping_keys(
+    workflow,
+    0,
+    ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
+    "Action acceptance top-level workflow contract must remain narrowly scoped",
+)
+require(
+    scalar_mapping(workflow, 0) == {"name": "action acceptance"},
+    "Action acceptance workflow name must remain stable",
+)
 marker = "\n  acceptance:\n"
 require(workflow.count(marker) == 1, "Action acceptance aggregate must be unique")
 aggregate = workflow.split(marker, 1)[1]
@@ -211,6 +274,335 @@ require(
 require(
     workflow.count('CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}') == 5,
     "Action acceptance classifier guards are incomplete",
+)
+
+workflow_triggers = indented_block(
+    workflow,
+    "on:",
+    "Action acceptance must have one top-level trigger contract",
+)
+require_exact_mapping_keys(
+    workflow_triggers,
+    2,
+    ["push", "pull_request", "workflow_call"],
+    "Action acceptance triggers must remain fixed to main pushes, main pull requests, and reusable calls",
+)
+for trigger_name in ["push", "pull_request"]:
+    trigger = indented_block(
+        workflow_triggers,
+        f"  {trigger_name}:",
+        f"Action acceptance {trigger_name} trigger must be unique",
+    )
+    require_exact_mapping_keys(
+        trigger,
+        4,
+        ["branches"],
+        f"Action acceptance {trigger_name} trigger must contain only a branch filter",
+    )
+    require(
+        re.findall(
+            r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
+            trigger,
+        )
+        == ["main"],
+        f"Action acceptance {trigger_name} trigger must remain limited to main",
+    )
+
+workflow_call = indented_block(
+    workflow_triggers,
+    "  workflow_call:",
+    "Action acceptance reusable-call contract must be unique",
+)
+require_exact_mapping_keys(
+    workflow_call,
+    4,
+    ["inputs"],
+    "Action acceptance reusable call may expose only its reviewed inputs",
+)
+workflow_inputs = indented_block(
+    workflow_call,
+    "    inputs:",
+    "Action acceptance reusable inputs must be unique",
+)
+require_exact_mapping_keys(
+    workflow_inputs,
+    6,
+    ["action_ref", "candidate_kind", "acceptance_runner"],
+    "Action acceptance reusable inputs must remain narrowly scoped",
+)
+runner_input = indented_block(
+    workflow_inputs,
+    "      acceptance_runner:",
+    "Action acceptance runner input must be unique",
+)
+require_exact_mapping_keys(
+    runner_input,
+    8,
+    ["description", "required", "default", "type"],
+    "Action acceptance runner input fields must remain narrowly scoped",
+)
+runner_input_fields = scalar_mapping(runner_input, 8)
+require(
+    runner_input_fields.get("required") == "false"
+    and runner_input_fields.get("default") == "ubuntu-24.04"
+    and runner_input_fields.get("type") == "string",
+    "Action acceptance runner input must be an optional string defaulting to ubuntu-24.04",
+)
+
+jobs = indented_block(workflow, "jobs:", "Action acceptance jobs contract must be unique")
+target_jobs = [
+    "action",
+    "zero-input",
+    "nested-layout",
+    "setup-failure",
+    "tamper",
+    "action-finalization",
+]
+support_jobs = ["prepare-candidate", "verify-action-finalization", "acceptance"]
+require_exact_mapping_keys(
+    jobs,
+    2,
+    target_jobs + support_jobs,
+    "Action acceptance must retain six target job definitions and three fixed support jobs",
+)
+
+prepare = indented_block(
+    jobs,
+    "  prepare-candidate:",
+    "Action acceptance candidate preparation job must be unique",
+)
+select_candidate = indented_block(
+    prepare,
+    "      - name: select candidate",
+    "Action acceptance candidate selection step must be unique",
+)
+require(
+    prepare.index("      - name: select candidate")
+    < prepare.index("      - name: checkout candidate source"),
+    "Action acceptance runner validation must happen before checkout",
+)
+for fragment in [
+    "acceptance_runner: ${{ steps.candidate.outputs.acceptance_runner }}",
+    "INPUT_ACCEPTANCE_RUNNER: ${{ inputs.acceptance_runner }}",
+    'acceptance_runner="${INPUT_ACCEPTANCE_RUNNER:-ubuntu-24.04}"',
+    'echo "acceptance_runner=$acceptance_runner" >> "$GITHUB_OUTPUT"',
+]:
+    require(fragment in prepare, "Action acceptance validated runner output contract is incomplete")
+
+runner_case_match = re.search(
+    r'(?ms)^          case "\$acceptance_runner" in\n(.*?)^          esac$',
+    select_candidate,
+)
+require(runner_case_match is not None, "Action acceptance runner allowlist must be explicit")
+runner_case = runner_case_match.group(1)
+expected_runner_case = (
+    "            ubuntu-24.04) ;;\n"
+    "            ubuntu-latest)\n"
+    '              if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then\n'
+    '                echo "ubuntu-latest acceptance must run from refs/heads/main" >&2\n'
+    "                exit 1\n"
+    "              fi\n"
+    "              ;;\n"
+    "            *)\n"
+    '              echo "acceptance_runner must be ubuntu-24.04 or ubuntu-latest" >&2\n'
+    "              exit 1\n"
+    "              ;;\n"
+)
+require(
+    runner_case == expected_runner_case,
+    "Action acceptance runner allowlist and main-only ubuntu-latest guard must fail closed",
+)
+
+validated_runner = "${{ needs.prepare-candidate.outputs.acceptance_runner }}"
+for job_name in target_jobs:
+    job = indented_block(
+        jobs,
+        f"  {job_name}:",
+        f"Action acceptance {job_name} job must be unique",
+    )
+    require(
+        scalar_mapping(job, 4).get("runs-on") == validated_runner,
+        f"Action acceptance {job_name} must use only the validated runner output",
+    )
+for job_name in support_jobs:
+    job = indented_block(
+        jobs,
+        f"  {job_name}:",
+        f"Action acceptance {job_name} job must be unique",
+    )
+    require(
+        scalar_mapping(job, 4).get("runs-on") == "ubuntu-24.04",
+        f"Action acceptance {job_name} must remain fixed to ubuntu-24.04",
+    )
+require(
+    "inputs.acceptance_runner" not in "\n".join(
+        re.findall(r"(?m)^.*runs-on:.*$", workflow)
+    ),
+    "Action acceptance must not interpolate the raw runner input into runs-on",
+)
+require(
+    workflow.count(f"runs-on: {validated_runner}") == len(target_jobs)
+    and workflow.count("runs-on: ubuntu-24.04") == len(support_jobs),
+    "Action acceptance runner routing must remain complete and exclusive",
+)
+
+nightly_path = root / ".github/workflows/action-acceptance-ubuntu-latest.yml"
+require(nightly_path.is_file(), "Nightly ubuntu-latest acceptance workflow is missing")
+nightly = nightly_path.read_text(encoding="utf-8")
+require_exact_mapping_keys(
+    nightly,
+    0,
+    ["name", "on", "permissions", "concurrency", "jobs"],
+    "Nightly ubuntu-latest workflow must remain a minimal reusable-workflow caller",
+)
+require(
+    scalar_mapping(nightly, 0) == {"name": "nightly"},
+    "Nightly ubuntu-latest workflow name must remain stable",
+)
+
+nightly_triggers = indented_block(
+    nightly,
+    "on:",
+    "Nightly ubuntu-latest trigger contract must be unique",
+)
+require_exact_mapping_keys(
+    nightly_triggers,
+    2,
+    ["schedule", "workflow_dispatch"],
+    "Nightly ubuntu-latest may run only on schedule or manual dispatch",
+)
+nightly_schedule = indented_block(
+    nightly_triggers,
+    "  schedule:",
+    "Nightly ubuntu-latest schedule must be unique",
+)
+nightly_schedule_lines = [
+    line
+    for line in nightly_schedule.splitlines()[1:]
+    if line.strip() and not line.lstrip().startswith("#")
+]
+require(
+    len(nightly_schedule_lines) == 1
+    and re.fullmatch(
+        r'''    - cron: ["']17 9 \* \* \*["'](?:[ \t]+#.*)?''',
+        nightly_schedule_lines[0],
+    )
+    is not None,
+    "Nightly ubuntu-latest schedule must run daily at 09:17 UTC",
+)
+nightly_dispatch = indented_block(
+    nightly_triggers,
+    "  workflow_dispatch:",
+    "Nightly ubuntu-latest manual trigger must be unique",
+)
+require(
+    all(
+        not line.strip() or line.lstrip().startswith("#")
+        for line in nightly_dispatch.splitlines()[1:]
+    ),
+    "Nightly ubuntu-latest manual dispatch must not accept inputs",
+)
+
+nightly_permissions_block = indented_block(
+    nightly,
+    "permissions:",
+    "Nightly ubuntu-latest permissions contract must be unique",
+)
+require_exact_mapping_keys(
+    nightly_permissions_block,
+    2,
+    ["actions", "contents"],
+    "Nightly ubuntu-latest permissions must remain narrowly scoped",
+)
+nightly_permissions = scalar_mapping(nightly_permissions_block, 2)
+require(
+    nightly_permissions == {"actions": "read", "contents": "read"},
+    "Nightly ubuntu-latest permissions must be limited to read-only actions and contents",
+)
+nightly_concurrency_block = indented_block(
+    nightly,
+    "concurrency:",
+    "Nightly ubuntu-latest concurrency contract must be unique",
+)
+require_exact_mapping_keys(
+    nightly_concurrency_block,
+    2,
+    ["group", "cancel-in-progress"],
+    "Nightly ubuntu-latest concurrency fields must remain narrowly scoped",
+)
+nightly_concurrency = scalar_mapping(nightly_concurrency_block, 2)
+require(
+    nightly_concurrency
+    == {"group": "nightly-ubuntu-latest", "cancel-in-progress": "false"},
+    "Nightly ubuntu-latest concurrency must be distinct and non-cancelling",
+)
+
+nightly_jobs = indented_block(
+    nightly,
+    "jobs:",
+    "Nightly ubuntu-latest jobs contract must be unique",
+)
+require_exact_mapping_keys(
+    nightly_jobs,
+    2,
+    ["acceptance"],
+    "Nightly ubuntu-latest must contain exactly one caller job",
+)
+nightly_job = indented_block(
+    nightly_jobs,
+    "  acceptance:",
+    "Nightly ubuntu-latest caller job must be unique",
+)
+require_exact_mapping_keys(
+    nightly_job,
+    4,
+    ["name", "uses", "with"],
+    "Nightly ubuntu-latest caller may contain only its name, reusable call, and reviewed inputs",
+)
+require(
+    scalar_mapping(nightly_job, 4)
+    == {
+        "name": "ubuntu-latest action acceptance",
+        "uses": "./.github/workflows/action-acceptance.yml",
+    },
+    "Nightly ubuntu-latest caller job must remain an unconditional local reusable-workflow call",
+)
+nightly_with = indented_block(
+    nightly_job,
+    "    with:",
+    "Nightly ubuntu-latest caller inputs must be unique",
+)
+require_exact_mapping_keys(
+    nightly_with,
+    6,
+    ["action_ref", "candidate_kind", "acceptance_runner"],
+    "Nightly ubuntu-latest caller inputs must remain narrowly scoped",
+)
+require(
+    scalar_mapping(nightly_with, 6)
+    == {
+        "action_ref": "${{ github.sha }}",
+        "candidate_kind": "source",
+        "acceptance_runner": "ubuntu-latest",
+    },
+    "Nightly ubuntu-latest must validate the exact current source SHA on the floating label",
+)
+for forbidden in [
+    "continue-on-error",
+    "runs-on:",
+    "steps:",
+    "::warning::",
+]:
+    require(
+        forbidden not in nightly,
+        "Nightly ubuntu-latest caller contains duplicated implementation or a warning-only escape path",
+    )
+
+readme = (root / "README.md").read_text(encoding="utf-8")
+nightly_badge = "[![nightly](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml)"
+require(
+    readme.count(nightly_badge) == 1,
+    "README must expose exactly one main-branch nightly ubuntu-latest status badge",
 )
 
 canary_path = root / ".github/workflows/action-drift-canary.yml"
@@ -330,6 +722,34 @@ for fragment in [
     'echo "- uses: GrantBirki/fence@$ACTION_COMMIT"',
 ]:
     require(fragment in release, "One-PR Action release workflow contract is incomplete")
+require(
+    release.count("uses: ./.github/workflows/action-acceptance.yml") == 1,
+    "Release workflow must invoke Action acceptance exactly once",
+)
+release_acceptance = indented_block(
+    release,
+    "  candidate-action-acceptance:",
+    "Release Action acceptance caller must be unique",
+)
+release_acceptance_with = indented_block(
+    release_acceptance,
+    "    with:",
+    "Release Action acceptance inputs must be unique",
+)
+require_exact_mapping_keys(
+    release_acceptance_with,
+    6,
+    ["action_ref", "candidate_kind"],
+    "Release Action acceptance inputs must retain the fixed default runner",
+)
+require(
+    scalar_mapping(release_acceptance_with, 6)
+    == {
+        "action_ref": "${{ needs.create-candidate.outputs.action_commit }}",
+        "candidate_kind": "distribution",
+    },
+    "Release Action acceptance must retain the fixed default runner",
+)
 for required_check in [
     '"build"',
     '"coverage"',
