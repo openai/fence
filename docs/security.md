@@ -4,7 +4,7 @@ Fence reduces where later workflow steps can send data and removes common ways f
 
 ## Supported Boundary
 
-The protected v0 target is a GitHub-hosted `ubuntu-24.04` x64 host job running the native Linux GNU Action bundle. The `ubuntu-latest` canary provides drift signal but does not expand that support claim. Container jobs, other runner images, self-hosted runners, other architectures, and direct CLI launches do not establish the protected production lifecycle.
+The protected v0 target is a GitHub-hosted `ubuntu-24.04` x64 host job running the native Linux GNU Action bundle. The non-required `nightly` workflow runs daily and by input-free manual dispatch, fails closed unless the exact selected ref is `main`, builds an ephemeral production-shaped candidate from that exact `main` source SHA, and executes the complete Action-acceptance target matrix on `ubuntu-latest`. It is not a branch-protection or release gate. A green result means only that the image currently selected by the floating label matched Fence's reviewed fingerprint and passed the complete suite; a future image selected by `ubuntu-latest` is not automatically trusted, and the result does not expand the support claim. Container jobs, other runner images, self-hosted runners, other architectures, and direct CLI launches do not establish the protected production lifecycle.
 
 Fence should run before checkout and all other steps that need restriction. It checks a reviewed hosted-runner fingerprint before mutation, but it does not authenticate a privileged command or platform component that was already compromised before Fence started.
 
