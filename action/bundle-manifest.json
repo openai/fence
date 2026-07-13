@@ -1,0 +1,14 @@
+{
+  "artifact_name": "fence_v0.8.0_linux-amd64",
+  "artifact_sha256": "cdc3ba827bfba56e8cbe5c8febfc97f7efef40215006947eab84243cd72f379f",
+  "bundle_path": "action/bin/fence",
+  "release_channel": "stable",
+  "release_tag": "v0.8.0",
+  "release_url": "https://github.com/GrantBirki/fence/releases/tag/v0.8.0",
+  "repository": "GrantBirki/fence",
+  "schema_version": 4,
+  "signer_digest": "2fa866547653db4c84ad4aa38cce9055b480aba7",
+  "signer_workflow": "GrantBirki/fence/.github/workflows/release.yml",
+  "source_commit": "2fa866547653db4c84ad4aa38cce9055b480aba7",
+  "source_ref": "refs/heads/main"
+}
