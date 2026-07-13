@@ -24,6 +24,8 @@ Set `disable_broad_github_domains: true` to remove `github.com`, `api.github.com
 
 GitHub's authorized results-storage accounts are also reachable over TCP port `443` for the rest of the job after authorization. Fence limits dynamic authorization to DNS requests from the pinned runner process and records the bounded authorization locally; it does not permit the general Azure Blob Storage suffix.
 
+Separate hosted-runner platform rules permit root-only access to Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526`, plus host and forwarded access to Azure IMDS at `169.254.169.254` on TCP port `80`. These are built-in platform channels rather than user allowlist entries: later workflow code can use the shared IMDS rule, while any root-owned host process can use the WireServer rules.
+
 ## Integrity And Drift
 
 The Action validates its checked-in manifest, copies the bundled agent into a protected root-owned launcher directory, and starts only that protected copy. The agent validates trusted executable identities, reviewed path ancestors, sudo-policy sources, runner identity, and the bounded root TCP, Unix, and container inventory before protection is claimed.

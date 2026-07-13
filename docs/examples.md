@@ -85,7 +85,7 @@ One- and two-label leading wildcards are exact-depth patterns:
 
 ## Narrow The Built-In GitHub Policy
 
-Remove the broad GitHub web, API, release-asset, watchdog, and platform-origin GitHub application compatibility destinations while keeping the core Actions reporting and finalization path:
+Remove the broad GitHub web, API, release-asset, and watchdog destinations and new platform-origin `*.githubapp.com` authorizations while keeping the core Actions reporting and finalization path:
 
 ```yaml
 - uses: GrantBirki/fence@<commit-sha>

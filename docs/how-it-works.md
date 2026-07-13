@@ -24,7 +24,7 @@ flowchart TD
     config --> launch["Launch bundled agent<br/>with sudo + systemd"]
 
     launch --> support["Check supported runner shape"]
-    support --> plan["Build network plan<br/>GitHub workflow traffic + allowlist"]
+    support --> plan["Build network plan<br/>Built-in platform policy + allowlist"]
     plan --> network["Apply Linux nftables rules<br/>and local DNS handling"]
     network --> gate["Release approved DNS answers<br/>after matching firewall access is verified"]
 
