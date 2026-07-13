@@ -303,7 +303,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV3 {
                     canonical_target: "/etc/sudoers.d/90-cloud-init-users",
                     mode: "0440",
                     digest_profile: SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
-                    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                    sha256: "86edf54fdaf109a4da119f9fbbff9ff565d911b05076a500830e4b2d15ab6b10",
                     runner_nopasswd_markers: vec![],
                 },
                 AcceptedSudoPolicySourceV3 {
