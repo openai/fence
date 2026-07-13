@@ -133,6 +133,15 @@ SCHEMA4_REVIEWED_SUDO_SOURCE_TARGETS = {
     "README": "/etc/sudoers.d/README",
     "runner": "/etc/sudoers.d/runner",
 }
+CLOUD_INIT_SUDO_HEADER_PREFIX = b"# Created by cloud-init v. "
+CLOUD_INIT_SUDO_BODY_HASH_DOMAIN = b"fence-cloud-init-sudo-body-v1"
+CLOUD_INIT_SUDO_HEADER = re.compile(
+    rb"# Created by cloud-init v\. [A-Za-z0-9.+:~_-]{1,64} on "
+    rb"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), "
+    rb"(?:0[1-9]|[12][0-9]|3[01]) "
+    rb"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    rb"[0-9]{4} (?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9] \+0000"
+)
 SCHEMA4_REVIEWED_UNIT_STATES = {
     "docker.service": {
         "load_state": "loaded",
@@ -278,6 +287,25 @@ def canonical_sudo_sources(sources):
             source["name"],
         ),
     )
+
+
+def sudo_policy_sha256(name, contents):
+    if name != "90-cloud-init-users":
+        return hashlib.sha256(contents).hexdigest()
+    header, newline, body = contents.partition(b"\n")
+    if (
+        not newline
+        or not body
+        or CLOUD_INIT_SUDO_HEADER.fullmatch(header) is None
+        or any(
+            line.startswith(CLOUD_INIT_SUDO_HEADER_PREFIX)
+            for line in body.splitlines()
+        )
+    ):
+        raise ValueError("cloud-init sudo source has an invalid generated header")
+    return hashlib.sha256(
+        CLOUD_INIT_SUDO_BODY_HASH_DOMAIN + b"\0" + body
+    ).hexdigest()
 
 
 def public_host_identity(value, reviewed, unreviewed):
@@ -2232,6 +2260,45 @@ class HostObservationTests(unittest.TestCase):
     @staticmethod
     def _tcp_header(family="ipv4"):
         return (" ".join(TCP_TABLE_HEADERS[family]) + "\n").encode()
+
+    def test_cloud_init_sudo_digest_ignores_only_one_valid_generated_header(self):
+        body = b"# User rules for ubuntu\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
+        first = (
+            b"# Created by cloud-init v. 24.1.3-0ubuntu3.3 on Mon, 30 Jun 2026 10:11:12 +0000\n"
+            + body
+        )
+        second = (
+            b"# Created by cloud-init v. 25.1.2-0ubuntu0~24.04.1 on Tue, 13 Jul 2026 21:22:23 +0000\n"
+            + body
+        )
+        self.assertEqual(
+            sudo_policy_sha256("90-cloud-init-users", first),
+            sudo_policy_sha256("90-cloud-init-users", second),
+        )
+        self.assertNotEqual(hashlib.sha256(first).digest(), hashlib.sha256(second).digest())
+        self.assertNotEqual(
+            sudo_policy_sha256("90-cloud-init-users", first),
+            sudo_policy_sha256(
+                "90-cloud-init-users",
+                second.replace(b"NOPASSWD:ALL", b"NOPASSWD: ALL"),
+            ),
+        )
+        self.assertEqual(
+            sudo_policy_sha256("runner", first), hashlib.sha256(first).hexdigest()
+        )
+
+    def test_cloud_init_sudo_digest_rejects_malformed_or_duplicate_headers(self):
+        invalid = (
+            b"ubuntu ALL=(ALL) NOPASSWD:ALL\n",
+            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 99:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n",
+            b"# Created by cloud-init v. bad version on Tue, 13 Jul 2026 21:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n",
+            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:24 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n",
+            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n",
+        )
+        for contents in invalid:
+            with self.subTest(contents=contents):
+                with self.assertRaises(ValueError):
+                    sudo_policy_sha256("90-cloud-init-users", contents)
 
     @staticmethod
     def _private_owner(

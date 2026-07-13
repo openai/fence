@@ -75,6 +75,7 @@ public_socket_identity = helper.public_socket_identity
 public_sudo_source_name = helper.public_sudo_source_name
 public_sudo_source_target = helper.public_sudo_source_target
 public_unit_state = helper.public_unit_state
+sudo_policy_sha256 = helper.sudo_policy_sha256
 
 MAX_OUTPUT_BYTES = helper.MAX_SCHEMA4_OUTPUT_BYTES
 MAX_POLICY_SOURCE_BYTES = 256 * 1024
@@ -348,7 +349,7 @@ def regular_file_observation(path, principal, identity):
             return {**common, "status": "oversized"}
         return {
             **common,
-            "sha256": hashlib.sha256(contents).hexdigest(),
+            "sha256": sudo_policy_sha256(candidate.name, contents),
             "contains_nopasswd_directive": b"NOPASSWD:" in contents,
             "runner_nopasswd_markers": runner_nopasswd_markers(
                 contents,

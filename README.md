@@ -149,6 +149,8 @@ flowchart LR
 
 Fence reduces where later workflow steps can send data and removes common ways to undo the lockdown. It is not a full sandbox, does not make a runner perfectly hermetic, and currently supports only GitHub-hosted `ubuntu-24.04` x64 host jobs.
 
+Activation fails closed unless the live host matches Fence's reviewed fingerprint. Sudo policy files remain byte-exact except for the first line of `90-cloud-init-users`, which must match cloud-init's generated version/timestamp header; Fence hashes every remaining byte and retains a raw whole-file runtime pin so later changes are still detected.
+
 The built-in GitHub destinations are a compatibility tradeoff because later workflow code can also reach them. Pin Fence to the full immutable `action_commit` SHA from a release, use `disable_broad_github_domains: true` when the narrower GitHub path is sufficient, and treat `container_policy: unsafe_preserve` as a deliberately weaker mode.
 
 **Read more:** [Security boundaries and operational guidance](docs/security.md)

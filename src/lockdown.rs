@@ -1,6 +1,7 @@
 use crate::hosted_runner::{
-    AcceptedHostedRunnerFactsV2, AcceptedPermissionAncestorV2, AcceptedSudoPolicySourceV2,
-    AcceptedTrustedExecutableV2, hosted_runner_fingerprint_requirement,
+    AcceptedHostedRunnerFactsV3, AcceptedPermissionAncestorV2, AcceptedSudoPolicySourceV3,
+    AcceptedTrustedExecutableV2, SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+    SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1, hosted_runner_fingerprint_requirement,
 };
 use crate::lifecycle::validate_test_service_context;
 use crate::local_control::{
@@ -32,6 +33,8 @@ const MAX_POLICY_SOURCE_BYTES: u64 = 256 * 1024;
 const SUDOERS_PATH: &str = "/etc/sudoers";
 const SUDOERS_DROP_IN_ROOT: &str = "/etc/sudoers.d";
 const RUNNER_DROP_IN_PATH: &str = "/etc/sudoers.d/runner";
+const CLOUD_INIT_SUDO_HEADER_PREFIX: &[u8] = b"# Created by cloud-init v. ";
+const CLOUD_INIT_SUDO_BODY_HASH_DOMAIN: &[u8] = b"fence-cloud-init-sudo-body-v1";
 const RESTORED_SUDO_VISUDO_ARGUMENTS: [&str; 3] = ["--check", "--file", SUDOERS_PATH];
 const RUNNER_SUDO_VALIDATION_ARGUMENTS: [&str; 3] =
     ["--non-interactive", "--reset-timestamp", "--validate"];
@@ -138,7 +141,7 @@ impl RunnerAccessProbe {
 enum RunnerProbeTarget<'a> {
     TrustedExecutable(&'a AcceptedTrustedExecutableV2),
     PermissionAncestor(&'a AcceptedPermissionAncestorV2),
-    SudoPolicySource(&'a AcceptedSudoPolicySourceV2),
+    SudoPolicySource(&'a AcceptedSudoPolicySourceV3),
 }
 
 impl RunnerProbeTarget<'_> {
@@ -715,7 +718,7 @@ fn verify_test_local_control_inventory(
 }
 
 fn runner_access_probe_plan(
-    accepted: &AcceptedHostedRunnerFactsV2,
+    accepted: &AcceptedHostedRunnerFactsV3,
 ) -> Vec<RunnerAccessProbeSpec<'_>> {
     let mut plan = Vec::with_capacity(
         accepted.trusted_executables.len() * 2
@@ -758,7 +761,7 @@ fn runner_access_probe_plan(
 }
 
 fn collect_runner_probe_baselines<'a>(
-    accepted: &'a AcceptedHostedRunnerFactsV2,
+    accepted: &'a AcceptedHostedRunnerFactsV3,
     plan: &[RunnerAccessProbeSpec<'a>],
 ) -> Result<BTreeMap<&'static str, RunnerProbeIdentity>, LockdownError> {
     let mut baselines = BTreeMap::new();
@@ -784,7 +787,7 @@ fn collect_runner_probe_baselines<'a>(
 
 fn verify_runner_access_probes(
     executables: &TrustedExecutableSet,
-    accepted: &AcceptedHostedRunnerFactsV2,
+    accepted: &AcceptedHostedRunnerFactsV3,
 ) -> Result<(), LockdownError> {
     let plan = runner_access_probe_plan(accepted);
     let baselines = collect_runner_probe_baselines(accepted, &plan)?;
@@ -944,7 +947,7 @@ fn verify_fixed_fingerprint(
 }
 
 fn verify_sudo_sources(
-    expected: &[AcceptedSudoPolicySourceV2],
+    expected: &[AcceptedSudoPolicySourceV3],
 ) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
     verify_sudo_sources_with_runner_state(expected, true)
 }
@@ -971,7 +974,7 @@ fn remaining_sudo_source_pins_match(
 }
 
 fn verify_sudo_sources_with_runner_state(
-    expected: &[AcceptedSudoPolicySourceV2],
+    expected: &[AcceptedSudoPolicySourceV3],
     runner_source_present: bool,
 ) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
     let expected_sources = expected
@@ -1030,16 +1033,17 @@ fn verify_drop_in_inventory(root: &Path, expected: &[&str]) -> Result<(), Lockdo
 
 fn verify_policy_source(
     path: &Path,
-    expected: &AcceptedSudoPolicySourceV2,
+    expected: &AcceptedSudoPolicySourceV3,
 ) -> Result<SudoPolicySourcePin, LockdownError> {
     let (bytes, metadata) = read_bounded_policy_file_with_metadata(path)?;
     let expected_mode = parse_reviewed_mode(expected.mode)?;
-    let sha256 = sha256_bytes(&bytes);
+    let policy_sha256 = sudo_policy_sha256(expected.digest_profile, &bytes)?;
+    let raw_sha256 = sha256_bytes(&bytes);
     if path.to_str() != Some(expected.canonical_target)
         || fs::canonicalize(path).ok().as_deref() != Some(Path::new(expected.canonical_target))
         || !policy_source_metadata_is_safe(&metadata)
         || metadata.permissions().mode() & 0o7777 != expected_mode
-        || !source_accepts_sha256(expected, &sha256)
+        || policy_sha256 != expected.sha256
     {
         return Err(unsupported_fingerprint());
     }
@@ -1051,7 +1055,7 @@ fn verify_policy_source(
         gid: metadata.gid(),
         device: metadata.dev(),
         inode: metadata.ino(),
-        sha256,
+        sha256: raw_sha256,
     })
 }
 
@@ -1070,10 +1074,6 @@ fn require_policy_source_absent(path: &Path) -> Result<(), LockdownError> {
             "the accepted runner sudo policy source is present or could not be checked",
         )),
     }
-}
-
-fn source_accepts_sha256(source: &AcceptedSudoPolicySourceV2, observed_sha256: &str) -> bool {
-    observed_sha256 == source.sha256 || source.alternate_sha256.contains(&observed_sha256)
 }
 
 fn verify_socket_fingerprint(executables: &TrustedExecutableSet) -> Result<(), LockdownError> {
@@ -1119,13 +1119,14 @@ fn capture_runner_sudo_source() -> Result<SudoRollbackSource, LockdownError> {
         })?;
     let (bytes, metadata) = read_bounded_policy_file_with_metadata(Path::new(RUNNER_DROP_IN_PATH))?;
     let mode = metadata.permissions().mode() & 0o7777;
-    let sha256 = sha256_bytes(&bytes);
+    let policy_sha256 = sudo_policy_sha256(accepted.digest_profile, &bytes)?;
+    let raw_sha256 = sha256_bytes(&bytes);
     if accepted.canonical_target != RUNNER_DROP_IN_PATH
         || fs::canonicalize(RUNNER_DROP_IN_PATH).ok().as_deref()
             != Some(Path::new(accepted.canonical_target))
         || mode != parse_reviewed_mode(accepted.mode)?
         || !policy_source_metadata_is_safe(&metadata)
-        || !source_accepts_sha256(&accepted, &sha256)
+        || policy_sha256 != accepted.sha256
     {
         return Err(unsupported_fingerprint());
     }
@@ -1136,7 +1137,7 @@ fn capture_runner_sudo_source() -> Result<SudoRollbackSource, LockdownError> {
         gid: metadata.gid(),
         device: metadata.dev(),
         inode: metadata.ino(),
-        sha256,
+        sha256: raw_sha256,
     })
 }
 
@@ -1269,9 +1270,118 @@ fn sha256_bounded_file(path: &Path) -> Result<String, LockdownError> {
     Ok(sha256_bytes(&bytes))
 }
 
+fn sudo_policy_sha256(profile: &str, bytes: &[u8]) -> Result<String, LockdownError> {
+    match profile {
+        SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1 => Ok(sha256_bytes(bytes)),
+        SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1 => {
+            let body = cloud_init_sudo_body(bytes).ok_or_else(unsupported_fingerprint)?;
+            Ok(domain_separated_sha256(
+                CLOUD_INIT_SUDO_BODY_HASH_DOMAIN,
+                body,
+            ))
+        }
+        _ => Err(unsupported_fingerprint()),
+    }
+}
+
+fn cloud_init_sudo_body(bytes: &[u8]) -> Option<&[u8]> {
+    let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+    let header = &bytes[..newline];
+    let body = &bytes[newline + 1..];
+    if body.is_empty()
+        || !cloud_init_sudo_header_is_valid(header)
+        || body
+            .split(|byte| *byte == b'\n')
+            .any(|line| line.starts_with(CLOUD_INIT_SUDO_HEADER_PREFIX))
+    {
+        return None;
+    }
+    Some(body)
+}
+
+fn cloud_init_sudo_header_is_valid(header: &[u8]) -> bool {
+    let Some(rest) = header.strip_prefix(CLOUD_INIT_SUDO_HEADER_PREFIX) else {
+        return false;
+    };
+    let Some(separator) = rest.windows(4).position(|window| window == b" on ") else {
+        return false;
+    };
+    let version = &rest[..separator];
+    let timestamp = &rest[separator + 4..];
+    let version_is_valid = !version.is_empty()
+        && version.len() <= 64
+        && version.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b':' | b'~' | b'_' | b'-')
+        });
+    version_is_valid && cloud_init_timestamp_is_valid(timestamp)
+}
+
+fn cloud_init_timestamp_is_valid(timestamp: &[u8]) -> bool {
+    if timestamp.len() != 31
+        || &timestamp[3..5] != b", "
+        || timestamp[7] != b' '
+        || timestamp[11] != b' '
+        || timestamp[16] != b' '
+        || timestamp[19] != b':'
+        || timestamp[22] != b':'
+        || timestamp[25] != b' '
+        || &timestamp[26..] != b"+0000"
+    {
+        return false;
+    }
+    let weekday = std::str::from_utf8(&timestamp[..3]).ok();
+    let month = std::str::from_utf8(&timestamp[8..11]).ok();
+    matches!(
+        weekday,
+        Some("Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun")
+    ) && matches!(
+        month,
+        Some(
+            "Jan"
+                | "Feb"
+                | "Mar"
+                | "Apr"
+                | "May"
+                | "Jun"
+                | "Jul"
+                | "Aug"
+                | "Sep"
+                | "Oct"
+                | "Nov"
+                | "Dec"
+        )
+    ) && ascii_decimal_in_range(&timestamp[5..7], 1, 31)
+        && timestamp[12..16].iter().all(u8::is_ascii_digit)
+        && ascii_decimal_in_range(&timestamp[17..19], 0, 23)
+        && ascii_decimal_in_range(&timestamp[20..22], 0, 59)
+        && ascii_decimal_in_range(&timestamp[23..25], 0, 59)
+}
+
+fn ascii_decimal_in_range(bytes: &[u8], minimum: u32, maximum: u32) -> bool {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let value = bytes
+        .iter()
+        .fold(0_u32, |value, byte| value * 10 + u32::from(byte - b'0'));
+    (minimum..=maximum).contains(&value)
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
+    sha256_chunks(&[bytes])
+}
+
+fn domain_separated_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    sha256_chunks(&[domain, b"\0", bytes])
+}
+
+fn sha256_chunks(chunks: &[&[u8]]) -> String {
+    let mut digest = Sha256::new();
+    for chunk in chunks {
+        digest.update(chunk);
+    }
     let mut hexadecimal = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
+    for byte in digest.finalize() {
         write!(&mut hexadecimal, "{byte:02x}").expect("writing to a string cannot fail");
     }
     hexadecimal
@@ -1611,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_v2_builds_the_exact_runner_access_probe_plan() {
+    fn fingerprint_v3_builds_the_exact_runner_access_probe_plan() {
         let accepted = hosted_runner_fingerprint_requirement().accepted;
         let plan = runner_access_probe_plan(&accepted);
         assert_eq!(
@@ -2065,6 +2175,86 @@ mod tests {
             "unsupported_host_fingerprint"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cloud_init_sudo_digest_ignores_only_one_valid_generated_header() {
+        let body = b"# User rules for ubuntu\nubuntu ALL=(ALL) NOPASSWD:ALL\n";
+        let first = [
+            b"# Created by cloud-init v. 24.1.3-0ubuntu3.3 on Mon, 30 Jun 2026 10:11:12 +0000\n"
+                .as_slice(),
+            body,
+        ]
+        .concat();
+        let second = [
+            b"# Created by cloud-init v. 25.1.2-0ubuntu0~24.04.1 on Tue, 13 Jul 2026 21:22:23 +0000\n"
+                .as_slice(),
+            body,
+        ]
+        .concat();
+
+        let first_policy = sudo_policy_sha256(
+            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+            &first,
+        )
+        .unwrap();
+        let second_policy = sudo_policy_sha256(
+            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+            &second,
+        )
+        .unwrap();
+        assert_eq!(first_policy, second_policy);
+        assert_ne!(sha256_bytes(&first), sha256_bytes(&second));
+        assert_ne!(
+            first_policy,
+            sudo_policy_sha256(
+                SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+                &[
+                    b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n"
+                        .as_slice(),
+                    b"# User rules for ubuntu\nubuntu ALL=(ALL) NOPASSWD: ALL\n",
+                ]
+                .concat(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            sudo_policy_sha256(SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1, &first).unwrap(),
+            sha256_bytes(&first)
+        );
+    }
+
+    #[test]
+    fn cloud_init_sudo_digest_rejects_missing_malformed_duplicate_and_unknown_profiles() {
+        let valid = b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n";
+        let invalid = vec![
+            b"ubuntu ALL=(ALL) NOPASSWD:ALL\n".as_slice(),
+            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 99:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
+                .as_slice(),
+            b"# Created by cloud-init v. bad version on Tue, 13 Jul 2026 21:22:23 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
+                .as_slice(),
+            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:24 +0000\nubuntu ALL=(ALL) NOPASSWD:ALL\n"
+                .as_slice(),
+            b"# Created by cloud-init v. 25.1.2 on Tue, 13 Jul 2026 21:22:23 +0000\n"
+                .as_slice(),
+        ];
+        for contents in invalid {
+            assert_eq!(
+                sudo_policy_sha256(
+                    SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+                    contents,
+                )
+                .unwrap_err()
+                .code,
+                "unsupported_host_fingerprint"
+            );
+        }
+        assert_eq!(
+            sudo_policy_sha256("unknown_profile", valid)
+                .unwrap_err()
+                .code,
+            "unsupported_host_fingerprint"
+        );
     }
 
     #[test]

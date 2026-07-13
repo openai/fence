@@ -86,7 +86,7 @@ GitHub profile requires a new threat-model review.
 - **Network boundary:** a generated native `inet` ruleset, local DNS mediator,
   pinned `Runner.Worker` identity, and NFLOG reader implement and verify host egress policy
   (`src/nft.rs`, `src/nft_backend.rs`, `src/nflog.rs`).
-- **Privilege boundary:** schema-`2` hosted-runner fingerprint checks,
+- **Privilege boundary:** schema-`3` hosted-runner fingerprint checks,
   descriptor-pinned privileged commands, ACL-aware effective-access probes,
   in-memory passwordless-sudo rollback state, Docker/containerd stop and
   runtime masking, and the bounded local root-control inventory remove ordinary
@@ -228,8 +228,8 @@ flowchart TD
 | `/proc` attribution | Internal finding tuple | Agent -> kernel process metadata | Fixed queue and scan caps; ambiguous ownership is not guessed. | `src/attribution.rs::ProcAttributor` |
 | `nft` subprocess | Generated program and structured state | Agent -> kernel firewall | Fixed binary/args, bounded IO/time, JSON verification, singleton owned table. | `src/nft_backend.rs::NativeNftBackend` |
 | Trusted executable set | Twelve fixed command paths | Agent -> privileged host execution | No-follow descriptor capture, exact metadata/device/inode revalidation, ACL-aware effective access, no raw-path fallback. | `src/trusted_executable.rs::TrustedExecutableSet` |
-| Local root-control inventory | Bounded `/proc` TCP/Unix and container state | Agent -> host privilege state | Stable complete schema-`2` match before mutation, container-only reductions plus one exact fingerprint-tagged removable Docker listener during standard lockdown, exact resident baseline. | `src/local_control.rs::observe_local_control_inventory` |
-| Sudo/container controls | Fixed files, units, sockets, and one sudo source | Agent -> host privilege state | Fingerprint-gated, in-memory pre-ready rollback, exact removal/restoration checks, runtime masking, irreversible post-ready commit. | `src/lockdown.rs::SystemLockdownControl` |
+| Local root-control inventory | Bounded `/proc` TCP/Unix and container state | Agent -> host privilege state | Stable complete schema-`3` match before mutation, container-only reductions plus one exact fingerprint-tagged removable Docker listener during standard lockdown, exact resident baseline. | `src/local_control.rs::observe_local_control_inventory` |
+| Sudo/container controls | Fixed files, units, sockets, and one sudo source | Agent -> host privilege state | Fingerprint-gated exact-file digests except one strictly parsed generated cloud-init header, raw runtime digest pins, in-memory pre-ready rollback, exact removal/restoration checks, runtime masking, irreversible post-ready commit. | `src/lockdown.rs::SystemLockdownControl` |
 | Runtime evidence files | Root writes, runner reads | Agent -> post hook | No-follow fixed paths, exclusive readiness, atomic reports, owner/mode checks. | `src/runtime.rs::ProductionRuntimeStore` |
 | Protected post hook | GitHub post-job invocation | Runner -> evidence validator | Writable self-bind guards on renameable ancestors, read-only mounted source, device/inode and digest records, live PID, and fresh report validation. | `action/post.cts::main` |
 | Release and bundle publication | Merge-triggered release workflow and offline assembler | Source `M` -> distribution `D` -> consumer | Pinned actions, protected-main-only environment, reviewed version merge as sole human authorization, signed one-parent exact-diff commit, complete acceptance/canary gates, checksums, source-bound attestations, immutable tag to `D`, and verified `action-release.json`. | `.github/workflows/release.yml`, `script/assemble-action-bundle` |

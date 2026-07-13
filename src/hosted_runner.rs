@@ -1,19 +1,22 @@
 use serde::Serialize;
 
-pub const HOSTED_RUNNER_FINGERPRINT_SCHEMA_VERSION: u32 = 2;
+pub const HOSTED_RUNNER_FINGERPRINT_SCHEMA_VERSION: u32 = 3;
 pub const UNIX_NAME_HASH_SCHEMA_V1: &str = "fence-unix-name-v1";
+pub const SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1: &str = "exact_file_v1";
+pub const SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1: &str =
+    "cloud_init_generated_header_v1";
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct HostedRunnerFingerprintV2 {
+pub struct HostedRunnerFingerprintV3 {
     pub schema_version: u32,
     pub protected_target: &'static str,
     pub status: &'static str,
     pub observation_method: &'static str,
-    pub accepted: AcceptedHostedRunnerFactsV2,
+    pub accepted: AcceptedHostedRunnerFactsV3,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct AcceptedHostedRunnerFactsV2 {
+pub struct AcceptedHostedRunnerFactsV3 {
     pub os_id: &'static str,
     pub os_version_id: &'static str,
     pub architecture: &'static str,
@@ -22,7 +25,7 @@ pub struct AcceptedHostedRunnerFactsV2 {
     pub trusted_executables: Vec<AcceptedTrustedExecutableV2>,
     pub permission_ancestor_directories: Vec<AcceptedPermissionAncestorV2>,
     pub resolver: AcceptedResolverV2,
-    pub sudo_policy_sources: Vec<AcceptedSudoPolicySourceV2>,
+    pub sudo_policy_sources: Vec<AcceptedSudoPolicySourceV3>,
     pub container_units: Vec<AcceptedUnitV2>,
     pub container_sockets: Vec<AcceptedSocketV2>,
     pub required_docker_running_workload_count: u32,
@@ -53,14 +56,13 @@ pub struct AcceptedResolverV2 {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct AcceptedSudoPolicySourceV2 {
+pub struct AcceptedSudoPolicySourceV3 {
     pub path_class: &'static str,
     pub name: &'static str,
     pub canonical_target: &'static str,
     pub mode: &'static str,
+    pub digest_profile: &'static str,
     pub sha256: &'static str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub alternate_sha256: Vec<&'static str>,
     pub runner_nopasswd_markers: Vec<&'static str>,
 }
 
@@ -167,13 +169,13 @@ const DBUS_OWNER: AcceptedLocalControlOwnerV2 = AcceptedLocalControlOwnerV2 {
     processes: 1,
 };
 
-pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV2 {
-    HostedRunnerFingerprintV2 {
+pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV3 {
+    HostedRunnerFingerprintV3 {
         schema_version: HOSTED_RUNNER_FINGERPRINT_SCHEMA_VERSION,
         protected_target: "github_hosted_ubuntu_24_04_x86_64",
         status: "accepted_reference_not_checked",
         observation_method: "integration_read_only_observation",
-        accepted: AcceptedHostedRunnerFactsV2 {
+        accepted: AcceptedHostedRunnerFactsV3 {
             os_id: "ubuntu",
             os_version_id: "24.04",
             architecture: "x86_64",
@@ -286,44 +288,40 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV2 {
                 target_mode: "0644",
             },
             sudo_policy_sources: vec![
-                AcceptedSudoPolicySourceV2 {
+                AcceptedSudoPolicySourceV3 {
                     path_class: "main_policy",
                     name: "sudoers",
                     canonical_target: "/etc/sudoers",
                     mode: "0440",
+                    digest_profile: SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1,
                     sha256: "5bac27ce5ff1a78ace8f3ef81bfd60cbd44810ac3f3d280da9d7649fe90c18f8",
-                    alternate_sha256: vec![],
                     runner_nopasswd_markers: vec![],
                 },
-                AcceptedSudoPolicySourceV2 {
+                AcceptedSudoPolicySourceV3 {
                     path_class: "drop_in",
                     name: "90-cloud-init-users",
                     canonical_target: "/etc/sudoers.d/90-cloud-init-users",
                     mode: "0440",
-                    sha256: "55b0a6eab1edea9a2151c9b73deff81fb365854a070045452766aa4a0397ab13",
-                    alternate_sha256: vec![
-                        "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
-                        "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d",
-                        "6183596cbb737cdcd4559ec8b04cf30e8e7cbe132184a5412500cafa225342e8",
-                    ],
+                    digest_profile: SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1,
+                    sha256: "0000000000000000000000000000000000000000000000000000000000000000",
                     runner_nopasswd_markers: vec![],
                 },
-                AcceptedSudoPolicySourceV2 {
+                AcceptedSudoPolicySourceV3 {
                     path_class: "drop_in",
                     name: "README",
                     canonical_target: "/etc/sudoers.d/README",
                     mode: "0440",
+                    digest_profile: SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1,
                     sha256: "b428c9b673c3c806370f2aa28a98293a9cb578c70c3a8a2d1a39031861b3dbd8",
-                    alternate_sha256: vec![],
                     runner_nopasswd_markers: vec![],
                 },
-                AcceptedSudoPolicySourceV2 {
+                AcceptedSudoPolicySourceV3 {
                     path_class: "drop_in",
                     name: "runner",
                     canonical_target: "/etc/sudoers.d/runner",
                     mode: "0644",
+                    digest_profile: SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1,
                     sha256: "661b4f06df1e149cc4d88457270d9ce39d2597963042718fb0da9573398f8714",
-                    alternate_sha256: vec![],
                     runner_nopasswd_markers: vec!["principal"],
                 },
             ],
@@ -497,10 +495,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_v2_preserves_reviewed_host_facts_without_an_active_transition() {
+    fn fingerprint_v3_preserves_reviewed_host_facts_without_an_active_transition() {
         let requirement = hosted_runner_fingerprint_requirement();
 
-        assert_eq!(requirement.schema_version, 2);
+        assert_eq!(requirement.schema_version, 3);
         assert_eq!(
             requirement.protected_target,
             "github_hosted_ubuntu_24_04_x86_64"
@@ -529,12 +527,12 @@ mod tests {
         assert_eq!(runner_source.mode, "0644");
         assert_eq!(runner_source.runner_nopasswd_markers, vec!["principal"]);
         assert_eq!(
-            requirement.accepted.sudo_policy_sources[1].alternate_sha256,
-            vec![
-                "9a1d51e1aac764ffaa94a1dd1c5f74bcc2f667bc495c5bf559ff47a5eda46950",
-                "af0e90e05aa9a9afd0ac195de498c3080626d50dbb3366f4e7046a6b2eb5a92d",
-                "6183596cbb737cdcd4559ec8b04cf30e8e7cbe132184a5412500cafa225342e8",
-            ]
+            requirement.accepted.sudo_policy_sources[0].digest_profile,
+            SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1
+        );
+        assert_eq!(
+            requirement.accepted.sudo_policy_sources[1].digest_profile,
+            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1
         );
         assert_eq!(
             requirement.accepted.container_units[0].name,
@@ -555,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_v2_pins_trusted_paths_and_permission_ancestors() {
+    fn fingerprint_v3_pins_trusted_paths_and_permission_ancestors() {
         let requirement = hosted_runner_fingerprint_requirement();
 
         assert_eq!(requirement.accepted.trusted_executables.len(), 12);
@@ -649,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_v2_pins_exact_local_control_inventory_and_hash_contract() {
+    fn fingerprint_v3_pins_exact_local_control_inventory_and_hash_contract() {
         let requirement = hosted_runner_fingerprint_requirement();
 
         let inventory = &requirement.accepted.local_control_inventory;
