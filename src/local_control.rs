@@ -3362,7 +3362,7 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_v2_converts_to_the_reviewed_enforced_inventory() {
+    fn fingerprint_v3_converts_to_the_reviewed_enforced_inventory() {
         let fingerprint = crate::hosted_runner::hosted_runner_fingerprint_requirement();
         let accepted =
             accepted_local_control_snapshot(&fingerprint.accepted.local_control_inventory).unwrap();

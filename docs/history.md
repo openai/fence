@@ -48,6 +48,7 @@ See [`v0.md`](v0.md) for normative behavior and
 - The attested Action bundle later published fingerprint schema `2`, enforced
   the reviewed trusted-path, effective-access, and local-control facts during
   host classification, and added a fatal scheduled fixed-runner drift canary.
+- Fingerprint schema `3` replaced recurring whole-file alternates for the cloud-init sudo source with one strict generated-header digest profile while keeping all body bytes exact and retaining a raw runtime mutation pin.
 
 ## Hosted workflow compatibility
 

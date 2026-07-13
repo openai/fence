@@ -34,7 +34,11 @@ class ClassificationError(ValueError):
 
 
 UNIX_NAME_HASH_SCHEMA_V1 = "fence-unix-name-v1"
-SCHEMA2_EVIDENCE_ONLY_UNITS = {"walinuxagent.service"}
+SCHEMA3_EVIDENCE_ONLY_UNITS = {"walinuxagent.service"}
+SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1 = "exact_file_v1"
+SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1 = (
+    "cloud_init_generated_header_v1"
+)
 FIXTURE_ACCEPTED_DIGEST = "0" * 64
 FIXTURE_TRANSITION_DIGEST = "1" * 64
 FIXTURE_UNKNOWN_DIGEST = "2" * 64
@@ -55,10 +59,6 @@ def index_by(items, *keys):
         require(key not in indexed, "fingerprint item identity was duplicated")
         indexed[key] = item
     return indexed
-
-
-def accepted_digests(source):
-    return {source["sha256"], *source.get("alternate_sha256", [])}
 
 
 def is_sha256(value):
@@ -125,7 +125,7 @@ def validate_owner_list(owners):
     )
 
 
-def validate_schema2_local_control_inventory(inventory):
+def validate_schema3_local_control_inventory(inventory):
     require_fields(
         inventory,
         {
@@ -239,7 +239,7 @@ def validate_schema2_local_control_inventory(inventory):
     )
 
 
-def validate_schema2_fingerprint(fingerprint):
+def validate_schema3_fingerprint(fingerprint):
     require_fields(
         fingerprint,
         {
@@ -251,7 +251,7 @@ def validate_schema2_fingerprint(fingerprint):
         },
         "bundle fingerprint shape mismatch",
     )
-    require(fingerprint["schema_version"] == 2, "bundle fingerprint schema mismatch")
+    require(fingerprint["schema_version"] == 3, "bundle fingerprint schema mismatch")
     require(
         fingerprint["protected_target"] == "github_hosted_ubuntu_24_04_x86_64",
         "bundle fingerprint target mismatch",
@@ -349,24 +349,27 @@ def validate_schema2_fingerprint(fingerprint):
         "name",
         "canonical_target",
         "mode",
+        "digest_profile",
         "sha256",
         "runner_nopasswd_markers",
     }
     for source in sources:
         require(
-            isinstance(source, dict)
-            and frozenset(source)
-            in {
-                frozenset(source_fields),
-                frozenset(source_fields | {"alternate_sha256"}),
-            },
+            isinstance(source, dict) and set(source) == source_fields,
             "bundle sudo source shape mismatch",
+        )
+        expected_profile = (
+            SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1
+            if (source["path_class"], source["name"])
+            == ("drop_in", "90-cloud-init-users")
+            else SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1
         )
         require(
             source["path_class"] in {"main_policy", "drop_in"}
             and isinstance(source["name"], str)
             and isinstance(source["canonical_target"], str)
             and is_mode(source["mode"])
+            and source["digest_profile"] == expected_profile
             and is_sha256(source["sha256"]),
             "bundle sudo source value mismatch",
         )
@@ -376,14 +379,6 @@ def validate_schema2_fingerprint(fingerprint):
             and markers == sorted(set(markers))
             and set(markers).issubset({"principal", "group"}),
             "bundle sudo source marker mismatch",
-        )
-        alternate = source.get("alternate_sha256", [])
-        require(
-            isinstance(alternate, list)
-            and len(alternate) == len(set(alternate))
-            and source["sha256"] not in alternate
-            and all(is_sha256(digest) for digest in alternate),
-            "bundle sudo alternate digest mismatch",
         )
     index_by(sources, "path_class", "name")
 
@@ -402,7 +397,7 @@ def validate_schema2_fingerprint(fingerprint):
     index_by(units, "name")
     require(
         {unit["name"] for unit in units}
-        == set(SCHEMA4_FIXED_UNITS) - SCHEMA2_EVIDENCE_ONLY_UNITS,
+        == set(SCHEMA4_FIXED_UNITS) - SCHEMA3_EVIDENCE_ONLY_UNITS,
         "bundle container unit identity set mismatch",
     )
 
@@ -432,11 +427,11 @@ def validate_schema2_fingerprint(fingerprint):
         is_integer(accepted["required_docker_running_workload_count"]),
         "bundle Docker workload count mismatch",
     )
-    validate_schema2_local_control_inventory(accepted["local_control_inventory"])
+    validate_schema3_local_control_inventory(accepted["local_control_inventory"])
     return accepted
 
 
-def expected_schema2_local_control_snapshot(inventory):
+def expected_schema3_local_control_snapshot(inventory):
     return {
         "scan_status": "within_bounds",
         "bounds_exceeded": [],
@@ -487,7 +482,7 @@ def validate_transitions(transitions, accepted_sources):
     return index_by(entries, "path_class", "name", "sha256")
 
 
-def compare_schema4_observation_to_schema2(observation, accepted):
+def compare_schema4_observation_to_schema3(observation, accepted):
     try:
         validate_schema4_observation(observation)
     except ValueError as error:
@@ -627,14 +622,14 @@ def compare_schema4_observation_to_schema2(observation, accepted):
             == source["runner_nopasswd_markers"],
             "sudo policy marker classification drifted",
         )
-        if observed["sha256"] not in accepted_digests(source):
+        if observed["sha256"] != source["sha256"]:
             digest_mismatches.append((*key, observed["sha256"]))
 
     observed_units = index_by(observation["systemd"]["units"], "name")
     accepted_units = index_by(accepted["container_units"], "name")
     require(
         set(accepted_units)
-        == set(observed_units) - {(name,) for name in SCHEMA2_EVIDENCE_ONLY_UNITS},
+        == set(observed_units) - {(name,) for name in SCHEMA3_EVIDENCE_ONLY_UNITS},
         "fixed container unit set drifted",
     )
     for key, unit in accepted_units.items():
@@ -698,7 +693,7 @@ def compare_schema4_observation_to_schema2(observation, accepted):
     }
     require(
         observed_snapshot
-        == expected_schema2_local_control_snapshot(accepted["local_control_inventory"]),
+        == expected_schema3_local_control_snapshot(accepted["local_control_inventory"]),
         "local control inventory drifted",
     )
     return digest_mismatches
@@ -715,11 +710,11 @@ def classify(observation, support, transitions):
         "bundle support fingerprint is missing",
     )
     fingerprint = data["hosted_runner_fingerprint"]
-    accepted = validate_schema2_fingerprint(fingerprint)
+    accepted = validate_schema3_fingerprint(fingerprint)
     transition_index = validate_transitions(
         transitions, accepted["sudo_policy_sources"]
     )
-    mismatches = compare_schema4_observation_to_schema2(observation, accepted)
+    mismatches = compare_schema4_observation_to_schema3(observation, accepted)
     if not mismatches:
         return {"run_bundle": True, "classification": "bundle_compatible"}
     for mismatch in mismatches:
@@ -874,7 +869,6 @@ def fixture():
             "/etc/sudoers",
             "0440",
             "3" * 64,
-            ["4" * 64],
             [],
         ),
         (
@@ -884,7 +878,6 @@ def fixture():
             "0440",
             "5" * 64,
             [],
-            [],
         ),
         (
             "drop_in",
@@ -893,7 +886,6 @@ def fixture():
             "0440",
             "6" * 64,
             [],
-            [],
         ),
         (
             "drop_in",
@@ -901,23 +893,25 @@ def fixture():
             "/etc/sudoers.d/runner",
             "0644",
             FIXTURE_ACCEPTED_DIGEST,
-            [],
             ["principal"],
         ),
     ]
     accepted_sources = []
     observed_sources = []
-    for path_class, name, target, mode, digest, alternate, markers in source_specs:
+    for path_class, name, target, mode, digest, markers in source_specs:
         accepted_source = {
             "path_class": path_class,
             "name": name,
             "canonical_target": target,
             "mode": mode,
+            "digest_profile": (
+                SUDO_POLICY_DIGEST_PROFILE_CLOUD_INIT_GENERATED_HEADER_V1
+                if name == "90-cloud-init-users"
+                else SUDO_POLICY_DIGEST_PROFILE_EXACT_FILE_V1
+            ),
             "sha256": digest,
             "runner_nopasswd_markers": markers,
         }
-        if alternate:
-            accepted_source["alternate_sha256"] = alternate
         accepted_sources.append(accepted_source)
         observed_sources.append(
             {
@@ -979,7 +973,7 @@ def fixture():
                 **SCHEMA4_REVIEWED_UNIT_STATES[name],
             }
             for name in SCHEMA4_FIXED_UNITS
-            if name not in SCHEMA2_EVIDENCE_ONLY_UNITS
+            if name not in SCHEMA3_EVIDENCE_ONLY_UNITS
         ],
         "container_sockets": [
             {
@@ -1123,7 +1117,7 @@ def fixture():
         "status": "success",
         "data": {
             "hosted_runner_fingerprint": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "protected_target": "github_hosted_ubuntu_24_04_x86_64",
                 "status": "accepted_reference_not_checked",
                 "observation_method": "integration_read_only_observation",
@@ -1210,22 +1204,20 @@ class ClassificationTests(unittest.TestCase):
     def test_refreshed_bundle_runs_on_transition_digest(self):
         observation, support, transitions = fixture()
         self.observed_source(observation)["sha256"] = FIXTURE_TRANSITION_DIGEST
-        self.accepted_source(support)["alternate_sha256"] = [
-            FIXTURE_TRANSITION_DIGEST
-        ]
+        self.accepted_source(support)["sha256"] = FIXTURE_TRANSITION_DIGEST
         self.assertEqual(
             classify(observation, support, transitions)["classification"],
             "bundle_compatible",
         )
 
-    def test_schema4_to_schema2_boundary_is_explicit_and_fails_closed(self):
+    def test_schema4_to_schema3_boundary_is_explicit_and_fails_closed(self):
         observation, support, transitions = fixture()
         observation["schema_version"] = 3
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
         observation, support, transitions = fixture()
-        support["data"]["hosted_runner_fingerprint"]["schema_version"] = 1
+        support["data"]["hosted_runner_fingerprint"]["schema_version"] = 2
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
@@ -1280,7 +1272,7 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_schema2_enforces_test_but_not_the_synthetic_probe_result(self):
+    def test_schema3_enforces_test_but_not_the_synthetic_probe_result(self):
         observation, support, transitions = fixture()
         test_index = next(
             index
@@ -1302,7 +1294,7 @@ class ClassificationTests(unittest.TestCase):
         ] = "unavailable"
         self.assertEqual(classify(observation, support, transitions)["run_bundle"], True)
 
-    def test_schema2_local_control_projection_matches_the_rust_boundary(self):
+    def test_schema3_local_control_projection_matches_the_rust_boundary(self):
         observation, support, _ = fixture()
         inventory = support["data"]["hosted_runner_fingerprint"]["accepted"][
             "local_control_inventory"
@@ -1314,7 +1306,7 @@ class ClassificationTests(unittest.TestCase):
         }
         self.assertEqual(
             projected,
-            expected_schema2_local_control_snapshot(inventory),
+            expected_schema3_local_control_snapshot(inventory),
         )
         self.assertEqual(
             observation["local_control_inventory"]["snapshot"][
@@ -1408,7 +1400,7 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_schema2_rejects_local_control_inventory_drift(self):
+    def test_schema3_rejects_local_control_inventory_drift(self):
         observation, support, transitions = fixture()
         observation["local_control_inventory"]["snapshot"]["tcp_listeners"] = [
             {
@@ -1431,7 +1423,7 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
-    def test_schema2_requires_stable_complete_local_control_inventory(self):
+    def test_schema3_requires_stable_complete_local_control_inventory(self):
         def unavailable(inventory):
             inventory["status"] = "unavailable"
             inventory["snapshot"].update(
@@ -1471,7 +1463,7 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_schema2_requires_complete_sudo_evidence(self):
+    def test_schema3_requires_complete_sudo_evidence(self):
         observation, support, transitions = fixture()
         observation["sudo"]["policy_sources_truncated"] = True
         with self.assertRaises(ClassificationError):
@@ -1558,7 +1550,7 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
-    def test_schema2_enforces_trusted_executable_metadata_and_access(self):
+    def test_schema3_enforces_trusted_executable_metadata_and_access(self):
         def mutate(field, value):
             observation, support, transitions = fixture()
             executable = next(
@@ -1589,7 +1581,7 @@ class ClassificationTests(unittest.TestCase):
         executable.update({"device": 99, "inode": 100})
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
-    def test_schema2_enforces_permission_ancestor_metadata_and_access(self):
+    def test_schema3_enforces_permission_ancestor_metadata_and_access(self):
         for field, value in {
             "canonical_target": UNREVIEWED_METADATA_TARGET,
             "path_type": "regular",
@@ -1622,7 +1614,7 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
-    def test_schema2_enforces_resolver_and_sudo_metadata(self):
+    def test_schema3_enforces_resolver_and_sudo_metadata(self):
         for field, value in {
             "is_symlink": False,
             "canonical_target": UNREVIEWED_RESOLVER_TARGET,
@@ -1654,7 +1646,7 @@ class ClassificationTests(unittest.TestCase):
         self.observed_source(observation).update({"device": 99, "inode": 100})
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
-    def test_schema2_enforces_units_sockets_and_workload_count(self):
+    def test_schema3_enforces_units_sockets_and_workload_count(self):
         observation, support, transitions = fixture()
         observation["systemd"]["units"][0]["load_state"] = UNREVIEWED_UNIT_STATE
         with self.assertRaises(ClassificationError):
@@ -1686,7 +1678,7 @@ class ClassificationTests(unittest.TestCase):
         validate_schema4_observation(observation)
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
-    def test_schema2_rejects_each_local_control_inventory_class_of_drift(self):
+    def test_schema3_rejects_each_local_control_inventory_class_of_drift(self):
         mutations = {
             "container multiplicity": lambda snapshot: snapshot[
                 "root_container_processes"
@@ -1712,7 +1704,7 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_schema2_rejects_added_removed_and_unowned_local_control_endpoints(self):
+    def test_schema3_rejects_added_removed_and_unowned_local_control_endpoints(self):
         def add_endpoint(snapshot):
             listener = json.loads(json.dumps(snapshot["unix_listeners"][-1]))
             listener["name_sha256"] = "f" * 64
@@ -1737,7 +1729,7 @@ class ClassificationTests(unittest.TestCase):
                 with self.assertRaises(ClassificationError):
                     classify(observation, support, transitions)
 
-    def test_schema2_ignores_only_bounded_inaccessible_listener_count(self):
+    def test_schema3_ignores_only_bounded_inaccessible_listener_count(self):
         for count in (0, 15):
             with self.subTest(count=count):
                 observation, support, transitions = fixture()
@@ -1749,7 +1741,7 @@ class ClassificationTests(unittest.TestCase):
                 validate_schema4_observation(observation)
                 self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
-    def test_schema2_validates_the_bundled_local_control_hash_contract(self):
+    def test_schema3_validates_the_bundled_local_control_hash_contract(self):
         observation, support, transitions = fixture()
         inventory = support["data"]["hosted_runner_fingerprint"]["accepted"][
             "local_control_inventory"
@@ -1768,7 +1760,7 @@ class ClassificationTests(unittest.TestCase):
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
-    def test_schema2_validates_bundle_and_transition_shapes(self):
+    def test_schema3_validates_bundle_and_transition_shapes(self):
         observation, support, transitions = fixture()
         accepted = support["data"]["hosted_runner_fingerprint"]["accepted"]
         accepted["executable_paths"] = []
@@ -1776,9 +1768,7 @@ class ClassificationTests(unittest.TestCase):
             classify(observation, support, transitions)
 
         observation, support, transitions = fixture()
-        self.accepted_source(support, "sudoers")["alternate_sha256"].append(
-            "not-a-digest"
-        )
+        self.accepted_source(support, "sudoers")["digest_profile"] = "unknown_profile"
         with self.assertRaises(ClassificationError):
             classify(observation, support, transitions)
 
