@@ -2,10 +2,7 @@
 
 ## Scope
 
-This review covers the v0 Linux agent, DNS-mediated selected platform profile,
-native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted
-lockdown controls, bundled Action wrapper, release provenance workflow, and
-offline validation scripts as of June 2026.
+This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-13.
 
 This document records focused review findings. The current trust assumptions,
 attacker capabilities, abuse paths, and residual-risk priorities are defined in
@@ -281,12 +278,7 @@ compile TypeScript at workflow runtime. See Node's
   up to eight single-label `*.githubapp.com` names;
   `disable_broad_github_domains: true` removes those broad channels but retains
   core Actions status/finalization channels.
-- Explicit user wildcard patterns authorize at most eight concrete names per
-  invocation across all patterns. Each wildcard matches exactly one DNS label,
-  but the admitted query labels, matching HTTPS destinations, shared resolved
-  addresses, and bounded external CNAME descendants remain exfiltration
-  channels. Fence validates DNS structure rather than registrable-domain
-  ownership and carries no public-suffix database.
+- Explicit user wildcard patterns may contain one or two leading whole-label wildcards and authorize at most eight concrete names per invocation across all patterns. Each `*` matches exactly one DNS label, but the admitted query labels, matching HTTPS destinations, shared resolved addresses, and bounded external CNAME descendants remain exfiltration channels. Fence validates DNS structure rather than registrable-domain ownership and carries no public-suffix database.
 - The exact `productionresultssa19.blob.core.windows.net` account is always a
   reachable TCP `443` compatibility channel. Other matching results-storage
   accounts remain runner-authorized and bounded.

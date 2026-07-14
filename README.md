@@ -8,7 +8,7 @@
 [![nightly](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
-Fence runs first in a GitHub Actions job, allows only GitHub workflow traffic plus your `allowlist`, blocks other outbound network access, and turns off passwordless sudo and Docker by default.
+Fence runs first in a GitHub Actions job, applies a bounded built-in GitHub Actions and hosted-runner platform policy plus your `allowlist`, blocks other outbound network access, and turns off passwordless sudo and Docker by default.
 
 ![Fence](./docs/assets/fence.png)
 
@@ -80,7 +80,7 @@ Keep Docker/container access available while still applying network restrictions
 
 The wildcard can authorize exact-depth names such as `auth.docker.io`, but image pulls may require additional registry, layer, CDN, or storage destinations.
 
-Remove the broad GitHub web, API, release-asset, and watchdog destinations while keeping the core Actions reporting path:
+Remove the broad GitHub web, API, release-asset, and watchdog destinations and new platform-origin `*.githubapp.com` authorizations while keeping the core Actions reporting path:
 
 ```yaml
 - uses: GrantBirki/fence@<commit-sha>
@@ -127,7 +127,7 @@ Fence validates that it is running through the supported Action path, turns your
 ```mermaid
 flowchart LR
     start["Fence runs first"] --> verify["Validate runner and trusted bundle"]
-    verify --> policy["Build GitHub traffic and user policy"]
+    verify --> policy["Build built-in platform and user policy"]
     policy --> controls["Apply mode-specific controls"]
     controls --> monitor["Monitor controls during the job"]
     monitor --> report["Report evidence and critical drift"]
@@ -139,7 +139,7 @@ flowchart LR
 
 | Mode | What It Does | When To Use It |
 | --- | --- | --- |
-| `block` | Blocks network traffic outside GitHub workflow traffic and your `allowlist`; turns off passwordless sudo and Docker. | Default for locking down a job. |
+| `block` | Blocks network traffic unless it matches the bounded built-in GitHub Actions and hosted-runner platform policy or your `allowlist`; turns off passwordless sudo and Docker. | Default for locking down a job. |
 | `block` with `container_policy: unsafe_preserve` | Blocks network traffic and turns off passwordless sudo, but leaves Docker/container access available. | When a workflow needs Docker and you accept the weaker security claim. |
 | `audit` | Does not block traffic. Records what would need review before moving to `block`. | When tuning a workflow. |
 
