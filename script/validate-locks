@@ -599,46 +599,212 @@ for forbidden in [
     )
 
 readme = (root / "README.md").read_text(encoding="utf-8")
-nightly_badge = "[![nightly](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml)"
+release_canary_badge = "[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
+nightly_badge = "[![main / ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)"
+require(
+    readme.count(release_canary_badge) == 1
+    and readme.count("actions/workflows/action-drift-canary.yml/badge.svg") == 1,
+    "README must expose exactly one scheduled published-release canary badge",
+)
 require(
     readme.count(nightly_badge) == 1,
-    "README must expose exactly one main-branch nightly ubuntu-latest status badge",
+    "README must expose exactly one scheduled main-source ubuntu-latest badge",
+)
+require(
+    readme.count("actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg") == 1,
+    "README must not expose an unfiltered duplicate nightly badge",
 )
 
 canary_path = root / ".github/workflows/action-drift-canary.yml"
 require(canary_path.is_file(), "Action drift canary workflow is missing")
 canary = canary_path.read_text(encoding="utf-8")
-trigger_marker = "\non:\n"
-permissions_marker = "\npermissions:\n"
-defaults_marker = "\ndefaults:\n"
-concurrency_marker = "\nconcurrency:\n"
-jobs_marker = "\njobs:\n"
-for marker in [
-    trigger_marker,
-    permissions_marker,
-    defaults_marker,
-    concurrency_marker,
-    jobs_marker,
-]:
-    require(canary.count(marker) == 1, "Action drift canary top-level contract is invalid")
-triggers = canary.split(trigger_marker, 1)[1].split(permissions_marker, 1)[0]
-permissions = canary.split(permissions_marker, 1)[1].split(defaults_marker, 1)[0]
-concurrency = canary.split(concurrency_marker, 1)[1].split(jobs_marker, 1)[0]
-for fragment in [
-    '  schedule:\n    - cron: "23 13 * * *"',
-    "  workflow_dispatch:\n    inputs:\n      action_ref:",
-    "  workflow_call:\n    inputs:\n      action_ref:",
-]:
-    require(fragment in triggers, "Action drift canary triggers must remain fixed and reusable")
-for forbidden_trigger in ["  push:", "  pull_request:", "  repository_dispatch:"]:
-    require(forbidden_trigger not in triggers, "Action drift canary contains an unreviewed trigger")
-require(permissions == "  contents: read\n", "Action drift canary permissions must be read-only")
+require_exact_mapping_keys(
+    canary,
+    0,
+    ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
+    "Action drift canary top-level contract must remain narrowly scoped",
+)
 require(
-    concurrency == "  group: action-drift-canary-${{ inputs.action_ref || github.sha }}\n  cancel-in-progress: false\n",
+    scalar_mapping(canary, 0) == {"name": "action drift canary"},
+    "Action drift canary workflow name must remain stable",
+)
+
+canary_triggers = indented_block(
+    canary,
+    "on:",
+    "Action drift canary trigger contract must be unique",
+)
+require_exact_mapping_keys(
+    canary_triggers,
+    2,
+    ["schedule", "workflow_dispatch", "workflow_call"],
+    "Action drift canary may run only on schedule, manual dispatch, or reusable call",
+)
+canary_schedule = indented_block(
+    canary_triggers,
+    "  schedule:",
+    "Action drift canary schedule must be unique",
+)
+canary_schedule_lines = [
+    line
+    for line in canary_schedule.splitlines()[1:]
+    if line.strip() and not line.lstrip().startswith("#")
+]
+require(
+    canary_schedule_lines == ['    - cron: "23 13 * * *"'],
+    "Action drift canary schedule must run daily at 13:23 UTC",
+)
+
+for trigger_name, expected_required in [
+    ("workflow_dispatch", "false"),
+    ("workflow_call", "true"),
+]:
+    trigger_label = "manual" if trigger_name == "workflow_dispatch" else "reusable"
+    trigger = indented_block(
+        canary_triggers,
+        f"  {trigger_name}:",
+        f"Action drift canary {trigger_label} trigger must be unique",
+    )
+    require_exact_mapping_keys(
+        trigger,
+        4,
+        ["inputs"],
+        f"Action drift canary {trigger_label} trigger may expose only its reviewed inputs",
+    )
+    trigger_inputs = indented_block(
+        trigger,
+        "    inputs:",
+        f"Action drift canary {trigger_label} inputs must be unique",
+    )
+    require_exact_mapping_keys(
+        trigger_inputs,
+        6,
+        ["action_ref"],
+        f"Action drift canary {trigger_label} trigger may expose only action_ref",
+    )
+    action_ref_input = indented_block(
+        trigger_inputs,
+        "      action_ref:",
+        f"Action drift canary {trigger_label} action_ref input must be unique",
+    )
+    require_exact_mapping_keys(
+        action_ref_input,
+        8,
+        ["description", "required", "type"],
+        f"Action drift canary {trigger_label} action_ref fields must remain narrowly scoped",
+    )
+    action_ref_fields = scalar_mapping(action_ref_input, 8)
+    require(
+        action_ref_fields.get("required") == expected_required
+        and action_ref_fields.get("type") == "string",
+        f"Action drift canary {trigger_label} action_ref required/type contract changed",
+    )
+
+canary_permissions = indented_block(
+    canary,
+    "permissions:",
+    "Action drift canary permissions must be unique",
+)
+require_exact_mapping_keys(
+    canary_permissions,
+    2,
+    ["contents"],
+    "Action drift canary permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_permissions, 2) == {"contents": "read"},
+    "Action drift canary permissions must be read-only",
+)
+canary_concurrency = indented_block(
+    canary,
+    "concurrency:",
+    "Action drift canary concurrency must be unique",
+)
+require_exact_mapping_keys(
+    canary_concurrency,
+    2,
+    ["group", "cancel-in-progress"],
+    "Action drift canary concurrency fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_concurrency, 2)
+    == {
+        "group": "action-drift-canary-${{ inputs.action_ref || github.sha }}",
+        "cancel-in-progress": "false",
+    },
     "Action drift canary concurrency must be commit-scoped and non-cancelling",
 )
+
+canary_jobs = indented_block(
+    canary,
+    "jobs:",
+    "Action drift canary jobs contract must be unique",
+)
+require_exact_mapping_keys(
+    canary_jobs,
+    2,
+    ["canary"],
+    "Action drift canary must contain exactly one canary job",
+)
+canary_job = indented_block(
+    canary_jobs,
+    "  canary:",
+    "Action drift canary job must be unique",
+)
+require_exact_mapping_keys(
+    canary_job,
+    4,
+    ["name", "strategy", "timeout-minutes", "runs-on", "steps"],
+    "Action drift canary job fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_job, 4)
+    == {
+        "name": "${{ matrix.runner }} zero-input canary",
+        "timeout-minutes": "8",
+        "runs-on": "${{ matrix.runner }}",
+    },
+    "Action drift canary must name and route each job through the reviewed runner matrix",
+)
+canary_strategy = indented_block(
+    canary_job,
+    "    strategy:",
+    "Action drift canary strategy must be unique",
+)
+require_exact_mapping_keys(
+    canary_strategy,
+    6,
+    ["fail-fast", "matrix"],
+    "Action drift canary strategy fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_strategy, 6) == {"fail-fast": "false"},
+    "Action drift canary matrix must not cancel its other runner",
+)
+canary_matrix = indented_block(
+    canary_strategy,
+    "      matrix:",
+    "Action drift canary matrix must be unique",
+)
+require_exact_mapping_keys(
+    canary_matrix,
+    8,
+    ["runner"],
+    "Action drift canary matrix may select only its reviewed runner dimension",
+)
+require(
+    scalar_mapping(canary_matrix, 8)
+    == {
+        "runner": "${{ fromJSON(inputs.action_ref == '' && '[\"ubuntu-24.04\",\"ubuntu-latest\"]' || '[\"ubuntu-24.04\"]') }}",
+    },
+    "Action drift canary runner matrix must use both reviewed labels only when action_ref is absent",
+)
+require(
+    len(re.findall(r"(?m)^\s*runs-on:", canary)) == 1,
+    "Action drift canary must source exactly one runs-on field from its reviewed matrix",
+)
+
 canary_fragments = [
-    "runs-on: ubuntu-24.04",
     "uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
     "persist-credentials: false",
     "run: script/validate-locks --ci",
@@ -659,7 +825,6 @@ canary_fragments = [
 for fragment in canary_fragments:
     require(fragment in canary, "Action drift canary contract is incomplete")
 
-require(canary.count("runs-on: ubuntu-24.04") == 1, "Action drift canary must use one fixed runner")
 require(canary.count("uses: ./") == 1, "Action drift canary must activate the bundle exactly once")
 require(
     canary.count("script/test-action-acceptance standard") == 1,
@@ -668,10 +833,10 @@ require(
 
 for forbidden in [
     "continue-on-error",
-    "actions/upload-artifact",
+    "upload-artifact",
     "journalctl",
     "systemctl status",
-    "ubuntu-latest",
+    "::warning",
 ]:
     require(forbidden not in canary, "Action drift canary contains a forbidden escape path")
 require(
@@ -749,6 +914,61 @@ require(
         "candidate_kind": "distribution",
     },
     "Release Action acceptance must retain the fixed default runner",
+)
+require(
+    release.count("uses: ./.github/workflows/action-drift-canary.yml") == 1,
+    "Release workflow must invoke the drift canary exactly once",
+)
+release_canary = indented_block(
+    release,
+    "  candidate-drift-canary:",
+    "Release drift canary caller must be unique",
+)
+require_exact_mapping_keys(
+    release_canary,
+    4,
+    ["if", "needs", "permissions", "uses", "with"],
+    "Release drift canary caller must remain a direct, narrowly scoped reusable-workflow gate",
+)
+require(
+    scalar_mapping(release_canary, 4)
+    == {
+        "if": "needs.prepare.outputs.should_release == 'true'",
+        "needs": "[prepare, create-candidate]",
+        "uses": "./.github/workflows/action-drift-canary.yml",
+    },
+    "Release drift canary must remain an unconditional fixed-workflow gate on the exact candidate",
+)
+release_canary_permissions = indented_block(
+    release_canary,
+    "    permissions:",
+    "Release drift canary permissions must be unique",
+)
+require_exact_mapping_keys(
+    release_canary_permissions,
+    6,
+    ["contents"],
+    "Release drift canary permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(release_canary_permissions, 6) == {"contents": "read"},
+    "Release drift canary permissions must remain read-only",
+)
+release_canary_with = indented_block(
+    release_canary,
+    "    with:",
+    "Release drift canary inputs must be unique",
+)
+require_exact_mapping_keys(
+    release_canary_with,
+    6,
+    ["action_ref"],
+    "Release drift canary may receive only the exact candidate Action SHA",
+)
+require(
+    scalar_mapping(release_canary_with, 6)
+    == {"action_ref": "${{ needs.create-candidate.outputs.action_commit }}"},
+    "Release drift canary must receive the exact candidate Action SHA and remain fixed-label",
 )
 for required_check in [
     '"build"',
