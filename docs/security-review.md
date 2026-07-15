@@ -2,7 +2,7 @@
 
 ## Scope
 
-This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-13.
+This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-15.
 
 This document records focused review findings. The current trust assumptions,
 attacker capabilities, abuse paths, and residual-risk priorities are defined in
@@ -246,7 +246,7 @@ static numeric account list would be brittle, while a general
 `*.blob.core.windows.net` rule would authorize unrelated globally registered
 storage accounts. Fence instead routes host DNS directly to its local mediator,
 pins the unique reviewed `Runner.Worker` identity, and authorizes at most four
-exact `productionresultssa<digits>.blob.core.windows.net` accounts only when a
+exact `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts only when a
 matching host DNS socket belongs to that pinned process. PID reuse, executable
 replacement, ambiguous ownership, Docker-originated requests, and ordinary
 workflow-process requests fail closed. The DNS answer remains withheld until
@@ -258,6 +258,8 @@ inventory](https://api.github.com/meta). It is
 available without process attribution, while every other matching account
 continues to require the runner-bound authorization above. Fence does not allow
 the general Azure Blob suffix.
+
+Configuration rejects exact user entries for every non-static matching account before mutation, and bootstrap response processing independently refuses to materialize any hostname marked as requiring runner provenance. User wildcard policy remains lazy and cannot bypass the same attribution and four-account cap.
 
 ### Action child-process deadlines and dependency surface
 

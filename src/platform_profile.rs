@@ -113,6 +113,21 @@ pub fn is_optional_github_hosted_workflow_bootstrap_hostname(hostname: &str) -> 
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_OPTIONAL_HOSTNAMES.contains(&hostname)
 }
 
+pub(crate) fn matches_results_storage_hostname(hostname: &str) -> bool {
+    let Some(account) = hostname
+        .strip_prefix("productionresultssa")
+        .and_then(|value| value.strip_suffix(".blob.core.windows.net"))
+    else {
+        return false;
+    };
+    !account.is_empty() && account.len() <= 5 && account.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+pub(crate) fn is_runner_authorized_results_storage_hostname(hostname: &str) -> bool {
+    hostname != GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME
+        && matches_results_storage_hostname(hostname)
+}
+
 pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
     disable_broad_github_domains: bool,
 ) -> DnsMediatedCompatibilityPlan {
@@ -263,6 +278,28 @@ mod tests {
         ));
         assert!(!is_optional_github_hosted_workflow_bootstrap_hostname(
             "github.com"
+        ));
+        for hostname in [
+            "productionresultssa0.blob.core.windows.net",
+            "productionresultssa17.blob.core.windows.net",
+            "productionresultssa99999.blob.core.windows.net",
+        ] {
+            assert!(matches_results_storage_hostname(hostname));
+        }
+        for hostname in [
+            "productionresultssa.blob.core.windows.net",
+            "productionresultssa100000.blob.core.windows.net",
+            "productionresults-17.blob.core.windows.net",
+            "productionresultssa17.example.com",
+            "prefix.productionresultssa17.blob.core.windows.net",
+        ] {
+            assert!(!matches_results_storage_hostname(hostname));
+        }
+        assert!(!is_runner_authorized_results_storage_hostname(
+            GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME
+        ));
+        assert!(is_runner_authorized_results_storage_hostname(
+            "productionresultssa17.blob.core.windows.net"
         ));
         assert_eq!(
             opt_out.bootstrap_hostnames,
