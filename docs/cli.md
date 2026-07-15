@@ -15,7 +15,7 @@ Prints the source-agent version. `Cargo.toml` is the version authority for sourc
 
 ## `fence check-support`
 
-Checks whether the current host matches the accepted hosted-runner fingerprint reference. This is an inspection result and does not apply controls or claim active protection.
+Reports the current host's operating system, architecture, and native-backend presence, and exposes the accepted hosted-runner fingerprint reference without comparing it to the live host. Fingerprint comparison is deferred to Action activation; this inspection result does not apply controls or claim active protection.
 
 ## `fence render-plan`
 

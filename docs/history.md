@@ -95,6 +95,7 @@ See [`v0.md`](v0.md) for normative behavior and
 - The logical policy now merges platform and user hostname transports,
   prehydrates exact roots, refreshes them during the resident lifecycle, and
   keeps transient addresses out of the logical hash.
+- Exact user policy can no longer prehydrate non-static results-storage accounts: configuration rejects those entries before mutation, and bootstrap processing independently refuses runner-gated materialization.
 - Source-built policy added exact-depth one- and two-label user wildcard
   hostnames with one shared eight-name lifetime budget, lazy DNS-mediated
   materialization, deterministic transport union, and explicit local evidence.

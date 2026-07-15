@@ -122,10 +122,17 @@ validate_ci_evidence() {
   python3 -E - "$DIR" <<'PY'
 import ast
 import collections
+import contextlib
+import io
+import json
+import os
 import pathlib
 import re
 import sys
 import textwrap
+import time
+import urllib.parse
+import urllib.request
 
 if sys.flags.optimize != 0:
     raise SystemExit("Python optimization must be disabled")
@@ -2575,8 +2582,9 @@ require(
     release_check_script_match is not None,
     "Release protected source-check Python gate must be explicit",
 )
+release_check_source = textwrap.dedent(release_check_script_match.group(1))
 release_check_tree = ast.parse(
-    textwrap.dedent(release_check_script_match.group(1)),
+    release_check_source,
     filename=".github/workflows/release.yml:required-checks",
 )
 required_assignments = [
@@ -2597,6 +2605,161 @@ require(
     and {element.value for element in required_assignments[0].value.elts}
     == {"lint", "test", "build", "acceptance", "action acceptance", "integration"},
     "Release workflow protected source checks must match the repository ruleset",
+)
+page_loops = [
+    node
+    for node in ast.walk(release_check_tree)
+    if isinstance(node, ast.For)
+    and isinstance(node.target, ast.Name)
+    and node.target.id == "page"
+    and isinstance(node.iter, ast.Call)
+    and isinstance(node.iter.func, ast.Name)
+    and node.iter.func.id == "range"
+    and [
+        argument.value
+        for argument in node.iter.args
+        if isinstance(argument, ast.Constant)
+    ]
+    == [1, 11]
+]
+require(
+    len(page_loops) == 1,
+    "Release protected source-check pagination must be bounded",
+)
+
+fixture_source_commit = "a" * 40
+
+def fixture_check(name, identifier):
+    return {
+        "id": identifier,
+        "name": name,
+        "head_sha": fixture_source_commit,
+        "status": "completed",
+        "conclusion": "success",
+        "app": {"id": 15368, "slug": "github-actions"},
+    }
+
+def run_release_check_fixture(pages):
+    requested_pages = []
+    sleep_calls = []
+
+    class Response:
+        def __init__(self, document):
+            self.body = json.dumps(document).encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _error_type, _error, _traceback):
+            return False
+
+        def read(self, maximum):
+            require(
+                maximum == 2 * 1024 * 1024 + 1,
+                "Release protected source-check page lost its response-size bound",
+            )
+            return self.body
+
+    def urlopen(request, timeout):
+        require(timeout == 20, "Release protected source-check request timeout drifted")
+        parsed = urllib.parse.urlparse(request.full_url)
+        query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
+        require(
+            parsed.scheme == "https"
+            and parsed.netloc == "api.github.com"
+            and query.get("per_page") == ["100"]
+            and len(query.get("page", [])) == 1,
+            "Release protected source-check request is malformed",
+        )
+        page = int(query["page"][0])
+        requested_pages.append(page)
+        require(page in pages, "Release protected source-check requested an unexpected page")
+        return Response(pages[page])
+
+    def sleep(seconds):
+        sleep_calls.append(seconds)
+        raise SystemExit("Release protected source-check fixture stopped after retry sleep")
+
+    original_urlopen = urllib.request.urlopen
+    original_sleep = time.sleep
+    environment = {
+        "GITHUB_REPOSITORY": "GrantBirki/fence",
+        "SOURCE_COMMIT": fixture_source_commit,
+        "GH_TOKEN": "fixture-token",
+    }
+    previous_environment = {name: os.environ.get(name) for name in environment}
+    urllib.request.urlopen = urlopen
+    time.sleep = sleep
+    os.environ.update(environment)
+    error = None
+    output = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(output):
+            exec(
+                compile(
+                    release_check_source,
+                    ".github/workflows/release.yml:required-checks-fixture",
+                    "exec",
+                ),
+                {"__name__": "__main__"},
+            )
+    except SystemExit as fixture_error:
+        error = fixture_error
+    finally:
+        urllib.request.urlopen = original_urlopen
+        time.sleep = original_sleep
+        for name, value in previous_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return requested_pages, sleep_calls, error, output.getvalue()
+
+irrelevant_checks = [fixture_check(f"scheduled-{index}", index + 1) for index in range(100)]
+required_checks = [
+    fixture_check(name, 1000 + index)
+    for index, name in enumerate(sorted({"lint", "test", "build", "acceptance", "action acceptance", "integration"}))
+]
+requested_pages, sleep_calls, fixture_error, _fixture_output = run_release_check_fixture(
+    {
+        1: {"total_count": 106, "check_runs": irrelevant_checks},
+        2: {"total_count": 106, "check_runs": required_checks},
+    }
+)
+require(
+    fixture_error is None and requested_pages == [1, 2] and sleep_calls == [],
+    "Release protected source-check gate did not inspect later pages",
+)
+requested_pages, sleep_calls, fixture_error, _fixture_output = run_release_check_fixture(
+    {1: {"total_count": 1001, "check_runs": irrelevant_checks}}
+)
+require(
+    requested_pages == [1]
+    and sleep_calls == []
+    and fixture_error is not None
+    and str(fixture_error) == "check-run pagination exceeded its fixed bound",
+    "Release protected source-check gate did not fail closed above its page bound",
+)
+older_required_checks = [
+    fixture_check(name, 2000 + index)
+    for index, name in enumerate(sorted({"lint", "test", "build", "acceptance", "action acceptance", "integration"}))
+]
+requested_pages, sleep_calls, fixture_error, fixture_output = run_release_check_fixture(
+    {
+        1: {
+            "total_count": 106,
+            "check_runs": older_required_checks + irrelevant_checks[:94],
+        },
+        2: {"total_count": 106, "check_runs": []},
+    }
+)
+require(
+    requested_pages == [1, 2]
+    and sleep_calls == [30]
+    and fixture_error is not None
+    and str(fixture_error) == "Release protected source-check fixture stopped after retry sleep"
+    and fixture_output == "check-run pagination changed or was incomplete; retrying\n",
+    "Release protected source-check gate accepted an incomplete final page",
 )
 require("all nine required checks" not in release, "Release logs must not claim the superseded check count")
 require("workflow_dispatch:" not in release, "Release workflow must not be manually dispatchable")

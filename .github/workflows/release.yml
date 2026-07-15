@@ -153,34 +153,75 @@ jobs:
               "action acceptance",
               "integration",
           }
-          url = f"https://api.github.com/repos/{repository}/commits/{source_commit}/check-runs?per_page=100"
-          request = urllib.request.Request(
-              url,
-              headers={
-                  "Accept": "application/vnd.github+json",
-                  "Authorization": f"Bearer {token}",
-                  "User-Agent": "fence-release-check-gate",
-                  "X-GitHub-Api-Version": "2022-11-28",
-              },
-          )
+          base_url = f"https://api.github.com/repos/{repository}/commits/{source_commit}/check-runs?per_page=100"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "User-Agent": "fence-release-check-gate",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
           for attempt in range(120):
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  body = response.read(2 * 1024 * 1024 + 1)
-              if len(body) > 2 * 1024 * 1024:
-                  raise SystemExit("check-run response exceeded its fixed bound")
-              document = json.loads(body)
               latest = {}
-              for check in document.get("check_runs", []):
-                  name = check.get("name")
-                  app = check.get("app") or {}
+              expected_total_count = None
+              observed_count = 0
+              pagination_complete = True
+              for page in range(1, 11):
+                  request = urllib.request.Request(
+                      f"{base_url}&page={page}",
+                      headers=headers,
+                  )
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      body = response.read(2 * 1024 * 1024 + 1)
+                  if len(body) > 2 * 1024 * 1024:
+                      raise SystemExit("check-run response exceeded its fixed per-page bound")
+                  document = json.loads(body)
+                  if not isinstance(document, dict):
+                      raise SystemExit("check-run pagination response is malformed")
+                  total_count = document.get("total_count")
+                  check_runs = document.get("check_runs")
                   if (
-                      name in required
-                      and check.get("head_sha") == source_commit
-                      and app.get("id") == 15368
-                      and app.get("slug") == "github-actions"
+                      not isinstance(total_count, int)
+                      or isinstance(total_count, bool)
+                      or total_count < 0
+                      or not isinstance(check_runs, list)
+                      or len(check_runs) > 100
+                      or any(not isinstance(check, dict) for check in check_runs)
                   ):
-                      if name not in latest or check.get("id", 0) > latest[name].get("id", 0):
-                          latest[name] = check
+                      raise SystemExit("check-run pagination response is malformed")
+                  if total_count > 1000:
+                      raise SystemExit("check-run pagination exceeded its fixed bound")
+                  if expected_total_count is None:
+                      expected_total_count = total_count
+                  elif total_count != expected_total_count:
+                      pagination_complete = False
+                      break
+                  expected_page_count = min(100, expected_total_count - observed_count)
+                  if len(check_runs) != expected_page_count:
+                      pagination_complete = False
+                      break
+                  for check in check_runs:
+                      name = check.get("name")
+                      app = check.get("app") or {}
+                      if (
+                          name in required
+                          and check.get("head_sha") == source_commit
+                          and isinstance(app, dict)
+                          and app.get("id") == 15368
+                          and app.get("slug") == "github-actions"
+                      ):
+                          if name not in latest or check.get("id", 0) > latest[name].get("id", 0):
+                              latest[name] = check
+                  observed_count += len(check_runs)
+                  if observed_count == expected_total_count:
+                      break
+              else:
+                  raise SystemExit("check-run pagination exceeded its fixed bound")
+              if not pagination_complete:
+                  print("check-run pagination changed or was incomplete; retrying", flush=True)
+                  if attempt == 119:
+                      raise SystemExit("timed out waiting for required source checks")
+                  time.sleep(30)
+                  continue
               failed = sorted(
                   name for name, check in latest.items()
                   if check.get("status") == "completed" and check.get("conclusion") != "success"

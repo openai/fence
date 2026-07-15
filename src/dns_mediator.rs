@@ -52,7 +52,7 @@ use crate::platform_profile::{
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_RESULTS_STORAGE_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS,
-    is_optional_github_hosted_workflow_bootstrap_hostname,
+    is_optional_github_hosted_workflow_bootstrap_hostname, matches_results_storage_hostname,
     reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan,
 };
 use crate::runtime::{
@@ -3586,6 +3586,12 @@ fn pending_materializations_from_bootstrap_response(
             "a fixed DNS-mediated bootstrap response had invalid response-local lineage",
         )
     })?;
+    if response.requires_runner_provenance {
+        return Err(DnsMediationError::new(
+            "dns_block_prehydration_failed",
+            "a runner-authorized results-storage hostname cannot be prehydrated without an attributed query",
+        ));
+    }
     let mut materializations = response.materializations;
     materializations.sort();
     materializations.dedup();
@@ -5200,16 +5206,6 @@ fn requires_runner_results_storage_provenance(
         .active
         .get(hostname)
         .is_some_and(|authorization| authorization.requires_runner_provenance)
-}
-
-fn matches_results_storage_hostname(hostname: &str) -> bool {
-    let Some(account) = hostname
-        .strip_prefix("productionresultssa")
-        .and_then(|value| value.strip_suffix(".blob.core.windows.net"))
-    else {
-        return false;
-    };
-    !account.is_empty() && account.len() <= 5 && account.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn retain_address_answers(
@@ -10006,6 +10002,36 @@ mod tests {
         .unwrap_err();
         assert_eq!(expired_calls, 0);
         assert!(matches!(error, PrehydrationError::Transient(_)));
+    }
+
+    #[test]
+    fn bootstrap_rejects_runner_authorized_results_storage_materialization() {
+        let hostname = "productionresultssa17.blob.core.windows.net";
+        let mut policy = test_hostname_policy(false);
+        policy.exact.push(ExactHostnamePolicy {
+            hostname: hostname.to_owned(),
+            origins: vec![HostnamePolicyOrigin::User],
+            transports: vec![HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: 8443,
+            }],
+        });
+        policy.exact.sort();
+
+        let error = pending_materializations_from_bootstrap_response(
+            hostname,
+            1,
+            &response_with_address(hostname, 1, 60, &[192, 0, 2, 17]),
+            Instant::now(),
+            &policy,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "dns_block_prehydration_failed");
+        assert_eq!(
+            error.message,
+            "a runner-authorized results-storage hostname cannot be prehydrated without an attributed query"
+        );
     }
 
     #[test]

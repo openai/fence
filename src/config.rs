@@ -1,4 +1,5 @@
 use crate::error::ErrorDetail;
+use crate::platform_profile::is_runner_authorized_results_storage_hostname;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
@@ -271,16 +272,24 @@ fn normalize_allowance(
             .indexed_field("allowlist.port", index)
         })?;
     let (destination_type, destination) = match input.destination_type.as_str() {
-        "hostname" => (
-            DestinationType::Hostname,
-            normalize_hostname_destination(&input.destination).ok_or_else(|| {
-                ErrorDetail::new(
+        "hostname" => {
+            let destination = normalize_hostname_destination(&input.destination)
+                .ok_or_else(|| {
+                    ErrorDetail::new(
+                        "invalid_destination",
+                        "hostname destination is not a valid exact name or bounded wildcard pattern",
+                    )
+                    .indexed_field("allowlist.destination", index)
+                })?;
+            if is_runner_authorized_results_storage_hostname(&destination) {
+                return Err(ErrorDetail::new(
                     "invalid_destination",
-                    "hostname destination is not a valid exact name or bounded wildcard pattern",
+                    "runner-authorized results-storage hostnames cannot be exact user destinations",
                 )
-                .indexed_field("allowlist.destination", index)
-            })?,
-        ),
+                .indexed_field("allowlist.destination", index));
+            }
+            (DestinationType::Hostname, destination)
+        }
         "ip" => (
             DestinationType::Ip,
             input
@@ -738,6 +747,32 @@ mod tests {
         assert_eq!(
             normalize_hostname("127.1.example.com").as_deref(),
             Some("127.1.example.com")
+        );
+    }
+
+    #[test]
+    fn rejects_exact_runner_authorized_results_storage_destinations() {
+        let error = parse_and_normalize(&one_allowance(
+            "hostname",
+            "ProductionResultsSA17.Blob.Core.Windows.Net",
+            "tcp",
+            8443,
+        ))
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_destination");
+        assert_eq!(error.field.as_deref(), Some("allowlist.destination"));
+        assert_eq!(error.index, Some(0));
+
+        let trusted = parse_and_normalize(&one_allowance(
+            "hostname",
+            "productionresultssa19.blob.core.windows.net",
+            "tcp",
+            443,
+        ))
+        .unwrap();
+        assert_eq!(
+            trusted.requested_allowances[0].destination,
+            "productionresultssa19.blob.core.windows.net"
         );
     }
 

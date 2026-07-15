@@ -26,6 +26,8 @@ cidr 2001:db8::/64 tcp 443
 
 Fence resolves every required exact hostname before readiness, applies and verifies rules for all approved addresses, and refreshes those addresses while the job runs. Each refreshed address retains the protocol and port from its allowlist entry.
 
+Non-static `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts are runner-authorized platform destinations, not exact user destinations. Fence rejects an exact user entry for one of those accounts before mutation; the selected profile authorizes up to four of them at TCP port `443` only after an attributable request from the pinned runner process. The source-defined `productionresultssa19.blob.core.windows.net` compatibility account remains the sole static exception.
+
 Only `A` and `AAAA` questions are forwarded in block mode. Fence rebuilds outbound questions in canonical lowercase form and releases an approved address-bearing answer only after the corresponding firewall access has been applied and structurally verified.
 
 ## Wildcard Hostnames
