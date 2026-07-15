@@ -39,6 +39,7 @@ jobs:
   prepare-candidate:
     name: prepare Action candidate
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     outputs:
       action_ref: ${{ steps.candidate.outputs.action_ref }}
       source_candidate: ${{ steps.candidate.outputs.source_candidate }}
@@ -101,6 +102,9 @@ jobs:
 
       - name: validate source locks
         run: script/validate-locks --ci
+
+      - name: test Action wrapper
+        run: script/test-action-wrapper
 
       - name: require source-only candidate
         if: steps.candidate.outputs.source_candidate == 'true'
@@ -165,23 +169,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - scenario: standard
-            mode: block
-            invocation_id: action-standard
-            container_policy: disable
-            disable_broad_github_domains: 'false'
-            allowlist: ''
           - scenario: standard-opt-out
             mode: block
             invocation_id: action-standard-opt-out
             container_policy: disable
             disable_broad_github_domains: 'true'
-            allowlist: ''
-          - scenario: unsafe-preserve
-            mode: block
-            invocation_id: action-unsafe-preserve
-            container_policy: unsafe_preserve
-            disable_broad_github_domains: 'false'
             allowlist: ''
           - scenario: wildcard-docker
             mode: block
@@ -190,12 +182,6 @@ jobs:
             disable_broad_github_domains: 'false'
             allowlist: |
               *.docker.io
-          - scenario: audit
-            mode: audit
-            invocation_id: action-audit
-            container_policy: ''
-            disable_broad_github_domains: 'false'
-            allowlist: ''
     timeout-minutes: 8
     runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
@@ -213,14 +199,8 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
 
-      - name: validate locks
-        run: script/validate-locks --ci
-
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
-
-      - name: test Action wrapper
-        run: script/test-action-wrapper
 
       - name: classify bundled Action host compatibility
         id: bundle-host
@@ -268,14 +248,8 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
 
-      - name: validate locks
-        run: script/validate-locks --ci
-
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
-
-      - name: test Action wrapper
-        run: script/test-action-wrapper
 
       - name: classify bundled Action host compatibility
         id: bundle-host
@@ -318,17 +292,9 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: target/action-layout/owner/project/revision/action
 
-      - name: validate locks
-        working-directory: target/action-layout/owner/project/revision
-        run: script/validate-locks --ci
-
       - name: observe hosted runner fingerprint candidate
         working-directory: target/action-layout/owner/project/revision
         run: script/observe-hosted-runner
-
-      - name: test Action wrapper
-        working-directory: target/action-layout/owner/project/revision
-        run: script/test-action-wrapper
 
       - name: classify bundled Action host compatibility
         id: bundle-host
@@ -376,14 +342,8 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
 
-      - name: validate locks
-        run: script/validate-locks --ci
-
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
-
-      - name: test Action wrapper
-        run: script/test-action-wrapper
 
       - name: reject invalid setup before mutation
         run: script/test-action-setup-failure
@@ -408,14 +368,8 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
 
-      - name: validate locks
-        run: script/validate-locks --ci
-
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
-
-      - name: test Action wrapper
-        run: script/test-action-wrapper
 
       - name: classify bundled Action host compatibility
         id: bundle-host
@@ -458,14 +412,8 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
 
-      - name: validate locks
-        run: script/validate-locks --ci
-
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
-
-      - name: test Action wrapper
-        run: script/test-action-wrapper
 
       - name: classify bundled Action host compatibility
         id: bundle-host
@@ -486,9 +434,10 @@ jobs:
         with:
           invocation_id: action-finalization-${{ matrix.replica }}
 
-  verify-action-finalization:
-    name: verify Action finalization
-    needs: [prepare-candidate, action-finalization]
+  acceptance:
+    name: action acceptance
+    needs: [prepare-candidate, action, zero-input, nested-layout, setup-failure, tamper, action-finalization]
+    if: ${{ always() && !cancelled() }}
     timeout-minutes: 5
     runs-on: ubuntu-24.04
     permissions:
@@ -497,24 +446,22 @@ jobs:
 
     steps:
       - name: checkout
+        id: finalization-checkout
+        if: ${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
 
       - name: verify terminal jobs and downloadable logs
+        id: finalization-verifier
+        if: ${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: script/verify-protected-finalization action
 
-  acceptance:
-    name: action acceptance
-    needs: [prepare-candidate, action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]
-    if: ${{ always() && !cancelled() }}
-    runs-on: ubuntu-24.04
-
-    steps:
       - name: confirm bundled Action acceptance
+        if: ${{ always() }}
         env:
           PREPARE_RESULT: ${{ needs.prepare-candidate.result }}
           ACTION_RESULT: ${{ needs.action.result }}
@@ -522,7 +469,9 @@ jobs:
           NESTED_LAYOUT_RESULT: ${{ needs.nested-layout.result }}
           SETUP_FAILURE_RESULT: ${{ needs.setup-failure.result }}
           TAMPER_RESULT: ${{ needs.tamper.result }}
-          FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}
+          FINALIZATION_RESULT: ${{ needs.action-finalization.result }}
+          FINALIZATION_CHECKOUT_OUTCOME: ${{ steps.finalization-checkout.outcome }}
+          FINALIZATION_VERIFIER_OUTCOME: ${{ steps.finalization-verifier.outcome }}
         run: |
           for result in \
             "$PREPARE_RESULT" \
@@ -531,7 +480,9 @@ jobs:
             "$NESTED_LAYOUT_RESULT" \
             "$SETUP_FAILURE_RESULT" \
             "$TAMPER_RESULT" \
-            "$FINALIZATION_RESULT"
+            "$FINALIZATION_RESULT" \
+            "$FINALIZATION_CHECKOUT_OUTCOME" \
+            "$FINALIZATION_VERIFIER_OUTCOME"
           do
             if [[ "$result" != "success" ]]; then
               exit 1

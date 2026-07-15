@@ -55,7 +55,8 @@ validate_workflow_uses_pinned() {
   local ref
   local failed=false
 
-  for workflow in "$DIR"/.github/workflows/*.yml; do
+  for workflow in "$DIR"/.github/workflows/*.yml "$DIR"/.github/workflows/*.yaml; do
+    [[ -e "$workflow" ]] || continue
     while IFS= read -r line; do
       value="${line#*uses:}"
       value="${value%%#*}"
@@ -120,9 +121,11 @@ validate_cargo_vendor_surface() {
 validate_ci_evidence() {
   python3 -E - "$DIR" <<'PY'
 import ast
+import collections
 import pathlib
 import re
 import sys
+import textwrap
 
 if sys.flags.optimize != 0:
     raise SystemExit("Python optimization must be disabled")
@@ -184,7 +187,91 @@ def scalar_mapping(block, indentation):
     )
     return dict(entries)
 
+def require_step_contract(job, name, expected_keys, expected_scalars, message):
+    step = indented_block(
+        job,
+        f"      - name: {name}",
+        f"{message} must be unique",
+    )
+    require_exact_mapping_keys(step, 8, expected_keys, f"{message} fields changed")
+    require(
+        scalar_mapping(step, 8) == expected_scalars,
+        f"{message} scalar contract changed",
+    )
+    return step
+
+def literal_run_body(step, message):
+    marker = "        run: |\n"
+    require(step.count(marker) == 1, message)
+    return step.split(marker, 1)[1].rstrip() + "\n"
+
+def workflow_uses(source):
+    return collections.Counter(
+        re.findall(
+            r"(?m)^[ \t]+uses:[ \t]+([^#\s]+)(?:[ \t]+#.*)?$",
+            source,
+        )
+    )
+
+def require_no_write_permissions(source, message):
+    require(
+        re.search(
+            r'''(?m)^[ \t]+[A-Za-z0-9_-]+:[ \t]+["']?write["']?(?:[ \t]+#.*)?$''',
+            source,
+        )
+        is None,
+        message,
+    )
+
 root = pathlib.Path(sys.argv[1])
+workflow_dir = root / ".github/workflows"
+workflow_paths = sorted(
+    [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")],
+    key=lambda path: path.name,
+)
+workflow_sources = {
+    path.name: path.read_text(encoding="utf-8") for path in workflow_paths
+}
+for source in workflow_sources.values():
+    require(
+        len(re.findall(r"(?m)^on:(?:[ \t]+#.*)?$", source)) == 1,
+        "Workflow triggers must use one explicit top-level mapping",
+    )
+    require(
+        re.search(r'''(?m)^ {0,10}["'][A-Za-z0-9_-]+["'][ \t]*:''', source)
+        is None,
+        "Workflow structural keys must remain unquoted",
+    )
+pull_request_workflows = {
+    name for name, source in workflow_sources.items() if re.search(r"(?m)^  pull_request:", source)
+}
+require(
+    pull_request_workflows
+    == {
+        "lint.yml",
+        "test.yml",
+        "build.yml",
+        "acceptance.yml",
+        "action-acceptance.yml",
+        "integration.yml",
+    },
+    "Pull requests must run exactly the six reviewed CI workflows",
+)
+pull_request_sources = {
+    name: source
+    for name, source in workflow_sources.items()
+    if name in pull_request_workflows
+}
+require(
+    all("macos-" not in source for source in pull_request_sources.values()),
+    "Pull-request workflows must not claim pre-merge macOS assurance",
+)
+for source in pull_request_sources.values():
+    require_no_write_permissions(
+        source,
+        "Pull-request workflows must not grant write permissions",
+    )
+
 validator_paths = [
     "script/test-action-acceptance",
     "script/test-action-tamper",
@@ -228,7 +315,359 @@ for relative in validator_paths:
                 f"{relative}: evidence validator must reject optimized Python",
             )
 
+ci_specs = {
+    "lint": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "bootstrap",
+            "lint",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("bootstrap", "script/bootstrap"),
+            ("lint", "script/lint"),
+        ],
+    },
+    "test": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "install test tools",
+            "bootstrap",
+            "test with coverage",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("install test tools", "script/install-test-tools"),
+            ("bootstrap", "script/bootstrap"),
+            ("test with coverage", "script/test --coverage"),
+        ],
+    },
+    "build": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "bootstrap",
+            "build Linux x64 binary",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("bootstrap", "script/bootstrap"),
+            ("build Linux x64 binary", "script/build"),
+        ],
+    },
+    "acceptance": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "bootstrap",
+            "install retained cross-build tools",
+            "verify retained cross-build tools",
+            "build packaged Linux x64 artifact",
+            "verify packaged artifact checksum",
+            "exercise packaged public contract",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("bootstrap", "script/bootstrap"),
+            ("install retained cross-build tools", "script/install-zig"),
+            ("verify retained cross-build tools", "script/verify-release-toolchain"),
+        ],
+    },
+}
+ci_sources = {}
+for workflow_name, spec in ci_specs.items():
+    ci_path = root / ".github/workflows" / f"{workflow_name}.yml"
+    require(ci_path.is_file(), f"{workflow_name} CI workflow is missing")
+    ci_workflow = ci_path.read_text(encoding="utf-8")
+    ci_sources[workflow_name] = ci_workflow
+    label = f"{workflow_name} CI"
+
+    require(
+        workflow_uses(ci_workflow)
+        == collections.Counter(
+            {"actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 1}
+        ),
+        f"{label} may use only the reviewed checkout step",
+    )
+    require_exact_mapping_keys(
+        ci_workflow,
+        0,
+        ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
+        f"{label} top-level workflow contract must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(ci_workflow, 0) == {"name": workflow_name},
+        f"{label} workflow name must match its filename",
+    )
+
+    ci_triggers = indented_block(
+        ci_workflow,
+        "on:",
+        f"{label} trigger contract must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_triggers,
+        2,
+        ["push", "pull_request"],
+        f"{label} must run only on main pushes and pull requests",
+    )
+    for trigger_name in ["push", "pull_request"]:
+        trigger = indented_block(
+            ci_triggers,
+            f"  {trigger_name}:",
+            f"{label} {trigger_name} trigger must be unique",
+        )
+        require_exact_mapping_keys(
+            trigger,
+            4,
+            ["branches"],
+            f"{label} {trigger_name} trigger must contain only a branch filter",
+        )
+        require(
+            re.findall(
+                r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
+                trigger,
+            )
+            == ["main"],
+            f"{label} {trigger_name} trigger must remain limited to main",
+        )
+
+    ci_permissions = indented_block(
+        ci_workflow,
+        "permissions:",
+        f"{label} permissions must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_permissions,
+        2,
+        ["contents"],
+        f"{label} permissions must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(ci_permissions, 2) == {"contents": "read"},
+        f"{label} permissions must remain read-only",
+    )
+
+    ci_defaults = indented_block(
+        ci_workflow,
+        "defaults:",
+        f"{label} defaults must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_defaults,
+        2,
+        ["run"],
+        f"{label} defaults may configure only run steps",
+    )
+    ci_run_defaults = indented_block(
+        ci_defaults,
+        "  run:",
+        f"{label} run defaults must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_run_defaults,
+        4,
+        ["shell"],
+        f"{label} run defaults may configure only the shell",
+    )
+    require(
+        scalar_mapping(ci_run_defaults, 4) == {"shell": "bash"},
+        f"{label} run steps must use bash",
+    )
+
+    ci_concurrency = indented_block(
+        ci_workflow,
+        "concurrency:",
+        f"{label} concurrency must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_concurrency,
+        2,
+        ["group", "cancel-in-progress"],
+        f"{label} concurrency fields must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(ci_concurrency, 2)
+        == {
+            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
+            "cancel-in-progress": "true",
+        },
+        f"{label} must cancel superseded PR work without cancelling distinct main commits",
+    )
+
+    ci_jobs = indented_block(
+        ci_workflow,
+        "jobs:",
+        f"{label} jobs contract must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_jobs,
+        2,
+        [workflow_name],
+        f"{label} must contain exactly its same-named job",
+    )
+    job = indented_block(
+        ci_jobs,
+        f"  {workflow_name}:",
+        f"{label} job must be unique",
+    )
+    require_exact_mapping_keys(
+        job,
+        4,
+        ["name", "timeout-minutes", "runs-on", "steps"],
+        f"{label} job fields must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(job, 4)
+        == {
+            "name": workflow_name,
+            "timeout-minutes": "15",
+            "runs-on": "ubuntu-24.04",
+        },
+        f"{label} job must remain bounded on fixed ubuntu-24.04",
+    )
+
+    step_names = re.findall(r"(?m)^      - name: ([^\n]+)$", job)
+    require(
+        step_names == spec["steps"]
+        and len(re.findall(r"(?m)^      - ", job)) == len(step_names),
+        f"{label} steps must remain complete, named, and ordered",
+    )
+    checkout = require_step_contract(
+        job,
+        "checkout",
+        ["uses", "with"],
+        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        f"{label} checkout",
+    )
+    checkout_with = indented_block(
+        checkout,
+        "        with:",
+        f"{label} checkout inputs must be unique",
+    )
+    require_exact_mapping_keys(
+        checkout_with,
+        10,
+        ["persist-credentials"],
+        f"{label} checkout may configure only credential persistence",
+    )
+    require(
+        scalar_mapping(checkout_with, 10) == {"persist-credentials": "false"},
+        f"{label} checkout must disable persisted credentials",
+    )
+    for step_name, command in spec["commands"]:
+        require_step_contract(
+            job,
+            step_name,
+            ["run"],
+            {"run": command},
+            f"{label} {step_name} step",
+        )
+
+    require(
+        ci_workflow.count("uses: actions/checkout@") == 1
+        and ci_workflow.count("persist-credentials: false") == 1,
+        f"{label} must contain exactly one credential-safe checkout",
+    )
+    require(
+        ci_workflow.count("runs-on: ubuntu-24.04") == 1
+        and "runs-on: ${{" not in ci_workflow
+        and "macos-" not in ci_workflow,
+        f"{label} must run only on literal fixed ubuntu-24.04",
+    )
+    for forbidden in [
+        "continue-on-error",
+        "actions/cache",
+        "pull_request_target",
+        "workflow_dispatch",
+        "contents: write",
+    ]:
+        require(
+            forbidden not in ci_workflow,
+            f"{label} contains a forbidden escape or mutable surface",
+        )
+
+acceptance = indented_block(
+    indented_block(
+        ci_sources["acceptance"],
+        "jobs:",
+        "acceptance CI jobs contract must be unique",
+    ),
+    "  acceptance:",
+    "acceptance CI job must be unique",
+)
+packaged_build = require_step_contract(
+    acceptance,
+    "build packaged Linux x64 artifact",
+    ["env", "run"],
+    {
+        "run": 'script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$RUNNER_TEMP/fence-acceptance-dist"',
+    },
+    "acceptance CI packaged build step",
+)
+packaged_build_env = indented_block(
+    packaged_build,
+    "        env:",
+    "acceptance CI packaged build environment must be unique",
+)
+require_exact_mapping_keys(
+    packaged_build_env,
+    10,
+    ["BUILD_VERSION"],
+    "acceptance CI packaged build environment must remain narrowly scoped",
+)
+require(
+    scalar_mapping(packaged_build_env, 10) == {"BUILD_VERSION": "acceptance"},
+    "acceptance CI packaged build version must remain deterministic",
+)
+checksum_step = require_step_contract(
+    acceptance,
+    "verify packaged artifact checksum",
+    ["run"],
+    {"run": "|"},
+    "acceptance CI package checksum step",
+)
+require(
+    literal_run_body(checksum_step, "acceptance CI package checksum gate must use a literal run body")
+    == (
+        '          cd "$RUNNER_TEMP/fence-acceptance-dist"\n'
+        "          grep -Eq 'fence_acceptance_linux-amd64$' checksums.txt\n"
+        "          sha256sum -c checksums.txt\n"
+    ),
+    "acceptance CI package checksum gate is incomplete",
+)
+require_step_contract(
+    acceptance,
+    "exercise packaged public contract",
+    ["run"],
+    {"run": 'script/test-package-smoke "$RUNNER_TEMP/fence-acceptance-dist/fence_acceptance_linux-amd64"'},
+    "acceptance CI package smoke step",
+)
+
 workflow = (root / ".github/workflows/action-acceptance.yml").read_text(encoding="utf-8")
+require(
+    workflow_uses(workflow)
+    == collections.Counter(
+        {
+            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 8,
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a": 1,
+            "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c": 6,
+            "./": 3,
+            "./target/action-layout/owner/project/revision": 1,
+        }
+    ),
+    "Action acceptance external and local Action uses must match the reviewed allowlist",
+)
 require_exact_mapping_keys(
     workflow,
     0,
@@ -242,21 +681,6 @@ require(
 marker = "\n  acceptance:\n"
 require(workflow.count(marker) == 1, "Action acceptance aggregate must be unique")
 aggregate = workflow.split(marker, 1)[1]
-required_fragments = [
-    "needs: [prepare-candidate, action, zero-input, nested-layout, setup-failure, tamper, verify-action-finalization]",
-    "if: ${{ always() && !cancelled() }}",
-    "PREPARE_RESULT: ${{ needs.prepare-candidate.result }}",
-    "ACTION_RESULT: ${{ needs.action.result }}",
-    "ZERO_INPUT_RESULT: ${{ needs.zero-input.result }}",
-    "NESTED_LAYOUT_RESULT: ${{ needs.nested-layout.result }}",
-    "SETUP_FAILURE_RESULT: ${{ needs.setup-failure.result }}",
-    "TAMPER_RESULT: ${{ needs.tamper.result }}",
-    "FINALIZATION_RESULT: ${{ needs.verify-action-finalization.result }}",
-    'if [[ "$result" != "success" ]]; then',
-]
-for fragment in required_fragments:
-    require(fragment in aggregate, "Action acceptance aggregate must fail closed")
-require(aggregate.count("exit 1") == 1, "Action acceptance aggregate must reject unsuccessful jobs")
 for fragment in [
     "workflow_call:",
     "action_ref:",
@@ -267,14 +691,6 @@ for fragment in [
     "run: script/validate-action-bundle",
 ]:
     require(fragment in workflow, "Reusable Action acceptance candidate contract is incomplete")
-require(
-    workflow.count("- name: require bundled Action activation") == 5,
-    "Action acceptance must fail closed at every classifier-backed activation boundary",
-)
-require(
-    workflow.count('CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}') == 5,
-    "Action acceptance classifier guards are incomplete",
-)
 
 workflow_triggers = indented_block(
     workflow,
@@ -358,18 +774,120 @@ target_jobs = [
     "tamper",
     "action-finalization",
 ]
-support_jobs = ["prepare-candidate", "verify-action-finalization", "acceptance"]
+support_jobs = ["prepare-candidate", "acceptance"]
 require_exact_mapping_keys(
     jobs,
     2,
     target_jobs + support_jobs,
-    "Action acceptance must retain six target job definitions and three fixed support jobs",
+    "Action acceptance must retain six target job definitions and two fixed support jobs",
 )
 
 prepare = indented_block(
     jobs,
     "  prepare-candidate:",
     "Action acceptance candidate preparation job must be unique",
+)
+require_exact_mapping_keys(
+    prepare,
+    4,
+    ["name", "runs-on", "timeout-minutes", "outputs", "steps"],
+    "Action acceptance candidate preparation fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(prepare, 4)
+    == {
+        "name": "prepare Action candidate",
+        "runs-on": "ubuntu-24.04",
+        "timeout-minutes": "15",
+    },
+    "Action acceptance candidate preparation must remain bounded on fixed ubuntu-24.04",
+)
+require(
+    re.findall(r"(?m)^      - name: ([^\n]+)$", prepare)
+    == [
+        "select candidate",
+        "checkout candidate source",
+        "require exact checkout",
+        "validate source locks",
+        "test Action wrapper",
+        "require source-only candidate",
+        "prepare rust",
+        "bootstrap",
+        "build and assemble source candidate",
+        "validate committed distribution candidate",
+        "upload assembled Action bundle",
+    ],
+    "Action acceptance candidate preparation steps must remain complete and ordered",
+)
+require(
+    prepare.count("run: script/validate-locks --ci") == 1
+    and prepare.count("run: script/test-action-wrapper") == 1,
+    "Action acceptance commit-global validation must run once during candidate preparation",
+)
+prepare_checkout = require_step_contract(
+    prepare,
+    "checkout candidate source",
+    ["uses", "with"],
+    {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+    "Action acceptance candidate checkout",
+)
+prepare_checkout_with = indented_block(
+    prepare_checkout,
+    "        with:",
+    "Action acceptance candidate checkout inputs must be unique",
+)
+require(
+    scalar_mapping(prepare_checkout_with, 10)
+    == {
+        "ref": "${{ steps.candidate.outputs.action_ref }}",
+        "fetch-depth": "0",
+        "persist-credentials": "false",
+    },
+    "Action acceptance candidate checkout must use the exact candidate without persisted credentials",
+)
+require_step_contract(
+    prepare,
+    "validate source locks",
+    ["run"],
+    {"run": "script/validate-locks --ci"},
+    "Action acceptance source lock validation",
+)
+require_step_contract(
+    prepare,
+    "test Action wrapper",
+    ["run"],
+    {"run": "script/test-action-wrapper"},
+    "Action acceptance wrapper validation",
+)
+candidate_upload = require_step_contract(
+    prepare,
+    "upload assembled Action bundle",
+    ["if", "uses", "with"],
+    {
+        "if": "steps.candidate.outputs.source_candidate == 'true'",
+        "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    },
+    "Action acceptance candidate bundle upload",
+)
+candidate_upload_with = indented_block(
+    candidate_upload,
+    "        with:",
+    "Action acceptance candidate bundle upload inputs must be unique",
+)
+require(
+    scalar_mapping(candidate_upload_with, 10)
+    == {
+        "name": "${{ steps.candidate.outputs.artifact_name }}",
+        "path": "|",
+        "retention-days": "1",
+        "if-no-files-found": "error",
+    }
+    and re.findall(r"(?m)^            ([^\n]+)$", candidate_upload_with)
+    == [
+        "${{ runner.temp }}/fence-action-candidate/action/bin/fence",
+        "${{ runner.temp }}/fence-action-candidate/action/bundle-manifest.json",
+    ],
+    "Action acceptance may upload only the bounded source candidate bundle",
 )
 select_candidate = indented_block(
     prepare,
@@ -414,15 +932,30 @@ require(
 )
 
 validated_runner = "${{ needs.prepare-candidate.outputs.acceptance_runner }}"
+target_job_keys = {
+    "action": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
+    "zero-input": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
+    "nested-layout": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
+    "setup-failure": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
+    "tamper": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
+    "action-finalization": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
+}
 for job_name in target_jobs:
     job = indented_block(
         jobs,
         f"  {job_name}:",
         f"Action acceptance {job_name} job must be unique",
     )
+    require_exact_mapping_keys(
+        job,
+        4,
+        target_job_keys[job_name],
+        f"Action acceptance {job_name} fields must remain narrowly scoped",
+    )
     require(
-        scalar_mapping(job, 4).get("runs-on") == validated_runner,
-        f"Action acceptance {job_name} must use only the validated runner output",
+        scalar_mapping(job, 4).get("needs") == "prepare-candidate"
+        and scalar_mapping(job, 4).get("runs-on") == validated_runner,
+        f"Action acceptance {job_name} must depend on preparation and use only the validated runner output",
     )
 for job_name in support_jobs:
     job = indented_block(
@@ -445,6 +978,1018 @@ require(
     and workflow.count("runs-on: ubuntu-24.04") == len(support_jobs),
     "Action acceptance runner routing must remain complete and exclusive",
 )
+action_job = indented_block(
+    jobs,
+    "  action:",
+    "Action acceptance matrix job must be unique",
+)
+action_strategy = indented_block(
+    action_job,
+    "    strategy:",
+    "Action acceptance matrix strategy must be unique",
+)
+require(
+    scalar_mapping(action_strategy, 6).get("fail-fast") == "false",
+    "Action acceptance matrix must not hide sibling evidence",
+)
+action_entries = re.findall(
+    r"(?ms)^          - scenario: ([^\n]+)\n(.*?)(?=^          - scenario:|\Z)",
+    action_strategy,
+)
+require(
+    [scenario for scenario, _ in action_entries]
+    == ["standard-opt-out", "wildcard-docker"],
+    "Action acceptance matrix must contain only its two unique native-input scenarios",
+)
+expected_action_entries = {
+    "standard-opt-out": {
+        "mode": "block",
+        "invocation_id": "action-standard-opt-out",
+        "container_policy": "disable",
+        "disable_broad_github_domains": "'true'",
+        "allowlist": "''",
+    },
+    "wildcard-docker": {
+        "mode": "block",
+        "invocation_id": "action-wildcard-docker",
+        "container_policy": "unsafe_preserve",
+        "disable_broad_github_domains": "'false'",
+        "allowlist": "|",
+    },
+}
+for scenario, entry in action_entries:
+    require(
+        scalar_mapping(entry, 12) == expected_action_entries[scenario],
+        f"Action acceptance {scenario} native-input contract changed",
+    )
+require(
+    re.findall(r"(?m)^              ([^\n]+)$", action_entries[1][1])
+    == ["*.docker.io"],
+    "Action acceptance wildcard-Docker allowlist must remain exact",
+)
+
+action_job_blocks = {
+    job_name: indented_block(
+        jobs,
+        f"  {job_name}:",
+        f"Action acceptance {job_name} job must be unique",
+    )
+    for job_name in target_jobs
+}
+expected_action_steps = {
+    "action": [
+        "checkout",
+        "install assembled Action bundle",
+        "observe hosted runner fingerprint candidate",
+        "classify bundled Action host compatibility",
+        "require bundled Action activation",
+        "activate bundled Fence agent",
+        "verify Action lifecycle",
+    ],
+    "zero-input": [
+        "checkout",
+        "install assembled Action bundle",
+        "observe hosted runner fingerprint candidate",
+        "classify bundled Action host compatibility",
+        "require bundled Action activation",
+        "activate bundled Fence agent with strict defaults",
+        "verify zero-input Action lifecycle",
+    ],
+    "nested-layout": [
+        "checkout into nested Action path",
+        "install assembled Action bundle",
+        "observe hosted runner fingerprint candidate",
+        "classify bundled Action host compatibility",
+        "require bundled Action activation",
+        "activate bundled Fence agent from nested path",
+        "verify nested Action lifecycle",
+    ],
+    "setup-failure": [
+        "checkout",
+        "install assembled Action bundle",
+        "observe hosted runner fingerprint candidate",
+        "reject invalid setup before mutation",
+    ],
+    "tamper": [
+        "checkout",
+        "install assembled Action bundle",
+        "observe hosted runner fingerprint candidate",
+        "classify bundled Action host compatibility",
+        "require bundled Action activation",
+        "deny registered-path replacement and fail the post hook on drift",
+    ],
+    "action-finalization": [
+        "checkout",
+        "install assembled Action bundle",
+        "observe hosted runner fingerprint candidate",
+        "classify bundled Action host compatibility",
+        "require bundled Action activation",
+        "activate bundled Fence agent without post-ready warming",
+    ],
+}
+for job_name, job in action_job_blocks.items():
+    require(
+        re.findall(r"(?m)^      - name: ([^\n]+)$", job)
+        == expected_action_steps[job_name],
+        f"Action acceptance {job_name} steps must remain complete and ordered",
+    )
+    checkout_name = "checkout into nested Action path" if job_name == "nested-layout" else "checkout"
+    checkout = require_step_contract(
+        job,
+        checkout_name,
+        ["uses", "with"],
+        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        f"Action acceptance {job_name} checkout",
+    )
+    checkout_with = indented_block(
+        checkout,
+        "        with:",
+        f"Action acceptance {job_name} checkout inputs must be unique",
+    )
+    expected_checkout_inputs = {
+        "ref": "${{ needs.prepare-candidate.outputs.action_ref }}",
+        "persist-credentials": "false",
+    }
+    if job_name == "nested-layout":
+        expected_checkout_inputs["path"] = "target/action-layout/owner/project/revision"
+    require(
+        scalar_mapping(checkout_with, 10) == expected_checkout_inputs,
+        f"Action acceptance {job_name} must check out the exact candidate without persisted credentials",
+    )
+    install = require_step_contract(
+        job,
+        "install assembled Action bundle",
+        ["if", "uses", "with"],
+        {
+            "if": "needs.prepare-candidate.outputs.source_candidate == 'true'",
+            "uses": "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        },
+        f"Action acceptance {job_name} candidate bundle installation",
+    )
+    install_with = indented_block(
+        install,
+        "        with:",
+        f"Action acceptance {job_name} candidate bundle inputs must be unique",
+    )
+    install_path = (
+        "target/action-layout/owner/project/revision/action"
+        if job_name == "nested-layout"
+        else "action"
+    )
+    require(
+        scalar_mapping(install_with, 10)
+        == {
+            "name": "${{ needs.prepare-candidate.outputs.artifact_name }}",
+            "path": install_path,
+        },
+        f"Action acceptance {job_name} must install only the reviewed candidate bundle",
+    )
+    observe_keys = ["run"]
+    observe_scalars = {"run": "script/observe-hosted-runner"}
+    if job_name == "nested-layout":
+        observe_keys = ["working-directory", "run"]
+        observe_scalars["working-directory"] = "target/action-layout/owner/project/revision"
+    require_step_contract(
+        job,
+        "observe hosted runner fingerprint candidate",
+        observe_keys,
+        observe_scalars,
+        f"Action acceptance {job_name} host observation",
+    )
+
+for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-finalization"]:
+    job = action_job_blocks[job_name]
+    classifier_keys = ["id", "run"]
+    classifier_scalars = {
+        "id": "bundle-host",
+        "run": "script/classify-action-bundle-host",
+    }
+    guard_keys = ["env", "run"]
+    guard_scalars = {"run": "|"}
+    if job_name == "nested-layout":
+        classifier_keys = ["id", "working-directory", "run"]
+        classifier_scalars["working-directory"] = "target/action-layout/owner/project/revision"
+        guard_keys = ["working-directory", "env", "run"]
+        guard_scalars["working-directory"] = "target/action-layout/owner/project/revision"
+    require_step_contract(
+        job,
+        "classify bundled Action host compatibility",
+        classifier_keys,
+        classifier_scalars,
+        f"Action acceptance {job_name} host classifier",
+    )
+    guard = require_step_contract(
+        job,
+        "require bundled Action activation",
+        guard_keys,
+        guard_scalars,
+        f"Action acceptance {job_name} activation guard",
+    )
+    guard_env = indented_block(
+        guard,
+        "        env:",
+        f"Action acceptance {job_name} activation guard environment must be unique",
+    )
+    require(
+        scalar_mapping(guard_env, 10)
+        == {
+            "RUN_BUNDLE": "${{ steps.bundle-host.outputs.run_bundle }}",
+            "CLASSIFICATION": "${{ steps.bundle-host.outputs.classification }}",
+        }
+        and literal_run_body(
+            guard,
+            f"Action acceptance {job_name} activation guard must use a literal run body",
+        )
+        == (
+            '          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then\n'
+            '            echo "::error::bundled Action host classification did not authorize activation"\n'
+            "            exit 1\n"
+            "          fi\n"
+        ),
+        f"Action acceptance {job_name} activation guard must fail closed",
+    )
+
+require_step_contract(
+    action_job_blocks["action"],
+    "verify Action lifecycle",
+    ["run"],
+    {"run": 'script/test-action-acceptance "${{ matrix.scenario }}" "${{ matrix.invocation_id }}"'},
+    "Action acceptance native-input lifecycle verification",
+)
+require_step_contract(
+    action_job_blocks["zero-input"],
+    "verify zero-input Action lifecycle",
+    ["run"],
+    {"run": 'script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"'},
+    "Action acceptance zero-input lifecycle verification",
+)
+require_step_contract(
+    action_job_blocks["nested-layout"],
+    "verify nested Action lifecycle",
+    ["working-directory", "run"],
+    {
+        "working-directory": "target/action-layout/owner/project/revision",
+        "run": "script/test-action-acceptance audit action-nested-layout",
+    },
+    "Action acceptance nested audit lifecycle verification",
+)
+require_step_contract(
+    action_job_blocks["setup-failure"],
+    "reject invalid setup before mutation",
+    ["run"],
+    {"run": "script/test-action-setup-failure"},
+    "Action acceptance setup-failure evidence",
+)
+require_step_contract(
+    action_job_blocks["tamper"],
+    "deny registered-path replacement and fail the post hook on drift",
+    ["run"],
+    {"run": "script/test-action-tamper"},
+    "Action acceptance tamper evidence",
+)
+native_activation = require_step_contract(
+    action_job_blocks["action"],
+    "activate bundled Fence agent",
+    ["uses", "with"],
+    {"uses": "./"},
+    "Action acceptance native-input activation",
+)
+native_activation_with = indented_block(
+    native_activation,
+    "        with:",
+    "Action acceptance native-input activation inputs must be unique",
+)
+require(
+    scalar_mapping(native_activation_with, 10)
+    == {
+        "mode": "${{ matrix.mode }}",
+        "invocation_id": "${{ matrix.invocation_id }}",
+        "container_policy": "${{ matrix.container_policy }}",
+        "disable_broad_github_domains": "${{ matrix.disable_broad_github_domains }}",
+        "allowlist": "${{ matrix.allowlist }}",
+    },
+    "Action acceptance native-input activation must exercise every reviewed matrix field",
+)
+require_step_contract(
+    action_job_blocks["zero-input"],
+    "activate bundled Fence agent with strict defaults",
+    ["uses"],
+    {"uses": "./"},
+    "Action acceptance zero-input activation",
+)
+nested_activation = require_step_contract(
+    action_job_blocks["nested-layout"],
+    "activate bundled Fence agent from nested path",
+    ["uses", "with"],
+    {"uses": "./target/action-layout/owner/project/revision"},
+    "Action acceptance nested activation",
+)
+nested_activation_with = indented_block(
+    nested_activation,
+    "        with:",
+    "Action acceptance nested activation inputs must be unique",
+)
+require(
+    scalar_mapping(nested_activation_with, 10)
+    == {"mode": "audit", "invocation_id": "action-nested-layout"},
+    "Action acceptance nested activation must retain audit mode",
+)
+finalization_activation = require_step_contract(
+    action_job_blocks["action-finalization"],
+    "activate bundled Fence agent without post-ready warming",
+    ["uses", "with"],
+    {"uses": "./"},
+    "Action acceptance finalization activation",
+)
+finalization_activation_with = indented_block(
+    finalization_activation,
+    "        with:",
+    "Action acceptance finalization activation inputs must be unique",
+)
+require(
+    scalar_mapping(finalization_activation_with, 10)
+    == {"invocation_id": "action-finalization-${{ matrix.replica }}"},
+    "Action acceptance finalization replicas must use distinct strict invocations",
+)
+
+finalization = indented_block(
+    jobs,
+    "  action-finalization:",
+    "Action acceptance finalization matrix must be unique",
+)
+require(
+    "replica: [quiet-1, quiet-2, quiet-3]" in finalization
+    and "fail-fast: false" in finalization,
+    "Action acceptance must retain three non-cancelling finalization replicas",
+)
+
+require_exact_mapping_keys(
+    aggregate,
+    4,
+    ["name", "needs", "if", "timeout-minutes", "runs-on", "permissions", "steps"],
+    "Action acceptance aggregate fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(aggregate, 4)
+    == {
+        "name": "action acceptance",
+        "needs": "[prepare-candidate, action, zero-input, nested-layout, setup-failure, tamper, action-finalization]",
+        "if": "${{ always() && !cancelled() }}",
+        "timeout-minutes": "5",
+        "runs-on": "ubuntu-24.04",
+    },
+    "Action acceptance aggregate must retain its complete fail-closed dependency contract",
+)
+
+aggregate_permissions = indented_block(
+    aggregate,
+    "    permissions:",
+    "Action acceptance aggregate permissions must be unique",
+)
+require_exact_mapping_keys(
+    aggregate_permissions,
+    6,
+    ["actions", "contents"],
+    "Action acceptance aggregate permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(aggregate_permissions, 6)
+    == {"actions": "read", "contents": "read"},
+    "Action acceptance aggregate permissions must remain read-only",
+)
+aggregate_checkout = require_step_contract(
+    aggregate,
+    "checkout",
+    ["id", "if", "uses", "with"],
+    {
+        "id": "finalization-checkout",
+        "if": "${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}",
+        "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+    },
+    "Action acceptance finalization checkout",
+)
+aggregate_checkout_with = indented_block(
+    aggregate_checkout,
+    "        with:",
+    "Action acceptance finalization checkout inputs must be unique",
+)
+require(
+    scalar_mapping(aggregate_checkout_with, 10)
+    == {
+        "ref": "${{ needs.prepare-candidate.outputs.action_ref }}",
+        "persist-credentials": "false",
+    },
+    "Action acceptance finalization checkout must use the exact candidate without persisted credentials",
+)
+aggregate_verifier = require_step_contract(
+    aggregate,
+    "verify terminal jobs and downloadable logs",
+    ["id", "if", "env", "run"],
+    {
+        "id": "finalization-verifier",
+        "if": "${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}",
+        "run": "script/verify-protected-finalization action",
+    },
+    "Action acceptance finalization verifier",
+)
+aggregate_verifier_env = indented_block(
+    aggregate_verifier,
+    "        env:",
+    "Action acceptance finalization verifier environment must be unique",
+)
+require(
+    scalar_mapping(aggregate_verifier_env, 10) == {"GITHUB_TOKEN": "${{ github.token }}"},
+    "Action acceptance finalization verifier may receive only the job token",
+)
+aggregate_result_gate = require_step_contract(
+    aggregate,
+    "confirm bundled Action acceptance",
+    ["if", "env", "run"],
+    {"if": "${{ always() }}", "run": "|"},
+    "Action acceptance fail-closed result gate",
+)
+aggregate_result_env = indented_block(
+    aggregate_result_gate,
+    "        env:",
+    "Action acceptance result environment must be unique",
+)
+require(
+    scalar_mapping(aggregate_result_env, 10)
+    == {
+        "PREPARE_RESULT": "${{ needs.prepare-candidate.result }}",
+        "ACTION_RESULT": "${{ needs.action.result }}",
+        "ZERO_INPUT_RESULT": "${{ needs.zero-input.result }}",
+        "NESTED_LAYOUT_RESULT": "${{ needs.nested-layout.result }}",
+        "SETUP_FAILURE_RESULT": "${{ needs.setup-failure.result }}",
+        "TAMPER_RESULT": "${{ needs.tamper.result }}",
+        "FINALIZATION_RESULT": "${{ needs.action-finalization.result }}",
+        "FINALIZATION_CHECKOUT_OUTCOME": "${{ steps.finalization-checkout.outcome }}",
+        "FINALIZATION_VERIFIER_OUTCOME": "${{ steps.finalization-verifier.outcome }}",
+    }
+    and literal_run_body(
+        aggregate_result_gate,
+        "Action acceptance result gate must use a literal run body",
+    )
+    == (
+        "          for result in \\\n"
+        '            "$PREPARE_RESULT" \\\n'
+        '            "$ACTION_RESULT" \\\n'
+        '            "$ZERO_INPUT_RESULT" \\\n'
+        '            "$NESTED_LAYOUT_RESULT" \\\n'
+        '            "$SETUP_FAILURE_RESULT" \\\n'
+        '            "$TAMPER_RESULT" \\\n'
+        '            "$FINALIZATION_RESULT" \\\n'
+        '            "$FINALIZATION_CHECKOUT_OUTCOME" \\\n'
+        '            "$FINALIZATION_VERIFIER_OUTCOME"\n'
+        "          do\n"
+        '            if [[ "$result" != "success" ]]; then\n'
+        "              exit 1\n"
+        "            fi\n"
+        "          done\n"
+        '          echo "bundled Action acceptance passed"\n'
+    ),
+    "Action acceptance result gate must reject every unsuccessful prerequisite or verifier outcome",
+)
+for forbidden in ["verify-action-finalization:", "continue-on-error", "actions/cache", "contents: write"]:
+    require(forbidden not in workflow, "Action acceptance contains a forbidden redundant or mutable surface")
+
+integration_path = root / ".github/workflows/integration.yml"
+require(integration_path.is_file(), "Integration workflow is missing")
+integration_workflow = integration_path.read_text(encoding="utf-8")
+require(
+    workflow_uses(integration_workflow)
+    == collections.Counter(
+        {"actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 6}
+    ),
+    "Integration may use only the six reviewed checkout steps",
+)
+require_exact_mapping_keys(
+    integration_workflow,
+    0,
+    ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
+    "Integration top-level workflow contract must remain narrowly scoped",
+)
+require(
+    scalar_mapping(integration_workflow, 0) == {"name": "integration"},
+    "Integration workflow name must remain stable",
+)
+
+integration_triggers = indented_block(
+    integration_workflow,
+    "on:",
+    "Integration trigger contract must be unique",
+)
+require_exact_mapping_keys(
+    integration_triggers,
+    2,
+    ["push", "pull_request"],
+    "Integration must run only on main pushes and pull requests",
+)
+for trigger_name in ["push", "pull_request"]:
+    trigger = indented_block(
+        integration_triggers,
+        f"  {trigger_name}:",
+        f"Integration {trigger_name} trigger must be unique",
+    )
+    require_exact_mapping_keys(
+        trigger,
+        4,
+        ["branches"],
+        f"Integration {trigger_name} trigger must contain only a branch filter",
+    )
+    require(
+        re.findall(
+            r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
+            trigger,
+        )
+        == ["main"],
+        f"Integration {trigger_name} trigger must remain limited to main",
+    )
+
+integration_permissions = indented_block(
+    integration_workflow,
+    "permissions:",
+    "Integration top-level permissions must be unique",
+)
+require_exact_mapping_keys(
+    integration_permissions,
+    2,
+    ["contents"],
+    "Integration top-level permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(integration_permissions, 2) == {"contents": "read"},
+    "Integration top-level permissions must remain read-only",
+)
+
+integration_concurrency = indented_block(
+    integration_workflow,
+    "concurrency:",
+    "Integration concurrency must be unique",
+)
+require_exact_mapping_keys(
+    integration_concurrency,
+    2,
+    ["group", "cancel-in-progress"],
+    "Integration concurrency fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(integration_concurrency, 2)
+    == {
+        "group": "${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}",
+        "cancel-in-progress": "true",
+    },
+    "Integration concurrency must remain commit-scoped for stranded-host safety",
+)
+
+integration_jobs = indented_block(
+    integration_workflow,
+    "jobs:",
+    "Integration jobs contract must be unique",
+)
+integration_target_jobs = [
+    "lockdown",
+    "selected-profile-runtime",
+    "protected-run",
+    "protected-finalization",
+]
+require_exact_mapping_keys(
+    integration_jobs,
+    2,
+    ["preflight"] + integration_target_jobs + ["integration"],
+    "Integration must retain one preflight, four isolated matrices, and one terminal gate",
+)
+
+integration_preflight = indented_block(
+    integration_jobs,
+    "  preflight:",
+    "Integration preflight job must be unique",
+)
+require_exact_mapping_keys(
+    integration_preflight,
+    4,
+    ["name", "timeout-minutes", "runs-on", "steps"],
+    "Integration preflight fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(integration_preflight, 4)
+    == {
+        "name": "integration preflight",
+        "timeout-minutes": "5",
+        "runs-on": "ubuntu-24.04",
+    },
+    "Integration preflight must remain bounded on fixed ubuntu-24.04",
+)
+require(
+    re.findall(r"(?m)^      - name: ([^\n]+)$", integration_preflight)
+    == ["checkout", "validate locks"],
+    "Integration preflight steps must remain complete and ordered",
+)
+preflight_checkout = require_step_contract(
+    integration_preflight,
+    "checkout",
+    ["uses", "with"],
+    {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+    "Integration preflight checkout",
+)
+preflight_checkout_with = indented_block(
+    preflight_checkout,
+    "        with:",
+    "Integration preflight checkout inputs must be unique",
+)
+require(
+    scalar_mapping(preflight_checkout_with, 10) == {"persist-credentials": "false"},
+    "Integration preflight checkout must disable persisted credentials",
+)
+require_step_contract(
+    integration_preflight,
+    "validate locks",
+    ["run"],
+    {"run": "script/validate-locks --ci"},
+    "Integration preflight commit-global validation",
+)
+
+expected_target_timeouts = {
+    "lockdown": "8",
+    "selected-profile-runtime": "8",
+    "protected-run": "8",
+    "protected-finalization": "3",
+}
+expected_integration_steps = {
+    "lockdown": [
+        "checkout",
+        "observe hosted runner fingerprint candidate",
+        "prepare rust",
+        "bootstrap",
+        "test resident lifecycle evidence",
+        "test lockdown evidence",
+    ],
+    "selected-profile-runtime": [
+        "checkout",
+        "observe hosted runner fingerprint candidate",
+        "prepare rust",
+        "bootstrap",
+        "run selected profile runtime evidence",
+        "emit bounded late selected profile evidence",
+    ],
+    "protected-run": [
+        "checkout",
+        "observe hosted runner fingerprint candidate",
+        "prepare rust",
+        "bootstrap",
+        "run packaged trusted-launcher block",
+    ],
+    "protected-finalization": [
+        "checkout",
+        "observe hosted runner fingerprint candidate",
+        "prepare rust",
+        "bootstrap",
+        "run quiet packaged trusted-launcher block",
+    ],
+}
+for job_name in integration_target_jobs:
+    job = indented_block(
+        integration_jobs,
+        f"  {job_name}:",
+        f"Integration {job_name} job must be unique",
+    )
+    require_exact_mapping_keys(
+        job,
+        4,
+        ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
+        f"Integration {job_name} fields must remain narrowly scoped",
+    )
+    job_fields = scalar_mapping(job, 4)
+    require(
+        job_fields.get("needs") == "preflight"
+        and job_fields.get("timeout-minutes") == expected_target_timeouts[job_name]
+        and job_fields.get("runs-on") == "ubuntu-24.04",
+        f"Integration {job_name} must depend on preflight and remain bounded on fixed ubuntu-24.04",
+    )
+    strategy = indented_block(
+        job,
+        "    strategy:",
+        f"Integration {job_name} strategy must be unique",
+    )
+    require_exact_mapping_keys(
+        strategy,
+        6,
+        ["fail-fast", "matrix"],
+        f"Integration {job_name} strategy fields must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(strategy, 6).get("fail-fast") == "false",
+        f"Integration {job_name} must not hide sibling evidence",
+    )
+    require(
+        re.findall(r"(?m)^      - name: ([^\n]+)$", job)
+        == expected_integration_steps[job_name],
+        f"Integration {job_name} steps must remain complete and ordered",
+    )
+    target_checkout = require_step_contract(
+        job,
+        "checkout",
+        ["uses", "with"],
+        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        f"Integration {job_name} checkout",
+    )
+    target_checkout_with = indented_block(
+        target_checkout,
+        "        with:",
+        f"Integration {job_name} checkout inputs must be unique",
+    )
+    require(
+        scalar_mapping(target_checkout_with, 10) == {"persist-credentials": "false"},
+        f"Integration {job_name} checkout must disable persisted credentials",
+    )
+    require_step_contract(
+        job,
+        "observe hosted runner fingerprint candidate",
+        ["run"],
+        {"run": "script/observe-hosted-runner"},
+        f"Integration {job_name} host observation",
+    )
+    require_step_contract(
+        job,
+        "prepare rust",
+        ["run"],
+        {"run": "script/prepare-rust"},
+        f"Integration {job_name} Rust preparation",
+    )
+    require_step_contract(
+        job,
+        "bootstrap",
+        ["run"],
+        {"run": "script/bootstrap"},
+        f"Integration {job_name} bootstrap",
+    )
+
+lockdown = indented_block(
+    integration_jobs,
+    "  lockdown:",
+    "Integration lockdown job must be unique",
+)
+require(
+    "scenario: [acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]" in lockdown,
+    "Integration lockdown matrix must retain six isolated scenarios",
+)
+require_step_contract(
+    lockdown,
+    "test resident lifecycle evidence",
+    ["if", "run"],
+    {
+        "if": "${{ matrix.scenario == 'standard' }}",
+        "run": "script/test-privileged",
+    },
+    "Integration standard namespace evidence",
+)
+require_step_contract(
+    lockdown,
+    "test lockdown evidence",
+    ["run"],
+    {"run": 'script/test-lockdown "${{ matrix.scenario }}"'},
+    "Integration terminal lockdown evidence",
+)
+require(
+    lockdown.count("run: script/test-privileged") == 1
+    and lockdown.count('run: script/test-lockdown "${{ matrix.scenario }}"') == 1
+    and lockdown.index("run: script/test-privileged")
+    < lockdown.index('run: script/test-lockdown "${{ matrix.scenario }}"'),
+    "Integration standard lockdown must run namespace evidence before terminal host mutation",
+)
+
+selected_profile = indented_block(
+    integration_jobs,
+    "  selected-profile-runtime:",
+    "Integration selected-profile matrix must be unique",
+)
+require(
+    "scenario: [healthy, local-control-drift, worker-failure]" in selected_profile,
+    "Integration selected-profile matrix must retain all three health cases",
+)
+selected_profile_run = require_step_contract(
+    selected_profile,
+    "run selected profile runtime evidence",
+    ["env", "run"],
+    {"run": 'script/test-selected-profile-runtime "${{ matrix.scenario }}"'},
+    "Integration selected-profile runtime evidence",
+)
+selected_profile_env = indented_block(
+    selected_profile_run,
+    "        env:",
+    "Integration selected-profile environment must be unique",
+)
+require(
+    scalar_mapping(selected_profile_env, 10)
+    == {"SELECTED_PROFILE_RUNTIME_REPLICA": "${{ matrix.scenario }}"},
+    "Integration selected-profile runtime must retain scenario attribution",
+)
+selected_profile_report = require_step_contract(
+    selected_profile,
+    "emit bounded late selected profile evidence",
+    ["if", "env", "run"],
+    {
+        "if": "${{ matrix.scenario == 'healthy' }}",
+        "run": "script/report-selected-profile-runtime",
+    },
+    "Integration selected-profile late evidence",
+)
+selected_profile_report_env = indented_block(
+    selected_profile_report,
+    "        env:",
+    "Integration selected-profile late evidence environment must be unique",
+)
+require(
+    scalar_mapping(selected_profile_report_env, 10)
+    == {"SELECTED_PROFILE_RUNTIME_REPLICA": "${{ matrix.scenario }}"},
+    "Integration selected-profile late evidence must retain scenario attribution",
+)
+
+protected_run = indented_block(
+    integration_jobs,
+    "  protected-run:",
+    "Integration protected-run matrix must be unique",
+)
+protected_cases = re.findall(
+    r"(?m)^          - scenario: ([^\n]+)\n            replica: ([^\n]+)$",
+    protected_run,
+)
+require(
+    protected_cases
+    == [
+        ("standard", "first-connect-1"),
+        ("standard", "first-connect-2"),
+        ("standard", "first-connect-3"),
+        ("standard-opt-out", "required"),
+        ("unsafe-preserve", "required"),
+        ("wildcard-docker", "required"),
+        ("malformed-wildcard", "pre-mutation"),
+        ("audit", "required"),
+    ],
+    "Integration protected-run matrix must retain its complete isolated evidence set",
+)
+require_step_contract(
+    protected_run,
+    "run packaged trusted-launcher block",
+    ["run"],
+    {"run": 'script/test-protected-run "${{ matrix.scenario }}"'},
+    "Integration protected-run lifecycle evidence",
+)
+
+protected_finalization = indented_block(
+    integration_jobs,
+    "  protected-finalization:",
+    "Integration protected-finalization matrix must be unique",
+)
+require(
+    "replica: [quiet-1, quiet-2, quiet-3]" in protected_finalization,
+    "Integration must retain three protected finalization replicas",
+)
+require_step_contract(
+    protected_finalization,
+    "run quiet packaged trusted-launcher block",
+    ["run"],
+    {"run": "script/test-protected-run standard-finalization"},
+    "Integration protected finalization evidence",
+)
+
+integration_gate = indented_block(
+    integration_jobs,
+    "  integration:",
+    "Integration terminal gate must be unique",
+)
+require_exact_mapping_keys(
+    integration_gate,
+    4,
+    ["name", "needs", "if", "timeout-minutes", "runs-on", "permissions", "steps"],
+    "Integration terminal gate fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(integration_gate, 4)
+    == {
+        "name": "integration",
+        "needs": "[preflight, lockdown, selected-profile-runtime, protected-run, protected-finalization]",
+        "if": "${{ always() }}",
+        "timeout-minutes": "5",
+        "runs-on": "ubuntu-24.04",
+    },
+    "Integration terminal gate must depend on all evidence and remain bounded on fixed ubuntu-24.04",
+)
+integration_gate_permissions = indented_block(
+    integration_gate,
+    "    permissions:",
+    "Integration terminal permissions must be unique",
+)
+require_exact_mapping_keys(
+    integration_gate_permissions,
+    6,
+    ["actions", "contents"],
+    "Integration terminal permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(integration_gate_permissions, 6)
+    == {"actions": "read", "contents": "read"},
+    "Integration terminal permissions must remain read-only",
+)
+require(
+    re.findall(r"(?m)^      - name: ([^\n]+)$", integration_gate)
+    == [
+        "checkout",
+        "verify terminal jobs and downloadable logs",
+        "require prerequisite evidence",
+    ],
+    "Integration terminal steps must remain complete and ordered",
+)
+integration_checkout = require_step_contract(
+    integration_gate,
+    "checkout",
+    ["id", "uses", "with"],
+    {
+        "id": "checkout",
+        "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+    },
+    "Integration terminal checkout",
+)
+integration_checkout_with = indented_block(
+    integration_checkout,
+    "        with:",
+    "Integration terminal checkout inputs must be unique",
+)
+require(
+    scalar_mapping(integration_checkout_with, 10) == {"persist-credentials": "false"},
+    "Integration terminal checkout must disable persisted credentials",
+)
+integration_verifier = require_step_contract(
+    integration_gate,
+    "verify terminal jobs and downloadable logs",
+    ["id", "if", "env", "run"],
+    {
+        "id": "verify-finalization",
+        "if": "${{ always() && steps.checkout.outcome == 'success' && needs.protected-run.result == 'success' && needs.protected-finalization.result == 'success' }}",
+        "run": "script/verify-protected-finalization",
+    },
+    "Integration finalization verifier",
+)
+integration_verifier_env = indented_block(
+    integration_verifier,
+    "        env:",
+    "Integration finalization verifier environment must be unique",
+)
+require(
+    scalar_mapping(integration_verifier_env, 10) == {"GITHUB_TOKEN": "${{ github.token }}"},
+    "Integration finalization verifier may receive only the job token",
+)
+integration_result_gate = require_step_contract(
+    integration_gate,
+    "require prerequisite evidence",
+    ["if", "env", "run"],
+    {"if": "${{ always() }}", "run": "|"},
+    "Integration fail-closed result gate",
+)
+integration_result_env = indented_block(
+    integration_result_gate,
+    "        env:",
+    "Integration result environment must be unique",
+)
+require(
+    scalar_mapping(integration_result_env, 10)
+    == {
+        "PREFLIGHT_RESULT": "${{ needs.preflight.result }}",
+        "LOCKDOWN_RESULT": "${{ needs.lockdown.result }}",
+        "PROFILE_RESULT": "${{ needs.selected-profile-runtime.result }}",
+        "PROTECTED_RESULT": "${{ needs.protected-run.result }}",
+        "FINALIZATION_RESULT": "${{ needs.protected-finalization.result }}",
+        "FINALIZATION_VERIFIER_OUTCOME": "${{ steps.verify-finalization.outcome }}",
+    }
+    and literal_run_body(
+        integration_result_gate,
+        "Integration result gate must use a literal run body",
+    )
+    == (
+        "          for result in \\\n"
+        '            "$PREFLIGHT_RESULT" \\\n'
+        '            "$LOCKDOWN_RESULT" \\\n'
+        '            "$PROFILE_RESULT" \\\n'
+        '            "$PROTECTED_RESULT" \\\n'
+        '            "$FINALIZATION_RESULT" \\\n'
+        '            "$FINALIZATION_VERIFIER_OUTCOME"\n'
+        "          do\n"
+        '            if [[ "$result" != "success" ]]; then\n'
+        '              echo "required integration evidence did not succeed" >&2\n'
+        "              exit 1\n"
+        "            fi\n"
+        "          done\n"
+        '          echo "integration evidence passed"\n'
+    ),
+    "Integration result gate must reject every unsuccessful prerequisite or verifier outcome",
+)
+for forbidden in [
+    "verify-protected-finalization:",
+    "continue-on-error",
+    "actions/cache",
+    "contents: write",
+]:
+    require(forbidden not in integration_workflow, "Integration contains a forbidden redundant or mutable surface")
 
 nightly_path = root / ".github/workflows/action-acceptance-ubuntu-latest.yml"
 require(nightly_path.is_file(), "Nightly ubuntu-latest acceptance workflow is missing")
@@ -599,46 +2144,239 @@ for forbidden in [
     )
 
 readme = (root / "README.md").read_text(encoding="utf-8")
-nightly_badge = "[![nightly](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml)"
+ci_badges = [
+    f"[![{name}](https://github.com/GrantBirki/fence/actions/workflows/{name}.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/{name}.yml)"
+    for name in ["lint", "test", "build", "acceptance"]
+]
+release_canary_badge = "[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
+nightly_badge = "[![main / ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)"
+for name, badge in zip(["lint", "test", "build", "acceptance"], ci_badges):
+    require(
+        readme.count(badge) == 1
+        and readme.count(f"actions/workflows/{name}.yml/badge.svg") == 1,
+        f"README must expose exactly one {name} CI badge",
+    )
+require(
+    readme.count(release_canary_badge) == 1
+    and readme.count("actions/workflows/action-drift-canary.yml/badge.svg") == 1,
+    "README must expose exactly one scheduled published-release canary badge",
+)
 require(
     readme.count(nightly_badge) == 1,
-    "README must expose exactly one main-branch nightly ubuntu-latest status badge",
+    "README must expose exactly one scheduled main-source ubuntu-latest badge",
+)
+require(
+    readme.count("actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg") == 1,
+    "README must not expose an unfiltered duplicate nightly badge",
+)
+
+repository_settings = (root / "docs/repository-settings.md").read_text(encoding="utf-8")
+settings_checks_match = re.search(
+    r"(?m)^- Require status checks before merge:\n((?:  - `[^`]+`\n)+)",
+    repository_settings,
+)
+require(settings_checks_match is not None, "Repository settings required-check list is missing")
+settings_checks = re.findall(r"(?m)^  - `([^`]+)`$", settings_checks_match.group(1))
+require(
+    settings_checks
+    == ["lint", "test", "build", "acceptance", "action acceptance", "integration"],
+    "Repository settings required checks must match the release workflow",
+)
+require(
+    "Fence has no pre-merge macOS validation assurance." in repository_settings,
+    "Repository settings must disclose the absence of pre-merge macOS assurance",
 )
 
 canary_path = root / ".github/workflows/action-drift-canary.yml"
 require(canary_path.is_file(), "Action drift canary workflow is missing")
 canary = canary_path.read_text(encoding="utf-8")
-trigger_marker = "\non:\n"
-permissions_marker = "\npermissions:\n"
-defaults_marker = "\ndefaults:\n"
-concurrency_marker = "\nconcurrency:\n"
-jobs_marker = "\njobs:\n"
-for marker in [
-    trigger_marker,
-    permissions_marker,
-    defaults_marker,
-    concurrency_marker,
-    jobs_marker,
-]:
-    require(canary.count(marker) == 1, "Action drift canary top-level contract is invalid")
-triggers = canary.split(trigger_marker, 1)[1].split(permissions_marker, 1)[0]
-permissions = canary.split(permissions_marker, 1)[1].split(defaults_marker, 1)[0]
-concurrency = canary.split(concurrency_marker, 1)[1].split(jobs_marker, 1)[0]
-for fragment in [
-    '  schedule:\n    - cron: "23 13 * * *"',
-    "  workflow_dispatch:\n    inputs:\n      action_ref:",
-    "  workflow_call:\n    inputs:\n      action_ref:",
-]:
-    require(fragment in triggers, "Action drift canary triggers must remain fixed and reusable")
-for forbidden_trigger in ["  push:", "  pull_request:", "  repository_dispatch:"]:
-    require(forbidden_trigger not in triggers, "Action drift canary contains an unreviewed trigger")
-require(permissions == "  contents: read\n", "Action drift canary permissions must be read-only")
+require_exact_mapping_keys(
+    canary,
+    0,
+    ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
+    "Action drift canary top-level contract must remain narrowly scoped",
+)
 require(
-    concurrency == "  group: action-drift-canary-${{ inputs.action_ref || github.sha }}\n  cancel-in-progress: false\n",
+    scalar_mapping(canary, 0) == {"name": "action drift canary"},
+    "Action drift canary workflow name must remain stable",
+)
+
+canary_triggers = indented_block(
+    canary,
+    "on:",
+    "Action drift canary trigger contract must be unique",
+)
+require_exact_mapping_keys(
+    canary_triggers,
+    2,
+    ["schedule", "workflow_dispatch", "workflow_call"],
+    "Action drift canary may run only on schedule, manual dispatch, or reusable call",
+)
+canary_schedule = indented_block(
+    canary_triggers,
+    "  schedule:",
+    "Action drift canary schedule must be unique",
+)
+canary_schedule_lines = [
+    line
+    for line in canary_schedule.splitlines()[1:]
+    if line.strip() and not line.lstrip().startswith("#")
+]
+require(
+    canary_schedule_lines == ['    - cron: "23 13 * * *"'],
+    "Action drift canary schedule must run daily at 13:23 UTC",
+)
+
+for trigger_name, expected_required in [
+    ("workflow_dispatch", "false"),
+    ("workflow_call", "true"),
+]:
+    trigger_label = "manual" if trigger_name == "workflow_dispatch" else "reusable"
+    trigger = indented_block(
+        canary_triggers,
+        f"  {trigger_name}:",
+        f"Action drift canary {trigger_label} trigger must be unique",
+    )
+    require_exact_mapping_keys(
+        trigger,
+        4,
+        ["inputs"],
+        f"Action drift canary {trigger_label} trigger may expose only its reviewed inputs",
+    )
+    trigger_inputs = indented_block(
+        trigger,
+        "    inputs:",
+        f"Action drift canary {trigger_label} inputs must be unique",
+    )
+    require_exact_mapping_keys(
+        trigger_inputs,
+        6,
+        ["action_ref"],
+        f"Action drift canary {trigger_label} trigger may expose only action_ref",
+    )
+    action_ref_input = indented_block(
+        trigger_inputs,
+        "      action_ref:",
+        f"Action drift canary {trigger_label} action_ref input must be unique",
+    )
+    require_exact_mapping_keys(
+        action_ref_input,
+        8,
+        ["description", "required", "type"],
+        f"Action drift canary {trigger_label} action_ref fields must remain narrowly scoped",
+    )
+    action_ref_fields = scalar_mapping(action_ref_input, 8)
+    require(
+        action_ref_fields.get("required") == expected_required
+        and action_ref_fields.get("type") == "string",
+        f"Action drift canary {trigger_label} action_ref required/type contract changed",
+    )
+
+canary_permissions = indented_block(
+    canary,
+    "permissions:",
+    "Action drift canary permissions must be unique",
+)
+require_exact_mapping_keys(
+    canary_permissions,
+    2,
+    ["contents"],
+    "Action drift canary permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_permissions, 2) == {"contents": "read"},
+    "Action drift canary permissions must be read-only",
+)
+canary_concurrency = indented_block(
+    canary,
+    "concurrency:",
+    "Action drift canary concurrency must be unique",
+)
+require_exact_mapping_keys(
+    canary_concurrency,
+    2,
+    ["group", "cancel-in-progress"],
+    "Action drift canary concurrency fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_concurrency, 2)
+    == {
+        "group": "action-drift-canary-${{ inputs.action_ref || github.sha }}",
+        "cancel-in-progress": "false",
+    },
     "Action drift canary concurrency must be commit-scoped and non-cancelling",
 )
+
+canary_jobs = indented_block(
+    canary,
+    "jobs:",
+    "Action drift canary jobs contract must be unique",
+)
+require_exact_mapping_keys(
+    canary_jobs,
+    2,
+    ["canary"],
+    "Action drift canary must contain exactly one canary job",
+)
+canary_job = indented_block(
+    canary_jobs,
+    "  canary:",
+    "Action drift canary job must be unique",
+)
+require_exact_mapping_keys(
+    canary_job,
+    4,
+    ["name", "strategy", "timeout-minutes", "runs-on", "steps"],
+    "Action drift canary job fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_job, 4)
+    == {
+        "name": "${{ matrix.runner }} zero-input canary",
+        "timeout-minutes": "8",
+        "runs-on": "${{ matrix.runner }}",
+    },
+    "Action drift canary must name and route each job through the reviewed runner matrix",
+)
+canary_strategy = indented_block(
+    canary_job,
+    "    strategy:",
+    "Action drift canary strategy must be unique",
+)
+require_exact_mapping_keys(
+    canary_strategy,
+    6,
+    ["fail-fast", "matrix"],
+    "Action drift canary strategy fields must remain narrowly scoped",
+)
+require(
+    scalar_mapping(canary_strategy, 6) == {"fail-fast": "false"},
+    "Action drift canary matrix must not cancel its other runner",
+)
+canary_matrix = indented_block(
+    canary_strategy,
+    "      matrix:",
+    "Action drift canary matrix must be unique",
+)
+require_exact_mapping_keys(
+    canary_matrix,
+    8,
+    ["runner"],
+    "Action drift canary matrix may select only its reviewed runner dimension",
+)
+require(
+    scalar_mapping(canary_matrix, 8)
+    == {
+        "runner": "${{ fromJSON(inputs.action_ref == '' && '[\"ubuntu-24.04\",\"ubuntu-latest\"]' || '[\"ubuntu-24.04\"]') }}",
+    },
+    "Action drift canary runner matrix must use both reviewed labels only when action_ref is absent",
+)
+require(
+    len(re.findall(r"(?m)^\s*runs-on:", canary)) == 1,
+    "Action drift canary must source exactly one runs-on field from its reviewed matrix",
+)
+
 canary_fragments = [
-    "runs-on: ubuntu-24.04",
     "uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
     "persist-credentials: false",
     "run: script/validate-locks --ci",
@@ -659,7 +2397,6 @@ canary_fragments = [
 for fragment in canary_fragments:
     require(fragment in canary, "Action drift canary contract is incomplete")
 
-require(canary.count("runs-on: ubuntu-24.04") == 1, "Action drift canary must use one fixed runner")
 require(canary.count("uses: ./") == 1, "Action drift canary must activate the bundle exactly once")
 require(
     canary.count("script/test-action-acceptance standard") == 1,
@@ -668,10 +2405,10 @@ require(
 
 for forbidden in [
     "continue-on-error",
-    "actions/upload-artifact",
+    "upload-artifact",
     "journalctl",
     "systemctl status",
-    "ubuntu-latest",
+    "::warning",
 ]:
     require(forbidden not in canary, "Action drift canary contains a forbidden escape path")
 require(
@@ -750,18 +2487,118 @@ require(
     },
     "Release Action acceptance must retain the fixed default runner",
 )
-for required_check in [
-    '"build"',
-    '"coverage"',
-    '"lint (macos-14)"',
-    '"lint (ubuntu-24.04)"',
-    '"acceptance"',
-    '"action acceptance"',
-    '"integration"',
-    '"test (macos-14)"',
-    '"test (ubuntu-24.04)"',
-]:
-    require(required_check in release, "Release workflow is missing a protected source check")
+require(
+    release.count("uses: ./.github/workflows/action-drift-canary.yml") == 1,
+    "Release workflow must invoke the drift canary exactly once",
+)
+release_canary = indented_block(
+    release,
+    "  candidate-drift-canary:",
+    "Release drift canary caller must be unique",
+)
+require_exact_mapping_keys(
+    release_canary,
+    4,
+    ["if", "needs", "permissions", "uses", "with"],
+    "Release drift canary caller must remain a direct, narrowly scoped reusable-workflow gate",
+)
+require(
+    scalar_mapping(release_canary, 4)
+    == {
+        "if": "needs.prepare.outputs.should_release == 'true'",
+        "needs": "[prepare, create-candidate]",
+        "uses": "./.github/workflows/action-drift-canary.yml",
+    },
+    "Release drift canary must remain an unconditional fixed-workflow gate on the exact candidate",
+)
+release_canary_permissions = indented_block(
+    release_canary,
+    "    permissions:",
+    "Release drift canary permissions must be unique",
+)
+require_exact_mapping_keys(
+    release_canary_permissions,
+    6,
+    ["contents"],
+    "Release drift canary permissions must remain narrowly scoped",
+)
+require(
+    scalar_mapping(release_canary_permissions, 6) == {"contents": "read"},
+    "Release drift canary permissions must remain read-only",
+)
+release_canary_with = indented_block(
+    release_canary,
+    "    with:",
+    "Release drift canary inputs must be unique",
+)
+require_exact_mapping_keys(
+    release_canary_with,
+    6,
+    ["action_ref"],
+    "Release drift canary may receive only the exact candidate Action SHA",
+)
+require(
+    scalar_mapping(release_canary_with, 6)
+    == {"action_ref": "${{ needs.create-candidate.outputs.action_commit }}"},
+    "Release drift canary must receive the exact candidate Action SHA and remain fixed-label",
+)
+release_wait = indented_block(
+    release,
+    "  wait-required-checks:",
+    "Release required-check gate must be unique",
+)
+release_check_step = require_step_contract(
+    release_wait,
+    "require all protected source checks on the exact commit",
+    ["env", "run"],
+    {"run": "|"},
+    "Release protected source-check step",
+)
+release_check_env = indented_block(
+    release_check_step,
+    "        env:",
+    "Release protected source-check environment must be unique",
+)
+require(
+    scalar_mapping(release_check_env, 10)
+    == {
+        "GH_TOKEN": "${{ github.token }}",
+        "SOURCE_COMMIT": "${{ needs.prepare.outputs.source_commit }}",
+    },
+    "Release protected source-check step must use only the exact commit and job token",
+)
+release_check_script_match = re.search(
+    r"(?ms)^        run: \|\n          python3 - <<'PY'\n(.*?)^          PY$",
+    release_check_step,
+)
+require(
+    release_check_script_match is not None,
+    "Release protected source-check Python gate must be explicit",
+)
+release_check_tree = ast.parse(
+    textwrap.dedent(release_check_script_match.group(1)),
+    filename=".github/workflows/release.yml:required-checks",
+)
+required_assignments = [
+    node
+    for node in ast.walk(release_check_tree)
+    if isinstance(node, ast.Assign)
+    and len(node.targets) == 1
+    and isinstance(node.targets[0], ast.Name)
+    and node.targets[0].id == "required"
+]
+require(
+    len(required_assignments) == 1
+    and isinstance(required_assignments[0].value, ast.Set)
+    and all(
+        isinstance(element, ast.Constant) and isinstance(element.value, str)
+        for element in required_assignments[0].value.elts
+    )
+    and {element.value for element in required_assignments[0].value.elts}
+    == {"lint", "test", "build", "acceptance", "action acceptance", "integration"},
+    "Release workflow protected source checks must match the repository ruleset",
+)
+require("all nine required checks" not in release, "Release logs must not claim the superseded check count")
 require("workflow_dispatch:" not in release, "Release workflow must not be manually dispatchable")
 require(release.count("      contents: write") == 3, "Only candidate, publication, and guarded cleanup jobs may write contents")
 require(release.count("    environment: release") == 3, "Every release mutation must use the protected release environment")

@@ -29,9 +29,13 @@ concurrency:
 
 jobs:
   canary:
-    name: fixed ubuntu-24.04 zero-input canary
+    name: ${{ matrix.runner }} zero-input canary
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.action_ref == '' && '["ubuntu-24.04","ubuntu-latest"]' || '["ubuntu-24.04"]') }}
     timeout-minutes: 8
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: resolve immutable Action commit

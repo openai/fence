@@ -17,7 +17,7 @@ inputs:
     description: Optional platform profile; only github_hosted_workflow_bootstrap_v5 is supported
     required: false
   disable_broad_github_domains:
-    description: Set true to remove github.com, api.github.com, and release-assets.githubusercontent.com from the default GitHub compatibility profile
+    description: Set true to remove github.com, api.github.com, release-assets.githubusercontent.com, the optional hosted-runner watchdog, and new platform-origin *.githubapp.com authorizations from the default GitHub compatibility profile
     required: false
   allowlist:
     description: Optional multiline allowlist entries such as example.com, exact-depth *.example.com or *.*.example.com patterns, example.com:8443, or cidr 192.0.2.0/24 udp 123

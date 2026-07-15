@@ -5,10 +5,11 @@
 [![build](https://github.com/GrantBirki/fence/actions/workflows/build.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/build.yml)
 [![acceptance](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)
 [![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
-[![nightly](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml)
+[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)
+[![main / ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)
 [![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
 
-Fence runs first in a GitHub Actions job, allows only GitHub workflow traffic plus your `allowlist`, blocks other outbound network access, and turns off passwordless sudo and Docker by default.
+Fence runs first in a GitHub Actions job, applies a bounded built-in GitHub Actions and hosted-runner platform policy plus your `allowlist`, blocks other outbound network access, and turns off passwordless sudo and Docker by default.
 
 ![Fence](./docs/assets/fence.png)
 
@@ -80,7 +81,7 @@ Keep Docker/container access available while still applying network restrictions
 
 The wildcard can authorize exact-depth names such as `auth.docker.io`, but image pulls may require additional registry, layer, CDN, or storage destinations.
 
-Remove the broad GitHub web, API, release-asset, and watchdog destinations while keeping the core Actions reporting path:
+Remove the broad GitHub web, API, release-asset, and watchdog destinations and new platform-origin `*.githubapp.com` authorizations while keeping the core Actions reporting path:
 
 ```yaml
 - uses: GrantBirki/fence@<commit-sha>
@@ -127,7 +128,7 @@ Fence validates that it is running through the supported Action path, turns your
 ```mermaid
 flowchart LR
     start["Fence runs first"] --> verify["Validate runner and trusted bundle"]
-    verify --> policy["Build GitHub traffic and user policy"]
+    verify --> policy["Build built-in platform and user policy"]
     policy --> controls["Apply mode-specific controls"]
     controls --> monitor["Monitor controls during the job"]
     monitor --> report["Report evidence and critical drift"]
@@ -139,7 +140,7 @@ flowchart LR
 
 | Mode | What It Does | When To Use It |
 | --- | --- | --- |
-| `block` | Blocks network traffic outside GitHub workflow traffic and your `allowlist`; turns off passwordless sudo and Docker. | Default for locking down a job. |
+| `block` | Blocks network traffic unless it matches the bounded built-in GitHub Actions and hosted-runner platform policy or your `allowlist`; turns off passwordless sudo and Docker. | Default for locking down a job. |
 | `block` with `container_policy: unsafe_preserve` | Blocks network traffic and turns off passwordless sudo, but leaves Docker/container access available. | When a workflow needs Docker and you accept the weaker security claim. |
 | `audit` | Does not block traffic. Records what would need review before moving to `block`. | When tuning a workflow. |
 
@@ -148,6 +149,8 @@ flowchart LR
 ## Security Notes 🔒
 
 Fence reduces where later workflow steps can send data and removes common ways to undo the lockdown. It is not a full sandbox, does not make a runner perfectly hermetic, and currently supports only GitHub-hosted `ubuntu-24.04` x64 host jobs.
+
+Activation fails closed unless the live host matches Fence's reviewed fingerprint. Sudo policy files remain byte-exact except for the first line of `90-cloud-init-users`, which must match cloud-init's generated version/timestamp header; Fence hashes every remaining byte and retains a raw whole-file runtime pin so later changes are still detected.
 
 The built-in GitHub destinations are a compatibility tradeoff because later workflow code can also reach them. Pin Fence to the full immutable `action_commit` SHA from a release, use `disable_broad_github_domains: true` when the narrower GitHub path is sufficient, and treat `container_policy: unsafe_preserve` as a deliberately weaker mode.
 

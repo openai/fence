@@ -1,5 +1,5 @@
 use crate::IMPLEMENTATION_PHASE;
-use crate::hosted_runner::{HostedRunnerFingerprintV2, hosted_runner_fingerprint_requirement};
+use crate::hosted_runner::{HostedRunnerFingerprintV3, hosted_runner_fingerprint_requirement};
 use serde::Serialize;
 use std::path::Path;
 
@@ -57,7 +57,7 @@ pub struct SupportData {
     pub reasons: Vec<&'static str>,
     pub deferred_capability_probes: Vec<&'static str>,
     pub network_backend: NetworkBackendObservation,
-    pub hosted_runner_fingerprint: HostedRunnerFingerprintV2,
+    pub hosted_runner_fingerprint: HostedRunnerFingerprintV3,
 }
 
 pub fn inspect_support(provider: &dyn SupportProvider) -> SupportData {

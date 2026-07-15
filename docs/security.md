@@ -4,7 +4,9 @@ Fence reduces where later workflow steps can send data and removes common ways f
 
 ## Supported Boundary
 
-The protected v0 target is a GitHub-hosted `ubuntu-24.04` x64 host job running the native Linux GNU Action bundle. The non-required `nightly` workflow runs daily and by input-free manual dispatch, fails closed unless the exact selected ref is `main`, builds an ephemeral production-shaped candidate from that exact `main` source SHA, and executes the complete Action-acceptance target matrix on `ubuntu-latest`. It is not a branch-protection or release gate. A green result means only that the image currently selected by the floating label matched Fence's reviewed fingerprint and passed the complete suite; a future image selected by `ubuntu-latest` is not automatically trusted, and the result does not expand the support claim. Container jobs, other runner images, self-hosted runners, other architectures, and direct CLI launches do not establish the protected production lifecycle.
+The protected v0 target is a GitHub-hosted `ubuntu-24.04` x64 host job running the native Linux GNU Action bundle. Container jobs, other runner images, self-hosted runners, other architectures, and direct CLI launches do not establish the protected production lifecycle.
+
+Two non-required workflows provide operational compatibility evidence without expanding that boundary. `nightly` builds an ephemeral production-shaped candidate from the exact current `main` source SHA and runs the complete unique-case Action-acceptance suite on `ubuntu-latest`. Scheduled and input-free manual `action drift canary` runs resolve the newest non-prerelease immutable release, validate its `action-release.json`, and run the mapped release's zero-input standard lifecycle on both `ubuntu-24.04` and `ubuntu-latest`; explicit-SHA diagnostics and reusable release-candidate validation remain fixed to `ubuntu-24.04`. The scheduled compatibility signals are not branch-protection or release gates; the fixed-label reusable canary remains part of release validation. A green floating-label result means only that the image currently selected by `ubuntu-latest` matched Fence's reviewed fingerprint and passed its applicable suite; a future image is not automatically trusted.
 
 Fence should run before checkout and all other steps that need restriction. It checks a reviewed hosted-runner fingerprint before mutation, but it does not authenticate a privileged command or platform component that was already compromised before Fence started.
 
@@ -23,6 +25,8 @@ The built-in GitHub policy is a compatibility tradeoff. Core Actions status and 
 Set `disable_broad_github_domains: true` to remove `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the exact optional hosted-runner watchdog, and new platform-origin broad GitHub application authorizations. This does not remove the core reporting path, exact results-storage compatibility, or an explicit user wildcard.
 
 GitHub's authorized results-storage accounts are also reachable over TCP port `443` for the rest of the job after authorization. Fence limits dynamic authorization to DNS requests from the pinned runner process and records the bounded authorization locally; it does not permit the general Azure Blob Storage suffix.
+
+Separate hosted-runner platform rules permit root-only access to Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526`, plus host and forwarded access to Azure IMDS at `169.254.169.254` on TCP port `80`. These are built-in platform channels rather than user allowlist entries: later workflow code can use the shared IMDS rule, while any root-owned host process can use the WireServer rules.
 
 ## Integrity And Drift
 

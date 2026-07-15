@@ -2,10 +2,7 @@
 
 ## Scope
 
-This review covers the v0 Linux agent, DNS-mediated selected platform profile,
-native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted
-lockdown controls, bundled Action wrapper, release provenance workflow, and
-offline validation scripts as of June 2026.
+This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-13.
 
 This document records focused review findings. The current trust assumptions,
 attacker capabilities, abuse paths, and residual-risk priorities are defined in
@@ -104,13 +101,17 @@ a bounded regular file.
 
 ### Exact hosted sudo-policy variants
 
-Fresh hosted evidence has shown additional exact digests for the fixed `90-cloud-init-users` sudo-policy source. During a later mixed image rollout, three independent hosted VMs on the new image matched one additional digest while a separate older-image control retained an already accepted variant; after excluding non-enforced volatile device, inode, PID, and start-time identifiers, the complete bounded observations were otherwise identical. The fingerprint accepts each observed digest only as an additional exact value and retains the same source name, regular-file, ownership, mode, non-writability, marker, unit, socket, resolver, principal, group, and local-control checks.
+Earlier hosted evidence showed additional exact whole-file digests for the fixed `90-cloud-init-users` sudo-policy source. During a mixed image rollout, three independent hosted VMs on the new image matched one additional digest while a separate older-image control retained an already accepted variant; after excluding non-enforced volatile device, inode, PID, and start-time identifiers, the complete bounded observations were otherwise identical. Fingerprint schema `2` accepted each reviewed digest as an additional exact value while retaining the same source name, regular-file, ownership, mode, non-writability, marker, unit, socket, resolver, principal, group, and local-control checks.
+
+### Generated cloud-init sudo header normalization
+
+Cloud-init constructs the first `90-cloud-init-users` line from its package version and the current RFC 2822 timestamp before writing the policy body, so whole-file digests turn expected image-build metadata changes into recurring fingerprint maintenance. Cloud-init's own integration coverage compares this file after omitting that first line. Fingerprint schema `3` therefore requires a digest profile for every sudo source: `sudoers`, `README`, and `runner` remain `exact_file_v1`, while only the exact `drop_in` / `90-cloud-init-users` identity may use `cloud_init_generated_header_v1`. That profile accepts exactly one first line matching the reviewed cloud-init version/timestamp grammar, rejects missing, malformed, repeated, or non-UTC headers, and computes a domain-separated SHA-256 over every remaining byte without normalizing comments, whitespace, rules, or line endings. The lockdown path separately pins the raw whole-file SHA-256 after acceptance, so a later header-only or body mutation still fails resident verification. The relevant upstream behavior is public in [cloud-init's header generator](https://github.com/canonical/cloud-init/blob/a97e74661b12f16d1f8554d572698494e62d4fd9/cloudinit/util.py#L2318-L2323) and [its sudo policy integration test](https://github.com/canonical/cloud-init/blob/a97e74661b12f16d1f8554d572698494e62d4fd9/tests/integration_tests/modules/test_users_groups.py#L190-L206).
 
 ### Effective sudo and trusted-path access
 
 The production fingerprint previously relied on ownership and ordinary mode
 metadata without proving the runner's effective access after ACL processing.
-Fingerprint schema `2` now records every trusted executable, its reviewed
+Fingerprint schema `2` introduced records for every trusted executable, its reviewed
 ancestor directories, and every accepted sudo source. Before mutation, Fence
 uses descriptor-pinned `sudo` and descriptor-pinned `/usr/bin/test` to require
 that the runner cannot write any of those paths, can execute the fixed commands
@@ -145,7 +146,7 @@ Standard lockdown previously verified only named Docker/containerd units and
 sockets, so an additive rootful control endpoint outside that fixed list could
 escape the support gate. Three corrected same-image observations supplied one
 stable, within-bounds, reachability-complete, and ownership-complete reference.
-Fingerprint schema `2` now accepts the exact two root container identities,
+Fingerprint schema `2` introduced acceptance of the exact two root container identities,
 wildcard IPv4/IPv6 TCP port `22` listeners, and ten domain-separated Unix
 listener identities with reviewed owner sets and multiplicities.
 
@@ -178,7 +179,7 @@ attempt is rejected.
 
 ### Source-before-bundle host compatibility
 
-The ephemeral source-built candidate and published distribution bundle expose fingerprint schema `2`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, sudo source, principal, group, unit, socket, workload, and local-control fact before destructive activation. The candidate, release validation, and fixed-runner canary require normal activation and do not accept a classifier skip. Malformed, incomplete, mismatched, and unknown drift fails.
+The ephemeral source-built candidate and published distribution bundle expose fingerprint schema `3`. Action acceptance recursively validates the bounded schema-`4` live observation and compares every enforced executable, ancestor, effective-access, resolver, profile-specific sudo source digest, principal, group, unit, socket, workload, and local-control fact before destructive activation. The candidate, release validation, and fixed-runner canary require normal activation and do not accept a classifier skip. Malformed, incomplete, mismatched, and unknown drift fails.
 
 ### Invocation slug consistency
 
@@ -277,12 +278,7 @@ compile TypeScript at workflow runtime. See Node's
   up to eight single-label `*.githubapp.com` names;
   `disable_broad_github_domains: true` removes those broad channels but retains
   core Actions status/finalization channels.
-- Explicit user wildcard patterns authorize at most eight concrete names per
-  invocation across all patterns. Each wildcard matches exactly one DNS label,
-  but the admitted query labels, matching HTTPS destinations, shared resolved
-  addresses, and bounded external CNAME descendants remain exfiltration
-  channels. Fence validates DNS structure rather than registrable-domain
-  ownership and carries no public-suffix database.
+- Explicit user wildcard patterns may contain one or two leading whole-label wildcards and authorize at most eight concrete names per invocation across all patterns. Each `*` matches exactly one DNS label, but the admitted query labels, matching HTTPS destinations, shared resolved addresses, and bounded external CNAME descendants remain exfiltration channels. Fence validates DNS structure rather than registrable-domain ownership and carries no public-suffix database.
 - The exact `productionresultssa19.blob.core.windows.net` account is always a
   reachable TCP `443` compatibility channel. Other matching results-storage
   accounts remain runner-authorized and bounded.

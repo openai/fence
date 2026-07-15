@@ -16,12 +16,13 @@ defaults:
     shell: bash
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
   acceptance:
     name: acceptance
+    timeout-minutes: 15
     runs-on: ubuntu-24.04
 
     steps:
@@ -38,6 +39,12 @@ jobs:
 
       - name: bootstrap
         run: script/bootstrap
+
+      - name: install retained cross-build tools
+        run: script/install-zig
+
+      - name: verify retained cross-build tools
+        run: script/verify-release-toolchain
 
       - name: build packaged Linux x64 artifact
         env:

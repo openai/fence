@@ -184,19 +184,32 @@ require(
     "support nft path mismatch",
 )
 require(data["network_backend"]["nft_binary_present"] is True, "support omitted nft binary")
-require(data["hosted_runner_fingerprint"]["schema_version"] == 2, "support fingerprint schema mismatch")
+require(data["hosted_runner_fingerprint"]["schema_version"] == 3, "support fingerprint schema mismatch")
 require(data["hosted_runner_fingerprint"]["status"] == "accepted_reference_not_checked", "support fingerprint status mismatch")
 require(
     data["hosted_runner_fingerprint"]["accepted"]["expected_principal"] == "runner",
     "support fingerprint principal mismatch",
 )
+sources = data["hosted_runner_fingerprint"]["accepted"]["sudo_policy_sources"]
 require(
     any(
         source["name"] == "runner"
         and source["runner_nopasswd_markers"] == ["principal"]
-        for source in data["hosted_runner_fingerprint"]["accepted"]["sudo_policy_sources"]
+        for source in sources
     ),
     "support fingerprint did not classify the runner sudo source",
+)
+require(
+    all(
+        source["digest_profile"]
+        == (
+            "cloud_init_generated_header_v1"
+            if source["name"] == "90-cloud-init-users"
+            else "exact_file_v1"
+        )
+        for source in sources
+    ),
+    "support fingerprint sudo digest profile mismatch",
 )
 PY
 
