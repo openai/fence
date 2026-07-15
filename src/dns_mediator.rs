@@ -4908,20 +4908,21 @@ fn authorized_hostname(
     if cname_policy_for_authorized_name(hostname, state, hostname_policy).is_some() {
         return true;
     }
-    admit_user_wildcard_hostname(hostname, state, hostname_policy);
     if matches_results_storage_hostname(hostname) && hostname_policy.exact_entry(hostname).is_none()
     {
         if !state.runner_authorized_results_storage.contains(hostname)
             && state.runner_authorized_results_storage.len() >= MAX_RESULTS_STORAGE_AUTHORIZATIONS
         {
             state.runner_authorized_results_storage_truncated = true;
-        } else {
-            state
-                .runner_authorized_results_storage
-                .insert(hostname.to_owned());
+            return false;
         }
+        state
+            .runner_authorized_results_storage
+            .insert(hostname.to_owned());
+        admit_user_wildcard_hostname(hostname, state, hostname_policy);
         return hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some();
     }
+    admit_user_wildcard_hostname(hostname, state, hostname_policy);
     if matches_constrained_dynamic_githubapp_suffix_hostname(hostname, hostname_policy) {
         if !state.bounded_githubapp_suffix.contains(hostname)
             && state.bounded_githubapp_suffix.len() >= MAX_DYNAMIC_GITHUBAPP_SUFFIX_AUTHORIZATIONS
@@ -7966,7 +7967,7 @@ mod tests {
         );
 
         let results_config = parse_and_normalize(
-            br#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-results","allowlist":[{"destination_type":"hostname","destination":"*.blob.core.windows.net","protocol":"tcp","port":443}]}"#,
+            br#"{"schema_version":1,"mode":"block","invocation_id":"wildcard-results","allowlist":[{"destination_type":"hostname","destination":"*.blob.core.windows.net","protocol":"tcp","port":8443}]}"#,
         )
         .unwrap();
         let results_policy = crate::hostname_policy::build_runtime_hostname_policy(&results_config);
@@ -7996,6 +7997,61 @@ mod tests {
             results_authorizations
                 .bounded_user_wildcard
                 .contains(results_hostname)
+        );
+        for account in [1, 2, 3] {
+            assert!(authorized_hostname(
+                &format!("productionresultssa{account}.blob.core.windows.net"),
+                &mut results_authorizations,
+                now,
+                &results_policy,
+                DnsQueryProvenance::TrustedRunnerWorker,
+            ));
+        }
+        assert_eq!(
+            results_authorizations
+                .runner_authorized_results_storage
+                .len(),
+            MAX_RESULTS_STORAGE_AUTHORIZATIONS
+        );
+        let over_capacity = "productionresultssa4.blob.core.windows.net";
+        assert!(!authorized_hostname(
+            over_capacity,
+            &mut results_authorizations,
+            now,
+            &results_policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        assert!(results_authorizations.runner_authorized_results_storage_truncated);
+        assert!(
+            !results_authorizations
+                .runner_authorized_results_storage
+                .contains(over_capacity)
+        );
+        assert!(
+            !results_authorizations
+                .bounded_user_wildcard
+                .contains(over_capacity)
+        );
+        assert!(
+            hostname_policy_for_authorized_name(
+                over_capacity,
+                &results_authorizations,
+                &results_policy,
+            )
+            .is_none()
+        );
+        assert!(authorized_hostname(
+            results_hostname,
+            &mut results_authorizations,
+            now,
+            &results_policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        assert_eq!(
+            results_authorizations
+                .runner_authorized_results_storage
+                .len(),
+            MAX_RESULTS_STORAGE_AUTHORIZATIONS
         );
     }
 
