@@ -1,3 +1,4 @@
+use crate::attribution::SocketProtocol;
 use crate::config::Mode;
 use crate::findings::{
     ConnectionEvent, ConnectionFinding, bounded_timestamp_now, connection_event_from_prefix,
@@ -23,6 +24,7 @@ const NFLOG_PACKET_MESSAGE: u16 = (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_PACKET;
 const NFLOG_CONFIG_MESSAGE: u16 = (NFNL_SUBSYS_ULOG << 8) | NFULNL_MSG_CONFIG;
 const NFULA_PAYLOAD: u16 = libc::NFULA_PAYLOAD as u16;
 const NFULA_PREFIX: u16 = libc::NFULA_PREFIX as u16;
+const NFULA_IFINDEX_INDEV: u16 = libc::NFULA_IFINDEX_INDEV as u16;
 const NLA_TYPE_MASK: u16 = 0x3fff;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -103,12 +105,12 @@ impl NflogReader {
         loop {
             match receive_datagram(&self.socket) {
                 Ok(bytes) => {
-                    let payload = extract_logged_prefix(&bytes, self.mode)?;
-                    return Ok(Some(connection_event_from_prefix(
+                    return connection_event_from_datagram(
+                        &bytes,
                         self.mode,
                         bounded_timestamp_now(),
-                        payload,
-                    )));
+                    )
+                    .map(Some);
                 }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
                     if Instant::now() >= deadline {
@@ -229,7 +231,25 @@ fn parse_ack(bytes: &[u8]) -> Result<(), NflogError> {
     Ok(())
 }
 
-fn extract_logged_prefix(bytes: &[u8], mode: Mode) -> Result<&[u8], NflogError> {
+fn connection_event_from_datagram(
+    bytes: &[u8],
+    mode: Mode,
+    timestamp: String,
+) -> Result<ConnectionEvent, NflogError> {
+    let (payload, forwarded) = extract_logged_prefix(bytes, mode)?;
+    let mut event = connection_event_from_prefix(mode, timestamp, payload);
+    if forwarded
+        && event
+            .tuple
+            .as_ref()
+            .is_some_and(|tuple| tuple.protocol == SocketProtocol::Udp)
+    {
+        event.tuple = None;
+    }
+    Ok(event)
+}
+
+fn extract_logged_prefix(bytes: &[u8], mode: Mode) -> Result<(&[u8], bool), NflogError> {
     let length = netlink_length(bytes)?;
     if message_type(bytes)? != NFLOG_PACKET_MESSAGE || length < 20 {
         return Err(NflogError::new(
@@ -245,6 +265,7 @@ fn extract_logged_prefix(bytes: &[u8], mode: Mode) -> Result<&[u8], NflogError> 
     }
     let mut payload = None;
     let mut prefix = None;
+    let mut forwarded = false;
     let mut offset = 20;
     while offset + 4 <= length {
         let attribute_length = usize::from(u16::from_ne_bytes([bytes[offset], bytes[offset + 1]]));
@@ -273,6 +294,15 @@ fn extract_logged_prefix(bytes: &[u8], mode: Mode) -> Result<&[u8], NflogError> 
                     "nflog_invalid_attribute",
                     "received a duplicate NFLOG prefix attribute",
                 ));
+            }
+            NFULA_IFINDEX_INDEV => {
+                if forwarded || value.len() != 4 || value == [0; 4] {
+                    return Err(NflogError::new(
+                        "nflog_invalid_attribute",
+                        "received an invalid or duplicate NFLOG input-interface attribute",
+                    ));
+                }
+                forwarded = true;
             }
             _ => {}
         }
@@ -306,7 +336,7 @@ fn extract_logged_prefix(bytes: &[u8], mode: Mode) -> Result<&[u8], NflogError> 
             "NFLOG event exceeded the configured packet-prefix bound",
         ));
     }
-    Ok(payload)
+    Ok((payload, forwarded))
 }
 
 fn netlink_length(bytes: &[u8]) -> Result<usize, NflogError> {
@@ -375,6 +405,7 @@ mod tests {
         assert_eq!(
             extract_logged_prefix(&block_event, Mode::Block)
                 .unwrap()
+                .0
                 .len(),
             64
         );
@@ -402,6 +433,29 @@ mod tests {
             "nflog_invalid_attribute"
         );
 
+        let mut invalid_interface = event(Mode::Block, &[0x45; 64]);
+        invalid_interface.extend(attribute(NFULA_IFINDEX_INDEV, &[0, 0, 0, 0]));
+        let length = invalid_interface.len() as u32;
+        invalid_interface[..4].copy_from_slice(&length.to_ne_bytes());
+        assert_eq!(
+            extract_logged_prefix(&invalid_interface, Mode::Block)
+                .unwrap_err()
+                .code,
+            "nflog_invalid_attribute"
+        );
+
+        let mut duplicate_interface = event(Mode::Block, &[0x45; 64]);
+        duplicate_interface.extend(attribute(NFULA_IFINDEX_INDEV, &[0, 0, 0, 7]));
+        duplicate_interface.extend(attribute(NFULA_IFINDEX_INDEV, &[0, 0, 0, 7]));
+        let length = duplicate_interface.len() as u32;
+        duplicate_interface[..4].copy_from_slice(&length.to_ne_bytes());
+        assert_eq!(
+            extract_logged_prefix(&duplicate_interface, Mode::Block)
+                .unwrap_err()
+                .code,
+            "nflog_invalid_attribute"
+        );
+
         let mut duplicate_prefix = event(Mode::Block, &[0x45; 64]);
         duplicate_prefix.extend(attribute(NFULA_PREFIX, b"fence-v0-block\0"));
         let length = duplicate_prefix.len() as u32;
@@ -422,6 +476,53 @@ mod tests {
                 .unwrap_err()
                 .code,
             "nflog_invalid_attribute"
+        );
+    }
+
+    #[test]
+    fn suppresses_forwarded_udp_attribution_without_hiding_the_finding() {
+        let mut udp = vec![0_u8; 24];
+        udp[0] = 0x45;
+        udp[9] = 17;
+        udp[12..16].copy_from_slice(&[172, 17, 0, 2]);
+        udp[16..20].copy_from_slice(&[192, 0, 2, 10]);
+        udp[20..22].copy_from_slice(&40_000_u16.to_be_bytes());
+        udp[22..24].copy_from_slice(&53_u16.to_be_bytes());
+
+        let host = event(Mode::Audit, &udp);
+        assert!(
+            connection_event_from_datagram(&host, Mode::Audit, "host".to_owned())
+                .unwrap()
+                .tuple
+                .is_some()
+        );
+
+        let mut forwarded = event(Mode::Audit, &udp);
+        forwarded.extend(attribute(NFULA_IFINDEX_INDEV, &[0, 0, 0, 7]));
+        let length = forwarded.len() as u32;
+        forwarded[..4].copy_from_slice(&length.to_ne_bytes());
+        let forwarded_event =
+            connection_event_from_datagram(&forwarded, Mode::Audit, "forwarded".to_owned())
+                .unwrap();
+        assert_eq!(forwarded_event.finding.protocol, "udp");
+        assert_eq!(
+            forwarded_event.finding.remote_address.as_deref(),
+            Some("192.0.2.10")
+        );
+        assert_eq!(forwarded_event.finding.remote_port, Some(53));
+        assert!(forwarded_event.tuple.is_none());
+
+        let mut tcp = udp;
+        tcp[9] = 6;
+        let mut forwarded_tcp = event(Mode::Audit, &tcp);
+        forwarded_tcp.extend(attribute(NFULA_IFINDEX_INDEV, &[0, 0, 0, 7]));
+        let length = forwarded_tcp.len() as u32;
+        forwarded_tcp[..4].copy_from_slice(&length.to_ne_bytes());
+        assert!(
+            connection_event_from_datagram(&forwarded_tcp, Mode::Audit, "tcp".to_owned())
+                .unwrap()
+                .tuple
+                .is_some()
         );
     }
 

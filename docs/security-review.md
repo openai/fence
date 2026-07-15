@@ -197,20 +197,7 @@ report.
 
 ### DNS answer and firewall activation ordering
 
-The DNS mediator previously waited for an approved HTTPS address to enter the
-owned `nftables` ruleset but returned the upstream answer before the verified
-firewall update was active. Block mode now submits bounded materialization
-requests to the single resident firewall owner and releases an approved address
-answer only after that owner applies and structurally verifies the matching
-rules. Address-bearing responses are all-or-nothing: every returned address
-must be materializable before any answer is released. An approved zero-TTL
-address receives a one-second materialization lifetime, and a valid zero-TTL
-CNAME edge receives a one-second effective lineage lifetime, before the
-existing refresh overlap. Partial coverage, queue rejection, service disconnection, or
-an explicit failed result returns a minimal retryable `SERVFAIL` response. The
-response contains the original DNS question but no answer, authority,
-additional, or raw upstream data. Rejections increment bounded warning
-evidence; backend apply and verification failures remain critical findings.
+The DNS mediator previously waited for an approved HTTPS address to enter the owned `nftables` ruleset but returned the upstream answer before the verified firewall update was active. Block mode now submits bounded materialization requests to the single resident firewall owner and releases an approved address answer only after that owner applies and structurally verifies the matching rules. Address-bearing responses are all-or-nothing: every returned address must be materializable before any answer is released. An approved zero-TTL address receives a one-second materialization lifetime, and a valid zero-TTL CNAME edge receives a one-second effective lineage lifetime, before the existing refresh overlap. Partial coverage, queue rejection, service disconnection, or an explicit failed result returns a minimal retryable `SERVFAIL` response. Names outside policy and over-budget user wildcard names receive a minimal `REFUSED` response without forwarding. Both responses contain the original DNS question but no answer, authority, additional, or raw upstream data. Rejections increment bounded warning evidence; backend apply and verification failures remain critical findings.
 
 ### Response-local DNS alias authorization
 
