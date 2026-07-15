@@ -184,10 +184,6 @@ require_pattern() {
   fi
 }
 
-if grep -nE '\bcurl\b|cargo install[[:space:]].*--version|rustup target add|setup-rust-toolchain' "$DIR/.github/workflows/build.yml"; then
-  die ".github/workflows/build.yml contains networked prepared-tool installation commands"
-fi
-
 if grep -nE '\bcurl\b|cargo install[[:space:]].*--version|rustup target add|setup-rust-toolchain' "$DIR/.github/workflows/release.yml"; then
   die ".github/workflows/release.yml contains networked prepared-tool installation commands"
 fi
@@ -226,11 +222,6 @@ fi
 require_pattern "$DIR/.github/workflows/release.yml" 'uses:[[:space:]]+[.]/[.]github/workflows/action-acceptance[.]yml' "release workflow must reuse full Action acceptance against the generated commit"
 require_pattern "$DIR/.github/workflows/release.yml" 'uses:[[:space:]]+[.]/[.]github/workflows/action-drift-canary[.]yml' "release workflow must reuse the strict fixed-runner canary against the generated commit"
 require_pattern "$DIR/.github/workflows/release.yml" 'environment:[[:space:]]+release' "release mutations must remain protected by the release environment"
-require_pattern "$DIR/.github/workflows/build.yml" 'runs-on:[[:space:]]+ubuntu-24[.]04' "build workflow must exercise the supported Ubuntu 24.04 environment"
-require_pattern "$DIR/.github/workflows/build.yml" 'script/prepare-rust' "build workflow must prepare the pinned Rust toolchain explicitly before offline package validation"
-require_pattern "$DIR/.github/workflows/build.yml" 'script/build --release --targets "x86_64-unknown-linux-gnu"' "build workflow must run Linux x64 release-mode packaging"
-require_pattern "$DIR/.github/workflows/build.yml" 'script/install-zig' "build workflow must separately exercise committed retained cross-build-tool installation"
-require_pattern "$DIR/.github/workflows/build.yml" 'script/verify-release-toolchain' "build workflow must separately verify retained cross-build tools"
 require_pattern "$DIR/script/build" 'build_version="v[$][{]package_version[}]"' "build script must default local release artifact labels from the checked-out Cargo package version"
 
 require_pattern "$DIR/.github/workflows/release.yml" 'runs-on:[[:space:]]+ubuntu-24[.]04' "release workflow must run the supported Ubuntu 24.04 environment"

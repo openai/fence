@@ -61,19 +61,6 @@ if [[ "$artifact_count" -ne 4 ]]; then
   die "expected 4 vendored cargo-llvm-cov artifacts, found $artifact_count"
 fi
 
-require_pattern() {
-  local file="$1"
-  local pattern="$2"
-  local description="$3"
-
-  if ! grep -qE "$pattern" "$file"; then
-    die "$description"
-  fi
-}
-
-require_pattern "$DIR/.github/workflows/test.yml" 'script/install-test-tools' "test workflow must install vendored test tools before coverage validation"
-require_pattern "$DIR/.github/workflows/test.yml" 'script/test --coverage' "test workflow must run coverage through script/test --coverage"
-
 if grep -nE '\bcurl\b|cargo install[[:space:]].*--version|unset CARGO_NET_OFFLINE|unset RUSTUP_AUTO_INSTALL|RUSTUP_AUTO_INSTALL[[:space:]]*=' "$DIR/script/install-test-tools"; then
   die "script/install-test-tools must remain offline-only"
 fi

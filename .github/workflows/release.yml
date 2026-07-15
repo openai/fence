@@ -146,15 +146,10 @@ jobs:
           source_commit = os.environ["SOURCE_COMMIT"]
           token = os.environ["GH_TOKEN"]
           required = {
-              "build",
-              "coverage",
-              "lint (macos-14)",
-              "lint (ubuntu-24.04)",
+              "quality",
               "acceptance",
               "action acceptance",
               "integration",
-              "test (macos-14)",
-              "test (ubuntu-24.04)",
           }
           url = f"https://api.github.com/repos/{repository}/commits/{source_commit}/check-runs?per_page=100"
           request = urllib.request.Request(
@@ -196,7 +191,7 @@ jobs:
               }
               missing = sorted(required - successful)
               if not missing:
-                  print(f"all nine required checks passed on {source_commit}")
+                  print(f"all required checks passed on {source_commit}")
                   break
               print(f"waiting for required checks: {', '.join(missing)}", flush=True)
               if attempt == 119:
