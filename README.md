@@ -18,10 +18,10 @@ Fence runs first in a GitHub Actions job, applies a bounded built-in GitHub Acti
 Add Fence as the first step in a supported GitHub-hosted Linux job:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: GrantBirki/fence@<commit-sha> # pin@vX.Y.Z
 ```
 
-This starts Fence in `block` mode with an empty user `allowlist` on a GitHub-hosted `ubuntu-24.04` x64 host job. Replace `<commit-sha>` with the full `action_commit` value from a release's `action-release.json` asset; `main` is source-only and does not contain a runnable production bundle. Put Fence before checkout and any other steps you want it to constrain.
+This starts Fence in `block` mode with an empty user `allowlist` on a GitHub-hosted `ubuntu-24.04` x64 host job. Replace `<commit-sha>` with the full `action_commit` value and `vX.Y.Z` with the tag from the same release; release notes provide the ready-to-copy line with a Dependabot-friendly `# pin@vX.Y.Z` comment. `main` is source-only and does not contain a runnable production bundle. Put Fence before checkout and any other steps you want it to constrain.
 
 **Read more:** [Getting started with Fence](docs/getting-started.md)
 

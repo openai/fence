@@ -2463,7 +2463,8 @@ for fragment in [
     "uses: ./.github/workflows/action-drift-canary.yml",
     "action-release.json",
     'gh release create "$VERSION_TAG" "${assets[@]}" "${release_args[@]}"',
-    'echo "- uses: GrantBirki/fence@$ACTION_COMMIT"',
+    'echo "- uses: GrantBirki/fence@$ACTION_COMMIT # pin@$VERSION_TAG"',
+    'expected_pin = f"- uses: GrantBirki/fence@{os.environ[\'ACTION_COMMIT\']} # pin@{os.environ[\'VERSION_TAG\']}"',
 ]:
     require(fragment in release, "One-PR Action release workflow contract is incomplete")
 require(
