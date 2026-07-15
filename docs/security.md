@@ -38,7 +38,7 @@ After readiness, Fence rechecks its firewall, lockdown or observation state, loc
 
 Fence does not upload telemetry. Local reports contain bounded control results, network decisions, and findings. Best-effort process attribution may include attribution status, actor class, PID, executable basename, and up to four parent executable basenames; it excludes command arguments, full executable paths, environments, working directories, and packet payloads.
 
-Uniquely owned unconnected UDP sockets with wildcard local or remote endpoints can be correlated. Process races and shared sockets can still produce `not_found` or `ambiguous` attribution. Attribution enriches local evidence but does not decide whether a destination is allowed.
+Uniquely owned unconnected host UDP sockets with wildcard local or remote endpoints can be correlated. Forwarded or container UDP traffic is not matched against the host socket table, so it cannot be linked to an unrelated host program. Process races and shared sockets can still produce `not_found` or `ambiguous` attribution. Attribution enriches local evidence but does not decide whether a destination is allowed.
 
 ## Pinning And Provenance
 
