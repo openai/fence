@@ -247,8 +247,15 @@ pull_request_workflows = {
 }
 require(
     pull_request_workflows
-    == {"acceptance.yml", "action-acceptance.yml", "integration.yml"},
-    "Pull requests must run exactly the three reviewed CI workflows",
+    == {
+        "lint.yml",
+        "test.yml",
+        "build.yml",
+        "acceptance.yml",
+        "action-acceptance.yml",
+        "integration.yml",
+    },
+    "Pull requests must run exactly the six reviewed CI workflows",
 )
 pull_request_sources = {
     name: source
@@ -308,256 +315,297 @@ for relative in validator_paths:
                 f"{relative}: evidence validator must reject optimized Python",
             )
 
-ci_path = root / ".github/workflows/acceptance.yml"
-require(ci_path.is_file(), "Consolidated CI workflow is missing")
-for removed_workflow in ["build.yml", "lint.yml", "test.yml"]:
+ci_specs = {
+    "lint": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "bootstrap",
+            "lint",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("bootstrap", "script/bootstrap"),
+            ("lint", "script/lint"),
+        ],
+    },
+    "test": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "install test tools",
+            "bootstrap",
+            "test with coverage",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("install test tools", "script/install-test-tools"),
+            ("bootstrap", "script/bootstrap"),
+            ("test with coverage", "script/test --coverage"),
+        ],
+    },
+    "build": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "bootstrap",
+            "build Linux x64 binary",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("bootstrap", "script/bootstrap"),
+            ("build Linux x64 binary", "script/build"),
+        ],
+    },
+    "acceptance": {
+        "steps": [
+            "checkout",
+            "validate locks",
+            "prepare rust",
+            "bootstrap",
+            "install retained cross-build tools",
+            "verify retained cross-build tools",
+            "build packaged Linux x64 artifact",
+            "verify packaged artifact checksum",
+            "exercise packaged public contract",
+        ],
+        "commands": [
+            ("validate locks", "script/validate-locks --ci"),
+            ("prepare rust", "script/prepare-rust"),
+            ("bootstrap", "script/bootstrap"),
+            ("install retained cross-build tools", "script/install-zig"),
+            ("verify retained cross-build tools", "script/verify-release-toolchain"),
+        ],
+    },
+}
+ci_sources = {}
+for workflow_name, spec in ci_specs.items():
+    ci_path = root / ".github/workflows" / f"{workflow_name}.yml"
+    require(ci_path.is_file(), f"{workflow_name} CI workflow is missing")
+    ci_workflow = ci_path.read_text(encoding="utf-8")
+    ci_sources[workflow_name] = ci_workflow
+    label = f"{workflow_name} CI"
+
     require(
-        not (root / ".github/workflows" / removed_workflow).exists(),
-        f"Superseded workflow must remain removed: {removed_workflow}",
-    )
-
-ci_workflow = ci_path.read_text(encoding="utf-8")
-require(
-    workflow_uses(ci_workflow)
-    == collections.Counter(
-        {"actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 2}
-    ),
-    "Consolidated CI may use only the two reviewed checkout steps",
-)
-require_exact_mapping_keys(
-    ci_workflow,
-    0,
-    ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
-    "Consolidated CI top-level workflow contract must remain narrowly scoped",
-)
-require(
-    scalar_mapping(ci_workflow, 0) == {"name": "CI"},
-    "Consolidated CI workflow name must remain stable",
-)
-
-ci_triggers = indented_block(
-    ci_workflow,
-    "on:",
-    "Consolidated CI trigger contract must be unique",
-)
-require_exact_mapping_keys(
-    ci_triggers,
-    2,
-    ["push", "pull_request"],
-    "Consolidated CI must run only on main pushes and pull requests",
-)
-for trigger_name in ["push", "pull_request"]:
-    trigger = indented_block(
-        ci_triggers,
-        f"  {trigger_name}:",
-        f"Consolidated CI {trigger_name} trigger must be unique",
+        workflow_uses(ci_workflow)
+        == collections.Counter(
+            {"actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 1}
+        ),
+        f"{label} may use only the reviewed checkout step",
     )
     require_exact_mapping_keys(
-        trigger,
-        4,
-        ["branches"],
-        f"Consolidated CI {trigger_name} trigger must contain only a branch filter",
+        ci_workflow,
+        0,
+        ["name", "on", "permissions", "defaults", "concurrency", "jobs"],
+        f"{label} top-level workflow contract must remain narrowly scoped",
     )
     require(
-        re.findall(
-            r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
-            trigger,
-        )
-        == ["main"],
-        f"Consolidated CI {trigger_name} trigger must remain limited to main",
+        scalar_mapping(ci_workflow, 0) == {"name": workflow_name},
+        f"{label} workflow name must match its filename",
     )
 
-ci_permissions = indented_block(
-    ci_workflow,
-    "permissions:",
-    "Consolidated CI permissions must be unique",
-)
-require_exact_mapping_keys(
-    ci_permissions,
-    2,
-    ["contents"],
-    "Consolidated CI permissions must remain narrowly scoped",
-)
-require(
-    scalar_mapping(ci_permissions, 2) == {"contents": "read"},
-    "Consolidated CI permissions must remain read-only",
-)
+    ci_triggers = indented_block(
+        ci_workflow,
+        "on:",
+        f"{label} trigger contract must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_triggers,
+        2,
+        ["push", "pull_request"],
+        f"{label} must run only on main pushes and pull requests",
+    )
+    for trigger_name in ["push", "pull_request"]:
+        trigger = indented_block(
+            ci_triggers,
+            f"  {trigger_name}:",
+            f"{label} {trigger_name} trigger must be unique",
+        )
+        require_exact_mapping_keys(
+            trigger,
+            4,
+            ["branches"],
+            f"{label} {trigger_name} trigger must contain only a branch filter",
+        )
+        require(
+            re.findall(
+                r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
+                trigger,
+            )
+            == ["main"],
+            f"{label} {trigger_name} trigger must remain limited to main",
+        )
 
-ci_defaults = indented_block(
-    ci_workflow,
-    "defaults:",
-    "Consolidated CI defaults must be unique",
-)
-require_exact_mapping_keys(
-    ci_defaults,
-    2,
-    ["run"],
-    "Consolidated CI defaults may configure only run steps",
-)
-require(
-    "    shell: bash\n" in ci_defaults,
-    "Consolidated CI run steps must use bash",
-)
+    ci_permissions = indented_block(
+        ci_workflow,
+        "permissions:",
+        f"{label} permissions must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_permissions,
+        2,
+        ["contents"],
+        f"{label} permissions must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(ci_permissions, 2) == {"contents": "read"},
+        f"{label} permissions must remain read-only",
+    )
 
-ci_concurrency = indented_block(
-    ci_workflow,
-    "concurrency:",
-    "Consolidated CI concurrency must be unique",
-)
-require_exact_mapping_keys(
-    ci_concurrency,
-    2,
-    ["group", "cancel-in-progress"],
-    "Consolidated CI concurrency fields must remain narrowly scoped",
-)
-require(
-    scalar_mapping(ci_concurrency, 2)
-    == {
-        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
-        "cancel-in-progress": "true",
-    },
-    "Consolidated CI must cancel superseded PR work without cancelling distinct main commits",
-)
+    ci_defaults = indented_block(
+        ci_workflow,
+        "defaults:",
+        f"{label} defaults must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_defaults,
+        2,
+        ["run"],
+        f"{label} defaults may configure only run steps",
+    )
+    ci_run_defaults = indented_block(
+        ci_defaults,
+        "  run:",
+        f"{label} run defaults must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_run_defaults,
+        4,
+        ["shell"],
+        f"{label} run defaults may configure only the shell",
+    )
+    require(
+        scalar_mapping(ci_run_defaults, 4) == {"shell": "bash"},
+        f"{label} run steps must use bash",
+    )
 
-ci_jobs = indented_block(
-    ci_workflow,
-    "jobs:",
-    "Consolidated CI jobs contract must be unique",
-)
-require_exact_mapping_keys(
-    ci_jobs,
-    2,
-    ["quality", "acceptance"],
-    "Consolidated CI must contain exactly quality and acceptance jobs",
-)
-for job_name in ["quality", "acceptance"]:
+    ci_concurrency = indented_block(
+        ci_workflow,
+        "concurrency:",
+        f"{label} concurrency must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_concurrency,
+        2,
+        ["group", "cancel-in-progress"],
+        f"{label} concurrency fields must remain narrowly scoped",
+    )
+    require(
+        scalar_mapping(ci_concurrency, 2)
+        == {
+            "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}",
+            "cancel-in-progress": "true",
+        },
+        f"{label} must cancel superseded PR work without cancelling distinct main commits",
+    )
+
+    ci_jobs = indented_block(
+        ci_workflow,
+        "jobs:",
+        f"{label} jobs contract must be unique",
+    )
+    require_exact_mapping_keys(
+        ci_jobs,
+        2,
+        [workflow_name],
+        f"{label} must contain exactly its same-named job",
+    )
     job = indented_block(
         ci_jobs,
-        f"  {job_name}:",
-        f"Consolidated CI {job_name} job must be unique",
+        f"  {workflow_name}:",
+        f"{label} job must be unique",
     )
     require_exact_mapping_keys(
         job,
         4,
         ["name", "timeout-minutes", "runs-on", "steps"],
-        f"Consolidated CI {job_name} fields must remain narrowly scoped",
+        f"{label} job fields must remain narrowly scoped",
     )
     require(
         scalar_mapping(job, 4)
         == {
-            "name": job_name,
+            "name": workflow_name,
             "timeout-minutes": "15",
             "runs-on": "ubuntu-24.04",
         },
-        f"Consolidated CI {job_name} must remain bounded on fixed ubuntu-24.04",
+        f"{label} job must remain bounded on fixed ubuntu-24.04",
     )
 
-quality = indented_block(
-    ci_jobs,
-    "  quality:",
-    "Consolidated CI quality job must be unique",
-)
-require(
-    re.findall(r"(?m)^      - name: ([^\n]+)$", quality)
-    == [
-        "checkout",
-        "validate locks",
-        "prepare rust",
-        "install test tools",
-        "bootstrap",
-        "lint",
-        "test with coverage",
-    ],
-    "Consolidated CI quality steps must remain complete and ordered",
-)
-quality_checkout = require_step_contract(
-    quality,
-    "checkout",
-    ["uses", "with"],
-    {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
-    "Consolidated CI quality checkout",
-)
-quality_checkout_with = indented_block(
-    quality_checkout,
-    "        with:",
-    "Consolidated CI quality checkout inputs must be unique",
-)
-require(
-    scalar_mapping(quality_checkout_with, 10) == {"persist-credentials": "false"},
-    "Consolidated CI quality checkout must disable persisted credentials",
-)
-quality_commands = [
-    ("validate locks", "script/validate-locks --ci"),
-    ("prepare rust", "script/prepare-rust"),
-    ("install test tools", "script/install-test-tools"),
-    ("bootstrap", "script/bootstrap"),
-    ("lint", "script/lint"),
-    ("test with coverage", "script/test --coverage"),
-]
-for step_name, command in quality_commands:
-    require_step_contract(
-        quality,
-        step_name,
-        ["run"],
-        {"run": command},
-        f"Consolidated CI quality {step_name} step",
+    step_names = re.findall(r"(?m)^      - name: ([^\n]+)$", job)
+    require(
+        step_names == spec["steps"]
+        and len(re.findall(r"(?m)^      - ", job)) == len(step_names),
+        f"{label} steps must remain complete, named, and ordered",
     )
-require(
-    "run: script/test\n" not in quality,
-    "Consolidated CI must not duplicate the coverage-backed Rust test suite",
-)
+    checkout = require_step_contract(
+        job,
+        "checkout",
+        ["uses", "with"],
+        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        f"{label} checkout",
+    )
+    checkout_with = indented_block(
+        checkout,
+        "        with:",
+        f"{label} checkout inputs must be unique",
+    )
+    require_exact_mapping_keys(
+        checkout_with,
+        10,
+        ["persist-credentials"],
+        f"{label} checkout may configure only credential persistence",
+    )
+    require(
+        scalar_mapping(checkout_with, 10) == {"persist-credentials": "false"},
+        f"{label} checkout must disable persisted credentials",
+    )
+    for step_name, command in spec["commands"]:
+        require_step_contract(
+            job,
+            step_name,
+            ["run"],
+            {"run": command},
+            f"{label} {step_name} step",
+        )
+
+    require(
+        ci_workflow.count("uses: actions/checkout@") == 1
+        and ci_workflow.count("persist-credentials: false") == 1,
+        f"{label} must contain exactly one credential-safe checkout",
+    )
+    require(
+        ci_workflow.count("runs-on: ubuntu-24.04") == 1
+        and "runs-on: ${{" not in ci_workflow
+        and "macos-" not in ci_workflow,
+        f"{label} must run only on literal fixed ubuntu-24.04",
+    )
+    for forbidden in [
+        "continue-on-error",
+        "actions/cache",
+        "pull_request_target",
+        "workflow_dispatch",
+        "contents: write",
+    ]:
+        require(
+            forbidden not in ci_workflow,
+            f"{label} contains a forbidden escape or mutable surface",
+        )
 
 acceptance = indented_block(
-    ci_jobs,
+    indented_block(
+        ci_sources["acceptance"],
+        "jobs:",
+        "acceptance CI jobs contract must be unique",
+    ),
     "  acceptance:",
-    "Consolidated CI acceptance job must be unique",
+    "acceptance CI job must be unique",
 )
-require(
-    re.findall(r"(?m)^      - name: ([^\n]+)$", acceptance)
-    == [
-        "checkout",
-        "validate locks",
-        "prepare rust",
-        "bootstrap",
-        "install retained cross-build tools",
-        "verify retained cross-build tools",
-        "build packaged Linux x64 artifact",
-        "verify packaged artifact checksum",
-        "exercise packaged public contract",
-    ],
-    "Consolidated CI acceptance steps must remain complete and ordered",
-)
-acceptance_checkout = require_step_contract(
-    acceptance,
-    "checkout",
-    ["uses", "with"],
-    {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
-    "Consolidated CI acceptance checkout",
-)
-acceptance_checkout_with = indented_block(
-    acceptance_checkout,
-    "        with:",
-    "Consolidated CI acceptance checkout inputs must be unique",
-)
-require(
-    scalar_mapping(acceptance_checkout_with, 10) == {"persist-credentials": "false"},
-    "Consolidated CI acceptance checkout must disable persisted credentials",
-)
-acceptance_commands = [
-    ("validate locks", "script/validate-locks --ci"),
-    ("prepare rust", "script/prepare-rust"),
-    ("bootstrap", "script/bootstrap"),
-    ("install retained cross-build tools", "script/install-zig"),
-    ("verify retained cross-build tools", "script/verify-release-toolchain"),
-]
-for step_name, command in acceptance_commands:
-    require_step_contract(
-        acceptance,
-        step_name,
-        ["run"],
-        {"run": command},
-        f"Consolidated CI acceptance {step_name} step",
-    )
 packaged_build = require_step_contract(
     acceptance,
     "build packaged Linux x64 artifact",
@@ -565,59 +613,46 @@ packaged_build = require_step_contract(
     {
         "run": 'script/build --release --targets "x86_64-unknown-linux-gnu" --dist-dir "$RUNNER_TEMP/fence-acceptance-dist"',
     },
-    "Consolidated CI packaged build step",
+    "acceptance CI packaged build step",
 )
 packaged_build_env = indented_block(
     packaged_build,
     "        env:",
-    "Consolidated CI packaged build environment must be unique",
+    "acceptance CI packaged build environment must be unique",
+)
+require_exact_mapping_keys(
+    packaged_build_env,
+    10,
+    ["BUILD_VERSION"],
+    "acceptance CI packaged build environment must remain narrowly scoped",
 )
 require(
     scalar_mapping(packaged_build_env, 10) == {"BUILD_VERSION": "acceptance"},
-    "Consolidated CI packaged build version must remain deterministic",
+    "acceptance CI packaged build version must remain deterministic",
 )
 checksum_step = require_step_contract(
     acceptance,
     "verify packaged artifact checksum",
     ["run"],
     {"run": "|"},
-    "Consolidated CI package checksum step",
+    "acceptance CI package checksum step",
 )
 require(
-    literal_run_body(checksum_step, "Consolidated CI package checksum gate must use a literal run body")
+    literal_run_body(checksum_step, "acceptance CI package checksum gate must use a literal run body")
     == (
         '          cd "$RUNNER_TEMP/fence-acceptance-dist"\n'
         "          grep -Eq 'fence_acceptance_linux-amd64$' checksums.txt\n"
         "          sha256sum -c checksums.txt\n"
     ),
-    "Consolidated CI package checksum gate is incomplete",
+    "acceptance CI package checksum gate is incomplete",
 )
 require_step_contract(
     acceptance,
     "exercise packaged public contract",
     ["run"],
     {"run": 'script/test-package-smoke "$RUNNER_TEMP/fence-acceptance-dist/fence_acceptance_linux-amd64"'},
-    "Consolidated CI package smoke step",
+    "acceptance CI package smoke step",
 )
-
-require(
-    ci_workflow.count("uses: actions/checkout@") == 2
-    and ci_workflow.count("persist-credentials: false") == 2,
-    "Every consolidated CI checkout must disable persisted credentials",
-)
-require(
-    ci_workflow.count("runs-on: ubuntu-24.04") == 2
-    and "macos-" not in ci_workflow,
-    "Consolidated CI must run only on fixed ubuntu-24.04",
-)
-for forbidden in [
-    "continue-on-error",
-    "actions/cache",
-    "pull_request_target",
-    "workflow_dispatch",
-    "contents: write",
-]:
-    require(forbidden not in ci_workflow, "Consolidated CI contains a forbidden escape or mutable surface")
 
 workflow = (root / ".github/workflows/action-acceptance.yml").read_text(encoding="utf-8")
 require(
@@ -2109,20 +2144,18 @@ for forbidden in [
     )
 
 readme = (root / "README.md").read_text(encoding="utf-8")
-ci_badge = "[![CI](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)"
+ci_badges = [
+    f"[![{name}](https://github.com/GrantBirki/fence/actions/workflows/{name}.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/{name}.yml)"
+    for name in ["lint", "test", "build", "acceptance"]
+]
 release_canary_badge = "[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
 nightly_badge = "[![main / ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)"
-require(
-    readme.count(ci_badge) == 1
-    and readme.count("actions/workflows/acceptance.yml/badge.svg") == 1,
-    "README must expose exactly one consolidated CI badge",
-)
-for removed_badge in [
-    "actions/workflows/build.yml/badge.svg",
-    "actions/workflows/lint.yml/badge.svg",
-    "actions/workflows/test.yml/badge.svg",
-]:
-    require(removed_badge not in readme, "README contains a superseded workflow badge")
+for name, badge in zip(["lint", "test", "build", "acceptance"], ci_badges):
+    require(
+        readme.count(badge) == 1
+        and readme.count(f"actions/workflows/{name}.yml/badge.svg") == 1,
+        f"README must expose exactly one {name} CI badge",
+    )
 require(
     readme.count(release_canary_badge) == 1
     and readme.count("actions/workflows/action-drift-canary.yml/badge.svg") == 1,
@@ -2145,7 +2178,8 @@ settings_checks_match = re.search(
 require(settings_checks_match is not None, "Repository settings required-check list is missing")
 settings_checks = re.findall(r"(?m)^  - `([^`]+)`$", settings_checks_match.group(1))
 require(
-    settings_checks == ["quality", "acceptance", "action acceptance", "integration"],
+    settings_checks
+    == ["lint", "test", "build", "acceptance", "action acceptance", "integration"],
     "Repository settings required checks must match the release workflow",
 )
 require(
@@ -2561,7 +2595,7 @@ require(
         for element in required_assignments[0].value.elts
     )
     and {element.value for element in required_assignments[0].value.elts}
-    == {"quality", "acceptance", "action acceptance", "integration"},
+    == {"lint", "test", "build", "acceptance", "action acceptance", "integration"},
     "Release workflow protected source checks must match the repository ruleset",
 )
 require("all nine required checks" not in release, "Release logs must not claim the superseded check count")

@@ -146,7 +146,9 @@ jobs:
           source_commit = os.environ["SOURCE_COMMIT"]
           token = os.environ["GH_TOKEN"]
           required = {
-              "quality",
+              "lint",
+              "test",
+              "build",
               "acceptance",
               "action acceptance",
               "integration",

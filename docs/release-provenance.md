@@ -15,7 +15,7 @@ The schema-`4` manifest records the repository, release tag and channel, release
 
 ## Acceptance And Publication
 
-The release workflow runs the complete unique-case Action-acceptance suite and fixed-runner zero-input canary against exact distribution commit `D` before publication. The immutable `vX.Y.Z` release tag targets `D`, and the release's `action-release.json` asset maps:
+Before constructing a candidate, the release workflow requires the exact protected source checks `lint`, `test`, `build`, `acceptance`, `action acceptance`, and `integration` on source commit `M`. It then runs the complete unique-case Action-acceptance suite and fixed-runner zero-input canary against exact distribution commit `D` before publication. The immutable `vX.Y.Z` release tag targets `D`, and the release's `action-release.json` asset maps:
 
 - version
 - source commit `M`

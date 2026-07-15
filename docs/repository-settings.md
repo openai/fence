@@ -7,7 +7,9 @@ Some security controls cannot be fully represented in tracked files. Configure t
 - Require a pull request before merging.
 - Require CODEOWNER review.
 - Require status checks before merge:
-  - `quality`
+  - `lint`
+  - `test`
+  - `build`
   - `acceptance`
   - `action acceptance`
   - `integration`
@@ -22,7 +24,9 @@ Some security controls cannot be fully represented in tracked files. Configure t
 - Require approval for first-time contributor workflows.
 - Keep GitHub Actions pinned to full commit SHAs.
 - Do not allow untrusted pull request workflows to receive write tokens.
-- Keep the `quality` job on fixed `ubuntu-24.04`: run `script/validate-locks --ci`, prepare Rust through the checksum-gated repository path, install committed coverage tooling, bootstrap offline inputs, run lint, and run the complete all-features test suite through `script/test --coverage`.
+- Keep the `lint` job on fixed `ubuntu-24.04`: run `script/validate-locks --ci`, prepare Rust through the checksum-gated repository path, bootstrap offline inputs, and run `script/lint`.
+- Keep the `test` job on fixed `ubuntu-24.04`: run `script/validate-locks --ci`, prepare Rust through the checksum-gated repository path, install committed coverage tooling, bootstrap offline inputs, and run the complete all-features test suite through `script/test --coverage`.
+- Keep the `build` job on fixed `ubuntu-24.04`: run `script/validate-locks --ci`, prepare Rust through the checksum-gated repository path, bootstrap offline inputs, and prove the native Linux x64 GNU release build.
 - Fence has no pre-merge macOS validation assurance. macOS remains outside the protected target and requires its own implementation, tests, and public support decision before any enforcement claim.
 - Protected package and release jobs should run only on GitHub-hosted `ubuntu-24.04` x64 and publish only the `x86_64-unknown-linux-gnu` agent artifact until an additional protected target is implemented and tested.
 - Keep the `acceptance` job on fixed `ubuntu-24.04` as the Linux x64 retained-tool and packaged public-contract gate: validate locks, prepare Rust, bootstrap, install and verify the committed Zig/`cargo-zigbuild` inputs, package the current commit once, verify its checksum, then execute `script/test-package-smoke` to prove the public binary contract and direct-invocation rejection without mutation. Retained-tool verification is not a supported cross-platform artifact claim.
