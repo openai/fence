@@ -501,12 +501,16 @@ mod tests {
         forwarded.extend(attribute(NFULA_IFINDEX_INDEV, &[0, 0, 0, 7]));
         let length = forwarded.len() as u32;
         forwarded[..4].copy_from_slice(&length.to_ne_bytes());
-        let event = connection_event_from_datagram(&forwarded, Mode::Audit, "forwarded".to_owned())
-            .unwrap();
-        assert_eq!(event.finding.protocol, "udp");
-        assert_eq!(event.finding.remote_address.as_deref(), Some("192.0.2.10"));
-        assert_eq!(event.finding.remote_port, Some(53));
-        assert!(event.tuple.is_none());
+        let forwarded_event =
+            connection_event_from_datagram(&forwarded, Mode::Audit, "forwarded".to_owned())
+                .unwrap();
+        assert_eq!(forwarded_event.finding.protocol, "udp");
+        assert_eq!(
+            forwarded_event.finding.remote_address.as_deref(),
+            Some("192.0.2.10")
+        );
+        assert_eq!(forwarded_event.finding.remote_port, Some(53));
+        assert!(forwarded_event.tuple.is_none());
 
         let mut tcp = udp;
         tcp[9] = 6;
