@@ -478,17 +478,27 @@ impl ProcAttributor {
         })?;
         let local = proc_endpoint(&tuple.local_address, tuple.local_port, tuple.family);
         let remote = proc_endpoint(&tuple.remote_address, tuple.remote_port, tuple.family);
+        let unspecified = match tuple.family {
+            SocketFamily::Ipv4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketFamily::Ipv6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let wildcard_local = proc_endpoint(&unspecified, tuple.local_port, tuple.family);
+        let wildcard_remote = proc_endpoint(&unspecified, 0, tuple.family);
         let mut inodes = BTreeSet::new();
         for (index, line) in contents.lines().skip(1).enumerate() {
             if index >= MAX_SOCKET_ROWS {
                 return Ok(BoundedScan::LimitExceeded);
             }
             let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-            if fields.len() > 9
-                && fields[1].eq_ignore_ascii_case(&local)
-                && fields[2].eq_ignore_ascii_case(&remote)
-                && let Ok(inode) = fields[9].parse::<u64>()
-            {
+            let local_matches = fields.len() > 9
+                && (fields[1].eq_ignore_ascii_case(&local)
+                    || (tuple.protocol == SocketProtocol::Udp
+                        && fields[1].eq_ignore_ascii_case(&wildcard_local)));
+            let remote_matches = local_matches
+                && (fields[2].eq_ignore_ascii_case(&remote)
+                    || (tuple.protocol == SocketProtocol::Udp
+                        && fields[2].eq_ignore_ascii_case(&wildcard_remote)));
+            if remote_matches && let Ok(inode) = fields[9].parse::<u64>() {
                 inodes.insert(inode);
             }
         }
@@ -1115,6 +1125,51 @@ mod tests {
         );
         assert_eq!(
             attributor.attribute(&ipv6_tcp).unwrap().actor_class,
+            ActorClass::Other
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attributes_unconnected_ipv4_and_ipv6_udp_sockets() {
+        let root = root();
+        let ipv4_packet = tuple(SocketProtocol::Udp);
+        let ipv4_socket = SocketTuple {
+            local_address: Ipv4Addr::UNSPECIFIED.into(),
+            remote_address: Ipv4Addr::UNSPECIFIED.into(),
+            remote_port: 0,
+            ..ipv4_packet.clone()
+        };
+        write_socket(&root, "udp", &ipv4_socket, 83);
+        write_process(&root, 502, 1001, 1, "udp-client", 83);
+
+        let ipv6_packet = SocketTuple {
+            family: SocketFamily::Ipv6,
+            protocol: SocketProtocol::Udp,
+            local_address: "2001:db8::2".parse().unwrap(),
+            local_port: 42_000,
+            remote_address: "2001:db8::20".parse().unwrap(),
+            remote_port: 123,
+        };
+        let ipv6_socket = SocketTuple {
+            local_address: Ipv6Addr::UNSPECIFIED.into(),
+            remote_address: Ipv6Addr::UNSPECIFIED.into(),
+            remote_port: 0,
+            ..ipv6_packet.clone()
+        };
+        write_socket(&root, "udp6", &ipv6_socket, 84);
+        write_process(&root, 503, 1002, 1, "udp6-client", 84);
+
+        let attributor = ProcAttributor {
+            proc_root: root.clone(),
+            runner_uid: 1001,
+        };
+        assert_eq!(
+            attributor.attribute(&ipv4_packet).unwrap().actor_class,
+            ActorClass::Runner
+        );
+        assert_eq!(
+            attributor.attribute(&ipv6_packet).unwrap().actor_class,
             ActorClass::Other
         );
         fs::remove_dir_all(root).unwrap();

@@ -110,6 +110,7 @@ See [`v0.md`](v0.md) for normative behavior and
 - Bounded local `/proc` correlation may add best-effort process attribution to
   actual findings without telemetry, command arguments, full paths,
   environments, or payload data.
+- Best-effort finding attribution now recognizes uniquely owned unconnected UDP sockets, and denied DNS questions return structurally valid minimal `REFUSED` responses instead of retaining stale EDNS/additional bytes.
 - Hosted evidence pinned the root-owned `walinuxagent.service` identity and
   observed the same service process naturally connecting to both Azure
   WireServer ports. The next profile version added exact UID `0` TCP `80` and

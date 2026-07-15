@@ -4632,13 +4632,9 @@ fn restore_client_query_id(response: &mut [u8], query: &[u8]) {
 }
 
 fn refused_response(query: &[u8]) -> Option<Vec<u8>> {
-    if query.len() < 12 {
-        return None;
-    }
-    let mut response = query.to_vec();
+    let mut response = server_failure_response(query)?;
     let flags = u16::from_be_bytes([response[2], response[3]]);
-    response[2..4].copy_from_slice(&((flags | 0x8000) & 0xfff0 | 0x0005).to_be_bytes());
-    response[6..12].fill(0);
+    response[2..4].copy_from_slice(&(flags & 0xfff0 | 0x0005).to_be_bytes());
     Some(response)
 }
 
@@ -7191,6 +7187,27 @@ mod tests {
         assert!(records.addresses.is_empty());
         assert!(records.aliases.is_empty());
         assert!(server_failure_response(&[]).is_none());
+    }
+
+    #[test]
+    fn refused_response_preserves_only_the_dns_question() {
+        let mut request = query("www.example.com", 1);
+        request[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
+        request[2..4].copy_from_slice(&0x0110_u16.to_be_bytes());
+        request[10..12].copy_from_slice(&1_u16.to_be_bytes());
+        let question_length = request.len();
+        request.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+
+        let response = refused_response(&request).unwrap();
+        assert_eq!(response.len(), question_length);
+        assert_eq!(&response[..2], &0x1234_u16.to_be_bytes());
+        assert_eq!(u16::from_be_bytes([response[2], response[3]]), 0x8105);
+        assert_eq!(&response[4..6], &1_u16.to_be_bytes());
+        assert_eq!(&response[6..12], &[0; 6]);
+        let records = parse_complete_dns_response(&response, "www.example.com", 1).unwrap();
+        assert!(records.addresses.is_empty());
+        assert!(records.aliases.is_empty());
+        assert!(refused_response(&[]).is_none());
     }
 
     #[test]
