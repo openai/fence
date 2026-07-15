@@ -2,7 +2,7 @@
 
 Status: security-claim source for the v0 protected target
 Audience: workflow authors, maintainers, adopters, and security reviewers
-Last reviewed: 2026-07-13
+Last reviewed: 2026-07-15
 
 This model must be reviewed before changing the supported runner class,
 platform profile, trusted launcher, privilege controls, evidence trust model,

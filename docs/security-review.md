@@ -2,7 +2,7 @@
 
 ## Scope
 
-This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-13.
+This review covers the v0 Linux agent, DNS-mediated selected platform profile, native `nftables` and NFLOG boundaries, root-owned runtime storage, hosted lockdown controls, bundled Action wrapper, release provenance workflow, and offline validation scripts as of 2026-07-15.
 
 This document records focused review findings. The current trust assumptions,
 attacker capabilities, abuse paths, and residual-risk priorities are defined in
