@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory() as directory:
     lock.write_text('version = 4\n\n[[package]]\nname = "fence"\nversion = "0.6.3"\n', encoding="utf-8")
     expect_error(lambda: module.validate_root_versions(cargo, lock), "accepted a Cargo.toml/Cargo.lock mismatch")
 
-repository = "GrantBirki/fence"
+repository = "openai/fence"
 version = "0.7.0"
 source = "a" * 40
 action = "b" * 40

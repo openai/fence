@@ -31,10 +31,10 @@ Release assets remain attested to reviewed source commit `M`, while the generate
 Consumers must pin the full 40-character `action_commit` value from `action-release.json`:
 
 ```yaml
-- uses: GrantBirki/fence@<action-commit> # pin@vX.Y.Z
+- uses: openai/fence@<action-commit> # pin@vX.Y.Z
 ```
 
-Use the tag from the same release in the `# pin@vX.Y.Z` comment. Release notes fill in both values, and the same-line version comment lets Dependabot keep the label in sync when it updates the pinned Action commit. Do not consume Fence from `main`; it is intentionally source-only and omits the generated bundle. A version tag identifies the release, but the immutable distribution commit is the supported workflow reference. Releases through `v0.6.3` retain their historical tag semantics; the one-parent distribution-commit model begins with the first later release.
+Use the tag from the same release in the `# pin@vX.Y.Z` comment. Release notes fill in both values, and the same-line version comment lets Dependabot keep the label in sync when it updates the pinned Action commit. Do not consume Fence from `main`; it is intentionally source-only and omits the generated bundle. A version tag identifies the release, but the immutable distribution commit is the supported workflow reference. Releases through `v0.6.3` retain their historical tag semantics; the one-parent distribution-commit model begins with the first later release. Releases through `v0.8.3` also retain their original `GrantBirki/fence` repository, release URL, and signer-workflow provenance; later releases use `openai/fence`.
 
 ## Runtime Bundle Integrity
 

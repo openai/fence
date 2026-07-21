@@ -1084,16 +1084,16 @@ function validateBundle(manifestPath: string, binaryPath: string): any {
   if (
     JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify(expectedKeys) ||
     manifest.schema_version !== 4 ||
-    manifest.repository !== "GrantBirki/fence" ||
+    manifest.repository !== "openai/fence" ||
     !RELEASE_TAG.test(manifest.release_tag) ||
     manifest.release_channel !== expectedReleaseChannel ||
-    manifest.release_url !== `https://github.com/GrantBirki/fence/releases/tag/${manifest.release_tag}` ||
+    manifest.release_url !== `https://github.com/openai/fence/releases/tag/${manifest.release_tag}` ||
     !/^[0-9a-f]{40}$/.test(manifest.source_commit) ||
     manifest.source_ref !== "refs/heads/main" ||
     manifest.artifact_name !== `fence_${manifest.release_tag}_linux-amd64` ||
     !SHA256.test(manifest.artifact_sha256) ||
     manifest.signer_digest !== manifest.source_commit ||
-    manifest.signer_workflow !== "GrantBirki/fence/.github/workflows/release.yml" ||
+    manifest.signer_workflow !== "openai/fence/.github/workflows/release.yml" ||
     manifest.bundle_path !== "action/bin/fence"
   ) {
     fail("bundle manifest does not match the reviewed Fence release contract");
@@ -1785,7 +1785,7 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
     "<summary>View allowlist example</summary>",
     "",
     "```yaml",
-    "- uses: GrantBirki/fence@<commit-sha>",
+    "- uses: openai/fence@<commit-sha>",
     "  with:",
     "    allowlist: |",
     ...entries.map((line) => `      ${line}`),

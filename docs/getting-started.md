@@ -11,7 +11,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: GrantBirki/fence@<fence-commit-sha>
+      - uses: openai/fence@<fence-commit-sha>
       - uses: actions/checkout@<checkout-commit-sha>
       - run: script/test
 ```
