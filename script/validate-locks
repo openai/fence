@@ -2152,11 +2152,11 @@ for forbidden in [
 
 readme = (root / "README.md").read_text(encoding="utf-8")
 ci_badges = [
-    f"[![{name}](https://github.com/GrantBirki/fence/actions/workflows/{name}.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/{name}.yml)"
+    f"[![{name}](https://github.com/openai/fence/actions/workflows/{name}.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/{name}.yml)"
     for name in ["lint", "test", "build", "acceptance"]
 ]
-release_canary_badge = "[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
-nightly_badge = "[![main / ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)"
+release_canary_badge = "[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
+nightly_badge = "[![main / ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)"
 for name, badge in zip(["lint", "test", "build", "acceptance"], ci_badges):
     require(
         readme.count(badge) == 1
@@ -2395,6 +2395,15 @@ canary_fragments = [
     "--exclude-pre-releases",
     "--exclude-drafts",
     "action-release.json",
+    "LEGACY_RELEASE_REPOSITORY: GrantBirki/fence",
+    "LEGACY_RELEASE_TAG: v0.8.3",
+    "legacy release mapping is outside the transfer boundary",
+    "mapping_repository.lower() == legacy_repository.lower() and tag != legacy_tag",
+    "release_repository=$release_repository",
+    "RELEASE_REPOSITORY: ${{ steps.resolve.outputs.release_repository }}",
+    '"repository": os.environ["RELEASE_REPOSITORY"]',
+    '"release_url": f"https://github.com/{os.environ[\'RELEASE_REPOSITORY\']}/releases/tag/{os.environ[\'RELEASE_TAG\']}"',
+    '"signer_workflow": f"{os.environ[\'RELEASE_REPOSITORY\']}/.github/workflows/release.yml"',
     '"release-candidate/$tag" "release-verified/$tag"',
     "wasSignedByGitHub",
     "mapped Action commit parent mismatch",
@@ -2463,8 +2472,8 @@ for fragment in [
     "uses: ./.github/workflows/action-drift-canary.yml",
     "action-release.json",
     'gh release create "$VERSION_TAG" "${assets[@]}" "${release_args[@]}"',
-    'echo "- uses: GrantBirki/fence@$ACTION_COMMIT # pin@$VERSION_TAG"',
-    'expected_pin = f"- uses: GrantBirki/fence@{os.environ[\'ACTION_COMMIT\']} # pin@{os.environ[\'VERSION_TAG\']}"',
+    'echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"',
+    'expected_pin = f"- uses: openai/fence@{os.environ[\'ACTION_COMMIT\']} # pin@{os.environ[\'VERSION_TAG\']}"',
 ]:
     require(fragment in release, "One-PR Action release workflow contract is incomplete")
 require(
@@ -2684,7 +2693,7 @@ def run_release_check_fixture(pages):
     original_urlopen = urllib.request.urlopen
     original_sleep = time.sleep
     environment = {
-        "GITHUB_REPOSITORY": "GrantBirki/fence",
+        "GITHUB_REPOSITORY": "openai/fence",
         "SOURCE_COMMIT": fixture_source_commit,
         "GH_TOKEN": "fixture-token",
     }

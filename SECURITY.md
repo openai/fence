@@ -73,10 +73,18 @@ Report vulnerabilities through GitHub Security Advisories for this repository wh
 
 ## Verifying Release Artifacts
 
-Release assets include checksums and GitHub artifact attestations. Verify downloaded assets with:
+Release assets include checksums and GitHub artifact attestations. Verify releases published from `openai/fence` with:
 
 ```console
 shasum -a 256 -c checksums.txt
+gh attestation verify <artifact> \
+  --repo openai/fence \
+  --signer-workflow openai/fence/.github/workflows/release.yml
+```
+
+Releases through `v0.8.3` retain their original `GrantBirki/fence` provenance. Verify those historical artifacts with:
+
+```console
 gh attestation verify <artifact> \
   --repo GrantBirki/fence \
   --signer-workflow GrantBirki/fence/.github/workflows/release.yml

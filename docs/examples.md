@@ -7,7 +7,7 @@ All examples use `<commit-sha>` as a placeholder. Replace it with the full `acti
 The zero-input configuration enables standard `block` mode with no user-defined destinations:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
 ```
 
 ## Audit A Workflow
@@ -15,7 +15,7 @@ The zero-input configuration enables standard `block` mode with no user-defined 
 Use `audit` to observe activity without blocking traffic or disabling passwordless sudo and container access:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     mode: audit
 ```
@@ -27,7 +27,7 @@ Review the final **Fence Summary**, add only the destinations the job needs, and
 Bare hostnames use TCP port `443`:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     allowlist: |
       api.example.com
@@ -41,7 +41,7 @@ Exact hostname entries resolve before readiness and refresh from bounded DNS lif
 The short URI forms and explicit line forms can be mixed:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     allowlist: |
       registry.example.com:8443
@@ -59,7 +59,7 @@ Use the explicit `ip` and `cidr` forms for literal addresses, especially IPv6.
 Standard block mode disables Docker and containerd control paths. If the workflow needs containers, explicitly select the degraded policy:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     container_policy: unsafe_preserve
     allowlist: |
@@ -74,7 +74,7 @@ This still applies the network policy and disables passwordless sudo, but retain
 One- and two-label leading wildcards are exact-depth patterns:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     allowlist: |
       *.docker.io
@@ -88,7 +88,7 @@ One- and two-label leading wildcards are exact-depth patterns:
 Remove the broad GitHub web, API, release-asset, and watchdog destinations and new platform-origin `*.githubapp.com` authorizations while keeping the core Actions reporting and finalization path:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     disable_broad_github_domains: true
 ```
@@ -100,7 +100,7 @@ An explicit user wildcard is not removed by this input.
 The only accepted profile is the supported v5 profile, which is also selected when the input is omitted:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     platform_profile: github_hosted_workflow_bootstrap_v5
 ```
@@ -112,7 +112,7 @@ Other profile values are rejected before mutation.
 The advanced `config` input exposes the strict agent schema:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     config: >-
       {"schema_version":1,"mode":"block","invocation_id":"my-job-1","allowlist":[]}

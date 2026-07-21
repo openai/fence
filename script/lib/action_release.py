@@ -34,7 +34,7 @@ GENERATED_FILES = {
     ("action/bin/fence", "added"),
     ("action/bundle-manifest.json", "added"),
 }
-REPOSITORY = "GrantBirki/fence"
+REPOSITORY = "openai/fence"
 
 
 def fail(message):

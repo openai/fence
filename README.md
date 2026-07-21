@@ -1,13 +1,13 @@
 # Fence 🛡️
 
-[![lint](https://github.com/GrantBirki/fence/actions/workflows/lint.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/lint.yml)
-[![test](https://github.com/GrantBirki/fence/actions/workflows/test.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/test.yml)
-[![build](https://github.com/GrantBirki/fence/actions/workflows/build.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/build.yml)
-[![acceptance](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/acceptance.yml)
-[![action acceptance](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance.yml)
-[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)
-[![main / ubuntu-latest](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/GrantBirki/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)
-[![integration](https://github.com/GrantBirki/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/GrantBirki/fence/actions/workflows/integration.yml)
+[![lint](https://github.com/openai/fence/actions/workflows/lint.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/lint.yml)
+[![test](https://github.com/openai/fence/actions/workflows/test.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/test.yml)
+[![build](https://github.com/openai/fence/actions/workflows/build.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/build.yml)
+[![acceptance](https://github.com/openai/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/acceptance.yml)
+[![action acceptance](https://github.com/openai/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/action-acceptance.yml)
+[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)
+[![main / ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)
+[![integration](https://github.com/openai/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/integration.yml)
 
 Fence runs first in a GitHub Actions job, applies a bounded built-in GitHub Actions and hosted-runner platform policy plus your `allowlist`, blocks other outbound network access, and turns off passwordless sudo and Docker by default.
 
@@ -18,7 +18,7 @@ Fence runs first in a GitHub Actions job, applies a bounded built-in GitHub Acti
 Add Fence as the first step in a supported GitHub-hosted Linux job:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha> # pin@vX.Y.Z
+- uses: openai/fence@<commit-sha> # pin@vX.Y.Z
 ```
 
 This starts Fence in `block` mode with an empty user `allowlist` on a GitHub-hosted `ubuntu-24.04` x64 host job. Replace `<commit-sha>` with the full `action_commit` value and `vX.Y.Z` with the tag from the same release; release notes provide the ready-to-copy line with a Dependabot-friendly `# pin@vX.Y.Z` comment. `main` is source-only and does not contain a runnable production bundle. Put Fence before checkout and any other steps you want it to constrain.
@@ -34,7 +34,7 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: GrantBirki/fence@<fence-commit-sha>
+      - uses: openai/fence@<fence-commit-sha>
       - uses: actions/checkout@<checkout-commit-sha>
       - run: script/test
 ```
@@ -42,7 +42,7 @@ jobs:
 Run in audit mode first to see what would need review before enabling blocking:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     mode: audit
 ```
@@ -50,7 +50,7 @@ Run in audit mode first to see what would need review before enabling blocking:
 Allow one or more HTTPS hostnames:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     allowlist: |
       api.example.com
@@ -60,7 +60,7 @@ Allow one or more HTTPS hostnames:
 Allow custom TCP, UDP, or CIDR destinations:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     allowlist: |
       registry.example.com:8443
@@ -72,7 +72,7 @@ Allow custom TCP, UDP, or CIDR destinations:
 Keep Docker/container access available while still applying network restrictions and disabling passwordless sudo:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     container_policy: unsafe_preserve
     allowlist: |
@@ -84,7 +84,7 @@ The wildcard can authorize exact-depth names such as `auth.docker.io`, but image
 Remove the broad GitHub web, API, release-asset, and watchdog destinations and new platform-origin `*.githubapp.com` authorizations while keeping the core Actions reporting path:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     disable_broad_github_domains: true
 ```
@@ -92,7 +92,7 @@ Remove the broad GitHub web, API, release-asset, and watchdog destinations and n
 Use raw JSON only when you need exact agent-schema control:
 
 ```yaml
-- uses: GrantBirki/fence@<commit-sha>
+- uses: openai/fence@<commit-sha>
   with:
     config: >-
       {"schema_version":1,"mode":"block","invocation_id":"my-job-1","allowlist":[]}

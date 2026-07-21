@@ -63,11 +63,11 @@ expected = {
     "bundle_path": "action/bin/fence",
     "release_channel": "prerelease" if "-" in version else "stable",
     "release_tag": f"v{version}",
-    "release_url": f"https://github.com/GrantBirki/fence/releases/tag/v{version}",
-    "repository": "GrantBirki/fence",
+    "release_url": f"https://github.com/openai/fence/releases/tag/v{version}",
+    "repository": "openai/fence",
     "schema_version": 4,
     "signer_digest": source_commit,
-    "signer_workflow": "GrantBirki/fence/.github/workflows/release.yml",
+    "signer_workflow": "openai/fence/.github/workflows/release.yml",
     "source_commit": source_commit,
     "source_ref": "refs/heads/main",
 }
@@ -98,7 +98,7 @@ manifest.update({
     "artifact_name": f"fence_v{version}_linux-amd64",
     "release_channel": channel,
     "release_tag": f"v{version}",
-    "release_url": f"https://github.com/GrantBirki/fence/releases/tag/v{version}",
+    "release_url": f"https://github.com/openai/fence/releases/tag/v{version}",
 })
 path.write_text(json.dumps(manifest), encoding="utf-8")
 PY
@@ -169,10 +169,10 @@ expect_manifest_rejected mismatched-artifact-version set artifact_name '"fence_v
 expect_manifest_rejected wrong-source set source_commit '"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"'
 expect_manifest_rejected wrong-source-ref set source_ref '"refs/heads/topic"'
 expect_manifest_rejected wrong-signer set signer_digest '"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"'
-expect_manifest_rejected wrong-signer-workflow set signer_workflow '"GrantBirki/fence/.github/workflows/other.yml"'
+expect_manifest_rejected wrong-signer-workflow set signer_workflow '"openai/fence/.github/workflows/other.yml"'
 expect_manifest_rejected wrong-path set bundle_path '"action/bin/other"'
 expect_manifest_rejected malformed-digest set artifact_sha256 '"not-a-sha256"'
-expect_manifest_rejected mismatched-release-url set release_url '"https://github.com/GrantBirki/fence/releases/tag/v9.9.9"'
+expect_manifest_rejected mismatched-release-url set release_url '"https://github.com/openai/fence/releases/tag/v9.9.9"'
 
 printf '%s' "tampered" >> "$checksum_state/action/bin/fence"
 if script/validate-action-bundle --root "$checksum_state" > "$tmpdir/checksum-state.output" 2>&1; then

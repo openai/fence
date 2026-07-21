@@ -89,7 +89,7 @@ if set(manifest) != expected_keys:
     raise SystemExit("Action bundle manifest fields do not match the reviewed schema")
 if manifest["schema_version"] != 4:
     raise SystemExit("Action bundle manifest schema_version must be 4")
-if manifest["repository"] != "GrantBirki/fence":
+if manifest["repository"] != "openai/fence":
     raise SystemExit("Action bundle manifest repository mismatch")
 semver_tag = r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?"
 if not re.fullmatch(semver_tag, manifest["release_tag"]):
@@ -97,7 +97,7 @@ if not re.fullmatch(semver_tag, manifest["release_tag"]):
 expected_release_channel = "prerelease" if "-" in manifest["release_tag"] else "stable"
 if manifest["release_channel"] != expected_release_channel:
     raise SystemExit("Action bundle manifest release channel mismatch")
-if manifest["release_url"] != f"https://github.com/GrantBirki/fence/releases/tag/{manifest['release_tag']}":
+if manifest["release_url"] != f"https://github.com/openai/fence/releases/tag/{manifest['release_tag']}":
     raise SystemExit("Action bundle manifest release URL mismatch")
 if not re.fullmatch(r"[0-9a-f]{40}", manifest["source_commit"]):
     raise SystemExit("Action bundle manifest source_commit must be a full SHA")
@@ -109,7 +109,7 @@ if not re.fullmatch(r"[0-9a-f]{64}", manifest["artifact_sha256"]):
     raise SystemExit("Action bundle manifest artifact checksum is invalid")
 if manifest["bundle_path"] != "action/bin/fence":
     raise SystemExit("Action bundle manifest path mismatch")
-if manifest["signer_workflow"] != "GrantBirki/fence/.github/workflows/release.yml":
+if manifest["signer_workflow"] != "openai/fence/.github/workflows/release.yml":
     raise SystemExit("Action bundle signer workflow mismatch")
 if manifest["signer_digest"] != manifest["source_commit"]:
     raise SystemExit("Action bundle signer digest mismatch")

@@ -20,7 +20,7 @@ defaults:
 
 jobs:
   prepare:
-    if: github.repository == 'GrantBirki/fence'
+    if: github.repository == 'openai/fence'
     permissions:
       contents: read
     runs-on: ubuntu-24.04
@@ -963,7 +963,7 @@ jobs:
             echo "Complete Action commit: \`$ACTION_COMMIT\`"
             echo
             echo '```yaml'
-            echo "- uses: GrantBirki/fence@$ACTION_COMMIT # pin@$VERSION_TAG"
+            echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"
             echo '```'
           } > "$notes"
 
@@ -1110,7 +1110,7 @@ jobs:
           expected_prerelease = os.environ["RELEASE_CHANNEL"] == "prerelease"
           if release.get("isPrerelease") is not expected_prerelease:
               raise SystemExit("published release channel mismatch")
-          expected_pin = f"- uses: GrantBirki/fence@{os.environ['ACTION_COMMIT']} # pin@{os.environ['VERSION_TAG']}"
+          expected_pin = f"- uses: openai/fence@{os.environ['ACTION_COMMIT']} # pin@{os.environ['VERSION_TAG']}"
           if expected_pin not in str(release.get("body", "")).splitlines():
               raise SystemExit("published release notes are missing the verified full-SHA pin")
           PY
@@ -1416,8 +1416,8 @@ jobs:
             echo "Verified Action commit: \`$ACTION_COMMIT\`"
             echo
             echo '```yaml'
-            echo "- uses: GrantBirki/fence@$ACTION_COMMIT # pin@$VERSION_TAG"
+            echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Action commit: $ACTION_COMMIT"
-          echo "- uses: GrantBirki/fence@$ACTION_COMMIT # pin@$VERSION_TAG"
+          echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"

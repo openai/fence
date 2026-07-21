@@ -87,15 +87,15 @@ function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
   const digest = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
   return {
     schema_version: 4,
-    repository: "GrantBirki/fence",
+    repository: "openai/fence",
     release_tag: "v0.1.0-alpha.3",
     release_channel: "prerelease",
-    release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0-alpha.3",
+    release_url: "https://github.com/openai/fence/releases/tag/v0.1.0-alpha.3",
     source_commit: "a".repeat(40),
     source_ref: "refs/heads/main",
     artifact_name: "fence_v0.1.0-alpha.3_linux-amd64",
     signer_digest: "a".repeat(40),
-    signer_workflow: "GrantBirki/fence/.github/workflows/release.yml",
+    signer_workflow: "openai/fence/.github/workflows/release.yml",
     bundle_path: "action/bin/fence",
     artifact_sha256: digest,
     ...overrides,
@@ -1376,7 +1376,7 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
   assert.match(summary, /```yaml/);
-  assert.match(summary, /GrantBirki\/fence@<commit-sha>/);
+  assert.match(summary, /openai\/fence@<commit-sha>/);
   assert.match(summary, /allowlist: \|/);
   assert.match(summary, /      www.google.com/);
   assert.doesNotMatch(summary, /invocation_id/);
@@ -1619,7 +1619,7 @@ test("renders bounded allowlist YAML snippets", () => {
   assert.match(snippet.trimStart(), /^<details>/);
   assert.match(snippet, /<summary>View allowlist example<\/summary>/);
   assert.match(snippet, /```yaml/);
-  assert.match(snippet, /GrantBirki\/fence@<commit-sha>/);
+  assert.match(snippet, /openai\/fence@<commit-sha>/);
   assert.match(snippet, /allowlist: \|/);
   assert.match(snippet, /      api.example.com/);
   assert.match(snippet, /      metrics.example.com:8443/);
@@ -1666,7 +1666,7 @@ test("validates generated release bundle metadata and binary identity", () => {
     const stableManifest = manifestFor(binary, {
       release_tag: "v0.1.0",
       release_channel: "stable",
-      release_url: "https://github.com/GrantBirki/fence/releases/tag/v0.1.0",
+      release_url: "https://github.com/openai/fence/releases/tag/v0.1.0",
       source_commit: "b".repeat(40),
       signer_digest: "b".repeat(40),
       artifact_name: "fence_v0.1.0_linux-amd64",
@@ -1680,7 +1680,7 @@ test("validates generated release bundle metadata and binary identity", () => {
       ...stableManifest,
       release_tag: `v${version}`,
       release_channel: version.includes("-") ? "prerelease" : "stable",
-      release_url: `https://github.com/GrantBirki/fence/releases/tag/v${version}`,
+      release_url: `https://github.com/openai/fence/releases/tag/v${version}`,
       artifact_name: `fence_v${version}_linux-amd64`,
     });
     const invalidManifests: Array<[string, Record<string, unknown>]> = [
@@ -1696,11 +1696,11 @@ test("validates generated release bundle metadata and binary identity", () => {
       ["leading-zero numeric prerelease", invalidReleaseIdentity("1.2.3-01")],
       ["build metadata", invalidReleaseIdentity("1.2.3+build.1")],
       ["mismatched artifact version", { ...stableManifest, artifact_name: "fence_v9.9.9_linux-amd64" }],
-      ["mismatched release URL", { ...stableManifest, release_url: "https://github.com/GrantBirki/fence/releases/tag/v9.9.9" }],
+      ["mismatched release URL", { ...stableManifest, release_url: "https://github.com/openai/fence/releases/tag/v9.9.9" }],
       ["malformed source commit", { ...stableManifest, source_commit: "B".repeat(40) }],
       ["wrong source ref", { ...stableManifest, source_ref: "refs/heads/topic" }],
       ["wrong signer digest", { ...stableManifest, signer_digest: "c".repeat(40) }],
-      ["wrong signer workflow", { ...stableManifest, signer_workflow: "GrantBirki/fence/.github/workflows/other.yml" }],
+      ["wrong signer workflow", { ...stableManifest, signer_workflow: "openai/fence/.github/workflows/other.yml" }],
       ["wrong bundle path", { ...stableManifest, bundle_path: "action/bin/other" }],
       ["malformed artifact digest", { ...stableManifest, artifact_sha256: "not-a-sha256" }],
     ];
