@@ -33,6 +33,10 @@ if ! diff -u <(test_tools_cargo_llvm_cov_entries "$lockfile" | sort) <(test_tool
   die "test-tool lockfile and manifest cargo-llvm-cov entries differ"
 fi
 
+if ! diff -u <(test_tools_cargo_llvm_cov_license_entries "$lockfile" | sort) <(test_tools_cargo_llvm_cov_license_entries "$manifest" | sort); then
+  die "test-tool lockfile and manifest cargo-llvm-cov license entries differ"
+fi
+
 artifact_count=0
 while IFS='|' read -r platform arch os target version url path sha256; do
   artifact_count=$((artifact_count + 1))
@@ -59,6 +63,42 @@ done < <(test_tools_cargo_llvm_cov_entries "$manifest")
 
 if [[ "$artifact_count" -ne 4 ]]; then
   die "expected 4 vendored cargo-llvm-cov artifacts, found $artifact_count"
+fi
+
+license_count=0
+license_names="|"
+while IFS='|' read -r name version url path sha256; do
+  license_count=$((license_count + 1))
+  if [[ -z "$name" || -z "$version" || -z "$url" || -z "$path" || -z "$sha256" ]]; then
+    die "invalid cargo-llvm-cov license entry in test-tool manifest"
+  fi
+  case "$name" in
+    LICENSE-APACHE|LICENSE-MIT) ;;
+    *) die "unexpected cargo-llvm-cov license name: $name" ;;
+  esac
+  if [[ "$version" != "$cargo_llvm_cov_version" ]]; then
+    die "cargo-llvm-cov license version mismatch for $name"
+  fi
+  if [[ "$path" != "vendor/test-tools/cargo-llvm-cov/$name" ]]; then
+    die "cargo-llvm-cov license has unexpected path: $path"
+  fi
+  if [[ "$license_names" == *"|$name|"* ]]; then
+    die "duplicate cargo-llvm-cov license entry: $name"
+  fi
+  license_names+="$name|"
+  reject_unsafe_relative_path "$path" "cargo-llvm-cov license path for $name"
+  license="$DIR/$path"
+  if [[ ! -f "$license" ]]; then
+    die "missing cargo-llvm-cov license: $path"
+  fi
+  actual="$(sha256_file "$license")"
+  if [[ "$actual" != "$sha256" ]]; then
+    die "cargo-llvm-cov license checksum mismatch for $path"
+  fi
+done < <(test_tools_cargo_llvm_cov_license_entries "$manifest")
+
+if [[ "$license_count" -ne 2 || "$license_names" != "|LICENSE-APACHE|LICENSE-MIT|" ]]; then
+  die "expected cargo-llvm-cov Apache and MIT licenses"
 fi
 
 if grep -nE '\bcurl\b|cargo install[[:space:]].*--version|unset CARGO_NET_OFFLINE|unset RUSTUP_AUTO_INSTALL|RUSTUP_AUTO_INSTALL[[:space:]]*=' "$DIR/script/install-test-tools"; then

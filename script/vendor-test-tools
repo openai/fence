@@ -43,7 +43,58 @@ remove_generated_path "$test_tools_dir" "test-tool vendor directory"
 mkdir -p "$TOOLING_DIR" "$cargo_llvm_cov_dir"
 
 tool_entries="$tmpdir/cargo-llvm-cov-entries.toml"
+license_entries="$tmpdir/cargo-llvm-cov-license-entries.toml"
 : > "$tool_entries"
+: > "$license_entries"
+
+license_count=0
+while IFS='|' read -r name version url path expected_sha256; do
+  if [[ -z "$name" || -z "$version" || -z "$url" || -z "$path" || -z "$expected_sha256" ]]; then
+    die "invalid cargo-llvm-cov license entry in ${TEST_TOOLS_LOCK#$DIR/}"
+  fi
+
+  case "$name" in
+    LICENSE-APACHE|LICENSE-MIT) ;;
+    *) die "unexpected cargo-llvm-cov license name: $name" ;;
+  esac
+
+  if [[ "$version" != "$cargo_llvm_cov_version" ]]; then
+    die "cargo-llvm-cov license version mismatch for $name"
+  fi
+
+  if [[ "$path" != "vendor/test-tools/cargo-llvm-cov/$name" ]]; then
+    die "cargo-llvm-cov license has unexpected path: $path"
+  fi
+  reject_unsafe_relative_path "$path" "cargo-llvm-cov license path for $name"
+
+  tmp_license="$tmpdir/$name"
+
+  echo "fetching $url"
+  fetch "$url" "$tmp_license"
+
+  actual_sha256="$(sha256_file "$tmp_license")"
+  if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+    die "cargo-llvm-cov license checksum mismatch for $name (expected $expected_sha256, found $actual_sha256)"
+  fi
+
+  mv "$tmp_license" "$DIR/$path"
+
+  {
+    echo "[[cargo_llvm_cov_license]]"
+    echo "name = \"$name\""
+    echo "version = \"$version\""
+    echo "url = \"$url\""
+    echo "path = \"$path\""
+    echo "sha256 = \"$actual_sha256\""
+    echo
+  } >> "$license_entries"
+
+  license_count=$((license_count + 1))
+done < <(test_tools_cargo_llvm_cov_license_entries "$lockfile")
+
+if [[ "$license_count" -ne 2 ]]; then
+  die "expected 2 cargo-llvm-cov license entries in ${TEST_TOOLS_LOCK#$DIR/}, found $license_count"
+fi
 
 artifact_count=0
 while IFS='|' read -r platform arch os target version url path expected_sha256; do
@@ -106,7 +157,8 @@ fi
   echo "manifest_version = 1"
   echo "cargo_llvm_cov_version = \"$cargo_llvm_cov_version\""
   echo
-  cat "$tool_entries"
+  cat "$license_entries"
+  sed '$d' "$tool_entries"
 } > "$manifest"
 
 script/validate-test-tools
