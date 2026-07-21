@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: checkout source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -255,7 +255,7 @@ jobs:
 
     steps:
       - name: checkout source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 0
@@ -325,7 +325,7 @@ jobs:
 
     steps:
       - name: checkout source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 0
@@ -769,7 +769,7 @@ jobs:
 
     steps:
       - name: checkout source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 1
@@ -918,7 +918,7 @@ jobs:
 
     steps:
       - name: checkout source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 1
@@ -1053,7 +1053,7 @@ jobs:
           fi
 
       - name: checkout exact distribution commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.create-candidate.outputs.action_commit }}
           fetch-depth: 2
@@ -1214,7 +1214,7 @@ jobs:
 
     steps:
       - name: checkout source commit
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare.outputs.source_commit }}
           fetch-depth: 1
