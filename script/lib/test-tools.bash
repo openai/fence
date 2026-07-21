@@ -39,6 +39,42 @@ test_tools_cargo_llvm_cov_entries() {
   ' "$file"
 }
 
+test_tools_cargo_llvm_cov_license_entries() {
+  local file="$1"
+  awk '
+    function value(line) {
+      sub(/^[^=]*= "/, "", line)
+      sub(/"$/, "", line)
+      return line
+    }
+    /^\[\[cargo_llvm_cov_license\]\]/ {
+      if (in_license && name != "") {
+        print name "|" version "|" url "|" path "|" sha256
+      }
+      in_license = 1
+      name = version = url = path = sha256 = ""
+      next
+    }
+    /^\[/ {
+      if (in_license && name != "") {
+        print name "|" version "|" url "|" path "|" sha256
+      }
+      in_license = 0
+      next
+    }
+    in_license && $1 == "name" { name = value($0) }
+    in_license && $1 == "version" { version = value($0) }
+    in_license && $1 == "url" { url = value($0) }
+    in_license && $1 == "path" { path = value($0) }
+    in_license && $1 == "sha256" { sha256 = value($0) }
+    END {
+      if (in_license && name != "") {
+        print name "|" version "|" url "|" path "|" sha256
+      }
+    }
+  ' "$file"
+}
+
 test_tools_host_platform() {
   local os
   local arch

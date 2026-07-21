@@ -5,6 +5,20 @@
 manifest_version = 1
 cargo_llvm_cov_version = "0.8.6"
 
+[[cargo_llvm_cov_license]]
+name = "LICENSE-APACHE"
+version = "0.8.6"
+url = "https://raw.githubusercontent.com/taiki-e/cargo-llvm-cov/v0.8.6/LICENSE-APACHE"
+path = "vendor/test-tools/cargo-llvm-cov/LICENSE-APACHE"
+sha256 = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+
+[[cargo_llvm_cov_license]]
+name = "LICENSE-MIT"
+version = "0.8.6"
+url = "https://raw.githubusercontent.com/taiki-e/cargo-llvm-cov/v0.8.6/LICENSE-MIT"
+path = "vendor/test-tools/cargo-llvm-cov/LICENSE-MIT"
+sha256 = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+
 [[cargo_llvm_cov]]
 platform = "linux-x86_64"
 arch = "x86_64"
