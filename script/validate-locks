@@ -239,6 +239,19 @@ workflow_paths = sorted(
 workflow_sources = {
     path.name: path.read_text(encoding="utf-8") for path in workflow_paths
 }
+checkout_actions = {
+    action
+    for source in workflow_sources.values()
+    for action in workflow_uses(source)
+    if action.startswith("actions/checkout@")
+}
+require(
+    len(checkout_actions) == 1
+    and re.fullmatch(r"actions/checkout@[0-9a-f]{40}", next(iter(checkout_actions)))
+    is not None,
+    "Workflow checkout actions must share one immutable full commit SHA",
+)
+checkout_action = next(iter(checkout_actions))
 for source in workflow_sources.values():
     require(
         len(re.findall(r"(?m)^on:(?:[ \t]+#.*)?$", source)) == 1,
@@ -402,7 +415,7 @@ for workflow_name, spec in ci_specs.items():
     require(
         workflow_uses(ci_workflow)
         == collections.Counter(
-            {"actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 1}
+            {checkout_action: 1}
         ),
         f"{label} may use only the reviewed checkout step",
     )
@@ -554,7 +567,7 @@ for workflow_name, spec in ci_specs.items():
         job,
         "checkout",
         ["uses", "with"],
-        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        {"uses": checkout_action},
         f"{label} checkout",
     )
     checkout_with = indented_block(
@@ -666,7 +679,7 @@ require(
     workflow_uses(workflow)
     == collections.Counter(
         {
-            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 8,
+            checkout_action: 8,
             "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a": 1,
             "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c": 6,
             "./": 3,
@@ -835,7 +848,7 @@ prepare_checkout = require_step_contract(
     prepare,
     "checkout candidate source",
     ["uses", "with"],
-    {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+    {"uses": checkout_action},
     "Action acceptance candidate checkout",
 )
 prepare_checkout_with = indented_block(
@@ -1105,7 +1118,7 @@ for job_name, job in action_job_blocks.items():
         job,
         checkout_name,
         ["uses", "with"],
-        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        {"uses": checkout_action},
         f"Action acceptance {job_name} checkout",
     )
     checkout_with = indented_block(
@@ -1371,7 +1384,7 @@ aggregate_checkout = require_step_contract(
     {
         "id": "finalization-checkout",
         "if": "${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}",
-        "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+        "uses": checkout_action,
     },
     "Action acceptance finalization checkout",
 )
@@ -1466,7 +1479,7 @@ integration_workflow = integration_path.read_text(encoding="utf-8")
 require(
     workflow_uses(integration_workflow)
     == collections.Counter(
-        {"actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd": 6}
+        {checkout_action: 6}
     ),
     "Integration may use only the six reviewed checkout steps",
 )
@@ -1596,7 +1609,7 @@ preflight_checkout = require_step_contract(
     integration_preflight,
     "checkout",
     ["uses", "with"],
-    {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+    {"uses": checkout_action},
     "Integration preflight checkout",
 )
 preflight_checkout_with = indented_block(
@@ -1697,7 +1710,7 @@ for job_name in integration_target_jobs:
         job,
         "checkout",
         ["uses", "with"],
-        {"uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"},
+        {"uses": checkout_action},
         f"Integration {job_name} checkout",
     )
     target_checkout_with = indented_block(
@@ -1913,7 +1926,7 @@ integration_checkout = require_step_contract(
     ["id", "uses", "with"],
     {
         "id": "checkout",
-        "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+        "uses": checkout_action,
     },
     "Integration terminal checkout",
 )
@@ -2384,7 +2397,7 @@ require(
 )
 
 canary_fragments = [
-    "uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+    f"uses: {checkout_action}",
     "persist-credentials: false",
     "run: script/validate-locks --ci",
     "run: script/validate-action-bundle",
