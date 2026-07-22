@@ -120,10 +120,7 @@ GitHub profile requires a new threat-model review.
   only authorized `A`/`AAAA` names; audit forwards observation traffic while
   simulating the same bounded name policy without a containment claim
   (`src/dns_mediator.rs`).
-- **DNS mediator -> fixed resolver and firewall owner:** bounded queries go to
-  the reviewed resolver path. An approved answer is withheld until all matching
-  transport rules are applied and structurally verified
-  (`src/dns_mediator.rs::MaterializationSubmitter`).
+- **DNS mediator -> fixed resolver and firewall owner:** local UDP and TCP queries share the bounded root-only UDP resolver path. An approved answer is withheld until all matching transport rules are applied and structurally verified (`src/dns_mediator.rs::MaterializationSubmitter`).
 - **Platform compatibility -> GitHub service domains:** Fence permits fixed
   workflow roots, one exact results-storage compatibility account, and at most
   eight single-label `*.githubapp.com` names unless broad GitHub compatibility

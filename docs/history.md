@@ -98,6 +98,7 @@ See [`v0.md`](v0.md) for normative behavior and
   keeps transient addresses out of the logical hash.
 - Exact user policy can no longer prehydrate non-static results-storage accounts: configuration rejects those entries before mutation, and bootstrap processing independently refuses runner-gated materialization.
 - Response-local CNAME lineage now rejects non-static results-storage targets so user hostnames cannot bypass pinned-runner attribution or the four-account authorization cap.
+- Local TCP DNS queries now use the same bounded root-only UDP upstream resolver as local UDP queries, preserving the existing firewall exception without granting upstream TCP access.
 - Source-built policy added exact-depth one- and two-label user wildcard
   hostnames with one shared eight-name lifetime budget, lazy DNS-mediated
   materialization, deterministic transport union, and explicit local evidence.

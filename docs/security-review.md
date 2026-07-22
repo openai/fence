@@ -39,19 +39,11 @@ Post-publication verification re-downloads the assets, verifies checksums and so
 
 ### DNS TCP client deadlines
 
-The local TCP DNS listeners previously served connections serially without a
-client read deadline. A local workflow process could hold a connection open and
-strand subsequent TCP DNS requests on that listener. Accepted client sockets,
-upstream TCP connects, upstream reads, and upstream writes now use bounded
-deadlines. This limits accidental stalls and bounds one connection attempt.
+The local TCP DNS listeners previously served connections serially without a client read deadline, and forwarded their queries over upstream TCP even though the protected firewall permits only root-owned upstream UDP DNS. Accepted client sockets now use bounded deadlines, and both TCP and UDP clients share the same bounded, connected UDP resolver path without widening the firewall exception.
 
 ### DNS upstream response binding
 
-The UDP mediator previously accepted the first datagram received on its
-ephemeral upstream socket without binding the socket to the fixed resolver or
-checking the transaction identifier. The mediator now connects the UDP socket
-to the fixed resolver and rejects UDP or TCP responses whose identifier does
-not match the mediator-owned upstream query.
+The UDP mediator previously accepted the first datagram received on its ephemeral upstream socket without binding the socket to the fixed resolver or checking the transaction identifier. The mediator now connects every UDP upstream socket to the fixed resolver and rejects responses whose identifier does not match the mediator-owned upstream query for either local transport.
 
 ### Docker DNS configuration file safety
 

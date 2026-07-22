@@ -312,6 +312,47 @@ for hostname in (
     require(struct.unpack("!H", response[2:4])[0] & 0x000F == 5)
 PY
 
+if [[ "$scenario" == "healthy" ]]; then
+  python3 -E <<'PY'
+import random
+import socket
+import struct
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+def require(condition, message="TCP DNS resolution failed"):
+    if not condition:
+        raise SystemExit(message)
+
+def read_exact(connection, size):
+    output = bytearray()
+    while len(output) < size:
+        chunk = connection.recv(size - len(output))
+        require(chunk)
+        output.extend(chunk)
+    return bytes(output)
+
+identifier = random.randrange(0, 65536)
+hostname = b"github.com"
+question = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
+packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question + struct.pack("!HH", 1, 1)
+with socket.create_connection(("127.0.0.1", 53), timeout=5) as connection:
+    connection.settimeout(5)
+    connection.sendall(struct.pack("!H", len(packet)) + packet)
+    response_length = struct.unpack("!H", read_exact(connection, 2))[0]
+    response = read_exact(connection, response_length)
+
+response_identifier, flags, question_count, answer_count, _, _ = struct.unpack("!HHHHHH", response[:12])
+require(response_identifier == identifier)
+require(flags & 0x8000 != 0)
+require(flags & 0x000F == 0)
+require(question_count == 1)
+require(answer_count > 0)
+PY
+fi
+
 if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
   die "DNS-mediated selected-profile runtime evidence did not disable runner passwordless sudo"
 fi
