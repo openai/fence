@@ -13,6 +13,7 @@ hostname example.com tcp 443
 *.example.com
 *.*.example.com
 ip 192.0.2.10 tcp 443
+ip 2001:db8::10 udp 53
 cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
@@ -21,6 +22,7 @@ cidr 2001:db8::/64 tcp 443
 - `example.com:8443`, `tcp://...`, and `udp://...` select a specific transport and port.
 - `hostname ...`, `ip ...`, and `cidr ...` are the explicit forms.
 - Literal IPv6 addresses and address ranges should use `ip` or `cidr` so the port remains unambiguous.
+- CIDR entries must identify a canonical network without host bits; for example, `192.0.2.0/24` is valid but `192.0.2.1/24` is rejected before privileged setup.
 
 ## Exact Hostnames
 

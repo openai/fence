@@ -47,6 +47,8 @@ Run in audit mode first to see what would need review before enabling blocking:
     mode: audit
 ```
 
+The audit summary suggests allowlist entries for observed hostnames and direct IPv4 or IPv6 destinations.
+
 Allow one or more HTTPS hostnames:
 
 ```yaml
@@ -113,11 +115,12 @@ hostname example.com tcp 443
 *.example.com
 *.*.example.com
 ip 192.0.2.10 tcp 443
+ip 2001:db8::10 udp 53
 cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
 
-Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for address ranges and IPv6. Blank lines and comments beginning with `#` are ignored. Wildcards match exactly one or two leading labels and share a bounded lifetime authorization budget.
+Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for address ranges and IPv6. CIDR entries must identify a network address without host bits. Blank lines and comments beginning with `#` are ignored. Wildcards match exactly one or two leading labels and share a bounded lifetime authorization budget.
 
 **Read more:** [Allowlist syntax and DNS behavior](docs/allowlist.md)
 

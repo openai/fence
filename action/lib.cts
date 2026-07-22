@@ -343,7 +343,46 @@ function validateCidr(value: string): string {
   if (!Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > maximum) {
     fail(`allowlist cidr prefix length must be between 0 and ${maximum}`);
   }
-  return value;
+  if (address.includes("%")) {
+    fail("allowlist cidr entries must identify a canonical IP network");
+  }
+
+  const canonicalAddress = new net.SocketAddress({
+    address,
+    family: family === 4 ? "ipv4" : "ipv6",
+  }).address;
+  let addressParts: string[];
+  if (family === 4) {
+    addressParts = canonicalAddress.split(".");
+  } else {
+    let expandedAddress = canonicalAddress;
+    const finalSeparator = expandedAddress.lastIndexOf(":");
+    const finalComponent = expandedAddress.slice(finalSeparator + 1);
+    if (finalComponent.includes(".")) {
+      const octets = finalComponent.split(".").map(Number);
+      const firstGroup = ((octets[0] << 8) | octets[1]).toString(16);
+      const secondGroup = ((octets[2] << 8) | octets[3]).toString(16);
+      expandedAddress = `${expandedAddress.slice(0, finalSeparator)}:${firstGroup}:${secondGroup}`;
+    }
+    const [head, tail = ""] = expandedAddress.split("::");
+    const headGroups = head === "" ? [] : head.split(":");
+    const tailGroups = tail === "" ? [] : tail.split(":");
+    addressParts = [
+      ...headGroups,
+      ...Array(8 - headGroups.length - tailGroups.length).fill("0"),
+      ...tailGroups,
+    ];
+  }
+  const bitsPerPart = family === 4 ? 8n : 16n;
+  const addressValue = addressParts.reduce(
+    (result, part) => (result << bitsPerPart) + BigInt(family === 4 ? part : `0x${part}`),
+    0n,
+  );
+  const hostBits = BigInt(maximum - prefixLength);
+  if (((addressValue >> hostBits) << hostBits) !== addressValue) {
+    fail("allowlist cidr entries must identify a canonical IP network without host bits");
+  }
+  return `${canonicalAddress}/${prefixLength}`;
 }
 
 function classifyDestination(value: string): "hostname" | "ip" | "cidr" {
@@ -1770,6 +1809,9 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
     return [];
   }
   const entries = rows.map((row) => {
+    if (row.destinationKind === "ip") {
+      return `ip ${row.destination} ${row.protocol} ${row.port}`;
+    }
     if (row.protocol === "tcp" && row.port === 443) {
       return row.destination;
     }
@@ -2100,7 +2142,10 @@ function networkActivitySummary(
     lines.push("");
   }
   if (report.mode === "audit") {
-    lines.push(...allowlistYamlSnippet(auditSummary.hostnameRows));
+    lines.push(...allowlistYamlSnippet([
+      ...auditSummary.hostnameRows,
+      ...auditSummary.ipRows,
+    ]));
   }
   return lines;
 }
