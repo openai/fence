@@ -4027,7 +4027,7 @@ fn start_dns_proxy(
         let tcp_recorder = recorder.clone();
         let tcp_thread =
             spawn_supervised_worker(tcp_worker, Arc::clone(&stop), events.clone(), move |stop| {
-                serve_tcp(tcp, listener_kind, tcp_recorder, stop)
+                serve_tcp(tcp, listener_kind, tcp_recorder, stop, UPSTREAM_DNS)
             });
         match tcp_thread {
             Ok(thread) => threads.push(thread),
@@ -4184,38 +4184,24 @@ fn serve_udp(
                     continue;
                 }
             };
-        let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
+        let Ok(mut response) = forward_upstream_udp(UPSTREAM_DNS, &upstream_query) else {
             recorder.record_upstream_request_failure();
             send_udp_retryable_failure(&socket, bytes, peer);
             continue;
         };
-        let _ = upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT));
-        let _ = upstream.set_write_timeout(Some(DNS_FORWARD_TIMEOUT));
-        if upstream.connect(UPSTREAM_DNS).is_err() || upstream.send(&upstream_query).is_err() {
+        if !response_matches_upstream_query(&response, &upstream_query) {
             recorder.record_upstream_request_failure();
             send_udp_retryable_failure(&socket, bytes, peer);
             continue;
         }
-        let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
-        let Ok(response_length) = upstream.recv(&mut response) else {
-            recorder.record_upstream_request_failure();
-            send_udp_retryable_failure(&socket, bytes, peer);
-            continue;
-        };
-        let response = &mut response[..response_length];
-        if !response_matches_upstream_query(response, &upstream_query) {
-            recorder.record_upstream_request_failure();
-            send_udp_retryable_failure(&socket, bytes, peer);
-            continue;
-        }
-        restore_client_query_id(response, bytes);
+        restore_client_query_id(&mut response, bytes);
         let disposition = parsed_question
             .as_ref()
             .map(|(hostname, query_type)| {
-                recorder.record_response(hostname, *query_type, response, response_classification)
+                recorder.record_response(hostname, *query_type, &response, response_classification)
             })
             .unwrap_or(DnsResponseDisposition::ForwardOriginal);
-        let Some(output) = dns_response_for_disposition(bytes, response, disposition) else {
+        let Some(output) = dns_response_for_disposition(bytes, &response, disposition) else {
             continue;
         };
         let _ = socket.send_to(&output, peer);
@@ -4234,6 +4220,7 @@ fn serve_tcp(
     listener_kind: DnsListenerKind,
     recorder: ObservationRecorder,
     stop: &AtomicBool,
+    upstream_address: &str,
 ) -> Result<(), DnsMediationError> {
     while !stop.load(Ordering::Relaxed) {
         let (mut client, peer) = match listener.accept() {
@@ -4303,38 +4290,11 @@ fn serve_tcp(
                 continue;
             }
         };
-        let Ok(mut upstream) = connect_upstream_tcp() else {
+        let Ok(mut response) = forward_upstream_udp(upstream_address, &upstream_query) else {
             recorder.record_upstream_request_failure();
             write_tcp_retryable_failure(&mut client, &query);
             continue;
         };
-        if upstream
-            .write_all(&(upstream_query.len() as u16).to_be_bytes())
-            .is_err()
-            || upstream.write_all(&upstream_query).is_err()
-        {
-            recorder.record_upstream_request_failure();
-            write_tcp_retryable_failure(&mut client, &query);
-            continue;
-        }
-        let mut response_length = [0_u8; 2];
-        if upstream.read_exact(&mut response_length).is_err() {
-            recorder.record_upstream_request_failure();
-            write_tcp_retryable_failure(&mut client, &query);
-            continue;
-        }
-        let size = usize::from(u16::from_be_bytes(response_length));
-        if size == 0 || size > MAX_DNS_PACKET_BYTES {
-            recorder.record_upstream_request_failure();
-            write_tcp_retryable_failure(&mut client, &query);
-            continue;
-        }
-        let mut response = vec![0_u8; size];
-        if upstream.read_exact(&mut response).is_err() {
-            recorder.record_upstream_request_failure();
-            write_tcp_retryable_failure(&mut client, &query);
-            continue;
-        }
         if !response_matches_upstream_query(&response, &upstream_query) {
             recorder.record_upstream_request_failure();
             write_tcp_retryable_failure(&mut client, &query);
@@ -4370,16 +4330,15 @@ fn write_tcp_retryable_failure(client: &mut TcpStream, query: &[u8]) {
     let _ = client.write_all(&response);
 }
 
-fn connect_upstream_tcp() -> std::io::Result<TcpStream> {
-    let address = UPSTREAM_DNS.parse().map_err(|error| {
-        std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("invalid fixed upstream DNS address: {error}"),
-        )
-    })?;
-    let stream = TcpStream::connect_timeout(&address, DNS_FORWARD_TIMEOUT)?;
-    set_dns_tcp_deadlines(&stream)?;
-    Ok(stream)
+fn forward_upstream_udp(upstream_address: &str, query: &[u8]) -> std::io::Result<Vec<u8>> {
+    let upstream = UdpSocket::bind("0.0.0.0:0")?;
+    upstream.set_read_timeout(Some(DNS_FORWARD_TIMEOUT))?;
+    upstream.set_write_timeout(Some(DNS_FORWARD_TIMEOUT))?;
+    upstream.connect(upstream_address)?;
+    upstream.send(query)?;
+    let mut response = [0_u8; MAX_DNS_PACKET_BYTES];
+    let response_length = upstream.recv(&mut response)?;
+    Ok(response[..response_length].to_vec())
 }
 
 fn set_dns_tcp_deadlines(stream: &TcpStream) -> std::io::Result<()> {
@@ -6357,6 +6316,66 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn forwards_local_tcp_dns_queries_through_the_udp_upstream() {
+        let resolver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        resolver
+            .set_read_timeout(Some(DNS_FORWARD_TIMEOUT))
+            .unwrap();
+        let upstream_address = resolver.local_addr().unwrap().to_string();
+        let resolver_thread = thread::spawn(move || {
+            let mut request = [0_u8; MAX_DNS_PACKET_BYTES];
+            let (length, peer) = resolver.recv_from(&mut request).unwrap();
+            assert_eq!(
+                parse_dns_question(&request[..length]),
+                Some(("github.com".to_owned(), 1)),
+            );
+            let mut response = response_with_address("github.com", 1, 60, &[192, 0, 2, 10]);
+            response[..2].copy_from_slice(&request[..2]);
+            resolver.send_to(&response, peer).unwrap();
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener_address = listener.local_addr().unwrap();
+        let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            serve_tcp(
+                listener,
+                DnsListenerKind::Host,
+                recorder,
+                &server_stop,
+                &upstream_address,
+            )
+        });
+
+        let mut client = TcpStream::connect(listener_address).unwrap();
+        set_dns_tcp_deadlines(&client).unwrap();
+        let mut request = query("github.com", 1);
+        request[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
+        client
+            .write_all(&(request.len() as u16).to_be_bytes())
+            .unwrap();
+        client.write_all(&request).unwrap();
+        let mut response_length = [0_u8; 2];
+        client.read_exact(&mut response_length).unwrap();
+        let mut response = vec![0_u8; usize::from(u16::from_be_bytes(response_length))];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response[..2], &[0x12, 0x34]);
+        assert_eq!(
+            parse_dns_question(&response),
+            Some(("github.com".to_owned(), 1))
+        );
+        assert_eq!(&response[response.len() - 4..], &[192, 0, 2, 10]);
+
+        stop.store(true, Ordering::Relaxed);
+        server.join().unwrap().unwrap();
+        resolver_thread.join().unwrap();
+        let _ = fs::remove_file(report_path);
     }
 
     #[test]
