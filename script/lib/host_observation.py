@@ -3,6 +3,7 @@
 # Device and inode values in this module describe one observation only. They
 # are not accepted fingerprint values and must not be serialized as host pins.
 
+import copy
 import hashlib
 import ipaddress
 import json
@@ -1436,6 +1437,19 @@ def _public_snapshot(snapshot):
     return _summarize_public_snapshot(public)
 
 
+def _security_relevant_private_stability_key(snapshot):
+    return {
+        field: value
+        for field, value in snapshot.items()
+        if field
+        not in {
+            "_unreachable_unix",
+            "_unresolved_unix",
+            "inaccessible_root_filesystem_listener_count",
+        }
+    }
+
+
 def observe_local_control_inventory(
     filesystem_socket_access=None, sample=None, sleeper=time.sleep
 ):
@@ -1449,7 +1463,9 @@ def observe_local_control_inventory(
         sleeper(STABILITY_INTERVAL_SECONDS)
         second = sample()
         last = second
-        if first == second:
+        if _security_relevant_private_stability_key(
+            first
+        ) == _security_relevant_private_stability_key(second):
             public = _public_snapshot(second)
             status = {
                 "within_bounds": "stable",
@@ -3273,10 +3289,10 @@ os._exit(0 if started.exists() else 2)
         self.assertFalse(public["reachability_complete"])
         self.assertEqual(public["unix_listeners"], [])
 
-    def test_excluded_unix_identity_remains_private_and_controls_stability(self):
+    def test_excluded_unix_churn_remains_private_without_destabilizing_observation(self):
         metadata = mock.Mock(st_mode=stat.S_IFSOCK | 0o660, st_uid=0)
 
-        def collect(inode, pin):
+        def collect(inode, pin, reachable=False):
             unix = (
                 b"Num RefCount Protocol Flags Type St Inode Path\n"
                 + f"0: 2 0 00010000 0001 01 {inode} /run/example.sock\n".encode()
@@ -3307,26 +3323,146 @@ os._exit(0 if started.exists() else 2)
                 os.sys.modules[__name__], "_bounded_read", side_effect=bounded_read
             ), mock.patch.object(os, "stat", return_value=metadata):
                 return _collect_snapshot(
-                    pathlib.Path("/proc"), filesystem_socket_access=lambda _: False
+                    pathlib.Path("/proc"), filesystem_socket_access=lambda _: reachable
                 )
 
         first = collect(42, (10, 100, 1, 2))
         changed_inode = collect(43, (10, 100, 1, 2))
         changed_owner = collect(42, (11, 101, 1, 2))
+        changed_count = copy.deepcopy(first)
+        changed_count["inaccessible_root_filesystem_listener_count"] += 1
         self.assertEqual(_public_snapshot(first), _public_snapshot(changed_inode))
         self.assertEqual(_public_snapshot(first), _public_snapshot(changed_owner))
         self.assertNotEqual(first, changed_inode)
         self.assertNotEqual(first, changed_owner)
 
-        for changed in (changed_inode, changed_owner):
-            samples = iter((first, changed, changed, changed))
-            inventory = observe_local_control_inventory(
-                sample=lambda: next(samples), sleeper=lambda _: None
-            )
-            self.assertEqual(inventory["attempts"], 2)
-            encoded = json.dumps(inventory, sort_keys=True)
-            self.assertNotIn("_socket_inode", encoded)
-            self.assertNotIn("_process_pins", encoded)
+        for changed in (changed_inode, changed_owner, changed_count):
+            with self.subTest(changed=changed):
+                self.assertEqual(
+                    _security_relevant_private_stability_key(first),
+                    _security_relevant_private_stability_key(changed),
+                )
+                samples = iter((first, changed))
+                inventory = observe_local_control_inventory(
+                    sample=lambda: next(samples), sleeper=lambda _: None
+                )
+                self.assertEqual(inventory["status"], "stable")
+                self.assertTrue(inventory["stable"])
+                self.assertEqual(inventory["attempts"], 1)
+                encoded = json.dumps(inventory, sort_keys=True)
+                self.assertNotIn("_socket_inode", encoded)
+                self.assertNotIn("_process_pins", encoded)
+                validate_local_control_inventory(inventory)
+
+        reachable = collect(42, (10, 100, 1, 2), reachable=True)
+        self.assertNotEqual(
+            _security_relevant_private_stability_key(first),
+            _security_relevant_private_stability_key(reachable),
+        )
+        samples = iter([first, reachable] * STABILITY_ATTEMPTS)
+        inventory = observe_local_control_inventory(
+            sample=lambda: next(samples), sleeper=lambda _: None
+        )
+        self.assertEqual(inventory["status"], "unstable")
+        self.assertFalse(inventory["stable"])
+
+    def test_unresolved_listener_details_remain_fail_closed(self):
+        first = self._private_snapshot(
+            unresolved_unix_listener_count=1,
+            _unresolved_unix=[{"_socket_inode": 42}],
+        )
+        changed = self._private_snapshot(
+            unresolved_unix_listener_count=1,
+            _unresolved_unix=[{"_socket_inode": 43}],
+        )
+        self.assertEqual(
+            _security_relevant_private_stability_key(first),
+            _security_relevant_private_stability_key(changed),
+        )
+        samples = iter((first, changed))
+        inventory = observe_local_control_inventory(
+            sample=lambda: next(samples), sleeper=lambda _: None
+        )
+        self.assertEqual(inventory["status"], "unavailable")
+        self.assertFalse(inventory["snapshot"]["reachability_complete"])
+        validate_local_control_inventory(inventory)
+
+    def test_security_relevant_private_changes_remain_unstable(self):
+        first = self._private_snapshot(
+            root_container_processes=[
+                {
+                    "uid": 0,
+                    "executable_basename": "dockerd",
+                    "canonical_executable": "/usr/bin/dockerd",
+                    "unified_cgroup": "/system.slice/docker.service",
+                    "_process_pin": (20, 200, 3, 4),
+                }
+            ],
+            unix_listeners=[
+                {
+                    "_socket_inode": 42,
+                    "socket_type": "stream",
+                    "name_kind": "filesystem",
+                    "name_sha256": "a" * 64,
+                    "runner_reachable": True,
+                    "owners": [self._private_owner()],
+                    "ownership_complete": True,
+                }
+            ],
+            tcp_listeners=[
+                {
+                    "_socket_inode": 43,
+                    "_socket_uid": 0,
+                    "family": "ipv4",
+                    "bind_class": "loopback",
+                    "port": 8080,
+                    "owners": [self._private_owner()],
+                    "ownership_complete": True,
+                }
+            ],
+        )
+        changes = {
+            "reachable Unix inode": lambda value: value["unix_listeners"][0].__setitem__(
+                "_socket_inode", 44
+            ),
+            "reachable Unix owner": lambda value: value["unix_listeners"][0][
+                "owners"
+            ][0]["_process_pins"].__setitem__(0, (11, 101, 1, 2)),
+            "root TCP inode": lambda value: value["tcp_listeners"][0].__setitem__(
+                "_socket_inode", 44
+            ),
+            "root TCP owner": lambda value: value["tcp_listeners"][0]["owners"][
+                0
+            ].__setitem__("_executable_path_fingerprint", "c" * 64),
+            "root container identity": lambda value: value[
+                "root_container_processes"
+            ][0].__setitem__("_process_pin", (21, 201, 3, 4)),
+            "unresolved listener": lambda value: value.__setitem__(
+                "unresolved_unix_listener_count", 1
+            ),
+            "acquisition failure": lambda value: value["_unavailable_inputs"].append(
+                "proc"
+            ),
+            "collection bound": lambda value: value["_bounds_exceeded"].append(
+                "unix_listeners"
+            ),
+            "malformed input": lambda value: value.__setitem__("malformed_row_count", 1),
+        }
+        for label, mutate in changes.items():
+            with self.subTest(change=label):
+                changed = copy.deepcopy(first)
+                mutate(changed)
+                self.assertNotEqual(
+                    _security_relevant_private_stability_key(first),
+                    _security_relevant_private_stability_key(changed),
+                )
+                samples = iter([first, changed] * STABILITY_ATTEMPTS)
+                inventory = observe_local_control_inventory(
+                    sample=lambda: next(samples), sleeper=lambda _: None
+                )
+                self.assertEqual(inventory["status"], "unstable")
+                self.assertFalse(inventory["stable"])
+                self.assertEqual(inventory["attempts"], STABILITY_ATTEMPTS)
 
 
 def main(arguments):

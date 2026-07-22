@@ -79,7 +79,7 @@ Keep Docker/container access available while still applying network restrictions
       *.docker.io
 ```
 
-The wildcard can authorize exact-depth names such as `auth.docker.io`, but image pulls may require additional registry, layer, CDN, or storage destinations.
+The wildcard can authorize exact-depth names such as `auth.docker.io`, but image pulls may require additional registry, layer, CDN, or storage destinations. Normal Docker container startup and cleanup remain supported in this degraded mode without weakening checks for genuinely reachable root-control changes.
 
 Remove the broad GitHub web, API, release-asset, and watchdog destinations and new platform-origin `*.githubapp.com` authorizations while keeping the core Actions reporting path:
 

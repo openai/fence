@@ -34,10 +34,63 @@ report="$directory/report.json"
 dns_report="$directory/dns-report.json"
 launcher_directory="/run/fence-launcher/$invocation"
 launcher_integrity="$launcher_directory/integrity.json"
+docker_lifecycle_start_sequence=0
 
 probe_https_once() {
   local url="$1"
   curl --head --silent --show-error --max-time 10 --retry 0 --output /dev/null "$url"
+}
+
+exercise_docker_lifecycle() {
+  local rootfs
+  local library
+  local image
+  local container
+  local deadline
+  local iteration=0
+
+  require_cmd ldd
+  rootfs="$(make_temp_dir fence-docker-lifecycle "$RUNNER_TEMP")"
+  mkdir -p "$rootfs/bin"
+  cp -L /bin/sh "$rootfs/bin/sh"
+  cp -L /bin/sleep "$rootfs/bin/sleep"
+  while IFS= read -r library; do
+    [[ -n "$library" ]] || continue
+    mkdir -p "$rootfs$(dirname "$library")"
+    cp -L "$library" "$rootfs$library"
+  done < <(
+    ldd /bin/sh /bin/sleep |
+      awk '$2 == "=>" && $3 ~ /^\// { print $3; next } $1 ~ /^\// && $1 !~ /:$/ { print $1 }' |
+      sort -u
+  )
+
+  image="fence-local-lifecycle:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${invocation}"
+  docker build --network none --pull=false --tag "$image" --file - "$rootfs" <<'DOCKERFILE'
+FROM scratch
+COPY . /
+ENTRYPOINT ["/bin/sh", "-c", "/bin/sleep 30"]
+DOCKERFILE
+
+  docker_lifecycle_start_sequence="$(python3 -E - "$report" <<'PY'
+import json
+import pathlib
+import sys
+
+print(json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["resident_health"]["verification_sequence"])
+PY
+  )"
+  deadline=$((SECONDS + 20))
+  while (( SECONDS < deadline )); do
+    iteration=$((iteration + 1))
+    container="fence-local-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${iteration}"
+    docker create --network none --pull never --name "$container" "$image" >/dev/null
+    docker start "$container" >/dev/null
+    sleep 1
+    docker stop --time 1 "$container" >/dev/null
+    docker rm "$container" >/dev/null
+  done
+  docker image rm "$image" >/dev/null
+  remove_generated_path "$rootfs" "Docker lifecycle fixture"
 }
 
 assert_action_runtime_immutable() {
@@ -260,6 +313,7 @@ esac
 if [[ "$scenario" == "wildcard-docker" ]]; then
   probe_https_once https://auth.docker.io
   probe_https_once https://registry-1.docker.io
+  exercise_docker_lifecycle
 fi
 
 if [[ "$scenario" == "audit" ]]; then
@@ -277,7 +331,7 @@ if [[ "$scenario" == "standard" ]]; then
 fi
 
 sleep 6
-python3 -E - "$scenario" "$report" "$dns_report" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" "$docker_lifecycle_start_sequence" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -301,7 +355,8 @@ expected_workers = [
 ]
 
 scenario = sys.argv[1]
-report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:])
+report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:4])
+docker_lifecycle_start_sequence = int(sys.argv[4])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 require(report["runtime_evidence_schema_version"] == 5)
@@ -330,6 +385,7 @@ require(wildcard_authorizations == sorted(set(wildcard_authorizations)))
 require(len(wildcard_authorizations) <= 8)
 require(all("*" not in hostname for hostname in wildcard_authorizations))
 if scenario == "wildcard-docker":
+    require(resident["verification_sequence"] >= docker_lifecycle_start_sequence + 3)
     require({"auth.docker.io", "registry-1.docker.io"}.issubset(wildcard_authorizations))
     wildcard_materializations = [
         item for item in report["materialized_allowances"]
