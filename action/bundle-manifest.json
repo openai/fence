@@ -1,0 +1,14 @@
+{
+  "artifact_name": "fence_v0.8.5_linux-amd64",
+  "artifact_sha256": "f32f02fdea384615da3e190214bc42db59f9131c6694d6e2072919ea79ec4830",
+  "bundle_path": "action/bin/fence",
+  "release_channel": "stable",
+  "release_tag": "v0.8.5",
+  "release_url": "https://github.com/openai/fence/releases/tag/v0.8.5",
+  "repository": "openai/fence",
+  "schema_version": 4,
+  "signer_digest": "3eccaade5888992e77299369bd6b5e73724a7027",
+  "signer_workflow": "openai/fence/.github/workflows/release.yml",
+  "source_commit": "3eccaade5888992e77299369bd6b5e73724a7027",
+  "source_ref": "refs/heads/main"
+}
