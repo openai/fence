@@ -296,6 +296,11 @@ test("validates explicit and zero-input inline configurations", () => {
     "hostname 192.0.2.10 tcp 443",
     "ip example.com tcp 443",
     "cidr 192.0.2.0/33 tcp 443",
+    "cidr 192.0.2.1/24 tcp 443",
+    "cidr 192.0.2.1/0 tcp 443",
+    "cidr 2001:db8::1/64 tcp 443",
+    "cidr 2001:db8::1/0 tcp 443",
+    "cidr fe80::%en0/64 tcp 443",
     "hostname example.com icmp 443",
     "hostname example.com tcp 65536",
     "hostname example.com tcp 443 extra",
@@ -317,6 +322,24 @@ test("validates explicit and zero-input inline configurations", () => {
     () => validateInlineConfig(JSON.stringify({ invocation_id: "x", padding: "x".repeat(256 * 1024) })),
     /256 KiB/,
   );
+});
+
+test("normalizes canonical IPv4 and IPv6 allowlist networks", () => {
+  for (const [input, expected] of [
+    ["0.0.0.0/0", "0.0.0.0/0"],
+    ["192.0.2.10/32", "192.0.2.10/32"],
+    ["192.0.2.0/024", "192.0.2.0/24"],
+    ["::/0", "::/0"],
+    ["2001:0DB8:0000::/064", "2001:db8::/64"],
+    ["2001:db8::1/128", "2001:db8::1/128"],
+    ["::ffff:192.0.2.0/120", "::ffff:192.0.2.0/120"],
+  ]) {
+    const config = JSON.parse(defaultInlineConfig(
+      { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" },
+      { allowlist: `cidr ${input} tcp 443` },
+    ));
+    assert.equal(config.allowlist[0].destination, expected);
+  }
 });
 
 test("formats concise setup and ready logs without raw evidence fields", () => {
