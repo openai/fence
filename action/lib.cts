@@ -97,6 +97,7 @@ const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net$/;
+const MAX_ALLOWLIST_ENTRIES = 64;
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
 const MAX_USER_WILDCARD_AUTHORIZATIONS = 8;
 const MAX_USER_WILDCARD_PREFIX_LABELS = 2;
@@ -507,6 +508,9 @@ function parseAllowlistInput(value: unknown): AllowlistEntry[] {
       const message = error instanceof Error ? error.message : String(error);
       fail(`allowlist line ${index + 1}: ${message}`);
     }
+  }
+  if (entries.length > MAX_ALLOWLIST_ENTRIES) {
+    fail(`allowlist input must contain no more than ${MAX_ALLOWLIST_ENTRIES} unique entries`);
   }
   return entries;
 }

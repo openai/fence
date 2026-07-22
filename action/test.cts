@@ -342,6 +342,21 @@ test("normalizes canonical IPv4 and IPv6 allowlist networks", () => {
   }
 });
 
+test("enforces the native allowlist entry limit after deduplication", () => {
+  const environment = { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" };
+  const entries = Array.from({ length: 64 }, (_, index) => `host-${index}.example.com`);
+  const allowlistLength = (allowlist: string[]): number => JSON.parse(
+    defaultInlineConfig(environment, { allowlist: allowlist.join("\n") }),
+  ).allowlist.length;
+
+  assert.equal(allowlistLength(entries), 64);
+  assert.throws(
+    () => allowlistLength([...entries, "host-64.example.com"]),
+    /allowlist input must contain no more than 64 unique entries/,
+  );
+  assert.equal(allowlistLength([...entries, entries[0]]), 64);
+});
+
 test("formats concise setup and ready logs without raw evidence fields", () => {
   const details = actionLog.configLogDetails(
     JSON.stringify({
