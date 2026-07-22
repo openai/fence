@@ -246,7 +246,7 @@ available without process attribution, while every other matching account
 continues to require the runner-bound authorization above. Fence does not allow
 the general Azure Blob suffix.
 
-Configuration rejects exact user entries for every non-static matching account before mutation, and bootstrap response processing independently refuses to materialize any hostname marked as requiring runner provenance. User wildcard policy remains lazy and cannot bypass the same attribution and four-account cap.
+Configuration rejects exact user entries for every non-static matching account before mutation, and bootstrap response processing independently refuses to materialize any hostname marked as requiring runner provenance. Response-local CNAME lineage also rejects non-static matching targets, so exact and wildcard user hostnames cannot turn a restricted account into an unattributed derived allowance. User wildcard policy remains lazy and cannot bypass the same attribution and four-account cap.
 
 ### Action child-process deadlines and dependency surface
 
