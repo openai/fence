@@ -4997,6 +4997,11 @@ fn validate_dns_response_lineage(
     let mut new_authorization_names = BTreeSet::new();
     let mut authorizations = Vec::new();
     while let Some(alias) = edges.remove(&current) {
+        if matches_results_storage_hostname(&alias.target)
+            && requires_runner_results_storage_provenance(&alias.target, state, hostname_policy)
+        {
+            return Err(DnsResponseValidationError::Invalid);
+        }
         depth = depth
             .checked_add(1)
             .filter(|value| *value <= MAX_DERIVED_CNAME_DEPTH)
@@ -6736,6 +6741,88 @@ mod tests {
     }
 
     #[test]
+    fn user_cname_targets_cannot_bypass_runner_results_storage_provenance() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"results-cname","allowlist":[{"destination_type":"hostname","destination":"user.example","protocol":"tcp","port":8443}]}"#,
+        )
+        .unwrap();
+        let exact_policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let target = "productionresultssa17.blob.core.windows.net";
+
+        for (scope, hostname, policy) in [
+            (
+                DnsEvidenceScope::ProtectedHostBlock,
+                "user.example",
+                exact_policy,
+            ),
+            (
+                DnsEvidenceScope::ProtectedHostBlockDegraded,
+                "auth.docker.io",
+                test_user_wildcard_hostname_policy(),
+            ),
+        ] {
+            for target_previously_authorized in [false, true] {
+                let (submitter, requests) = materialization_request_channel();
+                let (recorder, report_path) =
+                    test_recorder_with_policy(scope, Some(submitter), policy.clone());
+                assert_eq!(
+                    recorder.forward_query(hostname, 1, None).unwrap(),
+                    DnsQueryAuthorization::Forward(None),
+                );
+                if target_previously_authorized {
+                    let mut authorizations = recorder.cname_authorizations.lock().unwrap();
+                    assert!(authorized_hostname(
+                        target,
+                        &mut authorizations,
+                        Instant::now(),
+                        &recorder.hostname_policy,
+                        DnsQueryProvenance::TrustedRunnerWorker,
+                    ));
+                }
+
+                assert_eq!(
+                    recorder.record_response(
+                        hostname,
+                        1,
+                        &response_with_cname_and_address(
+                            hostname,
+                            target,
+                            60,
+                            60,
+                            &[192, 0, 2, 17],
+                        ),
+                        None,
+                    ),
+                    DnsResponseDisposition::RetryableFailure,
+                );
+                assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
+                let authorizations = recorder.cname_authorizations.lock().unwrap();
+                assert!(authorizations.active.is_empty());
+                assert_eq!(
+                    authorizations.runner_authorized_results_storage.len(),
+                    usize::from(target_previously_authorized),
+                );
+                assert_eq!(
+                    authorizations
+                        .runner_authorized_results_storage
+                        .contains(target),
+                    target_previously_authorized,
+                );
+                drop(authorizations);
+                assert_eq!(
+                    recorder
+                        .state
+                        .lock()
+                        .unwrap()
+                        .materialization_request_rejections,
+                    1,
+                );
+                let _ = fs::remove_file(report_path);
+            }
+        }
+    }
+
+    #[test]
     fn rooted_cname_nodata_never_seeds_authorization_state() {
         let policy = test_hostname_policy(false);
         let target = "nodata-edge.example";
@@ -7469,6 +7556,87 @@ mod tests {
             ),
             "runner_authorized_results_storage_cname_derived"
         );
+    }
+
+    #[test]
+    fn results_storage_cname_targets_cannot_silently_admit_another_account() {
+        let now = Instant::now();
+        let policy = test_hostname_policy(false);
+        let root = "productionresultssa17.blob.core.windows.net";
+        let target = "productionresultssa18.blob.core.windows.net";
+        let mut authorizations = CnameAuthorizationState::default();
+        assert!(authorized_hostname(
+            root,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+
+        assert!(matches!(
+            validate_dns_response_lineage(
+                root,
+                &DnsAnswerRecords {
+                    aliases: vec![DnsCnameAnswer {
+                        owner: root.to_owned(),
+                        target: target.to_owned(),
+                        ttl_seconds: 60,
+                    }],
+                    addresses: vec![DnsAddressAnswer {
+                        hostname: target.to_owned(),
+                        address: "192.0.2.18".parse().unwrap(),
+                        ttl_seconds: 60,
+                    }],
+                },
+                &authorizations,
+                now,
+                &policy,
+            ),
+            Err(DnsResponseValidationError::Invalid),
+        ));
+        assert_eq!(authorizations.runner_authorized_results_storage.len(), 1);
+        assert!(!authorizations.runner_authorized_results_storage_truncated);
+        assert!(authorizations.active.is_empty());
+    }
+
+    #[test]
+    fn static_results_storage_cname_target_remains_available_without_runner_provenance() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"static-results-cname","allowlist":[{"destination_type":"hostname","destination":"user.example","protocol":"tcp","port":443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let target = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_TRUSTED_RESULTS_STORAGE_HOSTNAME;
+        let mut authorizations = CnameAuthorizationState::default();
+        let response = validate_dns_response_lineage(
+            "user.example",
+            &DnsAnswerRecords {
+                aliases: vec![DnsCnameAnswer {
+                    owner: "user.example".to_owned(),
+                    target: target.to_owned(),
+                    ttl_seconds: 60,
+                }],
+                addresses: vec![DnsAddressAnswer {
+                    hostname: target.to_owned(),
+                    address: "192.0.2.19".parse().unwrap(),
+                    ttl_seconds: 60,
+                }],
+            },
+            &authorizations,
+            Instant::now(),
+            &policy,
+        )
+        .unwrap();
+
+        assert!(!response.requires_runner_provenance);
+        assert_eq!(response.materializations[0].hostname, target);
+        assert_eq!(response.materializations[0].port, 443);
+        assert!(commit_dns_response_authorizations(
+            &mut authorizations,
+            response,
+        ));
+        assert!(authorizations.runner_authorized_results_storage.is_empty());
+        assert!(authorizations.active.contains_key(target));
     }
 
     #[test]
@@ -10104,6 +10272,26 @@ mod tests {
         assert_eq!(
             error.message,
             "a runner-authorized results-storage hostname cannot be prehydrated without an attributed query"
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_cname_delegation_to_runner_authorized_results_storage() {
+        let hostname = "github.com";
+        let target = "productionresultssa17.blob.core.windows.net";
+        let error = pending_materializations_from_bootstrap_response(
+            hostname,
+            1,
+            &response_with_cname_and_address(hostname, target, 60, 60, &[192, 0, 2, 17]),
+            Instant::now(),
+            &test_hostname_policy(false),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "dns_block_prehydration_failed");
+        assert_eq!(
+            error.message,
+            "a fixed DNS-mediated bootstrap response had invalid response-local lineage",
         );
     }
 

@@ -145,6 +145,7 @@ GitHub profile requires a new threat-model review.
   to the unique pinned `Runner.Worker` identity. The resulting HTTPS grants are
   also available to other local code (`src/attribution.rs::TrustedRunnerWorker`,
   `src/dns_mediator.rs`).
+- **CNAME lineage -> runner-restricted storage:** exact and wildcard user hostnames cannot derive non-static GitHub results-storage accounts; every restricted account remains subject to pinned-runner attribution and the four-account cap.
 - **Kernel NFLOG -> resident agent:** group `4242` may copy at most 64 packet
   bytes. Fence immediately reduces this to endpoint metadata and drops raw
   bytes (`src/nflog.rs`, `src/findings.rs`).
