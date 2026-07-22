@@ -45,6 +45,7 @@ See [`v0.md`](v0.md) for normative behavior and
 - The evidence-only hosted observer advanced to schema `4` and added stable,
   bounded, privacy-reduced Unix/TCP listener and root container-process
   inventory for review before any closed-host enforcement change.
+- Private local-control stabilization began excluding inaccessible Unix listener churn while retaining fail-closed acquisition checks and every security-relevant container, listener, and owner identity.
 - The attested Action bundle later published fingerprint schema `2`, enforced
   the reviewed trusted-path, effective-access, and local-control facts during
   host classification, and added a fatal scheduled fixed-runner drift canary.

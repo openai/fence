@@ -1118,7 +1118,30 @@ struct PrivateSnapshot {
     tcp_listeners: Vec<PrivateTcpListener>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PrivateSnapshotStabilityKey<'a> {
+    bounds_exceeded: &'a BTreeSet<BoundReason>,
+    unavailable_inputs: &'a BTreeSet<UnavailableReason>,
+    malformed_row_count: u64,
+    unresolved_unix_listener_count: u64,
+    root_container_processes: &'a [PrivateContainer],
+    unix_listeners: &'a [PrivateUnixListener],
+    tcp_listeners: &'a [PrivateTcpListener],
+}
+
 impl PrivateSnapshot {
+    fn security_relevant_stability_key(&self) -> PrivateSnapshotStabilityKey<'_> {
+        PrivateSnapshotStabilityKey {
+            bounds_exceeded: &self.bounds_exceeded,
+            unavailable_inputs: &self.unavailable_inputs,
+            malformed_row_count: self.malformed_row_count,
+            unresolved_unix_listener_count: self.unresolved_unix_listener_count,
+            root_container_processes: &self.root_container_processes,
+            unix_listeners: &self.unix_listeners,
+            tcp_listeners: &self.tcp_listeners,
+        }
+    }
+
     fn unavailable(reason: UnavailableReason) -> Self {
         Self {
             bounds_exceeded: BTreeSet::new(),
@@ -1188,7 +1211,7 @@ where
         sleep();
         let second = capture();
         last = second.clone();
-        if first == second {
+        if first.security_relevant_stability_key() == second.security_relevant_stability_key() {
             let snapshot = public_snapshot(second);
             let status = match snapshot.scan_status {
                 ScanStatus::WithinBounds => ObservationStatus::Stable,
@@ -2986,44 +3009,186 @@ mod tests {
     }
 
     #[test]
-    fn stability_uses_private_identity_and_fails_closed_after_three_pairs() {
-        let stable = empty_private();
-        let mut changed = empty_private();
-        changed.inaccessible_root_filesystem_listener_count = 1;
-        let samples = RefCell::new(
-            [
-                changed.clone(),
-                stable.clone(),
-                stable.clone(),
-                stable.clone(),
-            ]
-            .into_iter(),
+    fn stability_ignores_excluded_unix_identity_and_inaccessible_counts() {
+        let excluded = |inode, pid| ExcludedUnixListener {
+            socket_inode: inode,
+            socket_type: UnixSocketType::Stream,
+            name_kind: UnixNameKind::Filesystem,
+            name_sha256: "a".repeat(64),
+            access_state: ExcludedAccessState::Unreachable,
+            root_control_candidate: true,
+            owners: vec![private_owner(0, true, &[pid])],
+            ownership_complete: true,
+        };
+        let mut first = empty_private();
+        first.inaccessible_root_filesystem_listener_count = 1;
+        first.excluded_unix_listeners.push(excluded(42, 10));
+
+        let mut second = empty_private();
+        second.inaccessible_root_filesystem_listener_count = 2;
+        second.excluded_unix_listeners.push(excluded(43, 11));
+        second.excluded_unix_listeners.push(excluded(44, 12));
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first.security_relevant_stability_key(),
+            second.security_relevant_stability_key()
         );
+        assert!(local_control_snapshots_match(
+            &public_snapshot(first.clone()),
+            &public_snapshot(second.clone())
+        ));
+
+        let samples = RefCell::new([first, second].into_iter());
         let sleeps = Cell::new(0_u32);
         let observation = observe_local_control_with(
             || samples.borrow_mut().next().unwrap(),
             || sleeps.set(sleeps.get() + 1),
         );
         assert_eq!(observation.status, ObservationStatus::Stable);
-        assert_eq!(observation.attempts, 2);
-        assert_eq!(sleeps.get(), 2);
-
-        let calls = Cell::new(0_u32);
-        let observation = observe_local_control_with(
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call.is_multiple_of(2) {
-                    stable.clone()
-                } else {
-                    changed.clone()
-                }
-            },
-            || {},
+        assert_eq!(observation.attempts, 1);
+        assert_eq!(sleeps.get(), 1);
+        assert_eq!(
+            observation
+                .snapshot
+                .inaccessible_root_filesystem_listener_count,
+            2
         );
-        assert_eq!(observation.status, ObservationStatus::Unstable);
-        assert!(!observation.stable);
-        assert_eq!(calls.get(), STABILITY_ATTEMPTS * 2);
+    }
+
+    #[test]
+    fn stability_preserves_security_relevant_private_identities_and_acquisition_state() {
+        let owner = private_owner(0, true, &[10]);
+        let mut stable = empty_private();
+        stable.root_container_processes.push(PrivateContainer {
+            key: owner.key.clone(),
+            identity_complete: true,
+            process_pin: owner.process_pins.iter().next().cloned().unwrap(),
+        });
+        stable.unix_listeners.push(PrivateUnixListener {
+            socket_inode: 42,
+            socket_type: UnixSocketType::Stream,
+            name_kind: UnixNameKind::Filesystem,
+            name_sha256: "a".repeat(64),
+            owners: vec![owner.clone()],
+            ownership_complete: true,
+        });
+        stable.tcp_listeners.push(PrivateTcpListener {
+            socket_inode: 43,
+            socket_uid: 0,
+            family: InternetAddressFamily::Ipv4,
+            bind_class: BindClass::Loopback,
+            port: 443,
+            owners: vec![owner],
+            ownership_complete: true,
+        });
+
+        let mut changed_container = stable.clone();
+        changed_container.root_container_processes[0]
+            .process_pin
+            .start_time_ticks += 1;
+
+        let mut changed_unix_inode = stable.clone();
+        changed_unix_inode.unix_listeners[0].socket_inode += 1;
+
+        let mut changed_unix_owner = stable.clone();
+        changed_unix_owner.unix_listeners[0].owners[0] = private_owner(0, true, &[11]);
+
+        let mut changed_tcp_inode = stable.clone();
+        changed_tcp_inode.tcp_listeners[0].socket_inode += 1;
+
+        let mut changed_tcp_owner = stable.clone();
+        changed_tcp_owner.tcp_listeners[0].owners[0] = private_owner(0, true, &[11]);
+
+        let mut bounds_exceeded = stable.clone();
+        bounds_exceeded
+            .bounds_exceeded
+            .insert(BoundReason::TcpListeners);
+
+        let mut unavailable = stable.clone();
+        unavailable
+            .unavailable_inputs
+            .insert(UnavailableReason::Proc);
+
+        let mut malformed = stable.clone();
+        malformed.malformed_row_count = 1;
+
+        let mut unresolved = stable.clone();
+        unresolved.unresolved_unix_listener_count = 1;
+
+        for changed in [
+            changed_container,
+            changed_unix_inode,
+            changed_unix_owner,
+            changed_tcp_inode,
+            changed_tcp_owner,
+            bounds_exceeded,
+            unavailable,
+            malformed,
+            unresolved,
+        ] {
+            assert_ne!(
+                stable.security_relevant_stability_key(),
+                changed.security_relevant_stability_key()
+            );
+
+            let calls = Cell::new(0_u32);
+            let observation = observe_local_control_with(
+                || {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call.is_multiple_of(2) {
+                        stable.clone()
+                    } else {
+                        changed.clone()
+                    }
+                },
+                || {},
+            );
+            assert_eq!(observation.status, ObservationStatus::Unstable);
+            assert!(!observation.stable);
+            assert_eq!(calls.get(), STABILITY_ATTEMPTS * 2);
+        }
+    }
+
+    #[test]
+    fn excluded_unix_listener_becoming_reachable_remains_fatal() {
+        let owner = private_owner(0, true, &[10]);
+        let mut excluded = empty_private();
+        excluded.inaccessible_root_filesystem_listener_count = 1;
+        excluded.excluded_unix_listeners.push(ExcludedUnixListener {
+            socket_inode: 42,
+            socket_type: UnixSocketType::Stream,
+            name_kind: UnixNameKind::Filesystem,
+            name_sha256: "a".repeat(64),
+            access_state: ExcludedAccessState::Unreachable,
+            root_control_candidate: true,
+            owners: vec![owner.clone()],
+            ownership_complete: true,
+        });
+        let mut reachable = empty_private();
+        reachable.unix_listeners.push(PrivateUnixListener {
+            socket_inode: 42,
+            socket_type: UnixSocketType::Stream,
+            name_kind: UnixNameKind::Filesystem,
+            name_sha256: "a".repeat(64),
+            owners: vec![owner],
+            ownership_complete: true,
+        });
+
+        assert_ne!(
+            excluded.security_relevant_stability_key(),
+            reachable.security_relevant_stability_key()
+        );
+        let accepted = public_snapshot(excluded);
+        let observation = observe_local_control_with(|| reachable.clone(), || {});
+        assert_eq!(observation.status, ObservationStatus::Stable);
+        assert_eq!(
+            verify_local_control_observation(&accepted, &observation)
+                .unwrap_err()
+                .kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
+        );
     }
 
     #[test]
