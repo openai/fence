@@ -89,7 +89,7 @@ jobs:
           echo "acceptance_runner=$acceptance_runner" >> "$GITHUB_OUTPUT"
 
       - name: checkout candidate source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ steps.candidate.outputs.action_ref }}
           fetch-depth: 0
@@ -187,7 +187,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -236,7 +236,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -279,7 +279,7 @@ jobs:
 
     steps:
       - name: checkout into nested Action path
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           path: target/action-layout/owner/project/revision
@@ -330,7 +330,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -356,7 +356,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -400,7 +400,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -448,7 +448,7 @@ jobs:
       - name: checkout
         id: finalization-checkout
         if: ${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pin@v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # pin@v6.0.3
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
