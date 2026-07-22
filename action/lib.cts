@@ -1809,6 +1809,9 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
     return [];
   }
   const entries = rows.map((row) => {
+    if (row.destinationKind === "ip") {
+      return `ip ${row.destination} ${row.protocol} ${row.port}`;
+    }
     if (row.protocol === "tcp" && row.port === 443) {
       return row.destination;
     }
@@ -2139,7 +2142,10 @@ function networkActivitySummary(
     lines.push("");
   }
   if (report.mode === "audit") {
-    lines.push(...allowlistYamlSnippet(auditSummary.hostnameRows));
+    lines.push(...allowlistYamlSnippet([
+      ...auditSummary.hostnameRows,
+      ...auditSummary.ipRows,
+    ]));
   }
   return lines;
 }
