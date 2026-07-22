@@ -1321,6 +1321,16 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
         remote_port: 443,
         rule_class: "undeclared_new_egress",
       },
+      {
+        timestamp: "unix-ms:4",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv6",
+        protocol: "tcp",
+        remote_address: "2001:db8::10",
+        remote_port: 8443,
+        rule_class: "undeclared_new_egress",
+      },
     ],
     findings_truncated: false,
   };
@@ -1357,13 +1367,22 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
     port: 443,
     count: 2,
   }]);
-  assert.deepEqual(correlation.ipRows, [{
-    destination: "192.0.2.10",
-    destinationKind: "ip",
-    protocol: "udp",
-    port: 443,
-    count: 1,
-  }]);
+  assert.deepEqual(correlation.ipRows, [
+    {
+      destination: "192.0.2.10",
+      destinationKind: "ip",
+      protocol: "udp",
+      port: 443,
+      count: 1,
+    },
+    {
+      destination: "2001:db8::10",
+      destinationKind: "ip",
+      protocol: "tcp",
+      port: 8443,
+      count: 1,
+    },
+  ]);
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟢 Fence Summary/);
@@ -1374,11 +1393,14 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.match(summary, /#### Network activity/);
   assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query, 2 TCP\/443 attempts \|/);
   assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
+  assert.match(summary, /\| `2001:db8::10` \| ⚠️ Would block \| 1 TCP\/8443 attempt \|/);
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
   assert.match(summary, /```yaml/);
   assert.match(summary, /openai\/fence@<commit-sha>/);
   assert.match(summary, /allowlist: \|/);
   assert.match(summary, /      www.google.com/);
+  assert.match(summary, /      ip 192\.0\.2\.10 udp 443/);
+  assert.match(summary, /      ip 2001:db8::10 tcp 8443/);
   assert.doesNotMatch(summary, /invocation_id/);
   assert.doesNotMatch(summary, /config: >-/);
   assert.doesNotMatch(summary, /@main/);
@@ -1500,7 +1522,8 @@ test("renders audit IP-only and missing-DNS fallbacks safely", () => {
   assert.match(summary, /DNS evidence was unavailable; IP-level findings may require manual review/);
   assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /could not be mapped to an endpoint/);
-  assert.doesNotMatch(summary, /View allowlist example/);
+  assert.match(summary, /View allowlist example/);
+  assert.match(summary, /      ip 192\.0\.2\.10 udp 443/);
 });
 
 test("renders audit IP-only findings when DNS evidence excludes non-GitHub names", () => {
@@ -1537,7 +1560,8 @@ test("renders audit IP-only findings when DNS evidence excludes non-GitHub names
   assert.match(summary, /^### 🟢 Fence Summary/);
   assert.match(summary, /\| `203.0.113.10` \| ⚠️ Would block \| 1 TCP\/443 attempt \|/);
   assert.doesNotMatch(summary, /DNS evidence was unavailable/);
-  assert.doesNotMatch(summary, /View allowlist example/);
+  assert.match(summary, /View allowlist example/);
+  assert.match(summary, /      ip 203\.0\.113\.10 tcp 443/);
 });
 
 test("renders DNS materialization request rejection evidence as a non-critical warning", () => {
@@ -1615,6 +1639,20 @@ test("renders bounded allowlist YAML snippets", () => {
       port: 53,
       count: 1,
     },
+    {
+      destination: "192.0.2.10",
+      destinationKind: "ip",
+      protocol: "tcp",
+      port: 443,
+      count: 1,
+    },
+    {
+      destination: "2001:db8::10",
+      destinationKind: "ip",
+      protocol: "udp",
+      port: 53,
+      count: 1,
+    },
   ]).join("\n");
   assert.match(snippet.trimStart(), /^<details>/);
   assert.match(snippet, /<summary>View allowlist example<\/summary>/);
@@ -1624,6 +1662,8 @@ test("renders bounded allowlist YAML snippets", () => {
   assert.match(snippet, /      api.example.com/);
   assert.match(snippet, /      metrics.example.com:8443/);
   assert.match(snippet, /      hostname dns.example.com udp 53/);
+  assert.match(snippet, /      ip 192\.0\.2\.10 tcp 443/);
+  assert.match(snippet, /      ip 2001:db8::10 udp 53/);
   assert.doesNotMatch(snippet, /invocation_id/);
   assert.doesNotMatch(snippet, /config: >-/);
   assert.doesNotMatch(snippet, /@main/);

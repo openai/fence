@@ -13,6 +13,7 @@ hostname example.com tcp 443
 *.example.com
 *.*.example.com
 ip 192.0.2.10 tcp 443
+ip 2001:db8::10 udp 53
 cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```

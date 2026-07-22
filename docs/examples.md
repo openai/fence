@@ -20,7 +20,7 @@ Use `audit` to observe activity without blocking traffic or disabling passwordle
     mode: audit
 ```
 
-Review the final **Fence Summary**, add only the destinations the job needs, and then move to `block` mode.
+Review the final **Fence Summary**, add only the destinations the job needs, and then move to `block` mode. Its collapsed allowlist example includes DNS-backed hostnames and explicit `ip <address> <tcp|udp> <port>` entries for direct IPv4 or IPv6 destinations.
 
 ## Allow HTTPS Destinations
 
@@ -48,6 +48,7 @@ The short URI forms and explicit line forms can be mixed:
       tcp://cache.example.com:9443
       udp://dns.example.com:53
       ip 192.0.2.10 tcp 443
+      ip 2001:db8::10 udp 53
       cidr 192.0.2.0/24 udp 123
       cidr 2001:db8::/64 tcp 443
 ```

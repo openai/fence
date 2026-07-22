@@ -47,6 +47,8 @@ Run in audit mode first to see what would need review before enabling blocking:
     mode: audit
 ```
 
+The audit summary suggests allowlist entries for observed hostnames and direct IPv4 or IPv6 destinations.
+
 Allow one or more HTTPS hostnames:
 
 ```yaml
@@ -113,6 +115,7 @@ hostname example.com tcp 443
 *.example.com
 *.*.example.com
 ip 192.0.2.10 tcp 443
+ip 2001:db8::10 udp 53
 cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
