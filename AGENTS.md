@@ -233,6 +233,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-wrapper`
   - Offline-only dependency-free TypeScript, Node built-in `node:test`, Python standard-library host-classifier checks, and synthetic `gh`-shim checks for the Action launcher, registered-path guard selection, protected-runtime integrity records, exact writable guard and read-only runtime mount evidence, report validation, compact control and network-activity summary tables, bounded finding attribution, hostname and IPv4/IPv6 audit allowlist guidance, critical-finding propagation, runtime-path derivation, and release/bundle provenance validation.
+  - Native CIDR allowlist entries must match the Rust agent's canonical-network validation and fail before privileged setup when host bits or an address scope are present.
   - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
   - Action logs should stay concise by default and may use emoji plus ANSI colors for human readability. Debug logs are allowed only through GitHub Actions debug mode, must remain bounded and sanitized, and must not print raw config bodies, environment dumps, tokens, packet payloads, raw DNS packets, unrelated system logs, or arbitrary report JSON.
 
