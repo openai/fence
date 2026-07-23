@@ -89,6 +89,8 @@ pub struct DnsMediatedCompatibilityPlan {
     pub runner_authorized_results_storage_pattern: &'static str,
     pub max_runner_authorized_results_storage_accounts: usize,
     pub results_storage_authorization_origin: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_artifact_results_storage_authorization_origin: Option<&'static str>,
     pub forwarded_query_types: Vec<&'static str>,
     pub max_derived_cname_authorizations: usize,
     pub max_derived_cname_depth: u8,
@@ -130,6 +132,7 @@ pub(crate) fn is_runner_authorized_results_storage_hostname(hostname: &str) -> b
 
 pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
     disable_broad_github_domains: bool,
+    allow_github_artifacts: bool,
 ) -> DnsMediatedCompatibilityPlan {
     DnsMediatedCompatibilityPlan {
         realization_status: "trusted_launcher_runtime_materialization_required",
@@ -173,6 +176,8 @@ pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
         max_runner_authorized_results_storage_accounts:
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_RESULTS_STORAGE_AUTHORIZATIONS,
         results_storage_authorization_origin: "pinned_runner_worker_dns",
+        github_artifact_results_storage_authorization_origin: allow_github_artifacts
+            .then_some("opt_in_github_artifact_dns"),
         forwarded_query_types: vec!["a", "aaaa"],
         max_derived_cname_authorizations:
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DERIVED_CNAME_AUTHORIZATIONS,
@@ -190,8 +195,14 @@ pub fn github_hosted_workflow_bootstrap_dns_mediation_plan(
 pub fn reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(
     plan: &DnsMediatedCompatibilityPlan,
 ) -> bool {
-    plan == &github_hosted_workflow_bootstrap_dns_mediation_plan(false)
-        || plan == &github_hosted_workflow_bootstrap_dns_mediation_plan(true)
+    [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .any(|(disable_broad_github_domains, allow_github_artifacts)| {
+            plan == &github_hosted_workflow_bootstrap_dns_mediation_plan(
+                disable_broad_github_domains,
+                allow_github_artifacts,
+            )
+        })
 }
 
 #[cfg(test)]
@@ -200,8 +211,10 @@ mod tests {
 
     #[test]
     fn workflow_bootstrap_profile_descriptor_is_bounded_and_versioned() {
-        let profile = github_hosted_workflow_bootstrap_dns_mediation_plan(false);
-        let opt_out = github_hosted_workflow_bootstrap_dns_mediation_plan(true);
+        let profile = github_hosted_workflow_bootstrap_dns_mediation_plan(false, false);
+        let opt_out = github_hosted_workflow_bootstrap_dns_mediation_plan(true, false);
+        let artifact_profile = github_hosted_workflow_bootstrap_dns_mediation_plan(false, true);
+        let artifact_opt_out = github_hosted_workflow_bootstrap_dns_mediation_plan(true, true);
 
         assert_eq!(
             GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
@@ -241,6 +254,51 @@ mod tests {
             profile.runner_authorized_results_storage_pattern,
             "productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net"
         );
+        assert_eq!(
+            profile.results_storage_authorization_origin,
+            "pinned_runner_worker_dns"
+        );
+        assert_eq!(
+            opt_out.results_storage_authorization_origin,
+            "pinned_runner_worker_dns"
+        );
+        assert_eq!(
+            artifact_profile.results_storage_authorization_origin,
+            "pinned_runner_worker_dns"
+        );
+        assert_eq!(
+            artifact_opt_out.results_storage_authorization_origin,
+            "pinned_runner_worker_dns"
+        );
+        assert_eq!(
+            profile.github_artifact_results_storage_authorization_origin,
+            None
+        );
+        assert_eq!(
+            opt_out.github_artifact_results_storage_authorization_origin,
+            None
+        );
+        assert_eq!(
+            artifact_profile.github_artifact_results_storage_authorization_origin,
+            Some("opt_in_github_artifact_dns")
+        );
+        assert_eq!(
+            artifact_opt_out.github_artifact_results_storage_authorization_origin,
+            Some("opt_in_github_artifact_dns")
+        );
+        assert_eq!(
+            artifact_profile.max_runner_authorized_results_storage_accounts,
+            4
+        );
+        assert_eq!(
+            artifact_opt_out.max_runner_authorized_results_storage_accounts,
+            4
+        );
+        assert_eq!(
+            artifact_profile.bounded_githubapp_suffix_pattern,
+            Some("*.githubapp.com")
+        );
+        assert_eq!(artifact_opt_out.bounded_githubapp_suffix_pattern, None);
         assert_eq!(profile.forwarded_query_types, ["a", "aaaa"]);
         assert_eq!(profile.https_materialization_protocol, "tcp");
         assert_eq!(profile.https_materialization_port, 443);
@@ -312,5 +370,18 @@ mod tests {
         );
         assert!(reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&profile));
         assert!(reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&opt_out));
+        assert!(reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&artifact_profile));
+        assert!(reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&artifact_opt_out));
+
+        let mut unreviewed = artifact_profile;
+        unreviewed.results_storage_authorization_origin = "workflow_dns";
+        assert!(!reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&unreviewed));
+
+        let mut unreviewed_artifact = artifact_opt_out;
+        unreviewed_artifact.github_artifact_results_storage_authorization_origin =
+            Some("workflow_dns");
+        assert!(
+            !reviewed_github_hosted_workflow_bootstrap_dns_mediation_plan(&unreviewed_artifact)
+        );
     }
 }

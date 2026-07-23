@@ -174,14 +174,23 @@ jobs:
             invocation_id: action-standard-opt-out
             container_policy: disable
             disable_broad_github_domains: 'true'
+            allow_github_artifacts: 'false'
             allowlist: ''
           - scenario: wildcard-docker
             mode: block
             invocation_id: action-wildcard-docker
             container_policy: unsafe_preserve
             disable_broad_github_domains: 'false'
+            allow_github_artifacts: 'false'
             allowlist: |
               *.docker.io
+          - scenario: github-artifacts
+            mode: block
+            invocation_id: action-github-artifacts
+            container_policy: disable
+            disable_broad_github_domains: 'false'
+            allow_github_artifacts: 'true'
+            allowlist: ''
     timeout-minutes: 8
     runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
 
@@ -223,9 +232,31 @@ jobs:
           invocation_id: ${{ matrix.invocation_id }}
           container_policy: ${{ matrix.container_policy }}
           disable_broad_github_domains: ${{ matrix.disable_broad_github_domains }}
+          allow_github_artifacts: ${{ matrix.allow_github_artifacts }}
           allowlist: ${{ matrix.allowlist }}
 
+      - name: create bounded GitHub artifact fixture
+        if: ${{ matrix.scenario == 'github-artifacts' }}
+        env:
+          FENCE_ARTIFACT_FIXTURE: ${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt
+        run: |
+          python3 -E -c 'import socket; socket.getaddrinfo("productionresultssa17.blob.core.windows.net", 443, family=socket.AF_INET, type=socket.SOCK_STREAM)'
+          printf '%s\n' 'Fence GitHub artifact compatibility evidence.' > "$FENCE_ARTIFACT_FIXTURE"
+
+      - name: upload bounded GitHub artifact under Fence
+        id: github-artifact-upload
+        if: ${{ matrix.scenario == 'github-artifacts' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
+        with:
+          name: fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.prepare-candidate.outputs.acceptance_runner }}
+          path: ${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt
+          retention-days: 1
+          if-no-files-found: error
+
       - name: verify Action lifecycle
+        env:
+          FENCE_GITHUB_ARTIFACT_ID: ${{ steps.github-artifact-upload.outputs.artifact-id }}
+          FENCE_GITHUB_ARTIFACT_DIGEST: ${{ steps.github-artifact-upload.outputs.artifact-digest }}
         run: script/test-action-acceptance "${{ matrix.scenario }}" "${{ matrix.invocation_id }}"
 
   zero-input:

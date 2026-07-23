@@ -18,6 +18,12 @@ Start with `mode: audit` and inspect the final **Fence Summary**. Add the narrow
 
 If a hostname is allowlisted but still fails, check whether the service redirects to a different hostname, uses a CDN or object-storage domain, or opens a non-default port. Container image pulls commonly span authentication, registry, layer, CDN, and storage destinations.
 
+## Investigate GitHub Artifact, Pages, Or Cache Failures
+
+GitHub artifact uploads, Pages deployments, and caches may resolve a dynamically assigned results-storage account from an action process rather than the trusted GitHub runner. Default block mode intentionally refuses those requests.
+
+If the job must perform one of these operations, set `allow_github_artifacts: true` on its Fence step. This permits up to four exact, dynamically discovered results-storage accounts on HTTPS while preserving normal blocking for unrelated destinations. Artifact uploads become an explicit data-egress channel, so leave the option disabled in jobs that do not need them. Do not allowlist `*.blob.core.windows.net` or manually add dynamic storage accounts.
+
 ## Investigate Container Failures
 
 Standard block mode intentionally disables Docker and containerd control paths. Workflows that require containers must set `container_policy: unsafe_preserve` and accept that the result no longer carries the standard containment claim.

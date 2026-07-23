@@ -28,6 +28,8 @@ struct ConfigInput {
     container_policy: Option<String>,
     #[serde(default)]
     disable_broad_github_domains: bool,
+    #[serde(default)]
+    allow_github_artifacts: bool,
     allowlist: Vec<AllowanceInput>,
 }
 
@@ -106,6 +108,7 @@ pub struct NormalizedConfig {
     pub platform_profile: PlatformProfile,
     pub container_policy: Option<ContainerPolicy>,
     pub disable_broad_github_domains: bool,
+    pub allow_github_artifacts: bool,
     pub requested_allowances: Vec<NormalizedAllowance>,
     pub declared_allowance_count: usize,
     pub duplicate_requested_allowances_collapsed: usize,
@@ -159,6 +162,13 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
             );
         }
     };
+    if mode == Mode::Audit && input.allow_github_artifacts {
+        return Err(ErrorDetail::new(
+            "invalid_github_artifact_policy",
+            "allow_github_artifacts is supported only in block mode",
+        )
+        .field("allow_github_artifacts"));
+    }
     if !valid_invocation_id(&input.invocation_id) {
         return Err(ErrorDetail::new(
             "invalid_invocation_id",
@@ -206,6 +216,7 @@ pub fn parse_and_normalize(bytes: &[u8]) -> Result<NormalizedConfig, ErrorDetail
         platform_profile,
         container_policy,
         disable_broad_github_domains: input.disable_broad_github_domains,
+        allow_github_artifacts: input.allow_github_artifacts,
         duplicate_requested_allowances_collapsed: declared_allowance_count
             - requested_allowances.len(),
         requested_allowances,
@@ -487,7 +498,42 @@ mod tests {
             PlatformProfile::GithubHostedWorkflowBootstrapV5
         );
         assert!(!parsed.disable_broad_github_domains);
+        assert!(!parsed.allow_github_artifacts);
         assert!(parsed.requested_allowances.is_empty());
+    }
+
+    #[test]
+    fn github_artifact_compatibility_requires_explicit_block_mode() {
+        let standard = parse_and_normalize(&config(r#","allow_github_artifacts":true"#))
+            .expect("standard block may explicitly enable bounded artifact compatibility");
+        assert!(standard.allow_github_artifacts);
+        assert_eq!(standard.container_policy, Some(ContainerPolicy::Disable));
+
+        let degraded = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"degraded-artifacts","container_policy":"unsafe_preserve","allow_github_artifacts":true,"allowlist":[]}"#,
+        )
+        .expect("degraded block may explicitly enable bounded artifact compatibility");
+        assert!(degraded.allow_github_artifacts);
+        assert_eq!(
+            degraded.container_policy,
+            Some(ContainerPolicy::UnsafePreserve)
+        );
+
+        let explicit_false = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-artifacts","allow_github_artifacts":false,"allowlist":[]}"#,
+        )
+        .expect("audit may explicitly retain the disabled artifact policy");
+        assert!(!explicit_false.allow_github_artifacts);
+
+        let invalid_audit = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"audit","invocation_id":"audit-artifacts","allow_github_artifacts":true,"allowlist":[]}"#,
+        )
+        .expect_err("audit must not claim to enable a block-only compatibility policy");
+        assert_eq!(invalid_audit.code, "invalid_github_artifact_policy");
+
+        let invalid_type = parse_and_normalize(&config(r#","allow_github_artifacts":"true""#))
+            .expect_err("artifact compatibility must use a strict JSON boolean");
+        assert_eq!(invalid_type.code, "invalid_json_configuration");
     }
 
     #[test]

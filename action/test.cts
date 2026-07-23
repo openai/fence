@@ -22,6 +22,7 @@ const {
   materializationWarningLines,
   mountIdFromFdInfo,
   networkReportLines,
+  nativeInputsFromEnvironment,
   registeredActionPathGuardPaths,
   runtimePaths,
   structuredReportLine,
@@ -69,6 +70,7 @@ const report = {
   runtime_evidence_schema_version: 5,
   status: "protected_host_block",
   mode: "block",
+  allow_github_artifacts: false,
   readiness_status: "ready",
   platform_profile_id: "github_hosted_workflow_bootstrap_v5",
   profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
@@ -85,6 +87,86 @@ const report = {
   critical_findings_truncated: false,
   resident_health: residentHealth(),
 };
+
+const githubArtifactCompatibilityLimitations = [
+  "github_artifact_compatibility_explicitly_enabled",
+  "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+  "github_artifact_uploads_remain_an_intentional_data_egress_channel",
+];
+
+function dnsEvidenceFor(
+  currentReport: any = report,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    runtime_evidence_schema_version: 5,
+    status: currentReport.status,
+    mode: currentReport.mode,
+    allow_github_artifacts: currentReport.allow_github_artifacts,
+    platform_profile_id: currentReport.platform_profile_id,
+    profile_realization_id: currentReport.profile_realization_id,
+    protection_available: currentReport.protection_available,
+    routing_status: "active",
+    host_dns_routing: "direct_client_to_root_resident_mediator",
+    docker_dns_routing: "local_root_resident_mediator",
+    answer_attribution_status: "bounded_reportable_hostname_answers_only",
+    proxy_policy_status: currentReport.mode === "audit"
+      ? "audit_forwards_while_simulating_name_authorization"
+      : "block_forwards_exact_roots_bounded_user_wildcard_names_actions_suffix_names_githubapp_suffix_names_results_storage_and_bounded_cname_descendants",
+    hostname_policy: {
+      exact: [],
+      user_wildcards: [],
+      allow_dynamic_githubapp_suffix: true,
+      allow_github_artifacts: currentReport.allow_github_artifacts,
+    },
+    observations: [],
+    observations_truncated: false,
+    bounded_user_wildcard_authorizations: [],
+    bounded_user_wildcard_authorizations_truncated: false,
+    user_wildcard_request_rejections: 0,
+    runner_authorized_results_storage: [],
+    runner_authorized_results_storage_truncated: false,
+    results_storage_authorization_count: 0,
+    results_storage_attribution_failures: 0,
+    results_storage_request_rejections: 0,
+    resident_health: currentReport.resident_health,
+    limitations: currentReport.allow_github_artifacts
+      ? [...githubArtifactCompatibilityLimitations]
+      : [],
+    ...overrides,
+  };
+}
+
+function githubArtifactReport(
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    ...report,
+    allow_github_artifacts: true,
+    limitations: [...githubArtifactCompatibilityLimitations],
+    ...overrides,
+  };
+}
+
+function readinessFor(currentReport: any): Record<string, unknown> {
+  return {
+    runtime_evidence_schema_version: 5,
+    status: currentReport.readiness_status,
+    mode: currentReport.mode,
+    allow_github_artifacts: currentReport.allow_github_artifacts,
+    platform_profile_id: currentReport.platform_profile_id,
+    profile_realization_id: currentReport.profile_realization_id,
+    policy_hash_schema_version: currentReport.policy_hash_schema_version,
+    policy_hash: currentReport.policy_hash,
+    base_ruleset_hash: currentReport.base_ruleset_hash,
+    ruleset_hash: currentReport.ruleset_hash,
+    protection_available: currentReport.protection_available,
+    resident_health: currentReport.resident_health,
+    limitations: currentReport.allow_github_artifacts
+      ? [...githubArtifactCompatibilityLimitations]
+      : [],
+  };
+}
 
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
   const digest = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
@@ -335,6 +417,86 @@ test("validates explicit and zero-input inline configurations", () => {
   );
 });
 
+test("requires an explicit block-mode opt-in for bounded GitHub artifact uploads", () => {
+  const environment = { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" };
+  const strictConfig = defaultInlineConfig(environment);
+
+  assert.equal(
+    defaultInlineConfig(environment, { allowGithubArtifacts: "false" }),
+    strictConfig,
+  );
+  assert.equal(
+    defaultInlineConfig(environment, { allowGithubArtifacts: "  false  " }),
+    strictConfig,
+  );
+  assert.deepEqual(
+    JSON.parse(defaultInlineConfig(environment, { allowGithubArtifacts: "true" })),
+    {
+      schema_version: 1,
+      mode: "block",
+      invocation_id: "fence-12345-2",
+      allowlist: [],
+      allow_github_artifacts: true,
+    },
+  );
+  assert.equal(
+    nativeInputsFromEnvironment({ INPUT_ALLOW_GITHUB_ARTIFACTS: "true" })
+      .allowGithubArtifacts,
+    "true",
+  );
+
+  for (const value of ["TRUE", "False", "1", "yes", "enabled", true, 1]) {
+    assert.throws(
+      () => defaultInlineConfig(environment, { allowGithubArtifacts: value }),
+      /allow_github_artifacts input must be (?:either true or false|a string)/,
+    );
+  }
+  assert.throws(
+    () => defaultInlineConfig(environment, {
+      mode: "audit",
+      allowGithubArtifacts: "true",
+    }),
+    /allow_github_artifacts input can only be used with block mode/,
+  );
+
+  const rawBlockConfig = JSON.stringify({
+    schema_version: 1,
+    mode: "block",
+    invocation_id: "artifact-config",
+    allowlist: [],
+    allow_github_artifacts: true,
+  });
+  assert.equal(validateInlineConfig(rawBlockConfig).raw, rawBlockConfig);
+  for (const value of ["true", "false"]) {
+    assert.throws(
+      () => validateInlineConfig(rawBlockConfig, {}, { allowGithubArtifacts: value }),
+      /allow_github_artifacts input cannot be combined with config input/,
+    );
+  }
+  assert.throws(
+    () => validateInlineConfig(JSON.stringify({
+      schema_version: 1,
+      mode: "audit",
+      invocation_id: "artifact-config",
+      allowlist: [],
+      allow_github_artifacts: true,
+    })),
+    /allow_github_artifacts can only be used with block mode/,
+  );
+  for (const value of ["true", 1, null]) {
+    assert.throws(
+      () => validateInlineConfig(JSON.stringify({
+        schema_version: 1,
+        mode: "block",
+        invocation_id: "artifact-config",
+        allowlist: [],
+        allow_github_artifacts: value,
+      })),
+      /config allow_github_artifacts must be a boolean/,
+    );
+  }
+});
+
 test("normalizes canonical IPv4 and IPv6 allowlist networks", () => {
   for (const [input, expected] of [
     ["0.0.0.0/0", "0.0.0.0/0"],
@@ -417,6 +579,7 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
   assert.equal(details.containerPolicy, "disable");
   assert.equal(details.platformProfile, "github_hosted_workflow_bootstrap_v5");
   assert.equal(details.disableBroadGithubDomains, false);
+  assert.equal(details.allowGithubArtifacts, false);
   assert.equal(details.allowlistCount, 1);
   assert.deepEqual(details.allowlistDestinations, ["hostname:api.example.com:tcp:443"]);
 
@@ -424,6 +587,7 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
   assert.match(lines, /🛡️ Fence v0\.1\.6/);
   assert.match(lines, /🔒 Mode: block/);
   assert.match(lines, /🌐 Policy: GitHub workflow traffic \+ 1 allowlist entry/);
+  assert.doesNotMatch(lines, /GitHub artifact uploads/);
   assert.doesNotMatch(lines, /policy_hash/);
   assert.doesNotMatch(lines, /runtime_evidence_schema_version/);
 
@@ -431,6 +595,26 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
     actionLog.readyLine(report),
     "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down",
   );
+});
+
+test("discloses opted-in GitHub artifact egress in setup logs", () => {
+  const details = actionLog.configLogDetails(
+    JSON.stringify({
+      schema_version: 1,
+      mode: "block",
+      invocation_id: "fence-12345-1",
+      allowlist: [],
+      allow_github_artifacts: true,
+    }),
+    true,
+  );
+
+  assert.equal(details.allowGithubArtifacts, true);
+  const lines = actionLog.setupLines({ release_tag: "v0.8.9" }, details).join("\n");
+  assert.match(lines, /🔒 Mode: block/);
+  assert.match(lines, /⚠️ GitHub artifact uploads: enabled/);
+  assert.match(lines, /artifacts can send data outside the job/);
+  assert.doesNotMatch(lines, /sig=|token=|https:\/\//i);
 });
 
 test("formats audit and degraded log wording accurately", () => {
@@ -996,35 +1180,7 @@ test("requires active registered Action path guards to remain exact writable mou
 
 test("validates stable runtime evidence", () => {
   validateReport(report);
-  const dnsEvidence = {
-    runtime_evidence_schema_version: 5,
-    status: report.status,
-    mode: report.mode,
-    platform_profile_id: report.platform_profile_id,
-    profile_realization_id: report.profile_realization_id,
-    protection_available: report.protection_available,
-    routing_status: "active",
-    host_dns_routing: "direct_client_to_root_resident_mediator",
-    docker_dns_routing: "local_root_resident_mediator",
-    answer_attribution_status: "bounded_reportable_hostname_answers_only",
-    proxy_policy_status: "block_forwards_exact_roots_bounded_user_wildcard_names_actions_suffix_names_githubapp_suffix_names_results_storage_and_bounded_cname_descendants",
-    hostname_policy: {
-      exact: [],
-      user_wildcards: [],
-      allow_dynamic_githubapp_suffix: true,
-    },
-    observations: [],
-    observations_truncated: false,
-    bounded_user_wildcard_authorizations: [],
-    bounded_user_wildcard_authorizations_truncated: false,
-    user_wildcard_request_rejections: 0,
-    runner_authorized_results_storage: [],
-    runner_authorized_results_storage_truncated: false,
-    results_storage_authorization_count: 0,
-    results_storage_attribution_failures: 0,
-    results_storage_request_rejections: 0,
-    resident_health: report.resident_health,
-  };
+  const dnsEvidence = dnsEvidenceFor(report);
   validateDnsEvidence(dnsEvidence, report);
   const auditReport = {
     ...report,
@@ -1047,6 +1203,7 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
+    allow_github_artifacts: false,
     platform_profile_id: "github_hosted_workflow_bootstrap_v5",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
     policy_hash_schema_version: report.policy_hash_schema_version,
@@ -1059,6 +1216,7 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
+    allow_github_artifacts: false,
     platform_profile_id: "github_hosted_workflow_bootstrap_v5",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
     policy_hash_schema_version: report.policy_hash_schema_version,
@@ -1110,6 +1268,7 @@ test("validates stable runtime evidence", () => {
       },
     ],
     allow_dynamic_githubapp_suffix: true,
+    allow_github_artifacts: false,
   };
   validateDnsEvidence({
     ...dnsEvidence,
@@ -1220,7 +1379,187 @@ test("validates stable runtime evidence", () => {
     }, report),
     /resident process/,
   );
-  assert.throws(() => validateReady({ status: "ready" }, report), /identity/);
+  assert.throws(
+    () => validateReady({ status: "ready" }, report),
+    /does not declare the GitHub artifact compatibility policy/,
+  );
+});
+
+test("validates bounded GitHub artifact authorizations against the opted-in policy", () => {
+  const artifactReport = githubArtifactReport();
+  const authorizations = [
+    {
+      hostname: "productionresultssa10.blob.core.windows.net",
+      authorization_origin: "opt_in_github_artifact_dns",
+    },
+    {
+      hostname: "productionresultssa11.blob.core.windows.net",
+      authorization_origin: "opt_in_github_artifact_dns",
+    },
+    {
+      hostname: "productionresultssa12.blob.core.windows.net",
+      authorization_origin: "pinned_runner_worker_dns",
+    },
+    {
+      hostname: "productionresultssa13.blob.core.windows.net",
+      authorization_origin: "pinned_runner_worker_dns",
+    },
+  ];
+  const artifactDns = dnsEvidenceFor(artifactReport, {
+    runner_authorized_results_storage: authorizations,
+    results_storage_authorization_count: authorizations.length,
+    observations: [
+      {
+        hostname: authorizations[0].hostname,
+        policy_classification: "artifact_authorized_results_storage",
+      },
+      {
+        hostname: authorizations[1].hostname,
+        policy_classification: "artifact_authorized_results_storage_cname_derived",
+      },
+    ],
+  });
+
+  assert.equal(validateReport(artifactReport), artifactReport);
+  const ready = readinessFor(artifactReport);
+  assert.equal(validateReady(ready, artifactReport), ready);
+  assert.equal(validateDnsEvidence(artifactDns, artifactReport), artifactDns);
+  assert.throws(
+    () => validateDnsEvidence(dnsEvidenceFor(artifactReport, {
+      runner_authorized_results_storage: [
+        ...authorizations,
+        {
+          hostname: "productionresultssa14.blob.core.windows.net",
+          authorization_origin: "opt_in_github_artifact_dns",
+        },
+      ],
+      results_storage_authorization_count: 5,
+    }), artifactReport),
+    /bounded runner provenance/,
+  );
+});
+
+test("fails closed when GitHub artifact policy and resident evidence disagree", () => {
+  const artifactReport = githubArtifactReport();
+  const artifactDns = dnsEvidenceFor(artifactReport);
+  const artifactReady = readinessFor(artifactReport);
+
+  for (const invalidReport of [
+    githubArtifactReport({ allow_github_artifacts: undefined }),
+    githubArtifactReport({ allow_github_artifacts: "true" }),
+    githubArtifactReport({ limitations: [] }),
+    githubArtifactReport({ limitations: githubArtifactCompatibilityLimitations.slice(0, 2) }),
+    githubArtifactReport({
+      limitations: [
+        ...githubArtifactCompatibilityLimitations,
+        githubArtifactCompatibilityLimitations[0],
+      ],
+    }),
+    {
+      ...report,
+      limitations: [...githubArtifactCompatibilityLimitations],
+    },
+  ]) {
+    assert.throws(
+      () => validateReport(invalidReport),
+      /GitHub artifact (?:compatibility|data-egress) policy/,
+    );
+  }
+
+  assert.throws(
+    () => validateReport(githubArtifactReport({
+      status: "protected_host_audit_observation",
+      mode: "audit",
+      readiness_status: "ready_observation_only",
+      setup_status: "resident_observation_only",
+      protection_available: false,
+      sudo_status: "preserved_verified",
+      container_status: "preserved_verified",
+    })),
+    /cannot enable GitHub artifact compatibility in audit mode/,
+  );
+
+  assert.throws(
+    () => validateReady({
+      ...artifactReady,
+      allow_github_artifacts: false,
+      limitations: [],
+    }, artifactReport),
+    /readiness identity/,
+  );
+  assert.throws(
+    () => validateReady({ ...artifactReady, limitations: [] }, artifactReport),
+    /does not disclose the GitHub artifact data-egress policy/,
+  );
+
+  assert.throws(
+    () => validateDnsEvidence(dnsEvidenceFor(report), artifactReport),
+    /does not match the resident report/,
+  );
+  assert.throws(
+    () => validateDnsEvidence({ ...artifactDns, limitations: [] }, artifactReport),
+    /does not disclose the GitHub artifact data-egress policy/,
+  );
+  assert.throws(
+    () => validateDnsEvidence({
+      ...artifactDns,
+      hostname_policy: {
+        ...(artifactDns.hostname_policy as Record<string, unknown>),
+        allow_github_artifacts: false,
+      },
+    }, artifactReport),
+    /bounded wildcard policy/,
+  );
+});
+
+test("rejects artifact-origin storage access and classifications in strict mode", () => {
+  const strictDns = dnsEvidenceFor(report);
+  const unauthorizedAccount = {
+    hostname: "productionresultssa10.blob.core.windows.net",
+    authorization_origin: "opt_in_github_artifact_dns",
+  };
+
+  assert.throws(
+    () => validateDnsEvidence({
+      ...strictDns,
+      runner_authorized_results_storage: [unauthorizedAccount],
+      results_storage_authorization_count: 1,
+    }, report),
+    /invalid results-storage authorization/,
+  );
+  for (const classification of [
+    "artifact_authorized_results_storage",
+    "artifact_authorized_results_storage_cname_derived",
+  ]) {
+    assert.throws(
+      () => validateDnsEvidence({
+        ...strictDns,
+        observations: [{
+          hostname: unauthorizedAccount.hostname,
+          policy_classification: classification,
+        }],
+      }, report),
+      /invalid hostname observation/,
+    );
+  }
+  for (const hostname of [
+    "unrelated.blob.core.windows.net",
+    "productionresultssa10.blob.core.windows.net.evil.example",
+    "productionresultssa123456.blob.core.windows.net",
+    "*.blob.core.windows.net",
+  ]) {
+    const artifactReport = githubArtifactReport();
+    assert.throws(
+      () => validateDnsEvidence(dnsEvidenceFor(artifactReport, {
+        runner_authorized_results_storage: [{
+          hostname,
+          authorization_origin: "opt_in_github_artifact_dns",
+        }],
+        results_storage_authorization_count: 1,
+      }), artifactReport),
+      /invalid results-storage authorization/,
+    );
+  }
 });
 
 test("validates fresh resident worker and service identity evidence", () => {
@@ -1414,6 +1753,8 @@ test("renders a canonical healthy structured network report from bounded evidenc
   assert.deepEqual(document.suggested_allowlist, []);
   assert.equal(document.omissions.network_rows, 0);
   assert.equal(document.omissions.source_truncated, false);
+  assert.equal(document.warnings.github_artifact_uploads_enabled, false);
+  assert.equal(document.warnings.github_artifact_authorizations, 0);
 
   const humanReport = networkReportLines(currentReport, dnsEvidence).join("\n");
   assert.match(humanReport, /Fence network report: healthy/);
@@ -1422,6 +1763,90 @@ test("renders a canonical healthy structured network report from bounded evidenc
   assert.match(humanReport, /blocked\.example\.com/);
   assert.match(humanReport, /blocked \| blocked\.example\.com \| .* \| runner: curl \(PID 4242\)/);
   assert.match(humanReport, /2001:db8::44/);
+  assert.doesNotMatch(humanReport, /intentional data-egress channel/);
+});
+
+test("reports GitHub artifact compatibility as intentionally reduced assurance", () => {
+  const artifactReport = githubArtifactReport();
+  const artifactHostname = "productionresultssa10.blob.core.windows.net";
+  const pinnedHostname = "productionresultssa11.blob.core.windows.net";
+  const authorizations = [
+    { hostname: artifactHostname, authorization_origin: "opt_in_github_artifact_dns" },
+    { hostname: pinnedHostname, authorization_origin: "pinned_runner_worker_dns" },
+  ];
+  const artifactDns = dnsEvidenceFor(artifactReport, {
+    runner_authorized_results_storage: authorizations,
+    results_storage_authorization_count: authorizations.length,
+    observations: [{
+      hostname: artifactHostname,
+      query_type: "a",
+      policy_classification: "artifact_authorized_results_storage",
+      occurrences: 2,
+      resolved_addresses: ["192.0.2.10"],
+    }],
+  });
+
+  validateReport(artifactReport);
+  validateDnsEvidence(artifactDns, artifactReport);
+  const document = parsedStructuredNetworkReport(artifactReport, artifactDns);
+  assert.equal(document.schema_version, 1);
+  assert.equal(document.mode, "block");
+  assert.equal(document.result, "warning");
+  assert.equal(document.controls.protection_available, true);
+  assert.equal(document.controls.network, "verified");
+  assert.equal(document.controls.sudo, "disabled_verified");
+  assert.equal(document.controls.containers, "disabled_verified");
+  assert.equal(document.warnings.github_artifact_uploads_enabled, true);
+  assert.equal(document.warnings.github_artifact_authorizations, 1);
+  assert.equal(document.network.find((row: any) =>
+    row.destination === artifactHostname
+  ).decision, "allowed");
+
+  const summary = summaryLines(artifactReport, artifactDns).join("\n");
+  assert.match(summary, /^### 🟡 Fence Summary/);
+  assert.doesNotMatch(summary, /^### 🟢 Fence Summary/m);
+  assert.match(summary, /\| GitHub artifact uploads \| ⚠️ Enabled/);
+  assert.match(summary, /intentional data-egress channel/);
+  assert.match(summary, /1 of 4 storage accounts authorized/);
+  assert.match(summary, /productionresultssa10\.blob\.core\.windows\.net/);
+
+  const humanReport = networkReportLines(artifactReport, artifactDns).join("\n");
+  assert.match(humanReport, /^Fence network report: warning/m);
+  assert.match(humanReport, /GitHub artifact uploads: enabled; intentional data-egress channel/);
+  assert.match(humanReport, /1 of 4 storage accounts authorized/);
+  assert.match(humanReport, /allowed \| productionresultssa10\.blob\.core\.windows\.net/);
+  assert.doesNotMatch(`${summary}\n${humanReport}`, /sig=|token=|https:\/\//i);
+
+  const optedInWithoutUploads = parsedStructuredNetworkReport(
+    artifactReport,
+    dnsEvidenceFor(artifactReport),
+  );
+  assert.equal(optedInWithoutUploads.result, "warning");
+  assert.equal(optedInWithoutUploads.warnings.github_artifact_uploads_enabled, true);
+  assert.equal(optedInWithoutUploads.warnings.github_artifact_authorizations, 0);
+  assert.match(
+    summaryLines(artifactReport, dnsEvidenceFor(artifactReport)).join("\n"),
+    /0 of 4 storage accounts authorized/,
+  );
+});
+
+test("never reports artifact-only DNS classifications as allowed in strict mode", () => {
+  for (const policyClassification of [
+    "artifact_authorized_results_storage",
+    "artifact_authorized_results_storage_cname_derived",
+  ]) {
+    const strictDocument = parsedStructuredNetworkReport(report, {
+      observations: [{
+        hostname: "productionresultssa10.blob.core.windows.net",
+        query_type: "a",
+        policy_classification: policyClassification,
+        occurrences: 1,
+        resolved_addresses: [],
+      }],
+      observations_truncated: false,
+    });
+    assert.equal(strictDocument.network[0].decision, "blocked");
+  }
 });
 
 test("reports degraded and critical security states without claiming healthy protection", () => {

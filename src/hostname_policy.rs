@@ -39,6 +39,7 @@ pub struct RuntimeHostnamePolicy {
     pub exact: Vec<ExactHostnamePolicy>,
     pub user_wildcards: Vec<UserWildcardHostnamePolicy>,
     pub allow_dynamic_githubapp_suffix: bool,
+    pub allow_github_artifacts: bool,
 }
 
 impl RuntimeHostnamePolicy {
@@ -148,6 +149,7 @@ pub fn build_runtime_hostname_policy(config: &NormalizedConfig) -> RuntimeHostna
             )
             .collect(),
         allow_dynamic_githubapp_suffix: !config.disable_broad_github_domains,
+        allow_github_artifacts: config.allow_github_artifacts,
     }
 }
 
@@ -209,6 +211,7 @@ mod tests {
             ]
         );
         assert!(policy.allow_dynamic_githubapp_suffix);
+        assert!(!policy.allow_github_artifacts);
         assert!(policy.has_user_wildcards());
         assert_eq!(policy.user_wildcards.len(), 2);
         assert_eq!(
@@ -319,6 +322,34 @@ mod tests {
             ]
         );
         assert!(!policy.allow_dynamic_githubapp_suffix);
+        assert!(!policy.allow_github_artifacts);
         assert!(!policy.has_user_wildcards());
+    }
+
+    #[test]
+    fn artifact_compatibility_is_explicit_and_independent_of_broad_domains() {
+        let policy = build_runtime_hostname_policy(&parse(
+            r#"{"schema_version":1,"mode":"block","invocation_id":"artifact-compatibility","disable_broad_github_domains":true,"allow_github_artifacts":true,"allowlist":[]}"#,
+        ));
+
+        assert!(policy.allow_github_artifacts);
+        assert!(!policy.allow_dynamic_githubapp_suffix);
+        assert!(policy.exact_entry("github.com").is_none());
+        assert!(
+            policy
+                .exact_entry("results-receiver.actions.githubusercontent.com")
+                .is_some()
+        );
+        assert!(
+            policy
+                .exact_entry("productionresultssa19.blob.core.windows.net")
+                .is_some()
+        );
+        assert!(
+            policy
+                .exact_entry("productionresultssa17.blob.core.windows.net")
+                .is_none(),
+            "artifact storage accounts must remain dynamically mediated"
+        );
     }
 }

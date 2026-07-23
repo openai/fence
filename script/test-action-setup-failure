@@ -163,6 +163,69 @@ if ! sudo --non-interactive /usr/bin/true; then
   die "Action allowlist-limit setup-failure evidence unexpectedly disabled passwordless sudo"
 fi
 
+assert_invalid_artifact_input() {
+  local label="$1"
+  local invocation="$2"
+  local mode="$3"
+  local value="$4"
+  local expected_error="$5"
+  local unit="fence-$invocation.service"
+
+  if [[ -e "/run/fence/$invocation" || -e "/run/fence-launcher/$invocation" ]]; then
+    die "Action $label setup-failure evidence requires no preexisting runtime state"
+  fi
+  if [[ "$(systemctl show "$unit" --property=LoadState --value)" != "not-found" ]]; then
+    die "Action $label setup-failure evidence requires an unused transient service name"
+  fi
+
+  : >"$state"
+  : >"$summary"
+  : >"$stdout"
+  : >"$stderr"
+  if INPUT_CONFIG='' \
+    INPUT_MODE="$mode" \
+    INPUT_INVOCATION_ID="$invocation" \
+    INPUT_ALLOW_GITHUB_ARTIFACTS="$value" \
+    GITHUB_STATE="$state" \
+    GITHUB_STEP_SUMMARY="$summary" \
+    node action/main.cts >"$stdout" 2>"$stderr"; then
+    die "Action setup unexpectedly accepted $label"
+  fi
+
+  if ! grep -Fq "$expected_error" "$stderr"; then
+    die "Action $label setup-failure evidence did not report the expected configuration error"
+  fi
+  if [[ -s "$stdout" || -s "$state" || -s "$summary" ]]; then
+    die "Action $label setup-failure evidence unexpectedly emitted success state"
+  fi
+  if [[ -e "/run/fence/$invocation" || -e "/run/fence-launcher/$invocation" ]]; then
+    die "Action $label setup-failure evidence unexpectedly created runtime state"
+  fi
+  if [[ "$(systemctl show "$unit" --property=LoadState --value)" != "not-found" ]]; then
+    die "Action $label setup-failure evidence unexpectedly created a transient service"
+  fi
+  if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+    die "Action $label setup-failure evidence unexpectedly created inet fence_v0"
+  fi
+  if ! sudo --non-interactive /usr/bin/true; then
+    die "Action $label setup-failure evidence unexpectedly disabled passwordless sudo"
+  fi
+}
+
+assert_invalid_artifact_input \
+  "malformed GitHub artifact compatibility" \
+  "action-invalid-github-artifact-boolean" \
+  "block" \
+  "TRUE" \
+  "allow_github_artifacts input must be either true or false"
+
+assert_invalid_artifact_input \
+  "audit-mode GitHub artifact compatibility" \
+  "action-invalid-github-artifact-audit" \
+  "audit" \
+  "true" \
+  "allow_github_artifacts input can only be used with block mode"
+
 runtime_failure_invocation="action-runtime-failure"
 runtime_failure_unit="fence-$runtime_failure_invocation.service"
 if [[ "$(systemctl show "$runtime_failure_unit" --property=LoadState --value)" != "not-found" ]]; then
