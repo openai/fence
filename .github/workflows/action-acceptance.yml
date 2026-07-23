@@ -430,6 +430,7 @@ jobs:
           fi
 
       - name: activate bundled Fence agent without post-ready warming
+        timeout-minutes: 3
         uses: ./
         with:
           invocation_id: action-finalization-${{ matrix.replica }}

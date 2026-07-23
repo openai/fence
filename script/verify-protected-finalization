@@ -21,36 +21,26 @@ fi
 
 require_cmd python3
 
-FENCE_FINALIZATION_JOB_SET="$job_set" python3 <<'PY'
-import datetime
+FENCE_FINALIZATION_JOB_SET="$job_set" python3 -B -E - "$DIR" <<'PY'
 import io
 import json
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 import urllib.parse
 import zipfile
 
+sys.path.insert(0, os.path.join(sys.argv[1], "script", "lib"))
+
+from protected_finalization import validate_finalization_jobs
+
 repository = os.environ["GITHUB_REPOSITORY"]
 run_id = os.environ["GITHUB_RUN_ID"]
 token = os.environ["GITHUB_TOKEN"]
 job_set = os.environ["FENCE_FINALIZATION_JOB_SET"]
 api_root = f"https://api.github.com/repos/{repository}"
-expected_jobs = (
-    {
-        "protected finalization quiet-1",
-        "protected finalization quiet-2",
-        "protected finalization quiet-3",
-        "protected standard-opt-out required",
-    }
-    if job_set == "integration"
-    else {
-        "action finalization quiet-1",
-        "action finalization quiet-2",
-        "action finalization quiet-3",
-    }
-)
 authorization_marker = b"fence-results-storage-authorization-observed"
 authorization_observed = False
 
@@ -115,42 +105,13 @@ if len(body) > 1024 * 1024:
     raise SystemExit("protected finalization job metadata exceeded its fixed bound")
 document = json.loads(body)
 
-jobs = {}
-for job in document.get("jobs", []):
-    if not isinstance(job, dict) or not isinstance(job.get("name"), str):
-        continue
-    observed_name = job["name"]
-    matches = [
-        expected
-        for expected in expected_jobs
-        if observed_name == expected or observed_name.endswith(f" / {expected}")
-    ]
-    if not matches:
-        continue
-    if len(matches) != 1:
-        raise SystemExit(f"protected finalization job name was ambiguous: {observed_name}")
-    canonical_name = matches[0]
-    if observed_name != canonical_name:
-        prefix = observed_name[: -(len(canonical_name) + 3)]
-        if not prefix or len(prefix) > 128 or any(ord(character) < 0x20 for character in prefix):
-            raise SystemExit(f"protected finalization reusable-workflow prefix was invalid: {observed_name}")
-    if canonical_name in jobs:
-        raise SystemExit(f"protected finalization job was duplicated: {canonical_name}")
-    jobs[canonical_name] = job
+try:
+    jobs = validate_finalization_jobs(document, job_set)
+except ValueError as error:
+    raise SystemExit(str(error)) from None
 
-missing = sorted(expected_jobs - jobs.keys())
-if missing:
-    raise SystemExit(f"protected finalization jobs were not observable: {', '.join(missing)}")
-
-for name in sorted(expected_jobs):
+for name in sorted(jobs):
     job = jobs[name]
-    if job.get("status") != "completed" or job.get("conclusion") != "success":
-        raise SystemExit(f"protected finalization job did not complete successfully: {name}")
-    started = datetime.datetime.fromisoformat(job["started_at"].replace("Z", "+00:00"))
-    completed = datetime.datetime.fromisoformat(job["completed_at"].replace("Z", "+00:00"))
-    if (completed - started).total_seconds() > 180:
-        raise SystemExit(f"protected finalization job exceeded 180 seconds: {name}")
-
     archive = None
     for attempt in range(6):
         archive = log_archive(job["id"])
