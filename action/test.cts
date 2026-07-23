@@ -8,6 +8,7 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   ACTION_RUNTIME_FILES,
+  MAX_STRUCTURED_REPORT_BYTES,
   actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
   actionRuntimeDigest,
@@ -20,8 +21,10 @@ const {
   materializationRequestRejections,
   materializationWarningLines,
   mountIdFromFdInfo,
+  networkReportLines,
   registeredActionPathGuardPaths,
   runtimePaths,
+  structuredReportLine,
   summaryLines,
   validateBundle,
   validatedActionRuntimeSnapshot,
@@ -130,6 +133,14 @@ function captureStderr(callback: () => void): string {
     process.stderr.write = originalWrite;
   }
   return output;
+}
+
+function parsedStructuredNetworkReport(currentReport: any, dnsEvidence: any = undefined): any {
+  const line = structuredReportLine(currentReport, dnsEvidence);
+  assert.match(line, /^FENCE_REPORT_JSON=/);
+  assert.ok(Buffer.byteLength(line, "utf8") <= MAX_STRUCTURED_REPORT_BYTES);
+  assert.equal(captureStdout(() => actionLog.structuredRecord(line)), `${line}\n`);
+  return JSON.parse(line.slice("FENCE_REPORT_JSON=".length));
 }
 
 test("validates explicit and zero-input inline configurations", () => {
@@ -342,6 +353,53 @@ test("normalizes canonical IPv4 and IPv6 allowlist networks", () => {
   }
 });
 
+test("limits native allowlists to 64 unique canonical destinations", () => {
+  const environment = { GITHUB_RUN_ID: "12345", GITHUB_RUN_ATTEMPT: "2" };
+  const hostnames = Array.from({ length: 65 }, (_, index) => `host-${index}.example.com`);
+  const allowlistLength = (lines: string[]): number => JSON.parse(
+    defaultInlineConfig(environment, { allowlist: lines.join("\n") }),
+  ).allowlist.length;
+
+  assert.equal(allowlistLength(hostnames.slice(0, 64)), 64);
+  assert.throws(
+    () => allowlistLength(hostnames),
+    /allowlist line 65: allowlist input must contain no more than 64 unique entries/,
+  );
+  assert.equal(allowlistLength([...hostnames.slice(0, 64), hostnames[0]]), 64);
+  assert.equal(allowlistLength([
+    ...hostnames.slice(0, 63),
+    "EXAMPLE.COM",
+    "hostname example.com tcp 443",
+  ]), 64);
+  assert.equal(allowlistLength([
+    ...hostnames.slice(0, 63),
+    "cidr 192.0.2.0/024 tcp 443",
+    "cidr 192.0.2.0/24 tcp 443",
+  ]), 64);
+  assert.equal(allowlistLength([
+    ...hostnames.slice(0, 64),
+    "# comments do not consume allowlist entries",
+    "",
+    "   ",
+  ]), 64);
+  assert.throws(
+    () => allowlistLength([
+      ...hostnames.slice(0, 63),
+      "hostname protocols.example.com tcp 443",
+      "hostname protocols.example.com udp 443",
+    ]),
+    /allowlist line 65: allowlist input must contain no more than 64 unique entries/,
+  );
+  assert.throws(
+    () => allowlistLength([
+      ...hostnames.slice(0, 63),
+      "hostname ports.example.com tcp 443",
+      "hostname ports.example.com tcp 8443",
+    ]),
+    /allowlist line 65: allowlist input must contain no more than 64 unique entries/,
+  );
+});
+
 test("formats concise setup and ready logs without raw evidence fields", () => {
   const details = actionLog.configLogDetails(
     JSON.stringify({
@@ -474,6 +532,71 @@ test("emits bounded warning and error workflow commands", () => {
     captureStderr(() => actionLog.error("Fence setup failed\n100%")),
     "::error::Fence setup failed 100%25\n",
   );
+});
+
+test("writes canonical structured reports without the ordinary log truncation", () => {
+  const record = {
+    schema_version: 1,
+    message: "🔒".repeat(700),
+  };
+  const line = `FENCE_REPORT_JSON=${JSON.stringify(record)}`;
+
+  assert.ok(Buffer.byteLength(line, "utf8") > 2048);
+  assert.ok(Buffer.byteLength(line, "utf8") <= MAX_STRUCTURED_REPORT_BYTES);
+  const output = captureStdout(() => actionLog.structuredRecord(line));
+  assert.equal(output, `${line}\n`);
+  assert.deepEqual(JSON.parse(output.slice("FENCE_REPORT_JSON=".length)), record);
+  assert.doesNotMatch(output, /\.\.\.\[truncated\]/);
+});
+
+test("accepts the exact structured-report byte limit and rejects a larger record", () => {
+  const prefix = "FENCE_REPORT_JSON=";
+  const empty = `${prefix}${JSON.stringify({ schema_version: 1, padding: "" })}`;
+  const padding = "x".repeat(MAX_STRUCTURED_REPORT_BYTES - Buffer.byteLength(empty, "utf8"));
+  const exact = `${prefix}${JSON.stringify({ schema_version: 1, padding })}`;
+
+  assert.equal(Buffer.byteLength(exact, "utf8"), MAX_STRUCTURED_REPORT_BYTES);
+  assert.equal(captureStdout(() => actionLog.structuredRecord(exact)), `${exact}\n`);
+
+  const oversized = `${prefix}${JSON.stringify({ schema_version: 1, padding: `${padding}x` })}`;
+  const output = captureStdout(() => {
+    assert.throws(() => actionLog.structuredRecord(oversized), /16 KiB limit/);
+  });
+  assert.equal(output, "");
+});
+
+test("rejects malformed and injectable structured report records without emitting them", () => {
+  const prefix = "FENCE_REPORT_JSON=";
+  const valid = `${prefix}${JSON.stringify({ schema_version: 1 })}`;
+  const invalidRecords: [unknown, RegExp][] = [
+    [undefined, /must start with/],
+    [null, /must start with/],
+    [{ schema_version: 1 }, /must start with/],
+    ["::warning::forged report", /must start with/],
+    ["PREFIX_FENCE_REPORT_JSON={\"schema_version\":1}", /must start with/],
+    [`${prefix}`, /valid JSON/],
+    [`${prefix}{`, /valid JSON/],
+    [`${prefix}null`, /canonical schema-version-1 JSON/],
+    [`${prefix}[]`, /canonical schema-version-1 JSON/],
+    [`${prefix}${JSON.stringify({ schema_version: 2 })}`, /canonical schema-version-1 JSON/],
+    [`${prefix}{"schema_version":1,"schema_version":1}`, /canonical schema-version-1 JSON/],
+    [`${prefix}{ "schema_version": 1 }`, /canonical schema-version-1 JSON/],
+    [`${valid}\n::error::injected`, /single line without control characters/],
+    [`${valid}\r::warning::injected`, /single line without control characters/],
+    [`${valid}\u0000`, /single line without control characters/],
+    [`${valid}\u001b`, /single line without control characters/],
+    [`${valid}\u007f`, /single line without control characters/],
+    [`${valid}\u0085`, /single line without control characters/],
+    [`${valid}\u2028`, /single line without control characters/],
+    [`${valid}\u2029`, /single line without control characters/],
+  ];
+
+  for (const [record, expectedError] of invalidRecords) {
+    const output = captureStdout(() => {
+      assert.throws(() => actionLog.structuredRecord(record), expectedError);
+    });
+    assert.equal(output, "");
+  }
 });
 
 test("recognizes terminal service state and only bounded structured Fence error codes", () => {
@@ -1181,6 +1304,485 @@ test("validates fresh resident worker and service identity evidence", () => {
     () => validateResidentUnitStatus("ActiveState=active\nSubState=running\n", 4242),
     /incomplete/,
   );
+});
+
+test("renders a canonical healthy structured network report from bounded evidence", () => {
+  const currentReport = {
+    ...report,
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "block",
+        classification: "rejected",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "192.0.2.44",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+        local_attribution: {
+          status: "attributed",
+          actor_class: "runner",
+          pid: 4242,
+          executable_basename: "curl",
+        },
+      },
+      {
+        timestamp: "unix-ms:2",
+        mode: "block",
+        classification: "rejected",
+        family: "ipv6",
+        protocol: "udp",
+        remote_address: "2001:db8::44",
+        remote_port: 53,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [
+      {
+        hostname: "github.com",
+        query_type: "a",
+        policy_classification: "platform_profile",
+        occurrences: 2,
+        resolved_addresses: ["192.0.2.1"],
+      },
+      {
+        hostname: "blocked.example.com",
+        query_type: "a",
+        policy_classification: "outside_policy",
+        occurrences: 1,
+        resolved_addresses: ["192.0.2.44"],
+      },
+    ],
+    observations_truncated: false,
+    blocked_non_profile_query_count: 1,
+  };
+
+  const document = parsedStructuredNetworkReport(currentReport, dnsEvidence);
+  assert.deepEqual(Object.keys(document), [
+    "schema_version",
+    "mode",
+    "result",
+    "controls",
+    "network",
+    "warnings",
+    "omissions",
+    "suggested_allowlist",
+  ]);
+  assert.equal(document.schema_version, 1);
+  assert.equal(document.mode, "block");
+  assert.equal(document.result, "healthy");
+  assert.deepEqual(document.controls, {
+    network: "verified",
+    sudo: "disabled_verified",
+    containers: "disabled_verified",
+    protection_available: true,
+    readiness: "ready",
+    resident_health: "healthy",
+  });
+
+  const allowed = document.network.find((row: any) => row.destination === "github.com");
+  assert.deepEqual(Object.keys(allowed), [
+    "destination_kind",
+    "destination",
+    "decision",
+    "activities",
+    "actors",
+    "count",
+  ]);
+  assert.equal(allowed.destination_kind, "hostname");
+  assert.equal(allowed.decision, "allowed");
+  assert.deepEqual(allowed.activities, [{ kind: "dns_query", query_type: "a", count: 2 }]);
+
+  const blocked = document.network.find((row: any) => row.destination === "blocked.example.com");
+  assert.equal(blocked.destination_kind, "hostname");
+  assert.equal(blocked.decision, "blocked");
+  assert.deepEqual(blocked.activities, [
+    { kind: "dns_query", query_type: "a", count: 1 },
+    { kind: "connection_attempt", protocol: "tcp", port: 443, count: 1 },
+  ]);
+  assert.deepEqual(blocked.actors, [{ label: "runner: curl (PID 4242)", count: 1 }]);
+
+  const directIp = document.network.find((row: any) => row.destination === "2001:db8::44");
+  assert.equal(directIp.destination_kind, "ip");
+  assert.equal(directIp.decision, "blocked");
+  assert.deepEqual(directIp.activities, [
+    { kind: "connection_attempt", protocol: "udp", port: 53, count: 1 },
+  ]);
+  assert.deepEqual(document.suggested_allowlist, []);
+  assert.equal(document.omissions.network_rows, 0);
+  assert.equal(document.omissions.source_truncated, false);
+
+  const humanReport = networkReportLines(currentReport, dnsEvidence).join("\n");
+  assert.match(humanReport, /Fence network report: healthy/);
+  assert.match(humanReport, /Decision \| Destination \| Activity \| Actor/);
+  assert.match(humanReport, /github\.com/);
+  assert.match(humanReport, /blocked\.example\.com/);
+  assert.match(humanReport, /blocked \| blocked\.example\.com \| .* \| runner: curl \(PID 4242\)/);
+  assert.match(humanReport, /2001:db8::44/);
+});
+
+test("reports degraded and critical security states without claiming healthy protection", () => {
+  const degraded = {
+    ...report,
+    status: "protected_host_block_degraded",
+    readiness_status: "ready_degraded",
+    setup_status: "resident_degraded",
+    protection_available: false,
+    container_status: "preserved_unsafe",
+  };
+  const degradedDocument = parsedStructuredNetworkReport(degraded, {
+    observations: [],
+    observations_truncated: false,
+  });
+  assert.equal(degradedDocument.mode, "block");
+  assert.equal(degradedDocument.result, "warning");
+  assert.equal(degradedDocument.controls.protection_available, false);
+  assert.equal(degradedDocument.controls.containers, "preserved_unsafe");
+  assert.match(networkReportLines(degraded).join("\n"), /Fence network report: warning/);
+
+  const critical = {
+    ...report,
+    network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "owned_nftables_state_missing",
+      message: "Fence-owned network state changed after readiness.",
+    }],
+  };
+  const criticalDocument = parsedStructuredNetworkReport(critical, {
+    observations: [],
+    observations_truncated: false,
+  });
+  assert.equal(criticalDocument.result, "critical");
+  assert.equal(criticalDocument.controls.network, "critical_drift");
+  assert.equal(criticalDocument.controls.resident_health, "critical");
+  assert.equal(criticalDocument.warnings.critical_findings, 1);
+  assert.deepEqual(criticalDocument.warnings.critical_codes, ["owned_nftables_state_missing"]);
+  assert.match(networkReportLines(critical).join("\n"), /Fence network report: critical/);
+  assert.throws(() => validateReport(critical, true), /critical resident findings/);
+});
+
+test("renders audit network decisions and hostname and direct-IP allowlist suggestions", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      {
+        timestamp: "unix-ms:1",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv4",
+        protocol: "tcp",
+        remote_address: "203.0.113.10",
+        remote_port: 443,
+        rule_class: "undeclared_new_egress",
+      },
+      {
+        timestamp: "unix-ms:2",
+        mode: "audit",
+        classification: "would_block",
+        family: "ipv6",
+        protocol: "udp",
+        remote_address: "2001:db8::10",
+        remote_port: 53,
+        rule_class: "undeclared_new_egress",
+      },
+    ],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [{
+      hostname: "api.example.com",
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 1,
+      resolved_addresses: ["203.0.113.10"],
+    }],
+    observations_truncated: false,
+  };
+
+  const document = parsedStructuredNetworkReport(audit, dnsEvidence);
+  assert.equal(document.mode, "audit");
+  assert.equal(document.controls.protection_available, false);
+  assert.equal(document.controls.sudo, "preserved_verified");
+  assert.equal(document.controls.containers, "preserved_verified");
+  assert.equal(document.network.find((row: any) => row.destination === "api.example.com").decision, "would_block");
+  assert.equal(document.network.find((row: any) => row.destination === "2001:db8::10").decision, "would_block");
+  assert.deepEqual(document.suggested_allowlist, [
+    "api.example.com",
+    "ip 2001:db8::10 udp 53",
+  ]);
+  const humanReport = networkReportLines(audit, dnsEvidence).join("\n");
+  assert.match(humanReport, /would.block/i);
+  assert.match(humanReport, /api\.example\.com/);
+  assert.match(humanReport, /2001:db8::10/);
+});
+
+test("caps structured network rows and explicitly reports omitted evidence", () => {
+  const dnsEvidence = {
+    observations: Array.from({ length: 27 }, (_, index) => ({
+      hostname: `host-${String(index).padStart(2, "0")}.example.com`,
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 1,
+      resolved_addresses: [],
+    })),
+    observations_truncated: true,
+    blocked_non_profile_query_count: 27,
+  };
+
+  const document = parsedStructuredNetworkReport(report, dnsEvidence);
+  assert.equal(document.network.length, 20);
+  assert.equal(document.omissions.network_rows, 7);
+  assert.equal(document.omissions.source_truncated, true);
+  assert.ok(document.network.every((row: any) => row.decision === "blocked"));
+  assert.match(networkReportLines(report, dnsEvidence).join("\n"), /omitt|truncat/i);
+});
+
+test("distinguishes typed DNS decisions and TCP and UDP connection attempts", () => {
+  const currentReport = {
+    ...report,
+    findings: ["tcp", "udp"].map((protocol) => ({
+      timestamp: "unix-ms:1",
+      mode: "block",
+      classification: "rejected",
+      family: "ipv4",
+      protocol,
+      remote_address: "203.0.113.22",
+      remote_port: 443,
+      rule_class: "undeclared_new_egress",
+    })),
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [
+      {
+        hostname: "allowed.example.com",
+        query_type: "a",
+        policy_classification: "user_allowlist",
+        occurrences: 2,
+        resolved_addresses: ["192.0.2.20"],
+      },
+      {
+        hostname: "allowed.example.com",
+        query_type: "aaaa",
+        policy_classification: "user_allowlist",
+        occurrences: 1,
+        resolved_addresses: ["2001:db8::20"],
+      },
+      {
+        hostname: "allowed.example.com",
+        query_type: "type_15",
+        policy_classification: "user_allowlist",
+        occurrences: 1,
+        resolved_addresses: [],
+      },
+      {
+        hostname: "blocked.example.com",
+        query_type: "a",
+        policy_classification: "outside_policy",
+        occurrences: 1,
+        resolved_addresses: ["203.0.113.22"],
+      },
+    ],
+    observations_truncated: false,
+    blocked_non_profile_query_count: 2,
+  };
+
+  const document = parsedStructuredNetworkReport(currentReport, dnsEvidence);
+  const allowed = document.network.find((row: any) =>
+    row.destination === "allowed.example.com" && row.decision === "allowed"
+  );
+  assert.deepEqual(allowed.activities, [
+    { kind: "dns_query", query_type: "a", count: 2 },
+    { kind: "dns_query", query_type: "aaaa", count: 1 },
+  ]);
+
+  const blockedType = document.network.find((row: any) =>
+    row.destination === "allowed.example.com" && row.decision === "blocked"
+  );
+  assert.deepEqual(blockedType.activities, [
+    { kind: "dns_query", query_type: "type_15", count: 1 },
+  ]);
+
+  const blocked = document.network.find((row: any) => row.destination === "blocked.example.com");
+  assert.ok(blocked.activities.some((activity: any) =>
+    activity.kind === "connection_attempt" && activity.protocol === "tcp" && activity.port === 443
+  ));
+  assert.ok(blocked.activities.some((activity: any) =>
+    activity.kind === "connection_attempt" && activity.protocol === "udp" && activity.port === 443
+  ));
+});
+
+test("reports bounded firewall, wildcard, and results-storage warning counters", () => {
+  const dnsEvidence = {
+    observations: [],
+    observations_truncated: false,
+    materialization_request_rejections: 2,
+    user_wildcard_request_rejections: 3,
+    bounded_user_wildcard_authorizations_truncated: true,
+    results_storage_attribution_failures: 4,
+    results_storage_request_rejections: 5,
+    runner_authorized_results_storage_truncated: true,
+  };
+
+  const document = parsedStructuredNetworkReport(report, dnsEvidence);
+  assert.equal(document.result, "warning");
+  assert.equal(document.warnings.materialization_rejections, 2);
+  assert.equal(document.warnings.wildcard_rejections, 3);
+  assert.equal(document.warnings.wildcard_authorizations_truncated, true);
+  assert.equal(document.warnings.results_storage_attribution_failures, 4);
+  assert.equal(document.warnings.results_storage_rejections, 5);
+  assert.equal(document.warnings.results_storage_authorizations_truncated, true);
+  assert.equal(document.warnings.critical_findings, 0);
+  assert.match(networkReportLines(report, dnsEvidence).join("\n"), /Fence network report: warning/);
+});
+
+test("preserves the fixed byte budget by pruning whole network rows explicitly", () => {
+  const hostnames = Array.from({ length: 20 }, (_, index) =>
+    `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.host-${index}.example.com`
+  );
+  const dnsEvidence = {
+    observations: hostnames.map((hostname, index) => ({
+      hostname,
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 1,
+      resolved_addresses: [`198.51.100.${index + 1}`],
+    })),
+    observations_truncated: false,
+    blocked_non_profile_query_count: hostnames.length,
+  };
+  const currentReport = {
+    ...report,
+    findings: hostnames.flatMap((_, index) => Array.from({ length: 4 }, (_, actorIndex) => ({
+      timestamp: "unix-ms:1",
+      mode: "block",
+      classification: "rejected",
+      family: "ipv4",
+      protocol: "tcp",
+      remote_address: `198.51.100.${index + 1}`,
+      remote_port: 443,
+      rule_class: "undeclared_new_egress",
+      local_attribution: {
+        status: "attributed",
+        actor_class: "runner",
+        pid: 1000 + (index * 4) + actorIndex,
+        executable_basename: `worker-${index}-${actorIndex}-${"x".repeat(108)}`,
+      },
+    }))),
+    findings_truncated: false,
+  };
+
+  const line = structuredReportLine(currentReport, dnsEvidence);
+  const document = parsedStructuredNetworkReport(currentReport, dnsEvidence);
+  assert.ok(Buffer.byteLength(line, "utf8") <= MAX_STRUCTURED_REPORT_BYTES);
+  assert.equal(document.result, "warning");
+  assert.equal(document.omissions.byte_budget_exceeded, true);
+  assert.ok(document.network.length < hostnames.length);
+  assert.equal(document.omissions.network_rows, hostnames.length - document.network.length);
+  assert.doesNotMatch(line, /\.\.\.\[truncated\]/);
+  const humanReport = networkReportLines(currentReport, dnsEvidence).join("\n");
+  assert.match(humanReport, /omitt/i);
+  assert.match(humanReport, /truncat/i);
+});
+
+test("reports missing DNS evidence and unretained observations without inventing hostnames", () => {
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [{
+      timestamp: "unix-ms:1",
+      mode: "audit",
+      classification: "would_block",
+      family: "ipv4",
+      protocol: "udp",
+      remote_address: "192.0.2.10",
+      remote_port: 443,
+      rule_class: "undeclared_new_egress",
+    }],
+    findings_truncated: false,
+  };
+
+  const missingDns = parsedStructuredNetworkReport(audit);
+  assert.equal(missingDns.omissions.dns_evidence_missing, true);
+  assert.equal(missingDns.network.find((row: any) => row.destination === "192.0.2.10").destination_kind, "ip");
+
+  const unretained = parsedStructuredNetworkReport(audit, {
+    observations: [],
+    observations_truncated: false,
+    excluded_unretained_query_count: 3,
+  });
+  const unretainedRow = unretained.network.find((row: any) => row.destination_kind === "unretained");
+  assert.notEqual(unretainedRow, undefined);
+  assert.equal(unretainedRow.destination, null);
+  assert.equal(unretainedRow.decision, "would_block");
+  assert.equal(unretainedRow.count, 3);
+});
+
+test("excludes payloads, command arguments, private paths, and unsafe actors from reports", () => {
+  const marker = "sensitive-example-marker";
+  const currentReport = {
+    ...report,
+    findings: [{
+      timestamp: "unix-ms:1",
+      mode: "block",
+      classification: "rejected",
+      family: "ipv4",
+      protocol: "tcp",
+      remote_address: "203.0.113.10",
+      remote_port: 443,
+      rule_class: "undeclared_new_egress",
+      ignored_payload: marker,
+      command_line: marker,
+      local_attribution: {
+        status: "attributed",
+        actor_class: "runner",
+        pid: 4242,
+        executable_basename: "../../unsafe-executable",
+        executable_path: `/example/private/${marker}`,
+        command_line: marker,
+        parent_executable_basenames: [marker],
+      },
+    }],
+    findings_truncated: false,
+  };
+  const dnsEvidence = {
+    observations: [{
+      hostname: "example.com",
+      query_type: "a",
+      policy_classification: "outside_policy",
+      occurrences: 1,
+      resolved_addresses: ["203.0.113.10"],
+      ignored_payload: marker,
+    }],
+    observations_truncated: false,
+  };
+
+  const line = structuredReportLine(currentReport, dnsEvidence);
+  const humanReport = networkReportLines(currentReport, dnsEvidence).join("\n");
+  assert.doesNotMatch(line, new RegExp(marker));
+  assert.doesNotMatch(line, /unsafe-executable|example\/private|command_line|ignored_payload/);
+  assert.doesNotMatch(humanReport, new RegExp(marker));
+  assert.doesNotMatch(humanReport, /unsafe-executable|example\/private|command_line|ignored_payload/);
+  assert.doesNotMatch(line, /[\r\n\u0000-\u001f\u007f]/);
+  assert.ok(Buffer.byteLength(line, "utf8") <= MAX_STRUCTURED_REPORT_BYTES);
 });
 
 test("renders a concise healthy block results table without raw evidence fields", () => {

@@ -120,7 +120,7 @@ cidr 192.0.2.0/24 udp 123
 cidr 2001:db8::/64 tcp 443
 ```
 
-Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for address ranges and IPv6. CIDR entries must identify a network address without host bits. Blank lines and comments beginning with `#` are ignored. Wildcards match exactly one or two leading labels and share a bounded lifetime authorization budget.
+Hostname shortcuts use TCP port `443`; use the explicit `ip` or `cidr` form for address ranges and IPv6. CIDR entries must identify a network address without host bits. Fence accepts up to 64 unique, normalized allowlist entries; duplicate entries, blank lines, and comments beginning with `#` do not count more than once. Wildcards match exactly one or two leading labels and share a bounded lifetime authorization budget.
 
 **Read more:** [Allowlist syntax and DNS behavior](docs/allowlist.md)
 
@@ -138,6 +138,25 @@ flowchart LR
 ```
 
 **Read more:** [Fence architecture and lifecycle](docs/how-it-works.md)
+
+## Network Reports 📋
+
+At the end of each job, Fence adds a readable network activity table to the GitHub job summary and the Fence post-job log. The log also includes one bounded, machine-readable `FENCE_REPORT_JSON=` record containing sanitized network decisions, control results, warnings, and suggested audit-mode allowlist entries.
+
+Find the job and fetch its report through the GitHub API:
+
+```bash
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \
+  --jq '.jobs[] | {id, name}'
+
+gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
+  | sed -n 's/^.*FENCE_REPORT_JSON=//p' \
+  | jq .
+```
+
+Job logs can be read by anyone with access to the workflow run. Reports include only bounded destination and approved actor information; they never include credentials, environment variables, request payloads, or full process paths.
+
+**Read more:** [Network reports and lifecycle](docs/how-it-works.md#network-reports)
 
 ## Modes 🎛️
 

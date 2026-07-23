@@ -38,6 +38,8 @@ After readiness, Fence rechecks its firewall, lockdown or observation state, loc
 
 Fence does not upload telemetry. Local reports contain bounded control results, network decisions, and findings. Best-effort process attribution may include attribution status, actor class, PID, executable basename, and up to four parent executable basenames; it excludes command arguments, full executable paths, environments, working directories, and packet payloads.
 
+The protected post hook also writes a bounded network activity table and exactly one schema-`1` `FENCE_REPORT_JSON=` record to ordinary job logs after verifying its resident service and evidence. These public-facing reports contain at most 20 grouped destinations and never exceed 16 KiB for the structured record. They may expose observed hostnames, literal IP addresses, and the same approved actor class, executable basename, and PID already shown in the job summary to anyone with access to the workflow run. They do not expose parent-process details, raw reports, credentials, environment variables, packet contents, full paths, or process arguments. Critical results are recorded before the hook fails the job; malformed or unverified evidence is never reported as healthy.
+
 Uniquely owned unconnected host UDP sockets with wildcard local or remote endpoints can be correlated. Forwarded or container UDP traffic is not matched against the host socket table, so it cannot be linked to an unrelated host program. Process races and shared sockets can still produce `not_found` or `ambiguous` attribution. Attribution enriches local evidence but does not decide whether a destination is allowed.
 
 ## Pinning And Provenance

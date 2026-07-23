@@ -1,6 +1,6 @@
 # Allowlist Syntax And DNS Behavior
 
-The native Action `allowlist` input accepts one entry per line. Blank lines and lines beginning with `#` are ignored.
+The native Action `allowlist` input accepts one entry per line and supports up to 64 unique, normalized destinations. Blank lines and lines beginning with `#` are ignored. Equivalent entries are deduplicated using the destination type, normalized destination, protocol, and port before the limit is applied; a 65th unique entry fails before privileged setup.
 
 ## Accepted Forms
 

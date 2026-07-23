@@ -43,6 +43,18 @@ job_set = os.environ["FENCE_FINALIZATION_JOB_SET"]
 api_root = f"https://api.github.com/repos/{repository}"
 authorization_marker = b"fence-results-storage-authorization-observed"
 authorization_observed = False
+structured_report_prefix = b"FENCE_REPORT_JSON="
+max_structured_report_bytes = 16 * 1024
+structured_report_fields = {
+    "schema_version",
+    "mode",
+    "result",
+    "controls",
+    "network",
+    "warnings",
+    "omissions",
+    "suggested_allowlist",
+}
 
 
 def request(path):
@@ -99,6 +111,93 @@ def log_archive(job_id):
         raise RuntimeError("job log archive download failed") from None
 
 
+def unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("structured report contained duplicate JSON fields")
+        value[key] = item
+    return value
+
+
+def action_structured_reports(payload, job_name):
+    reports = []
+    for raw_line in io.BytesIO(payload):
+        line = raw_line.rstrip(b"\r\n")
+        marker_offset = line.find(structured_report_prefix)
+        if marker_offset == -1:
+            continue
+        record = line[marker_offset:]
+        if record.count(structured_report_prefix) != 1:
+            raise SystemExit(
+                f"protected finalization structured report marker was invalid: {job_name}"
+            )
+        if len(record) > max_structured_report_bytes:
+            raise SystemExit(
+                f"protected finalization structured report exceeded 16 KiB: {job_name}"
+            )
+        try:
+            report = json.loads(
+                record[len(structured_report_prefix):].decode("utf-8"),
+                object_pairs_hook=unique_json_object,
+            )
+        except (UnicodeError, ValueError, json.JSONDecodeError):
+            raise SystemExit(
+                f"protected finalization structured report was invalid JSON: {job_name}"
+            ) from None
+        if not isinstance(report, dict) or set(report) != structured_report_fields:
+            raise SystemExit(
+                f"protected finalization structured report schema was invalid: {job_name}"
+            )
+        if type(report["schema_version"]) is not int or report["schema_version"] != 1:
+            raise SystemExit(
+                f"protected finalization structured report version was invalid: {job_name}"
+            )
+        if report["mode"] != "block" or report["result"] != "healthy":
+            raise SystemExit(
+                f"protected finalization structured report was not healthy block evidence: "
+                f"{job_name}"
+            )
+        controls = report["controls"]
+        if (
+            not isinstance(controls, dict)
+            or controls.get("network") != "verified"
+            or controls.get("sudo") != "disabled_verified"
+            or controls.get("containers") != "disabled_verified"
+            or controls.get("protection_available") is not True
+            or controls.get("readiness") != "ready"
+            or controls.get("resident_health") != "healthy"
+        ):
+            raise SystemExit(
+                f"protected finalization structured report controls were invalid: {job_name}"
+            )
+        network = report["network"]
+        if (
+            not isinstance(network, list)
+            or len(network) > 20
+            or any(not isinstance(row, dict) for row in network)
+        ):
+            raise SystemExit(
+                f"protected finalization structured network evidence was invalid: {job_name}"
+            )
+        if not isinstance(report["warnings"], dict) or not isinstance(report["omissions"], dict):
+            raise SystemExit(
+                f"protected finalization structured report metadata was invalid: {job_name}"
+            )
+        suggestions = report["suggested_allowlist"]
+        if not isinstance(suggestions, list) or len(suggestions) > 20:
+            raise SystemExit(
+                f"protected finalization structured allowlist suggestions were invalid: "
+                f"{job_name}"
+            )
+        reports.append(report)
+        if len(reports) > 1:
+            raise SystemExit(
+                f"protected finalization structured report was duplicated: {job_name}"
+            )
+    return reports
+
+
 with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page=100"), timeout=15) as response:
     body = response.read(1024 * 1024 + 1)
 if len(body) > 1024 * 1024:
@@ -122,6 +221,7 @@ for name in sorted(jobs):
         time.sleep(5)
     if not archive or len(archive) > 8 * 1024 * 1024:
         raise SystemExit(f"protected finalization job log was empty or oversized: {name}")
+    reports = []
     if zipfile.is_zipfile(io.BytesIO(archive)):
         with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
             files = [
@@ -132,9 +232,24 @@ for name in sorted(jobs):
                 raise SystemExit(f"protected finalization log archive had no nonempty files: {name}")
             if sum(entry.file_size for entry in files) > 16 * 1024 * 1024:
                 raise SystemExit(f"protected finalization log archive expanded past its fixed bound: {name}")
-            marker_observed = any(authorization_marker in bundle.read(entry) for entry in files)
+            if job_set == "action":
+                marker_observed = False
+                for entry in files:
+                    reports.extend(action_structured_reports(bundle.read(entry), name))
+                    if len(reports) > 1:
+                        raise SystemExit(
+                            f"protected finalization structured report was duplicated: {name}"
+                        )
+            else:
+                marker_observed = any(authorization_marker in bundle.read(entry) for entry in files)
     else:
         marker_observed = authorization_marker in archive
+        if job_set == "action":
+            reports = action_structured_reports(archive, name)
+    if job_set == "action" and len(reports) != 1:
+        raise SystemExit(
+            f"protected finalization job must contain exactly one structured report: {name}"
+        )
     if job_set == "integration" and name.startswith("protected finalization "):
         authorization_observed = authorization_observed or marker_observed
 
