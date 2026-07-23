@@ -470,6 +470,7 @@ impl DnsBlockRuntimeScope {
         self,
         allow_dynamic_githubapp_suffix: bool,
         has_user_wildcards: bool,
+        allow_github_artifacts: bool,
     ) -> Vec<&'static str> {
         let mut limitations = match self {
             Self::TestEvidence => dns_block_test_limitations(allow_dynamic_githubapp_suffix),
@@ -481,6 +482,9 @@ impl DnsBlockRuntimeScope {
             }
         };
         limitations.extend(user_wildcard_limitations(has_user_wildcards));
+        limitations.extend(github_artifact_compatibility_limitations(
+            allow_github_artifacts,
+        ));
         limitations
     }
 
@@ -528,6 +532,7 @@ pub struct DnsMediationEvidence {
     pub bootstrap_hostnames: Vec<String>,
     pub hostname_policy: RuntimeHostnamePolicy,
     pub mode: Mode,
+    pub allow_github_artifacts: bool,
     pub protection_available: bool,
     pub resident_health: ResidentHealth,
     pub routing_status: &'static str,
@@ -592,6 +597,7 @@ pub struct DnsMediatedBlockEvidence {
     pub runtime_evidence_schema_version: u32,
     pub status: &'static str,
     pub mode: Mode,
+    pub allow_github_artifacts: bool,
     pub profile_realization_id: &'static str,
     pub platform_profile_id: &'static str,
     pub policy_hash_schema_version: u32,
@@ -628,6 +634,7 @@ struct DnsMediatedBlockState<'a> {
     runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
+    allow_github_artifacts: bool,
     profile_realization_id: &'static str,
     platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
@@ -644,6 +651,7 @@ struct DnsMediatedBlockReady<'a> {
     runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
+    allow_github_artifacts: bool,
     profile_realization_id: &'static str,
     platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
@@ -660,6 +668,7 @@ pub struct DnsMediatedAuditEvidence {
     pub runtime_evidence_schema_version: u32,
     pub status: &'static str,
     pub mode: Mode,
+    pub allow_github_artifacts: bool,
     pub profile_realization_id: &'static str,
     pub platform_profile_id: &'static str,
     pub policy_hash_schema_version: u32,
@@ -688,6 +697,7 @@ struct DnsMediatedAuditState<'a> {
     runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
+    allow_github_artifacts: bool,
     profile_realization_id: &'static str,
     platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
@@ -704,6 +714,7 @@ struct DnsMediatedAuditReady<'a> {
     runtime_evidence_schema_version: u32,
     status: &'static str,
     mode: Mode,
+    allow_github_artifacts: bool,
     profile_realization_id: &'static str,
     platform_profile_id: &'static str,
     policy_hash_schema_version: u32,
@@ -852,6 +863,7 @@ struct DnsQueryClient {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DnsQueryProvenance {
     TrustedRunnerWorker,
+    OptInGithubArtifact,
     Untrusted,
     AttributionFailed,
 }
@@ -886,6 +898,7 @@ struct CnameAuthorizationState {
     bounded_user_wildcard: BTreeSet<String>,
     bounded_user_wildcard_truncated: bool,
     runner_authorized_results_storage: BTreeSet<String>,
+    artifact_authorized_results_storage: BTreeSet<String>,
     runner_authorized_results_storage_truncated: bool,
     active: BTreeMap<String, ActiveCnameAuthorization>,
     truncated: bool,
@@ -1055,6 +1068,12 @@ impl ObservationRecorder {
         match worker.classify_dns_client(client.socket) {
             Ok(provenance) => Ok(match provenance {
                 DnsCallerProvenance::TrustedRunnerWorker => DnsQueryProvenance::TrustedRunnerWorker,
+                DnsCallerProvenance::RunnerOwnedWorkflow
+                    if self.hostname_policy.allow_github_artifacts && self.scope.is_block() =>
+                {
+                    DnsQueryProvenance::OptInGithubArtifact
+                }
+                DnsCallerProvenance::RunnerOwnedWorkflow => DnsQueryProvenance::Untrusted,
                 DnsCallerProvenance::Untrusted => DnsQueryProvenance::Untrusted,
                 DnsCallerProvenance::AttributionFailed => DnsQueryProvenance::AttributionFailed,
             }),
@@ -1984,6 +2003,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_STATUS,
             mode: Mode::Audit,
+            allow_github_artifacts: plan.allow_github_artifacts,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
             platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
@@ -2092,6 +2112,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_READY_STATUS,
             mode: Mode::Audit,
+            allow_github_artifacts: plan.allow_github_artifacts,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
             platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
@@ -2351,6 +2372,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.evidence_status(),
             mode: Mode::Block,
+            allow_github_artifacts: plan.allow_github_artifacts,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
             platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
@@ -2478,6 +2500,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.ready_status(),
             mode: Mode::Block,
+            allow_github_artifacts: plan.allow_github_artifacts,
             profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
             platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
             policy_hash_schema_version: plan.policy_hash_schema_version,
@@ -2489,6 +2512,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             limitations: scope.limitations(
                 plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix,
                 plan.runtime_hostname_policy.has_user_wildcards(),
+                plan.allow_github_artifacts,
             ),
         }) {
             evidence.setup_status = "failed_pre_ready";
@@ -3043,6 +3067,7 @@ fn initial_dns_block_evidence(
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: scope.evidence_status(),
         mode: Mode::Block,
+        allow_github_artifacts: plan.allow_github_artifacts,
         profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
         platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
         policy_hash_schema_version: plan.policy_hash_schema_version,
@@ -3077,6 +3102,7 @@ fn initial_dns_block_evidence(
         limitations: scope.limitations(
             plan.runtime_hostname_policy.allow_dynamic_githubapp_suffix,
             plan.runtime_hostname_policy.has_user_wildcards(),
+            plan.allow_github_artifacts,
         ),
     }
 }
@@ -3090,6 +3116,7 @@ fn initial_dns_audit_evidence(
         runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
         status: PROTECTED_AUDIT_STATUS,
         mode: Mode::Audit,
+        allow_github_artifacts: plan.allow_github_artifacts,
         profile_realization_id: DNS_MEDIATED_PROFILE_REALIZATION_ID,
         platform_profile_id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
         policy_hash_schema_version: plan.policy_hash_schema_version,
@@ -3134,6 +3161,18 @@ fn user_wildcard_limitations(has_user_wildcards: bool) -> Vec<&'static str> {
             "bounded_user_wildcard_dns_authorization_remains_an_egress_limitation",
             "configured_user_wildcard_dns_names_and_transports_remain_egress_and_data_channels",
             "user_wildcard_authorizations_are_limited_to_8_unique_names_and_two_exact_prefix_label_shapes",
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn github_artifact_compatibility_limitations(allow_github_artifacts: bool) -> Vec<&'static str> {
+    if allow_github_artifacts {
+        vec![
+            "github_artifact_compatibility_explicitly_enabled",
+            "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+            "github_artifact_uploads_remain_an_intentional_data_egress_channel",
         ]
     } else {
         Vec::new()
@@ -4857,6 +4896,8 @@ fn authorized_hostname(
     remove_expired_cname_authorizations(state, now);
     if requires_runner_results_storage_provenance(hostname, state, hostname_policy)
         && provenance != DnsQueryProvenance::TrustedRunnerWorker
+        && !(hostname_policy.allow_github_artifacts
+            && provenance == DnsQueryProvenance::OptInGithubArtifact)
     {
         return false;
     }
@@ -4871,9 +4912,15 @@ fn authorized_hostname(
             state.runner_authorized_results_storage_truncated = true;
             return false;
         }
-        state
+        if state
             .runner_authorized_results_storage
-            .insert(hostname.to_owned());
+            .insert(hostname.to_owned())
+            && provenance == DnsQueryProvenance::OptInGithubArtifact
+        {
+            state
+                .artifact_authorized_results_storage
+                .insert(hostname.to_owned());
+        }
         admit_user_wildcard_hostname(hostname, state, hostname_policy);
         return hostname_policy_for_authorized_name(hostname, state, hostname_policy).is_some();
     }
@@ -5312,6 +5359,11 @@ fn policy_classification(
                 {
                     "dynamic_platform"
                 } else if authorizations
+                    .artifact_authorized_results_storage
+                    .contains(hostname)
+                {
+                    "artifact_authorized_results_storage"
+                } else if authorizations
                     .runner_authorized_results_storage
                     .contains(hostname)
                 {
@@ -5332,7 +5384,11 @@ fn policy_classification(
     }
     if let Some(authorization) = authorizations.active.get(hostname) {
         if authorization.requires_runner_provenance {
-            return "runner_authorized_results_storage_cname_derived";
+            return if artifact_authorized_cname_lineage(hostname, authorizations) {
+                "artifact_authorized_results_storage_cname_derived"
+            } else {
+                "runner_authorized_results_storage_cname_derived"
+            };
         }
         return if authorization.origins.contains(&HostnamePolicyOrigin::User) {
             "user_cname_derived"
@@ -5341,6 +5397,26 @@ fn policy_classification(
         };
     }
     "outside_policy"
+}
+
+fn artifact_authorized_cname_lineage(
+    hostname: &str,
+    authorizations: &CnameAuthorizationState,
+) -> bool {
+    let mut current = hostname;
+    for _ in 0..=MAX_DERIVED_CNAME_DEPTH {
+        if authorizations
+            .artifact_authorized_results_storage
+            .contains(current)
+        {
+            return true;
+        }
+        let Some(authorization) = authorizations.active.get(current) else {
+            return false;
+        };
+        current = &authorization.source_hostname;
+    }
+    false
 }
 
 fn query_type_name(query_type: u16) -> String {
@@ -5389,6 +5465,7 @@ fn evidence_from_state_and_authorizations(
         bootstrap_hostnames: hostname_policy.platform_hostnames(),
         hostname_policy: hostname_policy.clone(),
         mode: scope.mode(),
+        allow_github_artifacts: hostname_policy.allow_github_artifacts,
         protection_available: scope == DnsEvidenceScope::ProtectedHostBlock,
         resident_health: resident_health.clone(),
         routing_status,
@@ -5464,7 +5541,14 @@ fn evidence_from_state_and_authorizations(
             .iter()
             .map(|hostname| DnsResultsStorageAuthorization {
                 hostname: hostname.clone(),
-                authorization_origin: "pinned_runner_worker_dns",
+                authorization_origin: if cname_authorizations
+                    .artifact_authorized_results_storage
+                    .contains(hostname)
+                {
+                    "opt_in_github_artifact_dns"
+                } else {
+                    "pinned_runner_worker_dns"
+                },
             })
             .collect(),
         runner_authorized_results_storage_truncated: cname_authorizations
@@ -5522,11 +5606,13 @@ fn evidence_from_state_and_authorizations(
                 false,
                 hostname_policy.allow_dynamic_githubapp_suffix,
                 hostname_policy.has_user_wildcards(),
+                hostname_policy.allow_github_artifacts,
             ),
             DnsEvidenceScope::ProtectedHostBlockDegraded => protected_dns_scope_limitations(
                 true,
                 hostname_policy.allow_dynamic_githubapp_suffix,
                 hostname_policy.has_user_wildcards(),
+                hostname_policy.allow_github_artifacts,
             ),
         },
     }
@@ -5536,6 +5622,7 @@ fn protected_dns_scope_limitations(
     degraded: bool,
     allow_dynamic_githubapp_suffix: bool,
     has_user_wildcards: bool,
+    allow_github_artifacts: bool,
 ) -> Vec<&'static str> {
     let mut limitations = vec![
         "bounded_actions_suffix_dns_authorization_remains_an_egress_limitation",
@@ -5562,6 +5649,9 @@ fn protected_dns_scope_limitations(
         allow_dynamic_githubapp_suffix,
     ));
     limitations.extend(user_wildcard_limitations(has_user_wildcards));
+    limitations.extend(github_artifact_compatibility_limitations(
+        allow_github_artifacts,
+    ));
     if degraded {
         limitations.push("container_control_preserved_invalidates_containment");
     }
@@ -7533,6 +7623,172 @@ mod tests {
     }
 
     #[test]
+    fn artifact_compatibility_requires_opt_in_and_shares_the_results_storage_bound() {
+        let now = Instant::now();
+        let strict_policy = test_hostname_policy(false);
+        let artifact_config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"artifact-policy","allow_github_artifacts":true,"allowlist":[]}"#,
+        )
+        .unwrap();
+        let artifact_policy =
+            crate::hostname_policy::build_runtime_hostname_policy(&artifact_config);
+        let mut authorizations = CnameAuthorizationState::default();
+
+        assert!(!authorized_hostname(
+            "productionresultssa10.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &strict_policy,
+            DnsQueryProvenance::OptInGithubArtifact,
+        ));
+        assert!(authorizations.runner_authorized_results_storage.is_empty());
+        assert!(
+            authorizations
+                .artifact_authorized_results_storage
+                .is_empty()
+        );
+
+        assert!(authorized_hostname(
+            "productionresultssa10.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &artifact_policy,
+            DnsQueryProvenance::OptInGithubArtifact,
+        ));
+        assert_eq!(
+            policy_classification(
+                "productionresultssa10.blob.core.windows.net",
+                &authorizations,
+                &artifact_policy,
+            ),
+            "artifact_authorized_results_storage"
+        );
+        assert!(authorized_hostname(
+            "productionresultssa11.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &artifact_policy,
+            DnsQueryProvenance::TrustedRunnerWorker,
+        ));
+        assert_eq!(
+            policy_classification(
+                "productionresultssa11.blob.core.windows.net",
+                &authorizations,
+                &artifact_policy,
+            ),
+            "runner_authorized_results_storage"
+        );
+        for account in [12, 13] {
+            assert!(authorized_hostname(
+                &format!("productionresultssa{account}.blob.core.windows.net"),
+                &mut authorizations,
+                now,
+                &artifact_policy,
+                DnsQueryProvenance::OptInGithubArtifact,
+            ));
+        }
+        assert_eq!(
+            authorizations.runner_authorized_results_storage.len(),
+            MAX_RESULTS_STORAGE_AUTHORIZATIONS
+        );
+        assert_eq!(authorizations.artifact_authorized_results_storage.len(), 3);
+        assert!(!authorized_hostname(
+            "productionresultssa14.blob.core.windows.net",
+            &mut authorizations,
+            now,
+            &artifact_policy,
+            DnsQueryProvenance::OptInGithubArtifact,
+        ));
+        assert!(authorizations.runner_authorized_results_storage_truncated);
+        assert!(
+            !authorizations
+                .artifact_authorized_results_storage
+                .contains("productionresultssa14.blob.core.windows.net")
+        );
+
+        let evidence = evidence_from_state_and_authorizations(
+            &ObservationState {
+                results_storage_authorization_count: 4,
+                results_storage_request_rejections: 1,
+                ..ObservationState::default()
+            },
+            "active",
+            DnsEvidenceScope::ProtectedHostBlock,
+            &authorizations,
+            &artifact_policy,
+            &initial_resident_health(),
+        );
+        assert!(evidence.allow_github_artifacts);
+        assert!(evidence.hostname_policy.allow_github_artifacts);
+        assert_eq!(evidence.runner_authorized_results_storage.len(), 4);
+        assert_eq!(
+            evidence
+                .runner_authorized_results_storage
+                .iter()
+                .filter(|entry| entry.authorization_origin == "opt_in_github_artifact_dns")
+                .count(),
+            3
+        );
+        assert_eq!(
+            evidence
+                .runner_authorized_results_storage
+                .iter()
+                .filter(|entry| entry.authorization_origin == "pinned_runner_worker_dns")
+                .count(),
+            1
+        );
+        for limitation in [
+            "github_artifact_compatibility_explicitly_enabled",
+            "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+            "github_artifact_uploads_remain_an_intentional_data_egress_channel",
+        ] {
+            assert!(evidence.limitations.contains(&limitation));
+        }
+    }
+
+    #[test]
+    fn artifact_storage_cname_descendants_preserve_opt_in_provenance() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"artifact-cname","allow_github_artifacts":true,"allowlist":[]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let now = Instant::now();
+        let mut authorizations = CnameAuthorizationState::default();
+        let root = "productionresultssa10.blob.core.windows.net";
+        let target = "blob.region.store.core.windows.net";
+
+        assert!(authorized_hostname(
+            root,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::OptInGithubArtifact,
+        ));
+        commit_test_cname_lineage(&mut authorizations, root, target, 60, now, &policy);
+        assert!(!authorized_hostname(
+            target,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::Untrusted,
+        ));
+        assert!(authorized_hostname(
+            target,
+            &mut authorizations,
+            now,
+            &policy,
+            DnsQueryProvenance::OptInGithubArtifact,
+        ));
+        assert_eq!(
+            policy_classification(target, &authorizations, &policy),
+            "artifact_authorized_results_storage_cname_derived"
+        );
+        assert_eq!(authorizations.runner_authorized_results_storage.len(), 1);
+        assert_eq!(authorizations.artifact_authorized_results_storage.len(), 1);
+    }
+
+    #[test]
     fn results_storage_cname_descendants_preserve_runner_provenance() {
         let policy = test_hostname_policy(false);
         let now = Instant::now();
@@ -7690,6 +7946,50 @@ mod tests {
         assert_eq!(state.results_storage_attribution_failures, 1);
         assert_eq!(state.results_storage_request_rejections, 2);
         drop(state);
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn artifact_compatibility_rejects_docker_and_unattributed_dns_clients() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"artifact-client","allow_github_artifacts":true,"allowlist":[]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (recorder, report_path) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostBlock, None, policy);
+        let request = query("productionresultssa10.blob.core.windows.net", 1);
+        let parsed = parse_dns_question(&request);
+        let docker = DnsQueryClient {
+            listener_kind: DnsListenerKind::Docker,
+            socket: DnsClientSocket {
+                protocol: SocketProtocol::Udp,
+                peer: "172.17.0.2:40000".parse().unwrap(),
+                listener: "172.17.0.1:53".parse().unwrap(),
+            },
+        };
+
+        assert_eq!(
+            query_for_upstream(&recorder, &request, parsed.as_ref(), Some(docker)).unwrap(),
+            DnsQueryDispatch::Refused(Some("outside_policy"))
+        );
+        assert_eq!(
+            query_for_upstream(&recorder, &request, parsed.as_ref(), None).unwrap(),
+            DnsQueryDispatch::RetryableFailure(Some("outside_policy"))
+        );
+        let state = recorder.state.lock().unwrap();
+        assert_eq!(state.results_storage_authorization_count, 0);
+        assert_eq!(state.results_storage_attribution_failures, 1);
+        assert_eq!(state.results_storage_request_rejections, 2);
+        drop(state);
+        let authorizations = recorder.cname_authorizations.lock().unwrap();
+        assert!(authorizations.runner_authorized_results_storage.is_empty());
+        assert!(
+            authorizations
+                .artifact_authorized_results_storage
+                .is_empty()
+        );
+        drop(authorizations);
         let _ = fs::remove_file(report_path);
     }
 
@@ -10447,7 +10747,7 @@ mod tests {
         );
         assert!(
             scope
-                .limitations(true, false)
+                .limitations(true, false, false)
                 .contains(&"container_control_remains_available_to_later_workflow_code")
         );
     }

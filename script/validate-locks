@@ -680,7 +680,7 @@ require(
     == collections.Counter(
         {
             checkout_action: 8,
-            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a": 1,
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a": 2,
             "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c": 6,
             "./": 3,
             "./target/action-layout/owner/project/revision": 1,
@@ -1018,8 +1018,8 @@ action_entries = re.findall(
 )
 require(
     [scenario for scenario, _ in action_entries]
-    == ["standard-opt-out", "wildcard-docker"],
-    "Action acceptance matrix must contain only its two unique native-input scenarios",
+    == ["standard-opt-out", "wildcard-docker", "github-artifacts"],
+    "Action acceptance matrix must contain its three unique native-input scenarios",
 )
 expected_action_entries = {
     "standard-opt-out": {
@@ -1027,6 +1027,7 @@ expected_action_entries = {
         "invocation_id": "action-standard-opt-out",
         "container_policy": "disable",
         "disable_broad_github_domains": "'true'",
+        "allow_github_artifacts": "'false'",
         "allowlist": "''",
     },
     "wildcard-docker": {
@@ -1034,7 +1035,16 @@ expected_action_entries = {
         "invocation_id": "action-wildcard-docker",
         "container_policy": "unsafe_preserve",
         "disable_broad_github_domains": "'false'",
+        "allow_github_artifacts": "'false'",
         "allowlist": "|",
+    },
+    "github-artifacts": {
+        "mode": "block",
+        "invocation_id": "action-github-artifacts",
+        "container_policy": "disable",
+        "disable_broad_github_domains": "'false'",
+        "allow_github_artifacts": "'true'",
+        "allowlist": "''",
     },
 }
 for scenario, entry in action_entries:
@@ -1064,6 +1074,8 @@ expected_action_steps = {
         "classify bundled Action host compatibility",
         "require bundled Action activation",
         "activate bundled Fence agent",
+        "create bounded GitHub artifact fixture",
+        "upload bounded GitHub artifact under Fence",
         "verify Action lifecycle",
     ],
     "zero-input": [
@@ -1229,12 +1241,25 @@ for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-fina
         f"Action acceptance {job_name} activation guard must fail closed",
     )
 
-require_step_contract(
+action_lifecycle = require_step_contract(
     action_job_blocks["action"],
     "verify Action lifecycle",
-    ["run"],
+    ["env", "run"],
     {"run": 'script/test-action-acceptance "${{ matrix.scenario }}" "${{ matrix.invocation_id }}"'},
     "Action acceptance native-input lifecycle verification",
+)
+action_lifecycle_env = indented_block(
+    action_lifecycle,
+    "        env:",
+    "Action acceptance native-input lifecycle environment must be unique",
+)
+require(
+    scalar_mapping(action_lifecycle_env, 10)
+    == {
+        "FENCE_GITHUB_ARTIFACT_ID": "${{ steps.github-artifact-upload.outputs.artifact-id }}",
+        "FENCE_GITHUB_ARTIFACT_DIGEST": "${{ steps.github-artifact-upload.outputs.artifact-digest }}",
+    },
+    "Action acceptance must verify the actual bounded GitHub artifact identity and SHA-256 digest",
 )
 require_step_contract(
     action_job_blocks["zero-input"],
@@ -1286,9 +1311,60 @@ require(
         "invocation_id": "${{ matrix.invocation_id }}",
         "container_policy": "${{ matrix.container_policy }}",
         "disable_broad_github_domains": "${{ matrix.disable_broad_github_domains }}",
+        "allow_github_artifacts": "${{ matrix.allow_github_artifacts }}",
         "allowlist": "${{ matrix.allowlist }}",
     },
     "Action acceptance native-input activation must exercise every reviewed matrix field",
+)
+artifact_fixture = require_step_contract(
+    action_job_blocks["action"],
+    "create bounded GitHub artifact fixture",
+    ["if", "env", "run"],
+    {"if": "${{ matrix.scenario == 'github-artifacts' }}", "run": "|"},
+    "Action acceptance GitHub artifact compatibility fixture",
+)
+artifact_fixture_env = indented_block(
+    artifact_fixture,
+    "        env:",
+    "Action acceptance GitHub artifact fixture environment must be unique",
+)
+require(
+    scalar_mapping(artifact_fixture_env, 10)
+    == {
+        "FENCE_ARTIFACT_FIXTURE": "${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt",
+    }
+    and literal_run_body(
+        artifact_fixture,
+        "Action acceptance GitHub artifact fixture must use a literal run body",
+    )
+    == "          printf '%s\\n' 'Fence GitHub artifact compatibility evidence.' > \"$FENCE_ARTIFACT_FIXTURE\"\n",
+    "Action acceptance GitHub artifact fixture may write only harmless local evidence",
+)
+artifact_upload = require_step_contract(
+    action_job_blocks["action"],
+    "upload bounded GitHub artifact under Fence",
+    ["id", "if", "uses", "with"],
+    {
+        "id": "github-artifact-upload",
+        "if": "${{ matrix.scenario == 'github-artifacts' }}",
+        "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    },
+    "Action acceptance GitHub artifact compatibility upload",
+)
+artifact_upload_with = indented_block(
+    artifact_upload,
+    "        with:",
+    "Action acceptance GitHub artifact upload inputs must be unique",
+)
+require(
+    scalar_mapping(artifact_upload_with, 10)
+    == {
+        "name": "fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.prepare-candidate.outputs.acceptance_runner }}",
+        "path": "${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt",
+        "retention-days": "1",
+        "if-no-files-found": "error",
+    },
+    "Action acceptance must upload only its bounded one-day GitHub artifact fixture",
 )
 require_step_contract(
     action_job_blocks["zero-input"],

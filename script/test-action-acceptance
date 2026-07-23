@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  die "usage: script/test-action-acceptance <standard|standard-opt-out|unsafe-preserve|wildcard-docker|audit> [invocation-id]"
+  die "usage: script/test-action-acceptance <standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit> [invocation-id]"
 fi
 
 scenario="$1"
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve|wildcard-docker|audit) ;;
+  standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit) ;;
   *) die "unknown Action acceptance scenario: $scenario" ;;
 esac
 
@@ -166,6 +166,7 @@ def require(condition, message="evidence validation failed"):
         raise SystemExit(message)
 
 import json
+import os
 import pathlib
 import re
 import sys
@@ -201,9 +202,11 @@ expected = {
     "standard-opt-out": ("block", "protected_host_block", "resident_protected", "ready", True, "disabled_verified", "disabled_verified"),
     "unsafe-preserve": ("block", "protected_host_block_degraded", "resident_degraded", "ready_degraded", False, "disabled_verified", "preserved_unsafe"),
     "wildcard-docker": ("block", "protected_host_block_degraded", "resident_degraded", "ready_degraded", False, "disabled_verified", "preserved_unsafe"),
+    "github-artifacts": ("block", "protected_host_block", "resident_protected", "ready", True, "disabled_verified", "disabled_verified"),
     "audit": ("audit", "protected_host_audit_observation", "resident_observation_only", "ready_observation_only", False, "preserved_verified", "preserved_verified"),
 }[scenario]
 mode, status, resident, readiness, protection, sudo_status, container_status = expected
+allow_github_artifacts = scenario == "github-artifacts"
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
@@ -220,10 +223,14 @@ require(report["readiness_status"] == readiness)
 require(report["protection_available"] is protection)
 require(report["sudo_status"] == sudo_status)
 require(report["container_status"] == container_status)
+require(report["allow_github_artifacts"] is allow_github_artifacts)
 require(report["network_verification_status"] == "verified")
 require(report["critical_findings"] == [])
 require(ready["status"] == readiness)
+require(ready["allow_github_artifacts"] is allow_github_artifacts)
 require(dns["routing_status"] == "active")
+require(dns["allow_github_artifacts"] is allow_github_artifacts)
+require(dns["hostname_policy"]["allow_github_artifacts"] is allow_github_artifacts)
 require(report["runtime_evidence_schema_version"] == 5)
 require(report["policy_hash_schema_version"] == 9)
 require(report["platform_profile_id"] == "github_hosted_workflow_bootstrap_v5")
@@ -274,10 +281,50 @@ require(dns["results_storage_authorization_count"] == len(dns["runner_authorized
 require(dns["results_storage_attribution_failures"] == 0)
 require(dns["results_storage_request_rejections"] == 0)
 require(dns["runner_authorized_results_storage_truncated"] is False)
+allowed_results_storage_origins = {"pinned_runner_worker_dns"}
+artifact_limitations = {
+    "github_artifact_compatibility_explicitly_enabled",
+    "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+    "github_artifact_uploads_remain_an_intentional_data_egress_channel",
+}
+if allow_github_artifacts:
+    allowed_results_storage_origins.add("opt_in_github_artifact_dns")
 require(all(
-    item["authorization_origin"] == "pinned_runner_worker_dns"
+    re.fullmatch(
+        r"productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net",
+        item["hostname"],
+    )
+    and item["authorization_origin"] in allowed_results_storage_origins
     for item in dns["runner_authorized_results_storage"]
 ))
+if allow_github_artifacts:
+    require(artifact_limitations.issubset(report["limitations"]))
+    require(artifact_limitations.issubset(dns["limitations"]))
+    require(re.fullmatch(
+        r"[1-9][0-9]{0,19}",
+        os.environ.get("FENCE_GITHUB_ARTIFACT_ID", ""),
+    ))
+    require(re.fullmatch(
+        r"[0-9a-f]{64}",
+        os.environ.get("FENCE_GITHUB_ARTIFACT_DIGEST", ""),
+    ))
+    artifact_hostnames = {
+        item["hostname"]
+        for item in dns["runner_authorized_results_storage"]
+        if item["authorization_origin"] == "opt_in_github_artifact_dns"
+    }
+    artifact_materializations = [
+        item for item in report["materialized_allowances"]
+        if item.get("source_hostname") in artifact_hostnames
+    ]
+    require(not artifact_hostnames or artifact_materializations)
+    require(all(
+        item["protocol"] == "tcp" and item["port"] == 443
+        for item in artifact_materializations
+    ))
+else:
+    require(artifact_limitations.isdisjoint(report["limitations"]))
+    require(artifact_limitations.isdisjoint(dns["limitations"]))
 resident_pid = assert_resident_health(report)
 assert_resident_health(ready, resident_pid)
 assert_resident_health(dns, resident_pid)
@@ -290,7 +337,7 @@ else:
 PY
 
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve|wildcard-docker)
+  standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts)
     if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
       die "Fence Action did not disable runner passwordless sudo"
     fi
@@ -300,7 +347,7 @@ case "$scenario" in
     ;;
 esac
 case "$scenario" in
-  standard|standard-opt-out)
+  standard|standard-opt-out|github-artifacts)
     if docker ps --quiet >/dev/null 2>&1; then
       die "Fence Action standard block did not disable Docker access"
     fi
@@ -375,6 +422,9 @@ require(dns["runtime_evidence_schema_version"] == 5)
 require(dns["resident_health"]["resident_pid"] == resident["resident_pid"])
 require(dns["resident_health"]["workers"] == expected_workers)
 require(dns["resident_health"]["verification_sequence"] >= 2)
+require(report["allow_github_artifacts"] is (scenario == "github-artifacts"))
+require(dns["allow_github_artifacts"] is (scenario == "github-artifacts"))
+require(dns["hostname_policy"]["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require("fence-action-audit-probe" not in json.dumps(report, sort_keys=True))
 require("fence-action-audit-probe" not in json.dumps(dns, sort_keys=True))
 require(dns["materialization_request_rejections"] == 0)

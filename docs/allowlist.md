@@ -28,7 +28,9 @@ cidr 2001:db8::/64 tcp 443
 
 Fence resolves every required exact hostname before readiness, applies and verifies rules for all approved addresses, and refreshes those addresses while the job runs. Each refreshed address retains the protocol and port from its allowlist entry.
 
-Non-static `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts are runner-authorized platform destinations, not exact user destinations. Fence rejects an exact user entry for one of those accounts before mutation; the selected profile authorizes up to four of them at TCP port `443` only after an attributable request from the pinned runner process. The source-defined `productionresultssa19.blob.core.windows.net` compatibility account remains the sole static exception.
+Non-static `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` accounts are bounded platform destinations, not exact user destinations. Fence rejects an exact user entry for one of those accounts before mutation. By default, the selected profile authorizes up to four accounts at TCP port `443` only after a DNS request from the pinned runner process. The source-defined `productionresultssa19.blob.core.windows.net` compatibility account remains the sole static exception.
+
+For GitHub artifact uploads, Pages, or caches, set the separate native Action input `allow_github_artifacts: true`; do not add dynamically selected storage accounts to `allowlist`. The option lets uniquely attributed runner-owned descendants of the pinned worker authorize exact matching accounts within the same four-account lifetime cap, bounded DNS lifetimes, CNAME checks, and TCP-`443` firewall rules. It is off by default and creates an intentional data-egress channel: other workflow code can also use an authorized account, and matching the account-name pattern does not prove GitHub ownership.
 
 Only `A` and `AAAA` questions are forwarded in block mode. Fence rebuilds outbound questions in canonical lowercase form and releases an approved address-bearing answer only after the corresponding firewall access has been applied and structurally verified.
 

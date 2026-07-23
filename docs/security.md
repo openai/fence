@@ -24,9 +24,15 @@ The built-in GitHub policy is a compatibility tradeoff. Core Actions status and 
 
 Set `disable_broad_github_domains: true` to remove `github.com`, `api.github.com`, `release-assets.githubusercontent.com`, the exact optional hosted-runner watchdog, and new platform-origin broad GitHub application authorizations. This does not remove the core reporting path, exact results-storage compatibility, or an explicit user wildcard.
 
-GitHub's authorized results-storage accounts are also reachable over TCP port `443` for the rest of the job after authorization. Fence limits dynamic authorization to DNS requests from the pinned runner process and records the bounded authorization locally; it does not permit the general Azure Blob Storage suffix.
+GitHub's authorized results-storage accounts are also reachable over TCP port `443` for the rest of the job after authorization. By default, Fence limits dynamic authorization to DNS requests from the pinned runner process and records the bounded authorization locally; it does not permit the general Azure Blob Storage suffix.
 
 Separate hosted-runner platform rules permit root-only access to Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526`, plus host and forwarded access to Azure IMDS at `169.254.169.254` on TCP port `80`. These are built-in platform channels rather than user allowlist entries: later workflow code can use the shared IMDS rule, while any root-owned host process can use the WireServer rules.
+
+### Optional GitHub Artifact Compatibility
+
+`allow_github_artifacts: true` explicitly permits uniquely attributed runner-owned descendants of the pinned `Runner.Worker`, including GitHub artifact, Pages, and cache actions, to request exact `productionresultssa<1-to-5-decimal-digits>.blob.core.windows.net` results-storage accounts. It remains limited to TCP port `443`, the shared maximum of four dynamically authorized accounts, bounded process ancestry, verified DNS answers, existing bounded TTLs, and structurally verified firewall materialization. It does not permit `*.blob.core.windows.net`, arbitrary Azure storage, Docker-originated requests, or unverified or ambiguously attributed DNS requests.
+
+This option is disabled by default and deliberately weakens the default results-storage provenance boundary. A matching storage hostname is not cryptographic proof that GitHub owns the account or issued it for the current job. Fence cannot authenticate the official upload action, inspect HTTPS contents, distinguish intended Pages or artifacts from uploaded secrets or source code, or prevent later workflow code from reusing an authorized account. The resulting artifact-upload channel is intentional and must be treated as data egress. Keep the option disabled for jobs that do not need GitHub artifacts, Pages, or caches.
 
 ## Integrity And Drift
 

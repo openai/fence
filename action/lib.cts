@@ -37,6 +37,7 @@ type NativeConfigInputs = {
   containerPolicy?: unknown;
   platformProfile?: unknown;
   disableBroadGithubDomains?: unknown;
+  allowGithubArtifacts?: unknown;
   allowlist?: unknown;
 };
 type DefaultMode = "block" | "audit";
@@ -109,6 +110,8 @@ const MAX_STRUCTURED_ACTIVITIES_PER_ROW = 8;
 const MAX_STRUCTURED_ACTORS_PER_ROW = 4;
 const MAX_STRUCTURED_CRITICAL_CODES = 5;
 const ALLOWED_DNS_CLASSIFICATIONS = new Set([
+  "artifact_authorized_results_storage",
+  "artifact_authorized_results_storage_cname_derived",
   "dynamic_platform",
   "platform_and_user_allowlist",
   "platform_cname_derived",
@@ -126,6 +129,11 @@ const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const RESULTS_STORAGE_HOSTNAME = /^productionresultssa[0-9]{1,5}\.blob\.core\.windows\.net$/;
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
+const GITHUB_ARTIFACT_COMPATIBILITY_LIMITATIONS = [
+  "github_artifact_compatibility_explicitly_enabled",
+  "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+  "github_artifact_uploads_remain_an_intentional_data_egress_channel",
+] as const;
 const MAX_USER_WILDCARD_AUTHORIZATIONS = 8;
 const MAX_USER_WILDCARD_PREFIX_LABELS = 2;
 const REVIEWED_PLATFORM_PROFILE = "github_hosted_workflow_bootstrap_v5";
@@ -559,6 +567,7 @@ function nativeInputsFromEnvironment(environment: Environment): NativeConfigInpu
     containerPolicy: environment.INPUT_CONTAINER_POLICY,
     platformProfile: environment.INPUT_PLATFORM_PROFILE,
     disableBroadGithubDomains: environment.INPUT_DISABLE_BROAD_GITHUB_DOMAINS,
+    allowGithubArtifacts: environment.INPUT_ALLOW_GITHUB_ARTIFACTS,
     allowlist: environment.INPUT_ALLOWLIST,
   };
 }
@@ -583,6 +592,12 @@ function defaultInlineConfig(environment: Environment, nativeInput: unknown = un
   }
   if (normalizeBooleanInput(inputs.disableBroadGithubDomains, "disable_broad_github_domains")) {
     document.disable_broad_github_domains = true;
+  }
+  if (normalizeBooleanInput(inputs.allowGithubArtifacts, "allow_github_artifacts")) {
+    if (mode !== "block") {
+      fail("allow_github_artifacts input can only be used with block mode");
+    }
+    document.allow_github_artifacts = true;
   }
 
   return JSON.stringify(document);
@@ -609,6 +624,7 @@ function validateInlineConfig(raw: unknown, environment: Environment = process.e
       ["container_policy", inputs.containerPolicy],
       ["platform_profile", inputs.platformProfile],
       ["disable_broad_github_domains", inputs.disableBroadGithubDomains],
+      ["allow_github_artifacts", inputs.allowGithubArtifacts],
       ["allowlist", inputs.allowlist],
     ] as [string, unknown][]) {
       if (normalizeOptionalInput(value, name) !== undefined) {
@@ -623,6 +639,15 @@ function validateInlineConfig(raw: unknown, environment: Environment = process.e
   const parsed = JSON.parse(normalizedRaw);
   if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
     fail("config input must be a JSON object");
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(parsed, "allow_github_artifacts") &&
+    typeof parsed.allow_github_artifacts !== "boolean"
+  ) {
+    fail("config allow_github_artifacts must be a boolean");
+  }
+  if (parsed.allow_github_artifacts === true && parsed.mode !== "block") {
+    fail("allow_github_artifacts can only be used with block mode");
   }
   const invocationId = parsed.invocation_id;
   if (
@@ -1190,6 +1215,29 @@ function validatedActionRuntimeSnapshot(
   return { manifest, files: after };
 }
 
+function validateGithubArtifactCompatibilityEvidence(evidence: any, description: string): void {
+  if (typeof evidence.allow_github_artifacts !== "boolean") {
+    fail(`Fence ${description} does not declare the GitHub artifact compatibility policy`);
+  }
+  if (evidence.allow_github_artifacts) {
+    if (
+      !Array.isArray(evidence.limitations) ||
+      GITHUB_ARTIFACT_COMPATIBILITY_LIMITATIONS.some((limitation) =>
+        evidence.limitations.filter((value: unknown) => value === limitation).length !== 1
+      )
+    ) {
+      fail(`Fence ${description} does not disclose the GitHub artifact data-egress policy`);
+    }
+  } else if (
+    Array.isArray(evidence.limitations) &&
+    GITHUB_ARTIFACT_COMPATIBILITY_LIMITATIONS.some((limitation) =>
+      evidence.limitations.includes(limitation)
+    )
+  ) {
+    fail(`Fence ${description} contains an unexpected GitHub artifact compatibility policy`);
+  }
+}
+
 function validateReport(report: any, failOnCritical = true): any {
   if (report === null || Array.isArray(report) || typeof report !== "object") {
     fail("Fence report must be a JSON object");
@@ -1199,6 +1247,10 @@ function validateReport(report: any, failOnCritical = true): any {
   }
   if (!READY_STATUSES.has(report.readiness_status)) {
     fail("Fence report does not contain a recognized readiness status");
+  }
+  validateGithubArtifactCompatibilityEvidence(report, "report");
+  if (report.mode === "audit" && report.allow_github_artifacts) {
+    fail("Fence report cannot enable GitHub artifact compatibility in audit mode");
   }
   const validIdentity =
     report.runtime_evidence_schema_version === RUNTIME_EVIDENCE_SCHEMA_VERSION &&
@@ -1299,11 +1351,14 @@ function validateReady(ready: any, report: any): any {
   if (!READY_STATUSES.has(ready.status) || ready.status !== report.readiness_status) {
     fail("Fence readiness does not match the resident report");
   }
+  validateGithubArtifactCompatibilityEvidence(ready, "readiness");
   const validIdentity =
     ready.runtime_evidence_schema_version === RUNTIME_EVIDENCE_SCHEMA_VERSION &&
     selectsReviewedProfile(ready.platform_profile_id, ready.profile_realization_id) &&
     ready.platform_profile_id === report.platform_profile_id &&
     ready.profile_realization_id === report.profile_realization_id &&
+    typeof ready.allow_github_artifacts === "boolean" &&
+    ready.allow_github_artifacts === report.allow_github_artifacts &&
     ready.policy_hash_schema_version === report.policy_hash_schema_version &&
     ready.policy_hash === report.policy_hash &&
     ready.base_ruleset_hash === report.base_ruleset_hash &&
@@ -1323,10 +1378,13 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
   if (dnsEvidence === null || Array.isArray(dnsEvidence) || typeof dnsEvidence !== "object") {
     fail("Fence DNS evidence must be a JSON object");
   }
+  validateGithubArtifactCompatibilityEvidence(dnsEvidence, "DNS evidence");
   if (
     dnsEvidence.runtime_evidence_schema_version !== RUNTIME_EVIDENCE_SCHEMA_VERSION ||
     dnsEvidence.status !== report.status ||
     dnsEvidence.mode !== report.mode ||
+    typeof dnsEvidence.allow_github_artifacts !== "boolean" ||
+    dnsEvidence.allow_github_artifacts !== report.allow_github_artifacts ||
     dnsEvidence.platform_profile_id !== report.platform_profile_id ||
     dnsEvidence.profile_realization_id !== report.profile_realization_id ||
     dnsEvidence.protection_available !== report.protection_available ||
@@ -1350,7 +1408,7 @@ function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function validateUserWildcardPolicy(hostnamePolicy: any): void {
+function validateUserWildcardPolicy(hostnamePolicy: any, allowGithubArtifacts: boolean): void {
   if (
     hostnamePolicy === null ||
     Array.isArray(hostnamePolicy) ||
@@ -1358,6 +1416,8 @@ function validateUserWildcardPolicy(hostnamePolicy: any): void {
     !Array.isArray(hostnamePolicy.exact) ||
     !Array.isArray(hostnamePolicy.user_wildcards) ||
     typeof hostnamePolicy.allow_dynamic_githubapp_suffix !== "boolean" ||
+    typeof hostnamePolicy.allow_github_artifacts !== "boolean" ||
+    hostnamePolicy.allow_github_artifacts !== allowGithubArtifacts ||
     hostnamePolicy.user_wildcards.length > 64
   ) {
     fail("Fence DNS evidence does not contain bounded wildcard policy");
@@ -1438,7 +1498,10 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
   if (dnsEvidence.proxy_policy_status !== expectedProxyPolicy) {
     fail("Fence DNS evidence does not contain the reviewed proxy policy");
   }
-  validateUserWildcardPolicy(dnsEvidence.hostname_policy);
+  validateUserWildcardPolicy(
+    dnsEvidence.hostname_policy,
+    dnsEvidence.allow_github_artifacts,
+  );
   let previousWildcard: string | undefined;
   for (const hostname of wildcardAuthorizations) {
     if (
@@ -1455,7 +1518,14 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
       Array.isArray(observation) ||
       typeof observation !== "object" ||
       !isSafeHostname(observation.hostname) ||
-      !DNS_CLASSIFICATIONS.has(observation.policy_classification)
+      !DNS_CLASSIFICATIONS.has(observation.policy_classification) ||
+      (
+        (
+          observation.policy_classification === "artifact_authorized_results_storage" ||
+          observation.policy_classification === "artifact_authorized_results_storage_cname_derived"
+        ) &&
+        !dnsEvidence.allow_github_artifacts
+      )
     ) {
       fail("Fence DNS evidence contains invalid hostname observation");
     }
@@ -1469,7 +1539,13 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
       Object.keys(authorization).sort().join(",") !== "authorization_origin,hostname" ||
       typeof authorization.hostname !== "string" ||
       !RESULTS_STORAGE_HOSTNAME.test(authorization.hostname) ||
-      authorization.authorization_origin !== "pinned_runner_worker_dns" ||
+      !(
+        authorization.authorization_origin === "pinned_runner_worker_dns" ||
+        (
+          dnsEvidence.allow_github_artifacts &&
+          authorization.authorization_origin === "opt_in_github_artifact_dns"
+        )
+      ) ||
       seen.has(authorization.hostname)
     ) {
       fail("Fence DNS evidence contains invalid results-storage authorization");
@@ -1730,6 +1806,7 @@ function summaryHeading(summaryState: { healthy: boolean; critical: boolean }): 
 function summaryHasWarnings(report: any, auditSummary: AuditSummary, dnsEvidence: any): boolean {
   return (
     report.status === "protected_host_block_degraded" ||
+    report.allow_github_artifacts === true ||
     report.network_verification_status !== "verified" ||
     (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) ||
     report.critical_findings_truncated === true ||
@@ -1770,6 +1847,27 @@ function materializationWarningRows(dnsEvidence: any): string[] {
 function resultsStorageEvidenceCounter(dnsEvidence: any, field: string): number {
   const value = dnsEvidence && dnsEvidence[field];
   return Number.isSafeInteger(value) && value > 0 ? value : 0;
+}
+
+function githubArtifactAuthorizationCount(dnsEvidence: any): number {
+  if (!Array.isArray(dnsEvidence?.runner_authorized_results_storage)) {
+    return 0;
+  }
+  return dnsEvidence.runner_authorized_results_storage.filter((authorization: any) =>
+    authorization !== null &&
+    typeof authorization === "object" &&
+    authorization.authorization_origin === "opt_in_github_artifact_dns"
+  ).length;
+}
+
+function githubArtifactWarningRows(report: any, dnsEvidence: any): string[] {
+  if (report.allow_github_artifacts !== true) {
+    return [];
+  }
+  const count = githubArtifactAuthorizationCount(dnsEvidence);
+  return [
+    `| ⚠️ GitHub artifact uploads are an intentional data-egress channel | ${markdownCode(`${count} of ${MAX_RESULTS_STORAGE_AUTHORIZATIONS} storage accounts authorized`)} |`,
+  ];
 }
 
 function resultsStorageWarningRows(dnsEvidence: any): string[] {
@@ -1863,6 +1961,9 @@ function controlsSummary(report: any): string[] {
     `| Outbound network | ${network} |`,
     `| Passwordless sudo | ${sudo} |`,
     `| Docker/container access | ${containers} |`,
+    ...(report.allow_github_artifacts === true
+      ? ["| GitHub artifact uploads | ⚠️ Enabled; artifacts can send data outside the job |"]
+      : []),
   ];
 }
 
@@ -1904,8 +2005,12 @@ function safePositiveInteger(value: unknown): number {
 }
 
 function networkDecision(report: any, classification: unknown, queryType: unknown): NetworkDecision {
+  const artifactClassification =
+    classification === "artifact_authorized_results_storage" ||
+    classification === "artifact_authorized_results_storage_cname_derived";
   const allowed = ALLOWED_DNS_CLASSIFICATIONS.has(classification) &&
-    FORWARDED_DNS_QUERY_TYPES.has(queryType);
+    FORWARDED_DNS_QUERY_TYPES.has(queryType) &&
+    (!artifactClassification || report.allow_github_artifacts === true);
   if (allowed) {
     return "allowed";
   }
@@ -2382,6 +2487,8 @@ function structuredNetworkReport(report: any, dnsEvidence: any = undefined): any
     results_storage_authorizations_truncated: Boolean(
       dnsEvidence && dnsEvidence.runner_authorized_results_storage_truncated === true,
     ),
+    github_artifact_uploads_enabled: report.allow_github_artifacts === true,
+    github_artifact_authorizations: githubArtifactAuthorizationCount(dnsEvidence),
   };
   const result: "healthy" | "warning" | "critical" =
     report.network_verification_status !== "verified" || warnings.critical_findings > 0
@@ -2439,6 +2546,11 @@ function networkReportLines(report: any, dnsEvidence: any = undefined): string[]
     `Mode: ${document.mode}`,
     `Controls: network=${document.controls.network}; sudo=${document.controls.sudo}; containers=${document.controls.containers}`,
   ];
+  if (document.warnings.github_artifact_uploads_enabled) {
+    lines.push(
+      `GitHub artifact uploads: enabled; intentional data-egress channel; ${document.warnings.github_artifact_authorizations} of ${MAX_RESULTS_STORAGE_AUTHORIZATIONS} storage accounts authorized`,
+    );
+  }
   if (document.network.length === 0) {
     lines.push("Network activity: none");
   } else {
@@ -2496,6 +2608,7 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
     ...controlsSummary(report),
     ...criticalFindingLines(report),
     ...warningTableLines([
+      ...githubArtifactWarningRows(report, dnsEvidence),
       ...materializationWarningRows(dnsEvidence),
       ...userWildcardWarningRows(dnsEvidence),
       ...resultsStorageWarningRows(dnsEvidence),

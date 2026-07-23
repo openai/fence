@@ -57,6 +57,7 @@ pub(crate) struct DnsClientSocket {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) enum DnsCallerProvenance {
     TrustedRunnerWorker,
+    RunnerOwnedWorkflow,
     Untrusted,
     AttributionFailed,
 }
@@ -173,13 +174,31 @@ impl TrustedRunnerWorker {
                 return Ok(DnsCallerProvenance::AttributionFailed);
             }
         };
-        if owners != BTreeSet::from([self.pid]) {
-            return Ok(if !owners.is_empty() && !owners.contains(&self.pid) {
-                DnsCallerProvenance::Untrusted
-            } else {
-                DnsCallerProvenance::AttributionFailed
-            });
+        if owners.len() != 1 {
+            return Ok(DnsCallerProvenance::AttributionFailed);
         }
+        let owner = *owners.first().expect("one socket owner exists");
+        let (provenance, owner_start_time) = if owner == self.pid {
+            (DnsCallerProvenance::TrustedRunnerWorker, None)
+        } else {
+            let Some((uid, _)) = process_identity_at(&self.proc_root, owner) else {
+                return Ok(DnsCallerProvenance::AttributionFailed);
+            };
+            if uid != self.runner_uid
+                || !has_pinned_runner_worker_ancestor(
+                    &self.proc_root,
+                    owner,
+                    self.pid,
+                    self.runner_uid,
+                )
+            {
+                return Ok(DnsCallerProvenance::Untrusted);
+            }
+            let Some(start_time) = process_start_time_at(&self.proc_root, owner) else {
+                return Ok(DnsCallerProvenance::AttributionFailed);
+            };
+            (DnsCallerProvenance::RunnerOwnedWorkflow, Some(start_time))
+        };
         self.revalidate()?;
         let Ok(current) = read_bounded(&table_path, MAX_PROC_FILE_BYTES) else {
             return Ok(DnsCallerProvenance::AttributionFailed);
@@ -189,10 +208,23 @@ impl TrustedRunnerWorker {
             Ok(BoundedScan::Values(owners)) => Some(owners),
             Ok(BoundedScan::LimitExceeded) | Err(_) => None,
         };
+        let workflow_identity_unchanged = owner_start_time.is_none_or(|start_time| {
+            process_identity_at(&self.proc_root, owner)
+                .is_some_and(|(uid, _)| uid == self.runner_uid)
+                && process_start_time_at(&self.proc_root, owner) == Some(start_time)
+                && has_pinned_runner_worker_ancestor(
+                    &self.proc_root,
+                    owner,
+                    self.pid,
+                    self.runner_uid,
+                )
+        });
         Ok(
-            if current_inodes.as_ref() == Some(&inodes) && current_owners.as_ref() == Some(&owners)
+            if current_inodes.as_ref() == Some(&inodes)
+                && current_owners.as_ref() == Some(&owners)
+                && workflow_identity_unchanged
             {
-                DnsCallerProvenance::TrustedRunnerWorker
+                provenance
             } else {
                 DnsCallerProvenance::AttributionFailed
             },
@@ -652,6 +684,37 @@ fn has_runner_listener_ancestor(proc_root: &Path, pid: u32, runner_uid: u32) -> 
             && executable_basename_at(proc_root, parent).as_deref()
                 == Some(RUNNER_LISTENER_BASENAME)
         {
+            return true;
+        }
+        parent = next_parent;
+    }
+    false
+}
+
+fn has_pinned_runner_worker_ancestor(
+    proc_root: &Path,
+    pid: u32,
+    runner_worker_pid: u32,
+    runner_uid: u32,
+) -> bool {
+    let Some((uid, mut parent)) = process_identity_at(proc_root, pid) else {
+        return false;
+    };
+    if uid != runner_uid {
+        return false;
+    }
+    let mut visited = BTreeSet::from([pid]);
+    for _ in 0..MAX_RUNNER_WORKER_ANCESTRY {
+        if parent == 0 || !visited.insert(parent) {
+            return false;
+        }
+        let Some((uid, next_parent)) = process_identity_at(proc_root, parent) else {
+            return false;
+        };
+        if uid != runner_uid {
+            return false;
+        }
+        if parent == runner_worker_pid {
             return true;
         }
         parent = next_parent;
@@ -1266,6 +1329,66 @@ mod tests {
             worker.classify_dns_client(tcp).unwrap(),
             DnsCallerProvenance::TrustedRunnerWorker
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attributes_only_unique_runner_owned_worker_descendant_dns_sockets() {
+        let root = root();
+        write_trusted_process(&root, 100, 1001, 1, RUNNER_LISTENER_BASENAME, 10, None);
+        write_trusted_process(&root, 200, 1001, 100, RUNNER_WORKER_BASENAME, 20, None);
+        let worker = TrustedRunnerWorker::discover(root.clone(), 1001).unwrap();
+
+        let udp = DnsClientSocket {
+            protocol: SocketProtocol::Udp,
+            peer: "127.0.0.1:43000".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        write_dns_client_socket(&root, udp, 801, true);
+        write_trusted_process(&root, 300, 1001, 200, "node", 30, Some(801));
+        assert_eq!(
+            worker.classify_dns_client(udp).unwrap(),
+            DnsCallerProvenance::RunnerOwnedWorkflow
+        );
+
+        let tcp = DnsClientSocket {
+            protocol: SocketProtocol::Tcp,
+            peer: "127.0.0.1:43001".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        write_dns_client_socket(&root, tcp, 802, false);
+        write_trusted_process(&root, 301, 1001, 300, "artifact-node", 31, Some(802));
+        assert_eq!(
+            worker.classify_dns_client(tcp).unwrap(),
+            DnsCallerProvenance::RunnerOwnedWorkflow
+        );
+
+        symlink("socket:[802]", root.join("300/fd/4")).unwrap();
+        assert_eq!(
+            worker.classify_dns_client(tcp).unwrap(),
+            DnsCallerProvenance::AttributionFailed
+        );
+        fs::remove_file(root.join("300/fd/4")).unwrap();
+        fs::remove_file(root.join("301/fd/3")).unwrap();
+        assert_eq!(
+            worker.classify_dns_client(tcp).unwrap(),
+            DnsCallerProvenance::AttributionFailed
+        );
+
+        write_dns_client_socket(&root, udp, 803, true);
+        write_trusted_process(&root, 302, 1002, 200, "other-node", 32, Some(803));
+        assert_eq!(
+            worker.classify_dns_client(udp).unwrap(),
+            DnsCallerProvenance::Untrusted
+        );
+
+        write_dns_client_socket(&root, udp, 804, true);
+        write_trusted_process(&root, 303, 1001, 100, "unrelated-node", 33, Some(804));
+        assert_eq!(
+            worker.classify_dns_client(udp).unwrap(),
+            DnsCallerProvenance::Untrusted
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 

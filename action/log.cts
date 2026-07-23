@@ -14,6 +14,7 @@ type ConfigLogDetails = {
   containerPolicy: string;
   platformProfile: string;
   disableBroadGithubDomains: boolean;
+  allowGithubArtifacts: boolean;
   allowlistCount: number;
   allowlistDestinations: string[];
 };
@@ -155,6 +156,7 @@ function configLogDetails(rawConfig: string, usingDefault: boolean): ConfigLogDe
       ? parsed.platform_profile
       : "github_hosted_workflow_bootstrap_v5",
     disableBroadGithubDomains: parsed.disable_broad_github_domains === true,
+    allowGithubArtifacts: parsed.allow_github_artifacts === true,
     allowlistCount: allowlist.length,
     allowlistDestinations: allowlist.map(formatAllowlistEntry).filter((value: unknown) => typeof value === "string"),
   };
@@ -172,6 +174,9 @@ function setupLines(manifest: any, details: ConfigLogDetails): string[] {
     `🛡️ Fence ${version}`,
     `${modeIcon} Mode: ${details.mode}`,
     `🌐 Policy: ${policyPrefix} + ${details.allowlistCount} ${pluralize(details.allowlistCount, "allowlist entry", "allowlist entries")}`,
+    ...(details.allowGithubArtifacts
+      ? ["⚠️ GitHub artifact uploads: enabled; uploaded artifacts can send data outside the job"]
+      : []),
   ];
 }
 

@@ -145,12 +145,18 @@ function main(): void {
     dnsEvidence,
     "results_storage_request_rejections",
   );
+  const githubArtifactAuthorizationCount = Array.isArray(dnsEvidence?.runner_authorized_results_storage)
+    ? dnsEvidence.runner_authorized_results_storage.filter((authorization: any) =>
+      authorization.authorization_origin === "opt_in_github_artifact_dns"
+    ).length
+    : 0;
   log.debugGroup("Fence debug: post-job evidence", [
     `report_path=${reportPath}`,
     `dns_report_path=${effectiveDnsReportPath}`,
     `dns_report_present=${dnsEvidence !== undefined}`,
     `protected_action_runtime=verified`,
     `mode=${report.mode}`,
+    `allow_github_artifacts=${report.allow_github_artifacts}`,
     `status=${report.status}`,
     `readiness=${report.readiness_status}`,
     `network_verification=${report.network_verification_status}`,
@@ -169,6 +175,7 @@ function main(): void {
     `user_wildcard_authorizations_truncated=${dnsEvidence?.bounded_user_wildcard_authorizations_truncated === true}`,
     `user_wildcard_request_rejections=${userWildcardRequestRejections}`,
     `results_storage_authorizations=${resultsStorageAuthorizationCount}`,
+    `github_artifact_authorizations=${githubArtifactAuthorizationCount}`,
     `results_storage_attribution_failures=${resultsStorageAttributionFailures}`,
     `results_storage_request_rejections=${resultsStorageRequestRejections}`,
     `results_storage_authorizations_truncated=${dnsEvidence?.runner_authorized_results_storage_truncated === true}`,
@@ -185,6 +192,11 @@ function main(): void {
     log.info(line);
   }
   log.structuredRecord(structuredReportLine(report, dnsEvidence));
+  if (report.allow_github_artifacts) {
+    log.warning(
+      `Fence GitHub artifact compatibility permitted ${githubArtifactAuthorizationCount} of 4 storage accounts; artifact uploads are an intentional data-egress channel`,
+    );
+  }
   if (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) {
     log.warning(`Fence detected ${report.critical_findings.length} critical resident finding(s); failing this job`);
   }

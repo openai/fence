@@ -49,6 +49,16 @@ Run in audit mode first to see what would need review before enabling blocking:
 
 The audit summary suggests allowlist entries for observed hostnames and direct IPv4 or IPv6 destinations.
 
+Allow GitHub artifact uploads, including GitHub Pages deployments and GitHub Actions caches, while keeping other network restrictions in place:
+
+```yaml
+- uses: openai/fence@<commit-sha>
+  with:
+    allow_github_artifacts: true
+```
+
+This setting is off by default. It permits up to four exact GitHub-shaped results-storage accounts on HTTPS and makes artifact storage available to the job. Enable it only when the workflow needs artifacts: later steps may also use the permitted accounts to upload data. Fence does not allow all Azure Blob Storage.
+
 Allow one or more HTTPS hostnames:
 
 ```yaml
@@ -163,6 +173,7 @@ Job logs can be read by anyone with access to the workflow run. Reports include 
 | Mode | What It Does | When To Use It |
 | --- | --- | --- |
 | `block` | Blocks network traffic unless it matches the bounded built-in GitHub Actions and hosted-runner platform policy or your `allowlist`; turns off passwordless sudo and Docker. | Default for locking down a job. |
+| `block` with `allow_github_artifacts: true` | Keeps network, sudo, and Docker restrictions while allowing a small, bounded GitHub artifact-storage channel. | When a job needs GitHub artifacts, Pages, or caches and you accept that artifact uploads can send data out of the runner. |
 | `block` with `container_policy: unsafe_preserve` | Blocks network traffic and turns off passwordless sudo, but leaves Docker/container access available. | When a workflow needs Docker and you accept the weaker security claim. |
 | `audit` | Does not block traffic. Records what would need review before moving to `block`. | When tuning a workflow. |
 
@@ -175,6 +186,7 @@ Fence adds a layer of protection to GitHub Actions jobs by limiting where later 
 - **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Use `ubuntu-24.04` for the most predictable runner image; `ubuntu-latest` is also regularly tested but can change over time. Fence refuses to start if the runner does not pass its security checks.
 - **Built-in connections:** Some GitHub and runner-platform connections remain open so the job can run and report results. Later steps can also reach those connections and destinations in your `allowlist`.
 - **Tighter GitHub access:** Set `disable_broad_github_domains: true` when your workflow does not need optional GitHub destinations.
+- **GitHub artifacts:** Set `allow_github_artifacts: true` only when the job needs GitHub artifact uploads, GitHub Pages, or caches. The option is off by default and permits a small, bounded artifact-storage egress channel that later workflow steps can also use.
 - **Audit mode:** Reports network activity without blocking it.
 - **Docker access:** `container_policy: unsafe_preserve` keeps Docker available but provides weaker protection.
 - **Release pinning:** Use the full, immutable `action_commit` SHA from a published release.

@@ -563,6 +563,9 @@ function main(): void {
   for (const line of log.setupLines(manifest, details)) {
     log.info(line);
   }
+  if (details.allowGithubArtifacts) {
+    log.warning("Fence GitHub artifact compatibility is enabled; artifact uploads are an intentional data-egress channel");
+  }
   log.debugGroup("Fence debug: setup inputs", [
     `mode=${details.mode}`,
     `invocation_id=${config.invocationId}`,
@@ -570,6 +573,7 @@ function main(): void {
     `container_policy=${details.containerPolicy}`,
     `platform_profile=${details.platformProfile}`,
     `disable_broad_github_domains=${details.disableBroadGithubDomains}`,
+    `allow_github_artifacts=${details.allowGithubArtifacts}`,
     `allowlist_count=${details.allowlistCount}`,
     ...details.allowlistDestinations.map((entry: string) => `allowlist=${entry}`),
     `bundle_release=${manifest.release_tag}`,

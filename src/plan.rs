@@ -98,6 +98,7 @@ pub struct PlanData {
     pub invocation_id: String,
     pub platform_profile: PlatformProfilePlan,
     pub container_policy: Option<ContainerPolicy>,
+    pub allow_github_artifacts: bool,
     pub requested_policy: Vec<NormalizedAllowance>,
     pub runtime_hostname_policy: RuntimeHostnamePolicy,
     pub runtime_static_policy: Vec<EffectiveAllowance>,
@@ -120,6 +121,8 @@ struct PolicyHashInput<'a> {
     policy_hash_schema_version: u32,
     mode: Mode,
     container_policy: Option<ContainerPolicy>,
+    #[serde(skip_serializing_if = "artifact_compatibility_disabled")]
+    allow_github_artifacts: bool,
     platform_profile: &'a str,
     platform_profile_dns_mediated_compatibility: Option<DnsMediatedCompatibilityPlan>,
     allowlist: &'a [NormalizedAllowance],
@@ -253,6 +256,7 @@ fn build_plan_inner(
     let platform_profile = platform_plan(
         config.platform_profile,
         config.disable_broad_github_domains,
+        config.allow_github_artifacts,
         platform_requested_policy,
         platform_effective_policy,
         platform_resolution_results,
@@ -264,6 +268,7 @@ fn build_plan_inner(
     let limitations = limitations(
         assurance_status,
         runtime_hostname_policy.has_user_wildcards(),
+        config.allow_github_artifacts,
     );
     let invocation_id = config.invocation_id.clone();
     let duplicate_effective_rules_collapsed =
@@ -277,6 +282,7 @@ fn build_plan_inner(
         invocation_id: config.invocation_id,
         platform_profile,
         container_policy: config.container_policy,
+        allow_github_artifacts: config.allow_github_artifacts,
         requested_policy: config.requested_allowances,
         runtime_hostname_policy,
         runtime_static_policy,
@@ -369,6 +375,7 @@ fn expand_allowances(
 fn platform_plan(
     profile: PlatformProfile,
     disable_broad_github_domains: bool,
+    allow_github_artifacts: bool,
     requested_allowances: Vec<NormalizedAllowance>,
     effective_allowances: Vec<EffectiveAllowance>,
     frozen_resolution_results: Vec<ResolutionResult>,
@@ -398,6 +405,13 @@ fn platform_plan(
                     "bounded_githubapp_suffix_dns_authorization_remains_an_egress_limitation",
                 );
             }
+            if allow_github_artifacts {
+                limitations.extend([
+                    "github_artifact_compatibility_explicitly_enabled",
+                    "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+                    "github_artifact_uploads_remain_an_intentional_data_egress_channel",
+                ]);
+            }
             PlatformProfilePlan {
                 id: GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_PROFILE_ID,
                 selection_status: "default_bounded_dns_mediated",
@@ -408,6 +422,7 @@ fn platform_plan(
                 dns_mediated_compatibility: Some(
                     github_hosted_workflow_bootstrap_dns_mediation_plan(
                         disable_broad_github_domains,
+                        allow_github_artifacts,
                     ),
                 ),
                 limitations,
@@ -428,7 +443,11 @@ fn assurance_status(mode: Mode, container_policy: Option<ContainerPolicy>) -> As
     }
 }
 
-fn limitations(status: AssuranceStatus, has_user_wildcards: bool) -> Vec<&'static str> {
+fn limitations(
+    status: AssuranceStatus,
+    has_user_wildcards: bool,
+    allow_github_artifacts: bool,
+) -> Vec<&'static str> {
     let mut limitations = vec!["render_plan_does_not_apply_or_verify_security_state"];
     match status {
         AssuranceStatus::PlannedBlockContainment => {
@@ -447,6 +466,13 @@ fn limitations(status: AssuranceStatus, has_user_wildcards: bool) -> Vec<&'stati
         limitations.extend([
             "user_wildcard_hostnames_materialize_only_after_runtime_dns_queries",
             "bounded_user_wildcard_dns_authorization_remains_an_egress_limitation",
+        ]);
+    }
+    if allow_github_artifacts {
+        limitations.extend([
+            "github_artifact_compatibility_explicitly_enabled",
+            "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+            "github_artifact_uploads_remain_an_intentional_data_egress_channel",
         ]);
     }
     limitations
@@ -468,10 +494,12 @@ fn policy_hash(config: &NormalizedConfig) -> String {
         policy_hash_schema_version: POLICY_HASH_SCHEMA_VERSION,
         mode: config.mode,
         container_policy: config.container_policy,
+        allow_github_artifacts: config.allow_github_artifacts,
         platform_profile: config.platform_profile.id(),
         platform_profile_dns_mediated_compatibility: Some(
             github_hosted_workflow_bootstrap_dns_mediation_plan(
                 config.disable_broad_github_domains,
+                config.allow_github_artifacts,
             ),
         ),
         allowlist: &config.requested_allowances,
@@ -479,6 +507,10 @@ fn policy_hash(config: &NormalizedConfig) -> String {
     })
     .expect("typed policy hashing input must serialize");
     sha256_hex(&bytes)
+}
+
+fn artifact_compatibility_disabled(enabled: &bool) -> bool {
+    !enabled
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -619,6 +651,90 @@ mod tests {
                 "audit_observes_only_and_never_contains"
             ]
         );
+    }
+
+    #[test]
+    fn artifact_compatibility_changes_logical_policy_and_discloses_egress() {
+        let strict = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"strict-artifacts","allowlist":[]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let explicit_false = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"false-artifacts","allow_github_artifacts":false,"allowlist":[]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+        let artifact = build_plan(
+            parse(
+                r#"{"schema_version":1,"mode":"block","invocation_id":"enabled-artifacts","allow_github_artifacts":true,"allowlist":[]}"#,
+            ),
+            &resolver(vec![]),
+        )
+        .unwrap();
+
+        assert!(!strict.allow_github_artifacts);
+        assert!(!strict.runtime_hostname_policy.allow_github_artifacts);
+        assert!(!explicit_false.allow_github_artifacts);
+        assert_eq!(strict.policy_hash, explicit_false.policy_hash);
+        assert!(artifact.allow_github_artifacts);
+        assert!(artifact.runtime_hostname_policy.allow_github_artifacts);
+        assert_ne!(strict.policy_hash, artifact.policy_hash);
+        assert_eq!(strict.ruleset_hash, artifact.ruleset_hash);
+        assert_eq!(
+            artifact.assurance_status,
+            AssuranceStatus::PlannedBlockContainment
+        );
+        assert_eq!(
+            strict
+                .platform_profile
+                .dns_mediated_compatibility
+                .as_ref()
+                .unwrap()
+                .results_storage_authorization_origin,
+            "pinned_runner_worker_dns"
+        );
+        assert_eq!(
+            artifact
+                .platform_profile
+                .dns_mediated_compatibility
+                .as_ref()
+                .unwrap()
+                .results_storage_authorization_origin,
+            "pinned_runner_worker_dns"
+        );
+        assert_eq!(
+            strict
+                .platform_profile
+                .dns_mediated_compatibility
+                .as_ref()
+                .unwrap()
+                .github_artifact_results_storage_authorization_origin,
+            None
+        );
+        assert_eq!(
+            artifact
+                .platform_profile
+                .dns_mediated_compatibility
+                .as_ref()
+                .unwrap()
+                .github_artifact_results_storage_authorization_origin,
+            Some("opt_in_github_artifact_dns")
+        );
+        for limitation in [
+            "github_artifact_compatibility_explicitly_enabled",
+            "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
+            "github_artifact_uploads_remain_an_intentional_data_egress_channel",
+        ] {
+            assert!(artifact.limitations.contains(&limitation));
+            assert!(artifact.platform_profile.limitations.contains(&limitation));
+            assert!(!strict.limitations.contains(&limitation));
+            assert!(!strict.platform_profile.limitations.contains(&limitation));
+        }
     }
 
     #[test]

@@ -58,6 +58,8 @@ Fence automatically reports bounded network activity at the end of both `block` 
 
 The JSON record uses stable `schema_version: 1` and includes the selected mode, `healthy`, `warning`, or `critical` result, final control states, at most 20 grouped network destinations, bounded warning and omission counters, and safe audit-mode allowlist recommendations. Its complete prefixed line is at most 16 KiB. Allowed DNS queries, rejected connections, and audit-mode `would_block` observations remain distinct; a DNS lookup does not claim that a network connection succeeded.
 
+When `allow_github_artifacts: true` is enabled, the report shows `result: "warning"`, records `warnings.github_artifact_uploads_enabled: true`, and counts `warnings.github_artifact_authorizations`. The warning identifies intentionally reduced results-storage assurance; normal block-mode network, sudo, and container controls remain verified. The bounded root-owned DNS evidence separately records exact account names and `opt_in_github_artifact_dns` authorization origins.
+
 For example, an audit-mode report with one observed network destination is emitted as a single complete line:
 
 ```text

@@ -22,6 +22,28 @@ Use `audit` to observe activity without blocking traffic or disabling passwordle
 
 Review the final **Fence Summary**, add only the destinations the job needs, and then move to `block` mode. Its collapsed allowlist example includes DNS-backed hostnames and explicit `ip <address> <tcp|udp> <port>` entries for direct IPv4 or IPv6 destinations.
 
+## Allow GitHub Artifacts And Pages
+
+GitHub artifact uploads, Pages deployments, and caches may use a dynamically selected results-storage account. Enable their bounded compatibility path only for jobs that need it:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: openai/fence@<commit-sha>
+        with:
+          allow_github_artifacts: true
+      - uses: actions/checkout@<checkout-commit-sha>
+      - run: script/build
+      - uses: actions/upload-artifact@<upload-artifact-commit-sha>
+        with:
+          name: build-output
+          path: dist/
+```
+
+The option is off by default. It admits only exact GitHub-shaped storage accounts, only on TCP port `443`, within the shared four-account lifetime budget and existing DNS and firewall checks. Because any later workflow step may use an authorized account, artifact uploads are an intentional data-egress channel; an account's name alone does not establish GitHub ownership. This option does not allow `*.blob.core.windows.net`.
+
 ## Allow HTTPS Destinations
 
 Bare hostnames use TCP port `443`:
