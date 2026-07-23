@@ -1466,6 +1466,177 @@ test("reports degraded and critical security states without claiming healthy pro
   assert.throws(() => validateReport(critical, true), /critical resident findings/);
 });
 
+test("reports source-produced sudo and container drift in every runtime mode", () => {
+  const modes = [
+    report,
+    {
+      ...report,
+      status: "protected_host_block_degraded",
+      readiness_status: "ready_degraded",
+      setup_status: "resident_degraded",
+      protection_available: false,
+      container_status: "preserved_unsafe",
+    },
+    {
+      ...report,
+      status: "protected_host_audit_observation",
+      mode: "audit",
+      readiness_status: "ready_observation_only",
+      setup_status: "resident_observation_only",
+      protection_available: false,
+      sudo_status: "preserved_verified",
+      container_status: "preserved_verified",
+    },
+  ];
+
+  for (const currentMode of modes) {
+    for (const controls of [
+      ["sudo_status"],
+      ["container_status"],
+      ["sudo_status", "container_status"],
+    ]) {
+      const critical = {
+        ...currentMode,
+        ...Object.fromEntries(controls.map((control) => [control, "critical_drift"])),
+        resident_health: residentHealth({ status: "critical" }),
+        critical_findings: controls.map((control, index) => ({
+          timestamp: `unix-ms:${index + 1}`,
+          code: `dns_${currentMode.mode === "audit" ? "audit" : "block"}_${
+            control === "sudo_status" ? "sudo" : "container"
+          }_drift`,
+          message: "Resident control verification detected drift.",
+        })),
+      };
+
+      assert.equal(validateReport(critical, false), critical);
+      const document = parsedStructuredNetworkReport(critical, {
+        observations: [],
+        observations_truncated: false,
+      });
+      assert.equal(document.mode, currentMode.mode);
+      assert.equal(document.result, "critical");
+      assert.equal(document.controls.resident_health, "critical");
+      assert.equal(
+        document.controls.sudo,
+        controls.includes("sudo_status") ? "critical_drift" : currentMode.sudo_status,
+      );
+      assert.equal(
+        document.controls.containers,
+        controls.includes("container_status") ? "critical_drift" : currentMode.container_status,
+      );
+      assert.equal(document.warnings.critical_findings, controls.length);
+      assert.match(networkReportLines(critical).join("\n"), /Fence network report: critical/);
+      assert.throws(() => validateReport(critical, true), /critical resident findings/);
+    }
+  }
+});
+
+test("reports bounded source-truncated critical findings and still fails closed", () => {
+  const critical = {
+    ...report,
+    sudo_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: Array.from({ length: 64 }, (_, index) => ({
+      timestamp: `unix-ms:${index + 1}`,
+      code: "dns_block_sudo_drift",
+      message: "Resident sudo verification detected drift.",
+    })),
+    critical_findings_truncated: true,
+  };
+
+  assert.equal(validateReport(critical, false), critical);
+  const document = parsedStructuredNetworkReport(critical, {
+    observations: [],
+    observations_truncated: false,
+  });
+  assert.equal(document.result, "critical");
+  assert.equal(document.controls.sudo, "critical_drift");
+  assert.equal(document.warnings.critical_findings, 64);
+  assert.deepEqual(
+    document.warnings.critical_codes,
+    Array.from({ length: 5 }, () => "dns_block_sudo_drift"),
+  );
+  assert.equal(document.omissions.critical_codes, 59);
+  assert.equal(document.omissions.source_truncated, true);
+  assert.match(networkReportLines(critical).join("\n"), /truncated/i);
+  assert.throws(() => validateReport(critical, true), /critical resident findings/);
+});
+
+test("rejects unbounded, inconsistent, and unsupported critical report evidence", () => {
+  const finding = {
+    timestamp: "unix-ms:1",
+    code: "dns_block_sudo_drift",
+    message: "Resident sudo verification detected drift.",
+  };
+  const critical = {
+    ...report,
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: [finding],
+  };
+  const audit = {
+    ...critical,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+  };
+
+  for (const invalid of [
+    { ...report, sudo_status: "critical_drift" },
+    { ...report, container_status: "critical_drift" },
+    { ...report, resident_health: residentHealth({ status: "critical" }) },
+    { ...critical, resident_health: residentHealth() },
+    {
+      ...critical,
+      resident_health: residentHealth({
+        status: "critical",
+        last_successful_verification_unix_milliseconds: Date.now() - 20_001,
+      }),
+    },
+    { ...critical, critical_findings_truncated: "true" },
+    { ...critical, critical_findings_truncated: true },
+    {
+      ...critical,
+      critical_findings: Array.from({ length: 63 }, () => finding),
+      critical_findings_truncated: true,
+    },
+    {
+      ...critical,
+      critical_findings: Array.from({ length: 65 }, () => finding),
+    },
+    { ...critical, network_verification_status: "critical_invented" },
+    { ...critical, sudo_status: "preserved_verified" },
+    { ...critical, container_status: "preserved_verified" },
+    { ...audit, network_verification_status: "critical_dynamic_update_failed" },
+  ]) {
+    assert.throws(() => validateReport(invalid, false));
+    assert.throws(() => structuredReportLine(invalid));
+  }
+
+  for (const currentMode of [
+    critical,
+    {
+      ...critical,
+      status: "protected_host_block_degraded",
+      readiness_status: "ready_degraded",
+      setup_status: "resident_degraded",
+      protection_available: false,
+      container_status: "preserved_unsafe",
+    },
+  ]) {
+    const dynamicUpdateFailure = {
+      ...currentMode,
+      network_verification_status: "critical_dynamic_update_failed",
+    };
+    assert.equal(validateReport(dynamicUpdateFailure, false), dynamicUpdateFailure);
+    assert.equal(parsedStructuredNetworkReport(dynamicUpdateFailure).result, "critical");
+    assert.throws(() => validateReport(dynamicUpdateFailure, true), /critical resident findings/);
+  }
+});
+
 test("renders audit network decisions and hostname and direct-IP allowlist suggestions", () => {
   const audit = {
     ...report,

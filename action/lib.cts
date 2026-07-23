@@ -100,6 +100,7 @@ type StructuredNetworkRow = {
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
 const MAX_NATIVE_ALLOWLIST_ENTRIES = 64;
+const MAX_CRITICAL_FINDINGS = 64;
 const MAX_STRUCTURED_REPORT_BYTES = 16 * 1024;
 const MAX_AUDIT_HOSTNAME_ROWS = 10;
 const MAX_AUDIT_IP_ROWS = 10;
@@ -1209,15 +1210,40 @@ function validateReport(report: any, failOnCritical = true): any {
   if (!validIdentity) {
     fail("Fence report does not select the reviewed hosted-runner profile");
   }
-  if (!Array.isArray(report.critical_findings) || report.critical_findings_truncated !== false) {
+  if (
+    !Array.isArray(report.critical_findings) ||
+    report.critical_findings.length > MAX_CRITICAL_FINDINGS ||
+    typeof report.critical_findings_truncated !== "boolean" ||
+    (
+      report.critical_findings_truncated &&
+      report.critical_findings.length !== MAX_CRITICAL_FINDINGS
+    )
+  ) {
     fail("Fence report does not contain bounded critical findings");
   }
   if (failOnCritical && report.critical_findings.length !== 0) {
     fail("Fence report contains critical resident findings");
   }
-  validateResidentHealth(report.resident_health, Date.now(), !failOnCritical);
+  const residentHealth = validateResidentHealth(
+    report.resident_health,
+    Date.now(),
+    !failOnCritical,
+  );
+  const hasCriticalFindings = report.critical_findings.length !== 0;
+  const hasCriticalResident = residentHealth.status === "critical";
+  if (!failOnCritical && hasCriticalFindings !== hasCriticalResident) {
+    fail("Fence report critical findings do not match resident health");
+  }
+  const reportOnlyCritical = !failOnCritical && hasCriticalFindings && hasCriticalResident;
   if (report.network_verification_status !== "verified") {
-    if (failOnCritical || report.critical_findings.length === 0) {
+    const validCriticalNetwork = reportOnlyCritical && (
+      report.network_verification_status === "critical_drift" ||
+      (
+        report.mode === "block" &&
+        report.network_verification_status === "critical_dynamic_update_failed"
+      )
+    );
+    if (!validCriticalNetwork) {
       fail("Fence report does not contain verified network state");
     }
   }
@@ -1252,8 +1278,14 @@ function validateReport(report: any, failOnCritical = true): any {
     report.readiness_status !== expected.readiness ||
     report.setup_status !== expected.setup ||
     report.protection_available !== expected.protection ||
-    report.sudo_status !== expected.sudo ||
-    report.container_status !== expected.containers
+    (
+      report.sudo_status !== expected.sudo &&
+      !(reportOnlyCritical && report.sudo_status === "critical_drift")
+    ) ||
+    (
+      report.container_status !== expected.containers &&
+      !(reportOnlyCritical && report.container_status === "critical_drift")
+    )
   ) {
     fail("Fence report mode and control status are inconsistent");
   }
@@ -2325,7 +2357,7 @@ function structuredNetworkReport(report: any, dnsEvidence: any = undefined): any
     critical_codes: Math.max(0, report.critical_findings.length - MAX_STRUCTURED_CRITICAL_CODES),
     unparsed_findings: audit.unparsedCount,
     dns_evidence_missing: audit.dnsMissing,
-    source_truncated: audit.sourceTruncated,
+    source_truncated: audit.sourceTruncated || report.critical_findings_truncated,
     byte_budget_exceeded: false,
   };
   const warnings = {
