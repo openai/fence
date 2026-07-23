@@ -169,9 +169,88 @@ if STATE_invocation_id="$invocation" \
 fi
 grep -q "Fence report contains critical resident findings" "$post_stderr"
 
+python3 -E - "$post_stdout" <<'PY'
+import json
+import pathlib
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Fence structured report contains duplicate JSON fields")
+        value[key] = item
+    return value
+
+
+prefix = b"FENCE_REPORT_JSON="
+with pathlib.Path(sys.argv[1]).open("rb") as stream:
+    output = stream.read(256 * 1024 + 1)
+require(len(output) <= 256 * 1024, "Action post hook output exceeded its fixed bound")
+records = [line for line in output.splitlines() if line.startswith(prefix)]
+require(len(records) == 1, "Action post hook must emit exactly one structured critical report")
+record = records[0]
+require(len(record) <= 16 * 1024, "Action structured critical report exceeded 16 KiB")
+try:
+    report = json.loads(record[len(prefix):].decode("utf-8"), object_pairs_hook=unique_object)
+except (UnicodeError, ValueError, json.JSONDecodeError) as error:
+    raise SystemExit("Action structured critical report is not valid unique-field JSON") from error
+
+expected_fields = {
+    "schema_version",
+    "mode",
+    "result",
+    "controls",
+    "network",
+    "warnings",
+    "omissions",
+    "suggested_allowlist",
+}
+require(isinstance(report, dict) and set(report) == expected_fields, "Action structured critical report has an invalid schema")
+require(type(report["schema_version"]) is int and report["schema_version"] == 1, "Action structured critical report schema version is invalid")
+require(report["mode"] == "audit", "Action structured critical report has the wrong mode")
+require(report["result"] == "critical", "Action structured critical report concealed resident drift")
+controls = report["controls"]
+require(
+    isinstance(controls, dict)
+    and controls.get("network") == "critical_drift"
+    and controls.get("sudo") == "preserved_verified"
+    and controls.get("containers") == "preserved_verified"
+    and controls.get("protection_available") is False
+    and controls.get("readiness") == "ready_observation_only"
+    and controls.get("resident_health") == "critical",
+    "Action structured critical report misrepresented the drifted audit controls",
+)
+require(
+    isinstance(report["network"], list)
+    and len(report["network"]) <= 20
+    and all(isinstance(row, dict) for row in report["network"]),
+    "Action structured critical report contains invalid network evidence",
+)
+require(isinstance(report["warnings"], dict), "Action structured critical report warnings are invalid")
+require(isinstance(report["omissions"], dict), "Action structured critical report omissions are invalid")
+require(
+    isinstance(report["suggested_allowlist"], list)
+    and len(report["suggested_allowlist"]) <= 20,
+    "Action structured critical report allowlist suggestions are invalid",
+)
+PY
+
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
   die "Action post hook unexpectedly restored inet fence_v0"
 fi
+if ! sudo --non-interactive /usr/bin/true; then
+  die "Action post hook unexpectedly changed audit-mode passwordless sudo"
+fi
 sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
 
-echo -e "${GREEN}Action tamper evidence verified:${OFF} registered path remained stable and post hook failed without restoring access"
+echo -e "${GREEN}Action tamper evidence verified:${OFF} registered path remained stable and post hook reported critical drift without restoring access"

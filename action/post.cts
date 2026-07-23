@@ -13,9 +13,11 @@ const {
   materializationRequestRejections,
   materializationEvidenceCounter,
   MAX_REPORT_BYTES,
+  networkReportLines,
   readJsonBounded,
   readLauncherIntegrity,
   runtimePaths,
+  structuredReportLine,
   summaryLines,
   validateBundle,
   validateActionPathGuardMount,
@@ -179,6 +181,10 @@ function main(): void {
       encoding: "utf8",
     });
   }
+  for (const line of networkReportLines(report, dnsEvidence)) {
+    log.info(line);
+  }
+  log.structuredRecord(structuredReportLine(report, dnsEvidence));
   if (Array.isArray(report.critical_findings) && report.critical_findings.length > 0) {
     log.warning(`Fence detected ${report.critical_findings.length} critical resident finding(s); failing this job`);
   }

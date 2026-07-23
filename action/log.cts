@@ -1,7 +1,10 @@
 "use strict";
 
+const { MAX_STRUCTURED_REPORT_BYTES } = require("./lib.cts");
+
 const MAX_LOG_LINE_BYTES = 2048;
 const MAX_DEBUG_LINE_BYTES = 4096;
+const STRUCTURED_REPORT_PREFIX = "FENCE_REPORT_JSON=";
 
 type LogEnvironment = Record<string, string | undefined>;
 type ColorName = "highlight" | "info" | "success" | "warning" | "error";
@@ -63,6 +66,36 @@ function debugEnabled(environment: LogEnvironment = process.env): boolean {
 
 function info(message: string): void {
   process.stdout.write(`${sanitizeLogText(message)}\n`);
+}
+
+function structuredRecord(line: unknown): void {
+  if (typeof line !== "string" || !line.startsWith(STRUCTURED_REPORT_PREFIX)) {
+    throw new Error("Fence structured report must start with FENCE_REPORT_JSON=");
+  }
+  if (/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/u.test(line)) {
+    throw new Error("Fence structured report must be a single line without control characters");
+  }
+  if (Buffer.byteLength(line, "utf8") > MAX_STRUCTURED_REPORT_BYTES) {
+    throw new Error("Fence structured report exceeds its 16 KiB limit");
+  }
+
+  let record: any;
+  try {
+    record = JSON.parse(line.slice(STRUCTURED_REPORT_PREFIX.length));
+  } catch {
+    throw new Error("Fence structured report must contain valid JSON");
+  }
+  if (
+    record === null ||
+    Array.isArray(record) ||
+    typeof record !== "object" ||
+    record.schema_version !== 1 ||
+    `${STRUCTURED_REPORT_PREFIX}${JSON.stringify(record)}` !== line
+  ) {
+    throw new Error("Fence structured report must contain canonical schema-version-1 JSON");
+  }
+
+  process.stdout.write(`${line}\n`);
 }
 
 function success(message: string, environment: LogEnvironment = process.env): void {
@@ -174,6 +207,7 @@ module.exports = {
   readyLine,
   sanitizeLogText,
   setupLines,
+  structuredRecord,
   success,
   warning,
   workflowEscape,

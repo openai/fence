@@ -234,8 +234,10 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/test-action-wrapper`
   - Offline-only dependency-free TypeScript, Node built-in `node:test`, Python standard-library host-classifier checks, and synthetic `gh`-shim checks for the Action launcher, registered-path guard selection, protected-runtime integrity records, exact writable guard and read-only runtime mount evidence, report validation, compact control and network-activity summary tables, bounded finding attribution, hostname and IPv4/IPv6 audit allowlist guidance, critical-finding propagation, runtime-path derivation, and release/bundle provenance validation.
   - Native CIDR allowlist entries must match the Rust agent's canonical-network validation and fail before privileged setup when host bits or an address scope are present.
+  - Native Action allowlists must reject the 65th unique canonical destination before privileged setup while preserving duplicate lines, equivalent normalized destination forms, blank lines, and comments.
   - The wrapper uses Node 24 built-in type stripping and Node standard-library modules only. Do not add `npm`, `package.json`, `node_modules`, external Node packages, or a runtime compilation step.
-  - Action logs should stay concise by default and may use emoji plus ANSI colors for human readability. Debug logs are allowed only through GitHub Actions debug mode, must remain bounded and sanitized, and must not print raw config bodies, environment dumps, tokens, packet payloads, raw DNS packets, unrelated system logs, or arbitrary report JSON.
+  - Action logs should stay concise by default and may use emoji plus ANSI colors for human readability. After verifying protected post-job evidence, emit a bounded readable network table and exactly one deterministic schema-`1` `FENCE_REPORT_JSON=` line containing at most 20 safe network rows and at most 16 KiB. Emit critical reports before failing the job; reject unverified evidence and never truncate structured JSON.
+  - Debug logs are allowed only through GitHub Actions debug mode, must remain bounded and sanitized, and must not print raw config bodies, environment dumps, tokens, packet payloads, raw DNS packets, unrelated system logs, or arbitrary report JSON. Public post-job reports must also exclude full paths, process arguments, parent process details, and signed URLs.
 
 - `script/classify-action-bundle-host`
   - GitHub-Actions-only compatibility classifier for an ephemeral candidate or published distribution bundle before destructive activation.
@@ -255,12 +257,12 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 
 - `script/test-action-setup-failure`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
-  - Invokes the dependency-free Action launcher with malformed invocation and wildcard inputs and proves rejection occurs before Action state, runtime directories, or owned nftables state are created.
+  - Invokes the dependency-free Action launcher with malformed invocation, wildcard, and over-limit native allowlist inputs and proves rejection occurs before Action state, runtime directories, transient services, or owned nftables state are created.
   - Passes one bounded unsupported profile through the raw-config wrapper boundary, proves the bundled source agent rejects it before control mutation, and requires the launcher to retain the failed transient unit, fail before the readiness timeout, and emit only the structured Fence error code from the unit journal.
 
 - `script/test-action-tamper`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
-  - Launches the bundled audit lifecycle through the Action entrypoint, proves direct runner-user modification of the protected post hook fails, verifies the closest registered-path guard retains its mounted device/inode identity, proves the guarded ancestor cannot be renamed and recreated, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the protected post hook fails without stopping the service or restoring network state.
+  - Launches the bundled audit lifecycle through the Action entrypoint, proves direct runner-user modification of the protected post hook fails, verifies the closest registered-path guard retains its mounted device/inode identity, proves the guarded ancestor cannot be renamed and recreated, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the protected post hook emits one bounded critical structured report before failing without stopping the service or restoring network state.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.

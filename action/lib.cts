@@ -74,12 +74,40 @@ type NetworkActivitySummary = {
   rows: NetworkActivityRow[];
   omittedRows: number;
 };
+type StructuredNetworkActivity = {
+  kind: "dns_query";
+  query_type: string | null;
+  count: number;
+} | {
+  kind: "connection_attempt";
+  protocol: "tcp" | "udp";
+  port: number;
+  count: number;
+};
+type StructuredNetworkActor = {
+  label: string;
+  count: number;
+};
+type StructuredNetworkRow = {
+  destination_kind: "hostname" | "ip" | "unretained";
+  destination: string | null;
+  decision: NetworkDecision;
+  activities: StructuredNetworkActivity[];
+  actors: StructuredNetworkActor[];
+  count: number;
+};
 
 const MAX_CONFIG_BYTES = 256 * 1024;
 const MAX_REPORT_BYTES = 4 * 1024 * 1024;
+const MAX_NATIVE_ALLOWLIST_ENTRIES = 64;
+const MAX_CRITICAL_FINDINGS = 64;
+const MAX_STRUCTURED_REPORT_BYTES = 16 * 1024;
 const MAX_AUDIT_HOSTNAME_ROWS = 10;
 const MAX_AUDIT_IP_ROWS = 10;
 const MAX_NETWORK_ACTIVITY_ROWS = 20;
+const MAX_STRUCTURED_ACTIVITIES_PER_ROW = 8;
+const MAX_STRUCTURED_ACTORS_PER_ROW = 4;
+const MAX_STRUCTURED_CRITICAL_CODES = 5;
 const ALLOWED_DNS_CLASSIFICATIONS = new Set([
   "dynamic_platform",
   "platform_and_user_allowlist",
@@ -500,6 +528,9 @@ function parseAllowlistInput(value: unknown): AllowlistEntry[] {
       const entry = parseAllowlistLine(line);
       const key = `${entry.destination_type}\0${entry.destination}\0${entry.protocol}\0${entry.port}`;
       if (!seen.has(key)) {
+        if (entries.length === MAX_NATIVE_ALLOWLIST_ENTRIES) {
+          fail(`allowlist input must contain no more than ${MAX_NATIVE_ALLOWLIST_ENTRIES} unique entries`);
+        }
         seen.add(key);
         entries.push(entry);
       }
@@ -1179,15 +1210,40 @@ function validateReport(report: any, failOnCritical = true): any {
   if (!validIdentity) {
     fail("Fence report does not select the reviewed hosted-runner profile");
   }
-  if (!Array.isArray(report.critical_findings) || report.critical_findings_truncated !== false) {
+  if (
+    !Array.isArray(report.critical_findings) ||
+    report.critical_findings.length > MAX_CRITICAL_FINDINGS ||
+    typeof report.critical_findings_truncated !== "boolean" ||
+    (
+      report.critical_findings_truncated &&
+      report.critical_findings.length !== MAX_CRITICAL_FINDINGS
+    )
+  ) {
     fail("Fence report does not contain bounded critical findings");
   }
   if (failOnCritical && report.critical_findings.length !== 0) {
     fail("Fence report contains critical resident findings");
   }
-  validateResidentHealth(report.resident_health, Date.now(), !failOnCritical);
+  const residentHealth = validateResidentHealth(
+    report.resident_health,
+    Date.now(),
+    !failOnCritical,
+  );
+  const hasCriticalFindings = report.critical_findings.length !== 0;
+  const hasCriticalResident = residentHealth.status === "critical";
+  if (!failOnCritical && hasCriticalFindings !== hasCriticalResident) {
+    fail("Fence report critical findings do not match resident health");
+  }
+  const reportOnlyCritical = !failOnCritical && hasCriticalFindings && hasCriticalResident;
   if (report.network_verification_status !== "verified") {
-    if (failOnCritical || report.critical_findings.length === 0) {
+    const validCriticalNetwork = reportOnlyCritical && (
+      report.network_verification_status === "critical_drift" ||
+      (
+        report.mode === "block" &&
+        report.network_verification_status === "critical_dynamic_update_failed"
+      )
+    );
+    if (!validCriticalNetwork) {
       fail("Fence report does not contain verified network state");
     }
   }
@@ -1222,8 +1278,14 @@ function validateReport(report: any, failOnCritical = true): any {
     report.readiness_status !== expected.readiness ||
     report.setup_status !== expected.setup ||
     report.protection_available !== expected.protection ||
-    report.sudo_status !== expected.sudo ||
-    report.container_status !== expected.containers
+    (
+      report.sudo_status !== expected.sudo &&
+      !(reportOnlyCritical && report.sudo_status === "critical_drift")
+    ) ||
+    (
+      report.container_status !== expected.containers &&
+      !(reportOnlyCritical && report.container_status === "critical_drift")
+    )
   ) {
     fail("Fence report mode and control status are inconsistent");
   }
@@ -2150,6 +2212,276 @@ function networkActivitySummary(
   return lines;
 }
 
+function structuredNetworkActivity(activity: string, count: number): StructuredNetworkActivity {
+  if (!Number.isSafeInteger(count) || count < 1) {
+    fail("Fence network activity contains an invalid event count");
+  }
+  if (activity === "DNS query" || activity === "DNS query (names not retained)") {
+    return { kind: "dns_query", query_type: null, count };
+  }
+  const dnsMatch = /^(A|AAAA|TYPE([0-9]{1,5})) query$/.exec(activity);
+  if (dnsMatch) {
+    return {
+      kind: "dns_query",
+      query_type: dnsMatch[2] === undefined ? dnsMatch[1].toLowerCase() : `type_${dnsMatch[2]}`,
+      count,
+    };
+  }
+  const connectionMatch = /^(TCP|UDP)\/([0-9]{1,5}) attempt$/.exec(activity);
+  if (connectionMatch) {
+    const protocol = connectionMatch[1].toLowerCase();
+    const port = Number(connectionMatch[2]);
+    if (isSupportedProtocol(protocol) && isValidPort(port)) {
+      return { kind: "connection_attempt", protocol: protocol as "tcp" | "udp", port, count };
+    }
+  }
+  return fail("Fence network activity contains an unsupported event");
+}
+
+function structuredNetworkActor(actor: string, count: number): StructuredNetworkActor {
+  const knownStatus = new Set([
+    "Ambiguous owner",
+    "Owner not found",
+    "Attribution scan limit reached",
+    "Attribution queue full",
+    "Attribution worker unavailable",
+  ]);
+  const attributed = /^(runner|root|other|unknown): ([A-Za-z0-9._+-]{1,128}) \(PID ([1-9][0-9]{0,9})\)$/.exec(actor);
+  if (
+    !Number.isSafeInteger(count) ||
+    count < 1 ||
+    (!knownStatus.has(actor) && (
+      attributed === null ||
+      !Number.isSafeInteger(Number(attributed[3])) ||
+      Number(attributed[3]) > 0xffff_ffff
+    ))
+  ) {
+    fail("Fence network activity contains unsafe actor evidence");
+  }
+  return { label: actor, count };
+}
+
+function structuredNetworkRow(
+  row: NetworkActivityRow,
+  omissions: { actor_entries: number; activity_entries: number },
+): StructuredNetworkRow {
+  let destinationKind: StructuredNetworkRow["destination_kind"];
+  let destination: string | null;
+  if (row.destination === "Other DNS names") {
+    destinationKind = "unretained";
+    destination = null;
+  } else if (isSafeHostname(row.destination)) {
+    destinationKind = "hostname";
+    destination = row.destination;
+  } else if (net.isIP(row.destination) !== 0 && !row.destination.includes("%")) {
+    destinationKind = "ip";
+    destination = row.destination;
+  } else {
+    return fail("Fence network activity contains an unsafe destination");
+  }
+  if (
+    !new Set(["allowed", "blocked", "would_block"]).has(row.decision) ||
+    !Number.isSafeInteger(row.totalCount) ||
+    row.totalCount < 1
+  ) {
+    fail("Fence network activity contains an invalid decision or count");
+  }
+  const activityEntries = Array.from(row.activities.entries())
+    .sort(([left], [right]) => compareStrings(left, right));
+  const actorEntries = Array.from(row.actors.entries())
+    .sort(([left], [right]) => compareStrings(left, right));
+  omissions.activity_entries += Math.max(0, activityEntries.length - MAX_STRUCTURED_ACTIVITIES_PER_ROW);
+  omissions.actor_entries += Math.max(0, actorEntries.length - MAX_STRUCTURED_ACTORS_PER_ROW);
+  return {
+    destination_kind: destinationKind,
+    destination,
+    decision: row.decision,
+    activities: activityEntries
+      .slice(0, MAX_STRUCTURED_ACTIVITIES_PER_ROW)
+      .map(([activity, count]) => structuredNetworkActivity(activity, count)),
+    actors: actorEntries
+      .slice(0, MAX_STRUCTURED_ACTORS_PER_ROW)
+      .map(([actor, count]) => structuredNetworkActor(actor, count)),
+    count: row.totalCount,
+  };
+}
+
+function structuredAllowlistEntry(row: AuditFindingRow): string {
+  if (
+    !isSupportedProtocol(row.protocol) ||
+    !isValidPort(row.port) ||
+    !Number.isSafeInteger(row.count) ||
+    row.count < 1
+  ) {
+    return fail("Fence audit recommendation contains an invalid transport or count");
+  }
+  if (row.destinationKind === "ip") {
+    if (net.isIP(row.destination) === 0 || row.destination.includes("%")) {
+      return fail("Fence audit recommendation contains an unsafe IP address");
+    }
+    return `ip ${row.destination} ${row.protocol} ${row.port}`;
+  }
+  if (row.destinationKind !== "hostname" || !isSafeHostname(row.destination)) {
+    return fail("Fence audit recommendation contains an unsafe hostname");
+  }
+  if (row.protocol === "tcp") {
+    return row.port === 443 ? row.destination : `${row.destination}:${row.port}`;
+  }
+  return `hostname ${row.destination} ${row.protocol} ${row.port}`;
+}
+
+function structuredNetworkReport(report: any, dnsEvidence: any = undefined): any {
+  validateReport(report, false);
+  const audit = correlateFindingsToDns(report, dnsEvidence);
+  const activity = networkActivityRows(report, dnsEvidence);
+  const criticalCodes = report.critical_findings
+    .slice(0, MAX_STRUCTURED_CRITICAL_CODES)
+    .map((finding: any) => {
+      if (
+        finding === null ||
+        Array.isArray(finding) ||
+        typeof finding !== "object" ||
+        typeof finding.code !== "string" ||
+        !/^[a-z][a-z0-9_]{0,63}$/.test(finding.code)
+      ) {
+        return fail("Fence report contains an unsafe critical finding code");
+      }
+      return finding.code;
+    });
+  const omissions = {
+    network_rows: activity.omittedRows,
+    hostname_recommendations: audit.omittedHostnameRows,
+    ip_recommendations: audit.omittedIpRows,
+    actor_entries: 0,
+    activity_entries: 0,
+    critical_codes: Math.max(0, report.critical_findings.length - MAX_STRUCTURED_CRITICAL_CODES),
+    unparsed_findings: audit.unparsedCount,
+    dns_evidence_missing: audit.dnsMissing,
+    source_truncated: audit.sourceTruncated || report.critical_findings_truncated,
+    byte_budget_exceeded: false,
+  };
+  const warnings = {
+    critical_findings: report.critical_findings.length,
+    critical_codes: criticalCodes,
+    materialization_rejections: materializationRequestRejections(dnsEvidence),
+    wildcard_rejections: materializationEvidenceCounter(
+      dnsEvidence,
+      "user_wildcard_request_rejections",
+    ),
+    wildcard_authorizations_truncated: Boolean(
+      dnsEvidence && dnsEvidence.bounded_user_wildcard_authorizations_truncated === true,
+    ),
+    results_storage_attribution_failures: resultsStorageEvidenceCounter(
+      dnsEvidence,
+      "results_storage_attribution_failures",
+    ),
+    results_storage_rejections: resultsStorageEvidenceCounter(
+      dnsEvidence,
+      "results_storage_request_rejections",
+    ),
+    results_storage_authorizations_truncated: Boolean(
+      dnsEvidence && dnsEvidence.runner_authorized_results_storage_truncated === true,
+    ),
+  };
+  const result: "healthy" | "warning" | "critical" =
+    report.network_verification_status !== "verified" || warnings.critical_findings > 0
+      ? "critical"
+      : summaryHasWarnings(report, audit, dnsEvidence) || activity.omittedRows > 0
+        ? "warning"
+        : "healthy";
+  const document = {
+    schema_version: 1,
+    mode: report.mode as DefaultMode,
+    result,
+    controls: {
+      network: report.network_verification_status,
+      sudo: report.sudo_status,
+      containers: report.container_status,
+      protection_available: report.protection_available,
+      readiness: report.readiness_status,
+      resident_health: report.resident_health.status,
+    },
+    network: activity.rows.map((row) => structuredNetworkRow(row, omissions)),
+    warnings,
+    omissions,
+    suggested_allowlist: report.mode === "audit"
+      ? Array.from(new Set(
+        [...audit.hostnameRows, ...audit.ipRows].map(structuredAllowlistEntry),
+      )).sort(compareStrings)
+      : [],
+  };
+  while (
+    Buffer.byteLength(`FENCE_REPORT_JSON=${JSON.stringify(document)}`, "utf8") >
+    MAX_STRUCTURED_REPORT_BYTES
+  ) {
+    if (document.network.length === 0) {
+      return fail("Fence structured report exceeds its fixed 16 KiB limit");
+    }
+    document.network.pop();
+    document.omissions.network_rows += 1;
+    document.omissions.byte_budget_exceeded = true;
+    if (document.result === "healthy") {
+      document.result = "warning";
+    }
+  }
+  if (document.omissions.actor_entries > 0 || document.omissions.activity_entries > 0) {
+    if (document.result === "healthy") {
+      document.result = "warning";
+    }
+  }
+  return document;
+}
+
+function networkReportLines(report: any, dnsEvidence: any = undefined): string[] {
+  const document = structuredNetworkReport(report, dnsEvidence);
+  const lines = [
+    `Fence network report: ${document.result}`,
+    `Mode: ${document.mode}`,
+    `Controls: network=${document.controls.network}; sudo=${document.controls.sudo}; containers=${document.controls.containers}`,
+  ];
+  if (document.network.length === 0) {
+    lines.push("Network activity: none");
+  } else {
+    lines.push(
+      "Network activity:",
+      "Decision | Destination | Activity | Actor",
+      "-------- | ----------- | -------- | -----",
+    );
+    for (const row of document.network as StructuredNetworkRow[]) {
+      const activities = row.activities.map((entry) => {
+        if (entry.kind === "dns_query") {
+          return `${entry.count} ${entry.query_type === null ? "DNS" : entry.query_type.toUpperCase()} ${entry.count === 1 ? "query" : "queries"}`;
+        }
+        return `${entry.count} ${entry.protocol.toUpperCase()}/${entry.port} ${entry.count === 1 ? "attempt" : "attempts"}`;
+      }).join(", ");
+      const actors = row.actors
+        .map((actor) => `${actor.label}${actor.count === 1 ? "" : ` (${actor.count})`}`)
+        .join(", ");
+      const destination = row.destination === null ? "Other DNS names (not retained)" : row.destination;
+      lines.push(
+        `${row.decision} | ${destination} | ${activities} | ${actors.length > 0 ? actors : "-"}`,
+      );
+    }
+  }
+  if (document.omissions.network_rows > 0) {
+    lines.push(`Additional network rows omitted: ${document.omissions.network_rows}`);
+  }
+  if (document.omissions.unparsed_findings > 0) {
+    lines.push(`Unparsed network findings: ${document.omissions.unparsed_findings}`);
+  }
+  if (document.omissions.source_truncated || document.omissions.byte_budget_exceeded) {
+    lines.push("Network evidence was truncated");
+  }
+  if (document.warnings.critical_findings > 0) {
+    lines.push(`Critical findings: ${document.warnings.critical_findings}`);
+  }
+  return lines;
+}
+
+function structuredReportLine(report: any, dnsEvidence: any = undefined): string {
+  return `FENCE_REPORT_JSON=${JSON.stringify(structuredNetworkReport(report, dnsEvidence))}`;
+}
+
 function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
   const critical = report.network_verification_status !== "verified" ||
@@ -2176,6 +2508,7 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 module.exports = {
   ACTION_RUNTIME_FILES,
   MAX_REPORT_BYTES,
+  MAX_STRUCTURED_REPORT_BYTES,
   activeActionMountEvidence,
   actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
@@ -2191,6 +2524,7 @@ module.exports = {
   materializationWarningLines,
   mountIdFromFdInfo,
   networkActivitySummary,
+  networkReportLines,
   nativeInputsFromEnvironment,
   readJsonBounded,
   readLauncherIntegrity,
@@ -2199,6 +2533,7 @@ module.exports = {
   runtimePaths,
   summaryHeading,
   summaryLines,
+  structuredReportLine,
   validateBundle,
   validatedActionRuntimeSnapshot,
   validateInlineConfig,

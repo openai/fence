@@ -111,6 +111,58 @@ if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1
   die "Action CIDR setup-failure evidence unexpectedly created inet fence_v0"
 fi
 
+native_limit_invocation="fence-12347-2"
+native_limit_unit="fence-$native_limit_invocation.service"
+if [[ -e "/run/fence/$native_limit_invocation" || -e "/run/fence-launcher/$native_limit_invocation" ]]; then
+  die "Action setup-failure evidence requires no preexisting allowlist-limit runtime state"
+fi
+if [[ "$(systemctl show "$native_limit_unit" --property=LoadState --value)" != "not-found" ]]; then
+  die "Action setup-failure evidence requires an unused allowlist-limit transient service name"
+fi
+if ! sudo --non-interactive /usr/bin/true; then
+  die "Action setup-failure evidence requires available passwordless sudo"
+fi
+
+native_limit_entries=()
+for ((index = 0; index < 65; index++)); do
+  native_limit_entries+=("ip 192.0.2.$index tcp 443")
+done
+printf -v native_limit_allowlist '%s\n' "${native_limit_entries[@]}"
+
+: >"$state"
+: >"$summary"
+: >"$stdout"
+: >"$stderr"
+if INPUT_CONFIG='' \
+  INPUT_ALLOWLIST="$native_limit_allowlist" \
+  INPUT_INVOCATION_ID="$native_limit_invocation" \
+  GITHUB_RUN_ID='12347' \
+  GITHUB_RUN_ATTEMPT='2' \
+  GITHUB_STATE="$state" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/main.cts >"$stdout" 2>"$stderr"; then
+  die "Action setup unexpectedly accepted more than 64 unique native allowlist entries"
+fi
+
+if ! grep -q "allowlist line 65: allowlist input must contain no more than 64 unique entries" "$stderr"; then
+  die "Action allowlist-limit setup-failure evidence did not report the unique-entry limit"
+fi
+if [[ -s "$stdout" || -s "$state" || -s "$summary" ]]; then
+  die "Action allowlist-limit setup-failure evidence unexpectedly emitted success state"
+fi
+if [[ -e "/run/fence/$native_limit_invocation" || -e "/run/fence-launcher/$native_limit_invocation" ]]; then
+  die "Action allowlist-limit setup-failure evidence unexpectedly created runtime state"
+fi
+if [[ "$(systemctl show "$native_limit_unit" --property=LoadState --value)" != "not-found" ]]; then
+  die "Action allowlist-limit setup-failure evidence unexpectedly created a transient service"
+fi
+if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
+  die "Action allowlist-limit setup-failure evidence unexpectedly created inet fence_v0"
+fi
+if ! sudo --non-interactive /usr/bin/true; then
+  die "Action allowlist-limit setup-failure evidence unexpectedly disabled passwordless sudo"
+fi
+
 runtime_failure_invocation="action-runtime-failure"
 runtime_failure_unit="fence-$runtime_failure_invocation.service"
 if [[ "$(systemctl show "$runtime_failure_unit" --property=LoadState --value)" != "not-found" ]]; then
