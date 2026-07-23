@@ -21,7 +21,7 @@ Add Fence as the first step in a supported GitHub-hosted Linux job:
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z
 ```
 
-This starts Fence in `block` mode with an empty user `allowlist` on a GitHub-hosted `ubuntu-24.04` x64 host job. Replace `<commit-sha>` with the full `action_commit` value and `vX.Y.Z` with the tag from the same release; release notes provide the ready-to-copy line with a Dependabot-friendly `# pin@vX.Y.Z` comment. `main` is source-only and does not contain a runnable production bundle. Put Fence before checkout and any other steps you want it to constrain.
+This starts Fence in `block` mode with an empty user `allowlist` on a GitHub-hosted x64 job using `ubuntu-24.04` or `ubuntu-latest`. Replace `<commit-sha>` with the full `action_commit` value and `vX.Y.Z` with the tag from the same release; release notes provide the ready-to-copy line with a Dependabot-friendly `# pin@vX.Y.Z` comment. `main` is source-only and does not contain a runnable production bundle. Put Fence before checkout and any other steps you want it to constrain.
 
 **Read more:** [Getting started with Fence](docs/getting-started.md)
 
@@ -151,13 +151,14 @@ flowchart LR
 
 ## Security Notes 🔒
 
-Fence reduces where later workflow steps can send data and removes common ways to undo the lockdown. It is not a full sandbox, does not make a runner perfectly hermetic, and currently supports only GitHub-hosted `ubuntu-24.04` x64 host jobs.
+Fence adds a layer of protection to GitHub Actions jobs by limiting where later steps can send network traffic. Its default `block` mode also turns off passwordless `sudo` and Docker to make those protections harder to undo. Fence is not a complete sandbox, and allowed destinations remain reachable.
 
-Activation fails closed unless the live host matches Fence's reviewed fingerprint. Sudo policy files remain byte-exact except for the first line of `90-cloud-init-users`, which must match cloud-init's generated version/timestamp header; Fence hashes every remaining byte and retains a raw whole-file runtime pin so later changes are still detected.
-
-Fence keeps a small set of GitHub Actions destinations open so your job can run and report results. The default policy includes up to eight `*.githubapp.com` hostnames and one fixed results-storage account, `productionresultssa19.blob.core.windows.net`. Up to four additional results-storage accounts are allowed only when requested by the verified GitHub runner. Later workflow steps can also reach allowed destinations.
-
-Set `disable_broad_github_domains: true` to remove optional GitHub destinations when your workflow does not need them. The fixed results-storage account remains available for runner compatibility. Pin Fence to the full immutable `action_commit` SHA from a release, and treat `container_policy: unsafe_preserve` as a deliberately weaker mode.
+- **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Use `ubuntu-24.04` for the most predictable runner image; `ubuntu-latest` is also regularly tested but can change over time. Fence refuses to start if the runner does not pass its security checks.
+- **Built-in connections:** Some GitHub and runner-platform connections remain open so the job can run and report results. Later steps can also reach those connections and destinations in your `allowlist`.
+- **Tighter GitHub access:** Set `disable_broad_github_domains: true` when your workflow does not need optional GitHub destinations.
+- **Audit mode:** Reports network activity without blocking it.
+- **Docker access:** `container_policy: unsafe_preserve` keeps Docker available but provides weaker protection.
+- **Release pinning:** Use the full, immutable `action_commit` SHA from a published release.
 
 **Read more:** [Security boundaries and operational guidance](docs/security.md)
 
