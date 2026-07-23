@@ -1317,8 +1317,8 @@ require(
 finalization_activation = require_step_contract(
     action_job_blocks["action-finalization"],
     "activate bundled Fence agent without post-ready warming",
-    ["uses", "with"],
-    {"uses": "./"},
+    ["timeout-minutes", "uses", "with"],
+    {"timeout-minutes": "3", "uses": "./"},
     "Action acceptance finalization activation",
 )
 finalization_activation_with = indented_block(
@@ -1339,8 +1339,9 @@ finalization = indented_block(
 )
 require(
     "replica: [quiet-1, quiet-2, quiet-3]" in finalization
-    and "fail-fast: false" in finalization,
-    "Action acceptance must retain three non-cancelling finalization replicas",
+    and "fail-fast: false" in finalization
+    and scalar_mapping(finalization, 4).get("timeout-minutes") == "8",
+    "Action acceptance must retain three non-cancelling finalization replicas with an eight-minute setup budget",
 )
 
 require_exact_mapping_keys(
@@ -1633,7 +1634,7 @@ expected_target_timeouts = {
     "lockdown": "8",
     "selected-profile-runtime": "8",
     "protected-run": "8",
-    "protected-finalization": "3",
+    "protected-finalization": "8",
 }
 expected_integration_steps = {
     "lockdown": [
@@ -1868,8 +1869,11 @@ require(
 require_step_contract(
     protected_finalization,
     "run quiet packaged trusted-launcher block",
-    ["run"],
-    {"run": "script/test-protected-run standard-finalization"},
+    ["timeout-minutes", "run"],
+    {
+        "timeout-minutes": "3",
+        "run": "script/test-protected-run standard-finalization",
+    },
     "Integration protected finalization evidence",
 )
 

@@ -138,7 +138,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/test`
   - Validates the release-tool lockfile and manifest before running tests.
   - Validates the test-tool lockfile and manifest before running tests.
-  - Runs the offline Action release-state regression suite before Rust tests.
+  - Runs the offline Action release-state and protected-finalization regression suites before Rust tests.
   - Runs `cargo test --frozen` by default.
   - `--coverage`, `--cov`, or `-c` requires `cargo-llvm-cov` from `script/install-test-tools` and `llvm-tools-preview` from `script/prepare-rust`.
   - Coverage mode writes text, JSON, LCOV, and HTML reports under `coverage/`.
@@ -187,12 +187,12 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
   - Runs `wildcard-docker` with `unsafe_preserve` to prove exact-depth `*.docker.io` user policy authorizes concrete registry names lazily, retains Docker access, and emits bounded user-origin materialization evidence without claiming that every Docker layer CDN is covered.
   - Runs `malformed-wildcard` to prove a three-label wildcard is rejected by the source agent under the trusted launcher before Fence writes readiness or state, creates its nftables table, disables sudo, or changes Docker availability.
   - Runs `audit` to prove owned non-blocking observation rules emit bounded `would_block` findings with local process attribution when ownership remains observable, while passwordless sudo, Docker access, and arbitrary traffic remain available without a containment claim.
-  - Runs three quiet `standard-finalization` replicas without artificial post-ready network warming. A downstream verifier must prove each reaches terminal success within 180 seconds and exposes a nonempty downloadable job-log archive.
+  - Runs three quiet `standard-finalization` replicas without artificial post-ready network warming. Each replica has an eight-minute job budget for checkout, runner observation, Rust preparation, and bootstrap; its protected activation step has a three-minute timeout. A downstream read-only verifier must prove successful terminal job completion, including post hooks, within 180 seconds of the protected activation step's start and verify a nonempty downloadable job-log archive.
   - Leaves applied state resident until ephemeral runner teardown. It must not restore access, intentionally initiate optional post-ready artifact/cache/API operations, or claim support beyond the reviewed paths.
 
 - `script/verify-protected-finalization`
   - GitHub-Actions-only downstream verifier for either the quiet protected-run replicas plus broad-domain opt-out scenario or the quiet bundled-Action replicas selected by its fixed argument.
-  - Uses a read-only Actions token to inspect only the current workflow run, requires the expected jobs to finish successfully within 180 seconds, follows the job-log redirect without forwarding the bearer token, and verifies each bounded downloaded log payload is nonempty. A naturally observed runner-authorized results-storage request is additional evidence rather than a required event because the runner may resolve or establish that path before Fence readiness or after the final readable report snapshot.
+  - Uses a read-only Actions token to inspect only the current workflow run, requires each expected job and its exact protected activation step to succeed, verifies successful terminal job completion, including Action post hooks, within 180 seconds of that step's start, follows the job-log redirect without forwarding the bearer token, and verifies each bounded downloaded log payload is nonempty. Checkout and setup remain outside the 180-second security timer and inside the bounded eight-minute job budget. A naturally observed runner-authorized results-storage request is additional evidence rather than a required event because the runner may resolve or establish that path before Fence readiness or after the final readable report snapshot.
   - Accepts only bounded HTTPS redirects to reviewed GitHub Actions, GitHub content, or Azure Blob host suffixes. It must not print signed URLs, query strings, tokens, archive contents, or unrelated job metadata.
 
 - `script/observe-hosted-runner`

@@ -154,7 +154,7 @@ jobs:
       fail-fast: false
       matrix:
         replica: [quiet-1, quiet-2, quiet-3]
-    timeout-minutes: 3
+    timeout-minutes: 8
     runs-on: ubuntu-24.04
 
     steps:
@@ -173,6 +173,7 @@ jobs:
         run: script/bootstrap
 
       - name: run quiet packaged trusted-launcher block
+        timeout-minutes: 3
         run: script/test-protected-run standard-finalization
 
   integration:
