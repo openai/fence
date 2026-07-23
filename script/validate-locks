@@ -1337,8 +1337,14 @@ require(
         artifact_fixture,
         "Action acceptance GitHub artifact fixture must use a literal run body",
     )
-    == "          printf '%s\\n' 'Fence GitHub artifact compatibility evidence.' > \"$FENCE_ARTIFACT_FIXTURE\"\n",
-    "Action acceptance GitHub artifact fixture may write only harmless local evidence",
+    == (
+        "          python3 -E -c 'import socket; "
+        'socket.getaddrinfo("productionresultssa17.blob.core.windows.net", '
+        "443, family=socket.AF_INET, type=socket.SOCK_STREAM)'\n"
+        "          printf '%s\\n' 'Fence GitHub artifact compatibility evidence.' > "
+        '"$FENCE_ARTIFACT_FIXTURE"\n'
+    ),
+    "Action acceptance GitHub artifact fixture must prove bounded opt-in DNS and write only harmless local evidence",
 )
 artifact_upload = require_step_contract(
     action_job_blocks["action"],

@@ -240,6 +240,7 @@ jobs:
         env:
           FENCE_ARTIFACT_FIXTURE: ${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt
         run: |
+          python3 -E -c 'import socket; socket.getaddrinfo("productionresultssa17.blob.core.windows.net", 443, family=socket.AF_INET, type=socket.SOCK_STREAM)'
           printf '%s\n' 'Fence GitHub artifact compatibility evidence.' > "$FENCE_ARTIFACT_FIXTURE"
 
       - name: upload bounded GitHub artifact under Fence

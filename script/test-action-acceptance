@@ -313,11 +313,31 @@ if allow_github_artifacts:
         for item in dns["runner_authorized_results_storage"]
         if item["authorization_origin"] == "opt_in_github_artifact_dns"
     }
+    artifact_fixture_hostname = "productionresultssa17.blob.core.windows.net"
+    require(
+        artifact_fixture_hostname in artifact_hostnames,
+        "GitHub artifact fixture must prove opt-in results-storage authorization",
+    )
+    require(
+        any(
+            item.get("hostname") == artifact_fixture_hostname
+            and item.get("query_type") == "a"
+            and item.get("policy_classification") == "artifact_authorized_results_storage"
+            for item in dns["observations"]
+        ),
+        "GitHub artifact fixture must prove an observed opt-in DNS query",
+    )
     artifact_materializations = [
         item for item in report["materialized_allowances"]
         if item.get("source_hostname") in artifact_hostnames
     ]
-    require(not artifact_hostnames or artifact_materializations)
+    require(
+        any(
+            item.get("source_hostname") == artifact_fixture_hostname
+            for item in artifact_materializations
+        ),
+        "GitHub artifact fixture must prove verified firewall materialization",
+    )
     require(all(
         item["protocol"] == "tcp" and item["port"] == 443
         for item in artifact_materializations
