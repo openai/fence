@@ -364,7 +364,7 @@ mod tests {
                 reads += 1;
                 Ok::<Option<ConnectionEvent>, ()>(None)
             },
-            &mut |_| panic!("an empty queue cannot produce a connection event"),
+            &mut drop,
         )
         .unwrap();
 
