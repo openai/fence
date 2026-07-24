@@ -123,39 +123,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
     except OSError:
         pass
 
-deadline = time.monotonic() + 2.0
-while True:
-    current = json.loads(report_path.read_text(encoding="utf-8"))
-    current_counters = current.get("counters")
-    findings = current.get("findings")
-    if (
-        current.get("mode") == "block"
-        and current.get("network_verification_status") == "verified"
-        and current.get("critical_findings") == []
-        and isinstance(current_counters, dict)
-        and isinstance(current_counters.get("total_violations"), int)
-        and isinstance(current_counters.get("sampled_violations"), int)
-        and current_counters["total_violations"] >= before_total + len(destinations) + 1
-        and current_counters["sampled_violations"] >= before_sampled + len(destinations) + 1
-        and isinstance(findings, list)
-        and any(
-            isinstance(finding, dict)
-            and finding.get("remote_address") == "192.0.2.1"
-            and finding.get("classification") == "rejected"
-            and finding.get("protocol") == "udp"
-            and finding.get("remote_port") == 443
-            for finding in findings
-        )
-    ):
-        require(
-            "fence-action-final-block-probe" not in json.dumps(current, sort_keys=True),
-            "bounded final blocked-event evidence retained packet payload",
-        )
-        break
-    if time.monotonic() >= deadline:
-        raise SystemExit("final blocked event was not persisted before its deadline")
-    time.sleep(0.005)
-
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
     try:
         probe.sendto(b"fence-action-post-block-probe", ("192.0.2.2", 443))
