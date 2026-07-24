@@ -50,6 +50,7 @@ if sys.flags.optimize != 0:
 
 import json
 import pathlib
+import re
 import socket
 import time
 
@@ -75,6 +76,12 @@ require(
     and before_sampled >= 0,
     "bounded blocked-event evidence requires valid initial counters",
 )
+before_ruleset_hash = initial.get("ruleset_hash")
+require(
+    isinstance(before_ruleset_hash, str)
+    and re.fullmatch(r"[0-9a-f]{64}", before_ruleset_hash) is not None,
+    "bounded blocked-event evidence requires a valid initial firewall epoch",
+)
 
 destinations = tuple(f"192.0.2.{index}" for index in range(10, 50))
 for destination in destinations:
@@ -88,6 +95,7 @@ deadline = time.monotonic() + 1.0
 while True:
     current = json.loads(report_path.read_text(encoding="utf-8"))
     current_counters = current.get("counters")
+    current_ruleset_hash = current.get("ruleset_hash")
     findings = current.get("findings")
     if (
         current.get("mode") == "block"
@@ -95,8 +103,16 @@ while True:
         and current.get("critical_findings") == []
         and isinstance(current_counters, dict)
         and isinstance(current_counters.get("total_violations"), int)
+        and not isinstance(current_counters.get("total_violations"), bool)
         and isinstance(current_counters.get("sampled_violations"), int)
-        and current_counters["total_violations"] >= before_total + len(destinations)
+        and not isinstance(current_counters.get("sampled_violations"), bool)
+        and current_counters["total_violations"] >= 0
+        and isinstance(current_ruleset_hash, str)
+        and re.fullmatch(r"[0-9a-f]{64}", current_ruleset_hash) is not None
+        and (
+            current_ruleset_hash != before_ruleset_hash
+            or current_counters["total_violations"] >= before_total + len(destinations)
+        )
         and current_counters["sampled_violations"] >= before_sampled + len(destinations)
         and isinstance(findings, list)
         and set(destinations).issubset({
