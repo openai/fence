@@ -41,6 +41,7 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
+const { settleResidentReport } = require("./post.cts");
 const {
   fenceErrorCodeFromJournal,
   residentServiceArgs,
@@ -1178,6 +1179,278 @@ test("requires active registered Action path guards to remain exact writable mou
   );
 });
 
+test("settles queued network evidence in a fixed monotonic four-read window", () => {
+  const initial = {
+    ...report,
+    counters: { total_violations: 0, sampled_violations: 0 },
+  };
+  const snapshots = Array.from({ length: 4 }, (_, index) => ({
+    ...initial,
+    counters: {
+      total_violations: index + 1,
+      sampled_violations: index + 1,
+    },
+  }));
+  let elapsed = 0n;
+  let reads = 0;
+  const pauses: number[] = [];
+  const serviceChecks: Array<[string, unknown]> = [];
+
+  const settled = settleResidentReport(
+    "/run/fence/action-test/report.json",
+    "fence-action-test.service",
+    initial,
+    {
+      now: () => elapsed,
+      pause: (milliseconds: number) => {
+        pauses.push(milliseconds);
+        elapsed += BigInt(milliseconds) * 1_000_000n;
+      },
+      read: (file: string) => {
+        assert.equal(file, "/run/fence/action-test/report.json");
+        return snapshots[reads++];
+      },
+      verifyService: (unit: string, pid: unknown) => {
+        serviceChecks.push([unit, pid]);
+      },
+    },
+  );
+
+  assert.equal(settled, snapshots[3]);
+  assert.equal(reads, 4);
+  assert.deepEqual(pauses, [40, 40, 40, 40]);
+  assert.equal(elapsed, 160_000_000n);
+  assert.deepEqual(serviceChecks, [
+    ["fence-action-test.service", 4242],
+    ["fence-action-test.service", 4242],
+  ]);
+});
+
+test("settles bounded block, degraded-block, and audit evidence", () => {
+  const variants = [
+    report,
+    {
+      ...report,
+      status: "protected_host_block_degraded",
+      readiness_status: "ready_degraded",
+      setup_status: "resident_degraded",
+      protection_available: false,
+      container_status: "preserved_unsafe",
+    },
+    {
+      ...report,
+      status: "protected_host_audit_observation",
+      mode: "audit",
+      readiness_status: "ready_observation_only",
+      setup_status: "resident_observation_only",
+      protection_available: false,
+      sudo_status: "preserved_verified",
+      container_status: "preserved_verified",
+    },
+  ];
+
+  for (const variant of variants) {
+    const initial = {
+      ...variant,
+      counters: { total_violations: 1, sampled_violations: 1 },
+    };
+    const latest = {
+      ...initial,
+      counters: { total_violations: 2, sampled_violations: 2 },
+    };
+    let elapsed = 0n;
+    let reads = 0;
+    let serviceChecks = 0;
+    const settled = settleResidentReport("/run/fence/test/report.json", "fence-test.service", initial, {
+      now: () => elapsed,
+      pause: (milliseconds: number) => {
+        elapsed += BigInt(milliseconds) * 1_000_000n;
+      },
+      read: () => {
+        reads += 1;
+        return latest;
+      },
+      verifyService: () => {
+        serviceChecks += 1;
+      },
+    });
+
+    assert.equal(settled, latest);
+    assert.equal(reads, 4);
+    assert.equal(serviceChecks, 2);
+  }
+});
+
+test("rejects swapped or decreasing reports during bounded evidence settlement", () => {
+  const initial = {
+    ...report,
+    counters: { total_violations: 4, sampled_violations: 3 },
+  };
+  const invalidSnapshots: Array<[any, RegExp]> = [
+    [{ ...initial, policy_hash: "d".repeat(64) }, /identity changed/],
+    [{ ...initial, resident_health: residentHealth({ resident_pid: 9000 }) }, /identity changed/],
+    [{ ...initial, counters: { total_violations: 3, sampled_violations: 3 } }, /counters decreased/],
+    [{ ...initial, counters: { total_violations: 4, sampled_violations: 2 } }, /counters decreased/],
+    [{ ...initial, counters: { total_violations: -1, sampled_violations: 3 } }, /bounded network counters/],
+    [{ ...initial, counters: { total_violations: 4, sampled_violations: "3" } }, /bounded network counters/],
+    [{ ...initial, runtime_evidence_schema_version: 4 }, /reviewed hosted-runner profile/],
+  ];
+
+  for (const [snapshot, expected] of invalidSnapshots) {
+    let elapsed = 0n;
+    assert.throws(() => settleResidentReport(
+      "/run/fence/test/report.json",
+      "fence-test.service",
+      initial,
+      {
+        now: () => elapsed,
+        pause: (milliseconds: number) => {
+          elapsed += BigInt(milliseconds) * 1_000_000n;
+        },
+        read: () => snapshot,
+        verifyService: () => {},
+      },
+    ), expected);
+  }
+});
+
+test("preserves a validated critical report during final evidence settlement", () => {
+  const initial = {
+    ...report,
+    counters: { total_violations: 1, sampled_violations: 1 },
+  };
+  const critical = {
+    ...initial,
+    network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "dns_block_network_drift",
+      message: "DNS-mediated owned nftables state drifted after readiness",
+    }],
+  };
+  let elapsed = 0n;
+  let reads = 0;
+  let serviceChecks = 0;
+  const settled = settleResidentReport("/run/fence/test/report.json", "fence-test.service", initial, {
+    now: () => elapsed,
+    pause: (milliseconds: number) => {
+      elapsed += BigInt(milliseconds) * 1_000_000n;
+    },
+    read: () => {
+      reads += 1;
+      return critical;
+    },
+    verifyService: () => {
+      serviceChecks += 1;
+    },
+  });
+
+  assert.equal(settled, critical);
+  assert.equal(reads, 1);
+  assert.equal(serviceChecks, 2);
+  assert.throws(() => validateReport(settled, true), /critical resident findings/);
+});
+
+test("does not delay or reread an already critical resident report", () => {
+  const critical = {
+    ...report,
+    network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "dns_block_network_drift",
+      message: "DNS-mediated owned nftables state drifted after readiness",
+    }],
+  };
+  let serviceChecks = 0;
+  const settled = settleResidentReport("/run/fence/test/report.json", "fence-test.service", critical, {
+    now: () => {
+      throw new Error("critical evidence must not start a settlement clock");
+    },
+    pause: () => {
+      throw new Error("critical evidence must not be delayed");
+    },
+    read: () => {
+      throw new Error("critical evidence must not be reread");
+    },
+    verifyService: () => {
+      serviceChecks += 1;
+    },
+  });
+
+  assert.equal(settled, critical);
+  assert.equal(serviceChecks, 1);
+});
+
+test("rejects malformed initial counters and an unverifiable final resident service", () => {
+  for (const counters of [
+    undefined,
+    null,
+    [],
+    { total_violations: 0, sampled_violations: -1 },
+    { total_violations: Number.MAX_SAFE_INTEGER + 1, sampled_violations: 0 },
+  ]) {
+    assert.throws(() => settleResidentReport(
+      "/run/fence/test/report.json",
+      "fence-test.service",
+      { ...report, counters },
+      { verifyService: () => {} },
+    ), /bounded network counters/);
+  }
+
+  let checks = 0;
+  let elapsed = 0n;
+  const initial = {
+    ...report,
+    counters: { total_violations: 0, sampled_violations: 0 },
+  };
+  assert.throws(() => settleResidentReport(
+    "/run/fence/test/report.json",
+    "fence-test.service",
+    initial,
+    {
+      now: () => elapsed,
+      pause: (milliseconds: number) => {
+        elapsed += BigInt(milliseconds) * 1_000_000n;
+      },
+      read: () => initial,
+      verifyService: () => {
+        checks += 1;
+        if (checks === 2) {
+          throw new Error("resident service changed");
+        }
+      },
+    },
+  ), /resident service changed/);
+  assert.equal(checks, 2);
+});
+
+test("never exceeds the fixed evidence reread count when a monotonic clock stalls", () => {
+  const initial = {
+    ...report,
+    counters: { total_violations: 0, sampled_violations: 0 },
+  };
+  let reads = 0;
+  let pauses = 0;
+
+  const settled = settleResidentReport("/run/fence/test/report.json", "fence-test.service", initial, {
+    now: () => 0n,
+    pause: () => {
+      pauses += 1;
+    },
+    read: () => {
+      reads += 1;
+      return initial;
+    },
+    verifyService: () => {},
+  });
+
+  assert.equal(settled, initial);
+  assert.equal(reads, 4);
+  assert.equal(pauses, 4);
+});
+
 test("validates stable runtime evidence", () => {
   validateReport(report);
   const dnsEvidence = dnsEvidenceFor(report);
@@ -2124,6 +2397,51 @@ test("renders audit network decisions and hostname and direct-IP allowlist sugge
   assert.match(humanReport, /2001:db8::10/);
 });
 
+test("retains both final denied burst destinations in one bounded warning report", () => {
+  const destinations = [
+    "192.0.2.1",
+    "192.0.2.2",
+    ...Array.from({ length: 40 }, (_, index) => `192.0.2.${index + 10}`),
+  ];
+  const burst = {
+    ...report,
+    counters: { total_violations: 42, sampled_violations: 42 },
+    findings: destinations.map((destination, index) => ({
+      timestamp: `unix-ms:${index + 1}`,
+      mode: "block",
+      classification: "rejected",
+      family: "ipv4",
+      protocol: "udp",
+      remote_address: destination,
+      remote_port: 443,
+      rule_class: "undeclared_new_egress",
+    })),
+    findings_truncated: false,
+  };
+  const document = parsedStructuredNetworkReport(burst, dnsEvidenceFor(burst));
+
+  assert.equal(document.mode, "block");
+  assert.equal(document.result, "warning");
+  assert.equal(document.network.length, 20);
+  assert.equal(document.omissions.network_rows, 22);
+  assert.equal(document.omissions.byte_budget_exceeded, false);
+  assert.equal(document.omissions.source_truncated, false);
+  assert.equal(document.warnings.critical_findings, 0);
+  assert.equal(document.warnings.github_artifact_uploads_enabled, false);
+  for (const destination of ["192.0.2.1", "192.0.2.2"]) {
+    const rows = document.network.filter((row: any) => row.destination === destination);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].destination_kind, "ip");
+    assert.equal(rows[0].decision, "blocked");
+    assert.deepEqual(rows[0].activities, [{
+      kind: "connection_attempt",
+      protocol: "udp",
+      port: 443,
+      count: 1,
+    }]);
+  }
+});
+
 test("caps structured network rows and explicitly reports omitted evidence", () => {
   const dnsEvidence = {
     observations: Array.from({ length: 27 }, (_, index) => ({
@@ -2791,6 +3109,10 @@ test("renders DNS materialization request rejection evidence as a non-critical w
     observations_truncated: false,
     materialization_request_rejections: 2,
   };
+  const structured = parsedStructuredNetworkReport(report, dnsEvidence);
+  assert.equal(structured.result, "warning");
+  assert.equal(structured.warnings.materialization_rejections, 2);
+  assert.equal(structured.warnings.critical_findings, 0);
   assert.equal(materializationRequestRejections(dnsEvidence), 2);
   assert.equal(materializationRequestRejections({ materialization_request_rejections: -1 }), 0);
   assert.equal(materializationRequestRejections({ materialization_request_rejections: "2" }), 0);

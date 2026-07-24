@@ -34,7 +34,12 @@ import zipfile
 
 sys.path.insert(0, os.path.join(sys.argv[1], "script", "lib"))
 
-from protected_finalization import validate_finalization_jobs
+from protected_finalization import (
+    ACTION_ZERO_INPUT_BURST_JOB,
+    validate_action_zero_input_burst_job,
+    validate_action_zero_input_burst_report,
+    validate_finalization_jobs,
+)
 
 repository = os.environ["GITHUB_REPOSITORY"]
 run_id = os.environ["GITHUB_RUN_ID"]
@@ -153,9 +158,12 @@ def action_structured_reports(payload, job_name):
             raise SystemExit(
                 f"protected finalization structured report version was invalid: {job_name}"
             )
-        if report["mode"] != "block" or report["result"] != "healthy":
+        expected_result = (
+            "warning" if job_name == ACTION_ZERO_INPUT_BURST_JOB else "healthy"
+        )
+        if report["mode"] != "block" or report["result"] != expected_result:
             raise SystemExit(
-                f"protected finalization structured report was not healthy block evidence: "
+                f"protected finalization structured report was not expected block evidence: "
                 f"{job_name}"
             )
         controls = report["controls"]
@@ -206,6 +214,8 @@ document = json.loads(body)
 
 try:
     jobs = validate_finalization_jobs(document, job_set)
+    if job_set == "action":
+        jobs[ACTION_ZERO_INPUT_BURST_JOB] = validate_action_zero_input_burst_job(document)
 except ValueError as error:
     raise SystemExit(str(error)) from None
 
@@ -250,10 +260,17 @@ for name in sorted(jobs):
         raise SystemExit(
             f"protected finalization job must contain exactly one structured report: {name}"
         )
+    if job_set == "action" and name == ACTION_ZERO_INPUT_BURST_JOB:
+        try:
+            validate_action_zero_input_burst_report(reports[0])
+        except ValueError as error:
+            raise SystemExit(str(error)) from None
     if job_set == "integration" and name.startswith("protected finalization "):
         authorization_observed = authorization_observed or marker_observed
 
 print(f"{job_set} finalization and downloadable job logs verified")
+if job_set == "action":
+    print("bounded blocked-burst and final post-job evidence verified")
 if authorization_observed:
     print("runner-authorized results storage was observed after Fence readiness")
 PY

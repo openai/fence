@@ -7,6 +7,9 @@ import unittest
 
 
 MAX_PROTECTED_SECONDS = 180
+ACTION_ZERO_INPUT_BURST_JOB = "action zero-input standard"
+ACTION_ZERO_INPUT_BURST_ACTIVATION = "activate bundled Fence agent with strict defaults"
+ACTION_ZERO_INPUT_BURST_DESTINATIONS = ("192.0.2.1", "192.0.2.2")
 EXPECTED_FINALIZATION_STEPS = {
     "integration": {
         "protected finalization quiet-1": "run quiet packaged trusted-launcher block",
@@ -154,6 +157,128 @@ def validate_finalization_jobs(document, job_set):
     return jobs
 
 
+def validate_action_zero_input_burst_job(document):
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
+        raise ValueError("blocked-burst job metadata was invalid")
+
+    matching = []
+    for job in document["jobs"]:
+        if not isinstance(job, dict) or not isinstance(job.get("name"), str):
+            raise ValueError("blocked-burst job metadata was invalid")
+        observed_name = job["name"]
+        if observed_name != ACTION_ZERO_INPUT_BURST_JOB and not observed_name.endswith(
+            f" / {ACTION_ZERO_INPUT_BURST_JOB}"
+        ):
+            continue
+        if observed_name != ACTION_ZERO_INPUT_BURST_JOB:
+            prefix = observed_name[: -(len(ACTION_ZERO_INPUT_BURST_JOB) + 3)]
+            if (
+                not prefix
+                or len(prefix) > 128
+                or any(ord(character) < 0x20 or ord(character) == 0x7F for character in prefix)
+            ):
+                raise ValueError("blocked-burst reusable-workflow prefix was invalid")
+        matching.append(job)
+
+    if len(matching) != 1:
+        raise ValueError("blocked-burst job was missing or duplicated")
+    job = matching[0]
+    job_id = job.get("id")
+    if not isinstance(job_id, int) or isinstance(job_id, bool) or job_id <= 0:
+        raise ValueError("blocked-burst job identifier was invalid")
+    if job.get("status") != "completed" or job.get("conclusion") != "success":
+        raise ValueError("blocked-burst job did not complete successfully")
+    started = _timestamp(job.get("started_at"), "blocked-burst job start")
+    completed = _timestamp(job.get("completed_at"), "blocked-burst job completion")
+    steps = job.get("steps")
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        raise ValueError("blocked-burst job steps were invalid")
+
+    ordered_steps = []
+    for name, description in (
+        (ACTION_ZERO_INPUT_BURST_ACTIVATION, "blocked-burst activation"),
+        ("verify zero-input Action lifecycle", "blocked-burst evidence"),
+        (f"Post {ACTION_ZERO_INPUT_BURST_ACTIVATION}", "blocked-burst post hook"),
+    ):
+        matches = [step for step in steps if step.get("name") == name]
+        if len(matches) != 1:
+            raise ValueError(f"{description} was missing or duplicated")
+        ordered_steps.append(_successful_step(matches[0], ACTION_ZERO_INPUT_BURST_JOB, description))
+
+    (activated, activation_completed), (evidence_started, evidence_completed), (
+        post_started,
+        post_completed,
+    ) = ordered_steps
+    if not (
+        started
+        <= activated
+        <= activation_completed
+        <= evidence_started
+        <= evidence_completed
+        <= post_started
+        <= post_completed
+        <= completed
+    ):
+        raise ValueError("blocked-burst job and post-hook timestamps were out of order")
+    return job
+
+
+def validate_action_zero_input_burst_report(report):
+    if not isinstance(report, dict) or report.get("mode") != "block" or report.get("result") != "warning":
+        raise ValueError("blocked-burst report was not verified warning-mode block evidence")
+    omissions = report.get("omissions")
+    if (
+        not isinstance(omissions, dict)
+        or type(omissions.get("network_rows")) is not int
+        or omissions["network_rows"] <= 0
+        or omissions.get("byte_budget_exceeded") is not False
+        or omissions.get("source_truncated") is not False
+    ):
+        raise ValueError("blocked-burst report did not disclose bounded network row omissions")
+    warnings = report.get("warnings")
+    if (
+        not isinstance(warnings, dict)
+        or type(warnings.get("critical_findings")) is not int
+        or warnings["critical_findings"] != 0
+        or warnings.get("github_artifact_uploads_enabled") is not False
+    ):
+        raise ValueError("blocked-burst report contained critical or artifact-enabled evidence")
+    network = report.get("network")
+    if not isinstance(network, list) or len(network) > 20:
+        raise ValueError("blocked-burst report did not contain bounded network evidence")
+
+    for destination in ACTION_ZERO_INPUT_BURST_DESTINATIONS:
+        rows = [
+            row
+            for row in network
+            if isinstance(row, dict)
+            and row.get("destination_kind") == "ip"
+            and row.get("destination") == destination
+            and row.get("decision") == "blocked"
+            and type(row.get("count")) is int
+            and row["count"] > 0
+        ]
+        if len(rows) != 1:
+            raise ValueError(f"blocked-burst destination was missing or duplicated: {destination}")
+        activities = rows[0].get("activities")
+        if (
+            not isinstance(activities, list)
+            or sum(
+                isinstance(activity, dict)
+                and activity.get("kind") == "connection_attempt"
+                and activity.get("protocol") == "udp"
+                and type(activity.get("port")) is int
+                and activity["port"] == 443
+                and type(activity.get("count")) is int
+                and activity["count"] > 0
+                for activity in activities
+            )
+            != 1
+        ):
+            raise ValueError(f"blocked-burst UDP evidence was invalid: {destination}")
+    return report
+
+
 class ProtectedFinalizationTests(unittest.TestCase):
     def document(self, job_set="integration", protected_seconds=45, setup_seconds=155):
         base = datetime.datetime(2026, 7, 23, tzinfo=datetime.timezone.utc)
@@ -196,6 +321,160 @@ class ProtectedFinalizationTests(unittest.TestCase):
                 }
             )
         return {"jobs": jobs}
+
+    def action_burst_document(self, prefix=""):
+        document = self.document("action")
+        job = copy.deepcopy(document["jobs"][0])
+        job["id"] = 99
+        job["name"] = (
+            f"{prefix} / {ACTION_ZERO_INPUT_BURST_JOB}"
+            if prefix
+            else ACTION_ZERO_INPUT_BURST_JOB
+        )
+        activation = job["steps"][0]
+        activation["name"] = ACTION_ZERO_INPUT_BURST_ACTIVATION
+        post = job["steps"][1]
+        post["name"] = f"Post {ACTION_ZERO_INPUT_BURST_ACTIVATION}"
+        evidence = {
+            "name": "verify zero-input Action lifecycle",
+            "status": "completed",
+            "conclusion": "success",
+            "started_at": activation["completed_at"],
+            "completed_at": activation["completed_at"],
+        }
+        job["steps"] = [activation, evidence, post]
+        document["jobs"].append(job)
+        return document
+
+    def action_burst_report(self):
+        return {
+            "mode": "block",
+            "result": "warning",
+            "warnings": {
+                "critical_findings": 0,
+                "github_artifact_uploads_enabled": False,
+            },
+            "omissions": {
+                "network_rows": 22,
+                "byte_budget_exceeded": False,
+                "source_truncated": False,
+            },
+            "network": [
+                {
+                    "destination_kind": "ip",
+                    "destination": destination,
+                    "decision": "blocked",
+                    "count": 1,
+                    "activities": [
+                        {
+                            "kind": "connection_attempt",
+                            "protocol": "udp",
+                            "port": 443,
+                            "count": 1,
+                        }
+                    ],
+                }
+                for destination in ACTION_ZERO_INPUT_BURST_DESTINATIONS
+            ],
+        }
+
+    def test_blocked_burst_job_preserves_exactly_three_quiet_replicas(self):
+        for prefix in ("", "release verification"):
+            with self.subTest(prefix=prefix):
+                document = self.action_burst_document(prefix)
+                job = validate_action_zero_input_burst_job(document)
+                self.assertEqual(job["id"], 99)
+                self.assertEqual(
+                    set(validate_finalization_jobs(document, "action")),
+                    set(EXPECTED_FINALIZATION_STEPS["action"]),
+                )
+
+    def test_missing_or_duplicated_blocked_burst_jobs_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "missing or duplicated"):
+            validate_action_zero_input_burst_job(self.document("action"))
+
+        document = self.action_burst_document()
+        duplicate = copy.deepcopy(document["jobs"][-1])
+        duplicate["name"] = f"release / {ACTION_ZERO_INPUT_BURST_JOB}"
+        document["jobs"].append(duplicate)
+        with self.assertRaisesRegex(ValueError, "missing or duplicated"):
+            validate_action_zero_input_burst_job(document)
+
+        for prefix in ("x" * 129, "bad\nname", "bad\x7fname"):
+            with self.subTest(prefix=repr(prefix)):
+                with self.assertRaisesRegex(ValueError, "prefix was invalid"):
+                    validate_action_zero_input_burst_job(self.action_burst_document(prefix))
+
+    def test_blocked_burst_requires_exact_successful_activation_evidence_and_post(self):
+        for index, expression in (
+            (0, "activation"),
+            (1, "evidence"),
+            (2, "post hook"),
+        ):
+            for field, value in (("name", "unexpected"), ("status", "in_progress"), ("conclusion", "failure")):
+                with self.subTest(index=index, field=field, value=value):
+                    document = self.action_burst_document()
+                    document["jobs"][-1]["steps"][index][field] = value
+                    with self.assertRaisesRegex(ValueError, expression):
+                        validate_action_zero_input_burst_job(document)
+
+        for job_id in (None, 0, -1, True, "99"):
+            with self.subTest(job_id=job_id):
+                document = self.action_burst_document()
+                document["jobs"][-1]["id"] = job_id
+                with self.assertRaisesRegex(ValueError, "identifier was invalid"):
+                    validate_action_zero_input_burst_job(document)
+
+    def test_blocked_burst_job_rejects_invalid_or_reversed_timestamps(self):
+        for index, field, value in (
+            (0, "started_at", "invalid"),
+            (1, "started_at", "2026-07-23T00:00:00"),
+            (2, "completed_at", "2026-07-23T00:00:00Z"),
+        ):
+            with self.subTest(index=index, field=field):
+                document = self.action_burst_document()
+                document["jobs"][-1]["steps"][index][field] = value
+                with self.assertRaisesRegex(ValueError, "timestamp|out of order"):
+                    validate_action_zero_input_burst_job(document)
+
+    def test_blocked_burst_report_requires_both_exact_final_udp_destinations(self):
+        report = self.action_burst_report()
+        self.assertIs(validate_action_zero_input_burst_report(report), report)
+
+        invalid = []
+        for field, value in (
+            ("mode", "audit"),
+            ("result", "healthy"),
+        ):
+            candidate = copy.deepcopy(report)
+            candidate[field] = value
+            invalid.append((candidate, "warning-mode block"))
+        for field, value in (
+            ("network_rows", 0),
+            ("network_rows", True),
+            ("byte_budget_exceeded", True),
+            ("source_truncated", True),
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["omissions"][field] = value
+            invalid.append((candidate, "row omissions"))
+        for field, value in (("critical_findings", 1), ("github_artifact_uploads_enabled", True)):
+            candidate = copy.deepcopy(report)
+            candidate["warnings"][field] = value
+            invalid.append((candidate, "critical or artifact"))
+        for index in range(len(ACTION_ZERO_INPUT_BURST_DESTINATIONS)):
+            candidate = copy.deepcopy(report)
+            candidate["network"].pop(index)
+            invalid.append((candidate, "destination was missing"))
+        for field, value in (("kind", "dns_query"), ("protocol", "tcp"), ("port", 8443), ("count", 0)):
+            candidate = copy.deepcopy(report)
+            candidate["network"][0]["activities"][0][field] = value
+            invalid.append((candidate, "UDP evidence"))
+
+        for candidate, expression in invalid:
+            with self.subTest(expression=expression, report=repr(candidate)):
+                with self.assertRaisesRegex(ValueError, expression):
+                    validate_action_zero_input_burst_report(candidate)
 
     def test_slow_setup_does_not_consume_the_protected_budget(self):
         for job_set in EXPECTED_FINALIZATION_STEPS:

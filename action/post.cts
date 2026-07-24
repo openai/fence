@@ -32,6 +32,9 @@ const {
 const ACTION_ROOT = __dirname;
 const BINARY = path.join(ACTION_ROOT, "bin", "fence");
 const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
+const EVIDENCE_SETTLE_INTERVAL_MILLISECONDS = 40;
+const EVIDENCE_SETTLE_MAX_READS = 4;
+const EVIDENCE_SETTLE_TIMEOUT_NANOSECONDS = 160_000_000n;
 const CHILD_ENV = {
   LANG: "C.UTF-8",
   LC_ALL: "C.UTF-8",
@@ -67,6 +70,101 @@ function validateResidentService(unit: string, expectedPid: unknown): void {
     throw new Error("Fence resident service status could not be verified");
   }
   validateResidentUnitStatus(String(result.stdout || ""), expectedPid);
+}
+
+type ResidentEvidenceSettleControls = {
+  now?: () => bigint;
+  pause?: (milliseconds: number) => void;
+  read?: (reportPath: string) => any;
+  verifyService?: (unit: string, expectedPid: unknown) => void;
+};
+
+function networkEvidenceCounters(report: any): { total: number; sampled: number } {
+  const counters = report.counters;
+  if (
+    counters === null ||
+    Array.isArray(counters) ||
+    typeof counters !== "object" ||
+    !Number.isSafeInteger(counters.total_violations) ||
+    counters.total_violations < 0 ||
+    !Number.isSafeInteger(counters.sampled_violations) ||
+    counters.sampled_violations < 0
+  ) {
+    throw new Error("Fence resident report does not contain bounded network counters");
+  }
+  return {
+    total: counters.total_violations,
+    sampled: counters.sampled_violations,
+  };
+}
+
+function settleResidentReport(
+  reportPath: string,
+  unit: string,
+  initialReport: any,
+  controls: ResidentEvidenceSettleControls = {},
+): any {
+  const now = controls.now || (() => process.hrtime.bigint());
+  const pause = controls.pause || ((milliseconds: number) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+  });
+  const read = controls.read || ((file: string) =>
+    readJsonBounded(file, MAX_REPORT_BYTES, "Fence report"));
+  const verifyService = controls.verifyService || validateResidentService;
+  let report = validateReport(initialReport, false);
+  verifyService(unit, report.resident_health.resident_pid);
+  if (report.critical_findings.length > 0) {
+    return report;
+  }
+
+  let counters = networkEvidenceCounters(report);
+  const started = now();
+  const deadline = started + EVIDENCE_SETTLE_TIMEOUT_NANOSECONDS;
+  const identityFields = [
+    "runtime_evidence_schema_version",
+    "status",
+    "mode",
+    "allow_github_artifacts",
+    "readiness_status",
+    "platform_profile_id",
+    "profile_realization_id",
+    "policy_hash_schema_version",
+    "policy_hash",
+    "base_ruleset_hash",
+    "setup_status",
+    "protection_available",
+  ];
+
+  for (let index = 0; index < EVIDENCE_SETTLE_MAX_READS; index += 1) {
+    const remaining = deadline - now();
+    if (remaining <= 0n) {
+      break;
+    }
+    const remainingMilliseconds = Number((remaining + 999_999n) / 1_000_000n);
+    pause(Math.min(EVIDENCE_SETTLE_INTERVAL_MILLISECONDS, remainingMilliseconds));
+    const next = validateReport(read(reportPath), false);
+    if (
+      identityFields.some((field) => next[field] !== initialReport[field]) ||
+      next.resident_health.resident_pid !== initialReport.resident_health.resident_pid
+    ) {
+      throw new Error("Fence resident report identity changed during final evidence settlement");
+    }
+    if (next.critical_findings.length > 0) {
+      verifyService(unit, next.resident_health.resident_pid);
+      return next;
+    }
+    const nextCounters = networkEvidenceCounters(next);
+    if (
+      nextCounters.total < counters.total ||
+      nextCounters.sampled < counters.sampled
+    ) {
+      throw new Error("Fence resident network counters decreased during final evidence settlement");
+    }
+    counters = nextCounters;
+    report = next;
+  }
+  verifyService(unit, report.resident_health.resident_pid);
+  return report;
 }
 
 function validateProtectedActionMount(actionRoot: string): void {
@@ -112,11 +210,11 @@ function main(): void {
     pathGuards,
   );
   validateBundle(MANIFEST, BINARY);
-  const report = validateReport(
+  const initialReport = validateReport(
     readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
     false,
   );
-  validateResidentService(paths.unit, report.resident_health.resident_pid);
+  const report = settleResidentReport(reportPath, paths.unit, initialReport);
   let dnsEvidence;
   const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
   if (fs.existsSync(effectiveDnsReportPath)) {
@@ -234,4 +332,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main };
+module.exports = { main, settleResidentReport };

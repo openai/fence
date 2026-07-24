@@ -41,6 +41,129 @@ probe_https_once() {
   curl --head --silent --show-error --max-time 10 --retry 0 --output /dev/null "$url"
 }
 
+assert_block_evidence_drains() {
+  python3 -E - "$report" <<'PY'
+import sys
+
+if sys.flags.optimize != 0:
+    raise SystemExit("Python optimization must be disabled")
+
+import json
+import pathlib
+import socket
+import time
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+
+
+report_path = pathlib.Path(sys.argv[1])
+initial = json.loads(report_path.read_text(encoding="utf-8"))
+require(initial.get("mode") == "block", "bounded blocked-event evidence requires block mode")
+counters = initial.get("counters")
+require(isinstance(counters, dict), "bounded blocked-event evidence requires network counters")
+before_total = counters.get("total_violations")
+before_sampled = counters.get("sampled_violations")
+require(
+    isinstance(before_total, int)
+    and not isinstance(before_total, bool)
+    and before_total >= 0
+    and isinstance(before_sampled, int)
+    and not isinstance(before_sampled, bool)
+    and before_sampled >= 0,
+    "bounded blocked-event evidence requires valid initial counters",
+)
+
+destinations = tuple(f"192.0.2.{index}" for index in range(10, 50))
+for destination in destinations:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        try:
+            probe.sendto(b"fence-action-block-probe", (destination, 443))
+        except OSError:
+            pass
+
+deadline = time.monotonic() + 1.0
+while True:
+    current = json.loads(report_path.read_text(encoding="utf-8"))
+    current_counters = current.get("counters")
+    findings = current.get("findings")
+    if (
+        current.get("mode") == "block"
+        and current.get("network_verification_status") == "verified"
+        and current.get("critical_findings") == []
+        and isinstance(current_counters, dict)
+        and isinstance(current_counters.get("total_violations"), int)
+        and isinstance(current_counters.get("sampled_violations"), int)
+        and current_counters["total_violations"] >= before_total + len(destinations)
+        and current_counters["sampled_violations"] >= before_sampled + len(destinations)
+        and isinstance(findings, list)
+        and set(destinations).issubset({
+            finding.get("remote_address")
+            for finding in findings
+            if isinstance(finding, dict)
+            and finding.get("classification") == "rejected"
+            and finding.get("protocol") == "udp"
+            and finding.get("remote_port") == 443
+        })
+    ):
+        require(
+            "fence-action-block-probe" not in json.dumps(current, sort_keys=True),
+            "bounded blocked-event evidence retained packet payload",
+        )
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("bounded blocked-event burst was not persisted before its deadline")
+    time.sleep(0.01)
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+    try:
+        probe.sendto(b"fence-action-final-block-probe", ("192.0.2.1", 443))
+    except OSError:
+        pass
+
+deadline = time.monotonic() + 0.5
+while True:
+    current = json.loads(report_path.read_text(encoding="utf-8"))
+    current_counters = current.get("counters")
+    findings = current.get("findings")
+    if (
+        current.get("mode") == "block"
+        and current.get("network_verification_status") == "verified"
+        and current.get("critical_findings") == []
+        and isinstance(current_counters, dict)
+        and isinstance(current_counters.get("total_violations"), int)
+        and isinstance(current_counters.get("sampled_violations"), int)
+        and current_counters["total_violations"] >= before_total + len(destinations) + 1
+        and current_counters["sampled_violations"] >= before_sampled + len(destinations) + 1
+        and isinstance(findings, list)
+        and any(
+            isinstance(finding, dict)
+            and finding.get("remote_address") == "192.0.2.1"
+            and finding.get("classification") == "rejected"
+            and finding.get("protocol") == "udp"
+            and finding.get("remote_port") == 443
+            for finding in findings
+        )
+    ):
+        require(
+            "fence-action-final-block-probe" not in json.dumps(current, sort_keys=True),
+            "bounded final blocked-event evidence retained packet payload",
+        )
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("final blocked event was not persisted before its deadline")
+    time.sleep(0.005)
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+    try:
+        probe.sendto(b"fence-action-post-block-probe", ("192.0.2.2", 443))
+    except OSError:
+        pass
+PY
+}
+
 exercise_docker_lifecycle() {
   local rootfs
   local library
@@ -410,6 +533,7 @@ def require(condition, message="evidence validation failed"):
 
 import json
 import pathlib
+import re
 import sys
 import time
 
@@ -447,7 +571,68 @@ require(dns["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require(dns["hostname_policy"]["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require("fence-action-audit-probe" not in json.dumps(report, sort_keys=True))
 require("fence-action-audit-probe" not in json.dumps(dns, sort_keys=True))
-require(dns["materialization_request_rejections"] == 0)
+materialization_rejections = dns.get("materialization_request_rejections")
+require(
+    type(materialization_rejections) is int
+    and 0 <= materialization_rejections <= (1 << 53) - 1,
+    "Fence DNS materialization rejection count must be a bounded nonnegative integer",
+)
+if materialization_rejections:
+    require(
+        scenario == "standard",
+        "explicit Fence Action acceptance scenarios must not reject DNS materializations",
+    )
+    require(
+        report.get("materializations_truncated") is False
+        and dns.get("observations_truncated") is False
+        and dns.get("bounded_githubapp_suffix_authorizations_truncated") is False,
+        "standard Fence Action materialization warnings require complete retained evidence",
+    )
+    require(
+        dns["hostname_policy"].get("allow_dynamic_githubapp_suffix") is True,
+        "standard Fence Action materialization warnings require enabled GitHub platform policy",
+    )
+    githubapp_authorizations = dns.get("bounded_githubapp_suffix_authorizations")
+    require(
+        isinstance(githubapp_authorizations, list)
+        and 1 <= len(githubapp_authorizations) <= 8
+        and all(isinstance(hostname, str) for hostname in githubapp_authorizations)
+        and githubapp_authorizations == sorted(set(githubapp_authorizations))
+        and all(
+            re.fullmatch(
+                r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.githubapp\.com",
+                hostname,
+            )
+            for hostname in githubapp_authorizations
+        ),
+        "standard Fence Action materialization warnings require bounded exact GitHub platform authorizations",
+    )
+    observations = dns.get("observations")
+    require(
+        isinstance(observations, list)
+        and all(isinstance(observation, dict) for observation in observations),
+        "standard Fence Action materialization warnings require retained DNS observations",
+    )
+    githubapp_observations = [
+        observation
+        for observation in observations
+        if observation.get("policy_classification") == "dynamic_platform"
+        and isinstance(observation.get("hostname"), str)
+        and observation["hostname"].endswith(".githubapp.com")
+    ]
+    require(
+        githubapp_observations
+        and all(
+            observation["hostname"] in githubapp_authorizations
+            and observation.get("query_type") in {"a", "aaaa"}
+            and type(observation.get("occurrences")) is int
+            and 1 <= observation["occurrences"] <= (1 << 53) - 1
+            for observation in githubapp_observations
+        )
+        and materialization_rejections
+        <= sum(observation["occurrences"] for observation in githubapp_observations),
+        "standard Fence Action materialization warnings must match observed authorized GitHub platform queries",
+    )
 require(dns["user_wildcard_request_rejections"] == 0)
 require(dns["bounded_user_wildcard_authorizations_truncated"] is False)
 wildcard_authorizations = dns["bounded_user_wildcard_authorizations"]
@@ -497,5 +682,9 @@ if scenario == "audit":
         for item in report["findings"]
     ))
 PY
+
+if [[ "$scenario" == "standard" ]]; then
+  assert_block_evidence_drains
+fi
 
 echo -e "${GREEN}Action acceptance verified:${OFF} $scenario"
