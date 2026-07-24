@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{Read, Result as IoResult};
+use std::io::{BufRead, BufReader, Read, Result as IoResult};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,7 @@ const MAX_PROCESSES: usize = 2_048;
 const MAX_FILE_DESCRIPTORS: usize = 8_192;
 const MAX_PARENT_EXECUTABLES: usize = 4;
 const MAX_PROC_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SOCKET_LINE_BYTES: u64 = 16 * 1024;
 const MAX_STATUS_FILE_BYTES: u64 = 64 * 1024;
 const MAX_EXECUTABLE_BASENAME_BYTES: usize = 128;
 const MAX_RUNNER_WORKER_ANCESTRY: usize = 8;
@@ -429,11 +430,16 @@ impl ProcAttributor {
     }
 
     fn attribute(&self, tuple: &SocketTuple) -> Result<LocalProcessAttribution, AttributionError> {
-        let inodes = match self.matching_socket_inodes(tuple)? {
-            BoundedScan::Values(inodes) => inodes,
-            BoundedScan::LimitExceeded => {
+        let inodes = match self.matching_socket_inodes(tuple) {
+            Ok(BoundedScan::Values(inodes)) => inodes,
+            Ok(BoundedScan::LimitExceeded) => {
                 return Ok(LocalProcessAttribution::unavailable(
                     AttributionStatus::ScanLimitExceeded,
+                ));
+            }
+            Err(_) => {
+                return Ok(LocalProcessAttribution::unavailable(
+                    AttributionStatus::WorkerUnavailable,
                 ));
             }
         };
@@ -447,11 +453,16 @@ impl ProcAttributor {
                 AttributionStatus::Ambiguous,
             ));
         }
-        let owners = match self.socket_owners(*inodes.first().expect("one inode exists"))? {
-            BoundedScan::Values(owners) => owners,
-            BoundedScan::LimitExceeded => {
+        let owners = match self.socket_owners(*inodes.first().expect("one inode exists")) {
+            Ok(BoundedScan::Values(owners)) => owners,
+            Ok(BoundedScan::LimitExceeded) => {
                 return Ok(LocalProcessAttribution::unavailable(
                     AttributionStatus::ScanLimitExceeded,
+                ));
+            }
+            Err(_) => {
+                return Ok(LocalProcessAttribution::unavailable(
+                    AttributionStatus::WorkerUnavailable,
                 ));
             }
         };
@@ -501,13 +512,13 @@ impl ProcAttributor {
             (SocketFamily::Ipv6, SocketProtocol::Tcp) => "tcp6",
             (SocketFamily::Ipv6, SocketProtocol::Udp) => "udp6",
         };
-        let contents = read_bounded(&self.proc_root.join("net").join(table), MAX_PROC_FILE_BYTES)
-            .map_err(|_| {
+        let file = File::open(self.proc_root.join("net").join(table)).map_err(|_| {
             AttributionError::new(
                 "attribution_socket_table_failed",
                 "process attribution could not read the required socket table",
             )
         })?;
+        let mut reader = BufReader::new(file);
         let local = proc_endpoint(&tuple.local_address, tuple.local_port, tuple.family);
         let remote = proc_endpoint(&tuple.remote_address, tuple.remote_port, tuple.family);
         let unspecified = match tuple.family {
@@ -517,10 +528,43 @@ impl ProcAttributor {
         let wildcard_local = proc_endpoint(&unspecified, tuple.local_port, tuple.family);
         let wildcard_remote = proc_endpoint(&unspecified, 0, tuple.family);
         let mut inodes = BTreeSet::new();
-        for (index, line) in contents.lines().skip(1).enumerate() {
-            if index >= MAX_SOCKET_ROWS {
+        let mut line = Vec::new();
+        let mut bytes_read = 0_u64;
+        let mut rows_read = 0_usize;
+        let mut header_read = false;
+        loop {
+            line.clear();
+            let count = (&mut reader)
+                .take(MAX_SOCKET_LINE_BYTES.saturating_add(1))
+                .read_until(b'\n', &mut line)
+                .map_err(|_| {
+                    AttributionError::new(
+                        "attribution_socket_table_failed",
+                        "process attribution could not read the required socket table",
+                    )
+                })?;
+            if count == 0 {
+                break;
+            }
+            let count = u64::try_from(count).unwrap_or(u64::MAX);
+            bytes_read = bytes_read.saturating_add(count);
+            if count > MAX_SOCKET_LINE_BYTES || bytes_read > MAX_PROC_FILE_BYTES {
                 return Ok(BoundedScan::LimitExceeded);
             }
+            let line = std::str::from_utf8(&line).map_err(|_| {
+                AttributionError::new(
+                    "attribution_socket_table_failed",
+                    "process attribution could not read the required socket table",
+                )
+            })?;
+            if !header_read {
+                header_read = true;
+                continue;
+            }
+            if rows_read >= MAX_SOCKET_ROWS {
+                return Ok(BoundedScan::LimitExceeded);
+            }
+            rows_read += 1;
             let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
             let local_matches = fields.len() > 9
                 && (fields[1].eq_ignore_ascii_case(&local)
@@ -886,6 +930,21 @@ mod tests {
         .unwrap();
     }
 
+    fn write_oversized_socket_table(root: &Path, protocol: &str, tuple: &SocketTuple) {
+        let local = proc_endpoint(&tuple.local_address, tuple.local_port, tuple.family);
+        let remote = proc_endpoint(&tuple.remote_address, tuple.remote_port, tuple.family);
+        let padding = "x".repeat(1024);
+        let mut table = String::from("header\n");
+        for index in 0..MAX_SOCKET_ROWS {
+            table.push_str(&format!(
+                "{index}: {local} {remote} 02 0 0 0 1001 0 {} {padding}\n",
+                index + 1
+            ));
+        }
+        assert!(u64::try_from(table.len()).unwrap() > MAX_PROC_FILE_BYTES);
+        fs::write(root.join("net").join(protocol), table).unwrap();
+    }
+
     fn write_process(root: &Path, pid: u32, uid: u32, parent: u32, executable: &str, inode: u64) {
         let directory = root.join(pid.to_string());
         fs::create_dir_all(directory.join("fd")).unwrap();
@@ -1070,6 +1129,144 @@ mod tests {
         assert_eq!(
             runner_uid_from_passwd(&passwd).unwrap_err().code,
             "attribution_runner_identity_failed"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_socket_tables_degrade_to_bounded_attribution() {
+        let root = root();
+        let tuple = tuple(SocketProtocol::Tcp);
+        write_oversized_socket_table(&root, "tcp", &tuple);
+        let attributor = ProcAttributor {
+            proc_root: root.clone(),
+            runner_uid: 1001,
+        };
+        let attribution = attributor.attribute(&tuple).unwrap();
+        assert_eq!(attribution.status, AttributionStatus::ScanLimitExceeded);
+        assert_eq!(attribution.actor_class, ActorClass::Unknown);
+        assert!(attribution.pid.is_none());
+        assert!(attribution.executable_basename.is_none());
+
+        let mut table = b"header\n".to_vec();
+        table.extend(std::iter::repeat_n(
+            b'x',
+            usize::try_from(MAX_SOCKET_LINE_BYTES).unwrap() + 1,
+        ));
+        table.push(b'\n');
+        fs::write(root.join("net/tcp"), table).unwrap();
+        assert_eq!(
+            attributor.attribute(&tuple).unwrap().status,
+            AttributionStatus::ScanLimitExceeded
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_advisory_socket_tables_do_not_fail_attribution() {
+        let root = root();
+        let tuple = tuple(SocketProtocol::Tcp);
+        let attributor = ProcAttributor {
+            proc_root: root.clone(),
+            runner_uid: 1001,
+        };
+
+        assert_eq!(
+            attributor.attribute(&tuple).unwrap(),
+            LocalProcessAttribution::unavailable(AttributionStatus::WorkerUnavailable)
+        );
+        fs::write(root.join("net/tcp"), b"header\n\xff\n").unwrap();
+        assert_eq!(
+            attributor.attribute(&tuple).unwrap(),
+            LocalProcessAttribution::unavailable(AttributionStatus::WorkerUnavailable)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn attribution_worker_survives_oversized_tables_and_processes_later_findings() {
+        let root = root();
+        let oversized = tuple(SocketProtocol::Tcp);
+        let next = tuple(SocketProtocol::Udp);
+        write_oversized_socket_table(&root, "tcp", &oversized);
+        write_socket(&root, "udp", &next, 55);
+        write_process(&root, 400, 1001, 1, "dns-client", 55);
+
+        let (request_sender, request_receiver) = mpsc::sync_channel(2);
+        let (result_sender, result_receiver) = mpsc::sync_channel(2);
+        let coordinator = AttributionCoordinator {
+            requests: request_sender,
+            results: result_receiver,
+        };
+        assert!(matches!(
+            coordinator.submit(0, oversized),
+            AttributionSubmission::Queued
+        ));
+        assert!(matches!(
+            coordinator.submit(1, next),
+            AttributionSubmission::Queued
+        ));
+        let worker = AttributionWorker {
+            requests: request_receiver,
+            results: result_sender,
+            attributor: ProcAttributor {
+                proc_root: root.clone(),
+                runner_uid: 1001,
+            },
+        };
+        let stop = AtomicBool::new(false);
+        let worker_result = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| worker.run(&stop));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut results = Vec::new();
+            while results.len() < 2 {
+                results.extend(coordinator.drain());
+                assert!(
+                    Instant::now() < deadline,
+                    "bounded attribution results timed out"
+                );
+                if results.len() < 2 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            results.sort_by_key(|result| result.finding_index);
+            assert_eq!(results[0].finding_index, 0);
+            assert_eq!(
+                results[0].attribution.status,
+                AttributionStatus::ScanLimitExceeded
+            );
+            assert_eq!(results[1].finding_index, 1);
+            assert_eq!(results[1].attribution.status, AttributionStatus::Attributed);
+            assert_eq!(results[1].attribution.actor_class, ActorClass::Runner);
+            stop.store(true, Ordering::Relaxed);
+            handle.join().unwrap()
+        });
+        assert!(worker_result.is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_socket_tables_cannot_authorize_trusted_dns_clients() {
+        let root = root();
+        write_trusted_process(&root, 100, 1001, 1, RUNNER_LISTENER_BASENAME, 10, None);
+        write_trusted_process(&root, 200, 1001, 100, RUNNER_WORKER_BASENAME, 20, Some(501));
+        let worker = TrustedRunnerWorker::discover(root.clone(), 1001).unwrap();
+        let client = DnsClientSocket {
+            protocol: SocketProtocol::Udp,
+            peer: "127.0.0.1:40000".parse().unwrap(),
+            listener: "127.0.0.1:53".parse().unwrap(),
+        };
+        write_dns_client_socket(&root, client, 501, true);
+        assert_eq!(
+            worker.classify_dns_client(client).unwrap(),
+            DnsCallerProvenance::TrustedRunnerWorker
+        );
+
+        write_oversized_socket_table(&root, "udp", &tuple(SocketProtocol::Udp));
+        assert!(read_bounded(&root.join("net/udp"), MAX_PROC_FILE_BYTES).is_err());
+        assert_eq!(
+            worker.classify_dns_client(client).unwrap(),
+            DnsCallerProvenance::AttributionFailed
         );
         fs::remove_dir_all(root).unwrap();
     }
