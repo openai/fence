@@ -1221,10 +1221,10 @@ mod tests {
             let mut results = Vec::new();
             while results.len() < 2 {
                 results.extend(coordinator.drain());
-                assert!(
-                    Instant::now() < deadline,
-                    "bounded attribution results timed out"
-                );
+                if Instant::now() >= deadline {
+                    stop.store(true, Ordering::Relaxed);
+                    panic!("bounded attribution results timed out");
+                }
                 if results.len() < 2 {
                     std::thread::sleep(Duration::from_millis(5));
                 }

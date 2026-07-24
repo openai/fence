@@ -1281,6 +1281,132 @@ test("settles bounded block, degraded-block, and audit evidence", () => {
   }
 });
 
+test("settles verified block and degraded-block firewall counter epochs", () => {
+  const variants = [
+    report,
+    {
+      ...report,
+      status: "protected_host_block_degraded",
+      readiness_status: "ready_degraded",
+      setup_status: "resident_degraded",
+      protection_available: false,
+      container_status: "preserved_unsafe",
+    },
+  ];
+
+  for (const variant of variants) {
+    const initial = {
+      ...variant,
+      counters: { total_violations: 9, sampled_violations: 4 },
+    };
+    const snapshots = [
+      {
+        ...initial,
+        ruleset_hash: "d".repeat(64),
+        counters: { total_violations: 1, sampled_violations: 5 },
+      },
+      {
+        ...initial,
+        ruleset_hash: "e".repeat(64),
+        counters: { total_violations: 0, sampled_violations: 6 },
+      },
+      {
+        ...initial,
+        ruleset_hash: "e".repeat(64),
+        counters: { total_violations: 2, sampled_violations: 7 },
+      },
+      {
+        ...initial,
+        ruleset_hash: "f".repeat(64),
+        counters: { total_violations: 1, sampled_violations: 8 },
+      },
+    ];
+    let elapsed = 0n;
+    let reads = 0;
+    let serviceChecks = 0;
+    const settled = settleResidentReport(
+      "/run/fence/test/report.json",
+      "fence-test.service",
+      initial,
+      {
+        now: () => elapsed,
+        pause: (milliseconds: number) => {
+          elapsed += BigInt(milliseconds) * 1_000_000n;
+        },
+        read: () => snapshots[reads++],
+        verifyService: () => {
+          serviceChecks += 1;
+        },
+      },
+    );
+
+    assert.equal(settled, snapshots[3]);
+    assert.equal(reads, 4);
+    assert.equal(elapsed, 160_000_000n);
+    assert.equal(serviceChecks, 2);
+  }
+});
+
+test("rejects audit firewall resets and sampled regressions across counter epochs", () => {
+  const initialBlock = {
+    ...report,
+    counters: { total_violations: 4, sampled_violations: 3 },
+  };
+  const initialAudit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    counters: { total_violations: 4, sampled_violations: 3 },
+  };
+  const invalidSnapshots = [
+    {
+      initial: initialBlock,
+      next: {
+        ...initialBlock,
+        counters: { total_violations: 3, sampled_violations: 3 },
+      },
+    },
+    {
+      initial: initialAudit,
+      next: {
+        ...initialAudit,
+        ruleset_hash: "d".repeat(64),
+        counters: { total_violations: 3, sampled_violations: 3 },
+      },
+    },
+    {
+      initial: initialBlock,
+      next: {
+        ...initialBlock,
+        ruleset_hash: "d".repeat(64),
+        counters: { total_violations: 0, sampled_violations: 2 },
+      },
+    },
+  ];
+
+  for (const { initial, next } of invalidSnapshots) {
+    let elapsed = 0n;
+    assert.throws(() => settleResidentReport(
+      "/run/fence/test/report.json",
+      "fence-test.service",
+      initial,
+      {
+        now: () => elapsed,
+        pause: (milliseconds: number) => {
+          elapsed += BigInt(milliseconds) * 1_000_000n;
+        },
+        read: () => next,
+        verifyService: () => {},
+      },
+    ), /counters decreased/);
+  }
+});
+
 test("rejects swapped or decreasing reports during bounded evidence settlement", () => {
   const initial = {
     ...report,
@@ -1345,6 +1471,51 @@ test("preserves a validated critical report during final evidence settlement", (
       serviceChecks += 1;
     },
   });
+
+  assert.equal(settled, critical);
+  assert.equal(reads, 1);
+  assert.equal(serviceChecks, 2);
+  assert.throws(() => validateReport(settled, true), /critical resident findings/);
+});
+
+test("preserves validated critical evidence across a block firewall counter epoch", () => {
+  const initial = {
+    ...report,
+    counters: { total_violations: 4, sampled_violations: 3 },
+  };
+  const critical = {
+    ...initial,
+    ruleset_hash: "d".repeat(64),
+    network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    counters: { total_violations: 0, sampled_violations: 4 },
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "dns_block_network_drift",
+      message: "DNS-mediated owned nftables state drifted after readiness",
+    }],
+  };
+  let elapsed = 0n;
+  let reads = 0;
+  let serviceChecks = 0;
+  const settled = settleResidentReport(
+    "/run/fence/test/report.json",
+    "fence-test.service",
+    initial,
+    {
+      now: () => elapsed,
+      pause: (milliseconds: number) => {
+        elapsed += BigInt(milliseconds) * 1_000_000n;
+      },
+      read: () => {
+        reads += 1;
+        return critical;
+      },
+      verifyService: () => {
+        serviceChecks += 1;
+      },
+    },
+  );
 
   assert.equal(settled, critical);
   assert.equal(reads, 1);

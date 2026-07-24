@@ -151,8 +151,14 @@ function settleResidentReport(
     }
     const nextCounters = networkEvidenceCounters(next);
     if (
-      nextCounters.total < counters.total ||
-      nextCounters.sampled < counters.sampled
+      nextCounters.sampled < counters.sampled ||
+      (
+        nextCounters.total < counters.total &&
+        (
+          next.mode !== "block" ||
+          next.ruleset_hash === report.ruleset_hash
+        )
+      )
     ) {
       throw new Error("Fence resident network counters decreased during final evidence settlement");
     }
