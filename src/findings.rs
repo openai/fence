@@ -49,21 +49,22 @@ pub(crate) enum ConnectionEventDrain {
 }
 
 #[cfg(any(target_os = "linux", test))]
-pub(crate) fn drain_connection_events<E>(
+pub(crate) fn drain_connection_events(
     first_timeout: Duration,
-    receive: impl FnMut(Duration) -> Result<Option<ConnectionEvent>, E>,
-    record: impl FnMut(ConnectionEvent),
-) -> Result<ConnectionEventDrain, E> {
-    drain_connection_events_with_clock(first_timeout, receive, record, Instant::now)
+    receive: &mut dyn FnMut(Duration) -> Result<Option<ConnectionEvent>, ()>,
+    record: &mut dyn FnMut(ConnectionEvent),
+) -> Result<ConnectionEventDrain, ()> {
+    let mut now = Instant::now;
+    drain_connection_events_with_clock(first_timeout, receive, record, &mut now)
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn drain_connection_events_with_clock<E>(
+fn drain_connection_events_with_clock(
     first_timeout: Duration,
-    mut receive: impl FnMut(Duration) -> Result<Option<ConnectionEvent>, E>,
-    mut record: impl FnMut(ConnectionEvent),
-    mut now: impl FnMut() -> Instant,
-) -> Result<ConnectionEventDrain, E> {
+    receive: &mut dyn FnMut(Duration) -> Result<Option<ConnectionEvent>, ()>,
+    record: &mut dyn FnMut(ConnectionEvent),
+    now: &mut dyn FnMut() -> Instant,
+) -> Result<ConnectionEventDrain, ()> {
     let started = now();
     for index in 0..MAX_CONNECTION_EVENTS_PER_BATCH {
         if index != 0
@@ -332,11 +333,11 @@ mod tests {
 
         let status = drain_connection_events(
             first_timeout,
-            |timeout| {
+            &mut |timeout| {
                 observed_timeouts.push(timeout);
                 Ok::<_, ()>(pending.pop_front())
             },
-            |event| recorded.push(event.finding.timestamp),
+            &mut |event| recorded.push(event.finding.timestamp),
         )
         .unwrap();
 
@@ -359,11 +360,11 @@ mod tests {
         let mut reads = 0;
         let status = drain_connection_events(
             Duration::ZERO,
-            |_| {
+            &mut |_| {
                 reads += 1;
                 Ok::<Option<ConnectionEvent>, ()>(None)
             },
-            |_| panic!("an empty queue cannot produce a connection event"),
+            &mut |_| panic!("an empty queue cannot produce a connection event"),
         )
         .unwrap();
 
@@ -380,8 +381,8 @@ mod tests {
 
         let status = drain_connection_events(
             Duration::ZERO,
-            |_| Ok::<_, ()>(pending.pop_front()),
-            |event| recorded.push(event.finding.timestamp),
+            &mut |_| Ok::<_, ()>(pending.pop_front()),
+            &mut |event| recorded.push(event.finding.timestamp),
         )
         .unwrap();
 
@@ -408,12 +409,12 @@ mod tests {
 
         let status = drain_connection_events_with_clock(
             Duration::ZERO,
-            |_| {
+            &mut |_| {
                 elapsed.set(elapsed.get() + Duration::from_millis(7));
                 Ok::<_, ()>(pending.pop_front())
             },
-            |event| recorded.push(event.finding.timestamp),
-            || started + elapsed.get(),
+            &mut |event| recorded.push(event.finding.timestamp),
+            &mut || started + elapsed.get(),
         )
         .unwrap();
 
@@ -427,21 +428,20 @@ mod tests {
         let mut reads = 0;
         let mut recorded = Vec::new();
 
-        let error = drain_connection_events(
+        let result = drain_connection_events(
             Duration::ZERO,
-            |_| {
+            &mut |_| {
                 reads += 1;
                 if reads == 1 {
                     Ok(Some(queued_connection_event(0)))
                 } else {
-                    Err("reader failed")
+                    Err(())
                 }
             },
-            |event| recorded.push(event.finding.timestamp),
-        )
-        .unwrap_err();
+            &mut |event| recorded.push(event.finding.timestamp),
+        );
 
-        assert_eq!(error, "reader failed");
+        assert!(result.is_err());
         assert_eq!(recorded, ["unix-ms:0"]);
         assert_eq!(reads, 2);
     }

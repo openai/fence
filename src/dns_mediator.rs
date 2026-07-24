@@ -2176,8 +2176,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let findings = &mut self.findings;
         match drain_connection_events(
             finding_timeout,
-            |timeout| reader.next_event(timeout),
-            |event| {
+            &mut |timeout| reader.next_event(timeout).map_err(|_| ()),
+            &mut |event| {
                 record_connection_event(mediation, findings, event);
                 finding_received = true;
             },
@@ -2584,8 +2584,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let findings = &mut self.findings;
         let more_findings_pending = match drain_connection_events(
             finding_timeout,
-            |timeout| reader.next_event(timeout),
-            |event| {
+            &mut |timeout| reader.next_event(timeout).map_err(|_| ()),
+            &mut |event| {
                 record_connection_event(mediation, findings, event);
                 finding_received = true;
             },
