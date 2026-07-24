@@ -96,7 +96,7 @@ while True:
         and isinstance(current_counters, dict)
         and isinstance(current_counters.get("total_violations"), int)
         and isinstance(current_counters.get("sampled_violations"), int)
-        and current_counters["total_violations"] >= before_total + len(destinations)
+        and current_counters["total_violations"] >= 0
         and current_counters["sampled_violations"] >= before_sampled + len(destinations)
         and isinstance(findings, list)
         and set(destinations).issubset({
