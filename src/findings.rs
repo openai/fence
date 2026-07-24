@@ -2,9 +2,15 @@ use crate::attribution::{LocalProcessAttribution, SocketFamily, SocketProtocol, 
 use crate::config::{MAX_FINDINGS, Mode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(any(target_os = "linux", test))]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const PACKET_PREFIX_BYTES: usize = 64;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const MAX_CONNECTION_EVENTS_PER_BATCH: usize = 32;
+#[cfg(any(target_os = "linux", test))]
+pub(crate) const MAX_CONNECTION_EVENT_BATCH_DURATION: Duration = Duration::from_millis(20);
 const RULE_CLASS_EGRESS: &str = "undeclared_new_egress";
 const RULE_CLASS_UNAVAILABLE: &str = "endpoint_unavailable_from_prefix";
 
@@ -33,6 +39,50 @@ pub struct ConnectionFinding {
 pub(crate) struct ConnectionEvent {
     pub finding: ConnectionFinding,
     pub tuple: Option<SocketTuple>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ConnectionEventDrain {
+    Exhausted,
+    Pending,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn drain_connection_events(
+    first_timeout: Duration,
+    receive: &mut dyn FnMut(Duration) -> Result<Option<ConnectionEvent>, ()>,
+    record: &mut dyn FnMut(ConnectionEvent),
+) -> Result<ConnectionEventDrain, ()> {
+    let mut now = Instant::now;
+    drain_connection_events_with_clock(first_timeout, receive, record, &mut now)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn drain_connection_events_with_clock(
+    first_timeout: Duration,
+    receive: &mut dyn FnMut(Duration) -> Result<Option<ConnectionEvent>, ()>,
+    record: &mut dyn FnMut(ConnectionEvent),
+    now: &mut dyn FnMut() -> Instant,
+) -> Result<ConnectionEventDrain, ()> {
+    let started = now();
+    for index in 0..MAX_CONNECTION_EVENTS_PER_BATCH {
+        if index != 0
+            && now().saturating_duration_since(started) >= MAX_CONNECTION_EVENT_BATCH_DURATION
+        {
+            return Ok(ConnectionEventDrain::Pending);
+        }
+        let timeout = if index == 0 {
+            first_timeout
+        } else {
+            Duration::ZERO
+        };
+        match receive(timeout)? {
+            Some(event) => record(event),
+            None => return Ok(ConnectionEventDrain::Exhausted),
+        }
+    }
+    Ok(ConnectionEventDrain::Pending)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
@@ -240,6 +290,8 @@ fn unavailable_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
 
     fn ipv4_prefix(protocol: u8, port: u16, payload: &[u8]) -> Vec<u8> {
         let mut packet = vec![0_u8; 20 + 4];
@@ -262,6 +314,136 @@ mod tests {
         packet[40..42].copy_from_slice(&53_000_u16.to_be_bytes());
         packet[42..44].copy_from_slice(&port.to_be_bytes());
         packet
+    }
+
+    fn queued_connection_event(index: usize) -> ConnectionEvent {
+        connection_event_from_prefix(
+            Mode::Block,
+            format!("unix-ms:{index}"),
+            &ipv4_prefix(6, 443, &[]),
+        )
+    }
+
+    #[test]
+    fn drains_ready_connection_events_in_fifo_order_without_blocking_again() {
+        let mut pending = (0..3).map(queued_connection_event).collect::<VecDeque<_>>();
+        let mut observed_timeouts = Vec::new();
+        let mut recorded = Vec::new();
+        let first_timeout = Duration::from_millis(13);
+
+        let status = drain_connection_events(
+            first_timeout,
+            &mut |timeout| {
+                observed_timeouts.push(timeout);
+                Ok::<_, ()>(pending.pop_front())
+            },
+            &mut |event| recorded.push(event.finding.timestamp),
+        )
+        .unwrap();
+
+        assert_eq!(status, ConnectionEventDrain::Exhausted);
+        assert_eq!(recorded, ["unix-ms:0", "unix-ms:1", "unix-ms:2"]);
+        assert_eq!(
+            observed_timeouts,
+            [
+                first_timeout,
+                Duration::ZERO,
+                Duration::ZERO,
+                Duration::ZERO,
+            ]
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn reports_an_empty_connection_event_queue_without_spinning() {
+        let mut reads = 0;
+        let status = drain_connection_events(
+            Duration::ZERO,
+            &mut |_| {
+                reads += 1;
+                Ok::<Option<ConnectionEvent>, ()>(None)
+            },
+            &mut drop,
+        )
+        .unwrap();
+
+        assert_eq!(status, ConnectionEventDrain::Exhausted);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn bounds_a_connection_event_batch_without_losing_fifo_work() {
+        let mut pending = (0..MAX_CONNECTION_EVENTS_PER_BATCH + 5)
+            .map(queued_connection_event)
+            .collect::<VecDeque<_>>();
+        let mut recorded = Vec::new();
+
+        let status = drain_connection_events(
+            Duration::ZERO,
+            &mut |_| Ok::<_, ()>(pending.pop_front()),
+            &mut |event| recorded.push(event.finding.timestamp),
+        )
+        .unwrap();
+
+        assert_eq!(status, ConnectionEventDrain::Pending);
+        assert_eq!(recorded.len(), MAX_CONNECTION_EVENTS_PER_BATCH);
+        assert_eq!(recorded[0], "unix-ms:0");
+        assert_eq!(
+            recorded[MAX_CONNECTION_EVENTS_PER_BATCH - 1],
+            format!("unix-ms:{}", MAX_CONNECTION_EVENTS_PER_BATCH - 1)
+        );
+        assert_eq!(pending.len(), 5);
+        assert_eq!(
+            pending.front().unwrap().finding.timestamp,
+            format!("unix-ms:{MAX_CONNECTION_EVENTS_PER_BATCH}")
+        );
+    }
+
+    #[test]
+    fn yields_a_connection_event_batch_when_its_monotonic_budget_expires() {
+        let started = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let mut pending = (0..8).map(queued_connection_event).collect::<VecDeque<_>>();
+        let mut recorded = Vec::new();
+
+        let status = drain_connection_events_with_clock(
+            Duration::ZERO,
+            &mut |_| {
+                elapsed.set(elapsed.get() + Duration::from_millis(7));
+                Ok::<_, ()>(pending.pop_front())
+            },
+            &mut |event| recorded.push(event.finding.timestamp),
+            &mut || started + elapsed.get(),
+        )
+        .unwrap();
+
+        assert_eq!(status, ConnectionEventDrain::Pending);
+        assert_eq!(recorded, ["unix-ms:0", "unix-ms:1", "unix-ms:2"]);
+        assert_eq!(pending.len(), 5);
+    }
+
+    #[test]
+    fn propagates_connection_event_reader_failures_after_recording_prior_events() {
+        let mut reads = 0;
+        let mut recorded = Vec::new();
+
+        let result = drain_connection_events(
+            Duration::ZERO,
+            &mut |_| {
+                reads += 1;
+                if reads == 1 {
+                    Ok(Some(queued_connection_event(0)))
+                } else {
+                    Err(())
+                }
+            },
+            &mut |event| recorded.push(event.finding.timestamp),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(recorded, ["unix-ms:0"]);
+        assert_eq!(reads, 2);
     }
 
     #[test]

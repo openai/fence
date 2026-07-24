@@ -8,7 +8,8 @@ use crate::config::{
 };
 use crate::error::ErrorDetail;
 use crate::findings::{
-    ConnectionEvent, ConnectionFinding, FindingCollection, bounded_timestamp_now,
+    ConnectionEvent, ConnectionEventDrain, ConnectionFinding, FindingCollection,
+    bounded_timestamp_now, drain_connection_events,
 };
 use crate::hosted_runner::{AcceptedResolverV2, hosted_runner_fingerprint_requirement};
 use crate::hostname_policy::{
@@ -2170,13 +2171,18 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             changed = true;
         }
         let mut finding_received = false;
-        match self.reader.next_event(finding_timeout) {
-            Ok(Some(event)) => {
-                record_connection_event(&self._mediation, &mut self.findings, event);
+        let reader = &self.reader;
+        let mediation = &self._mediation;
+        let findings = &mut self.findings;
+        match drain_connection_events(
+            finding_timeout,
+            &mut |timeout| reader.next_event(timeout).map_err(|_| ()),
+            &mut |event| {
+                record_connection_event(mediation, findings, event);
                 finding_received = true;
-                changed = true;
-            }
-            Ok(None) => {}
+            },
+        ) {
+            Ok(ConnectionEventDrain::Exhausted | ConnectionEventDrain::Pending) => {}
             Err(_) => {
                 self.record_critical(
                     "dns_audit_nflog_failure",
@@ -2184,6 +2190,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 );
                 changed = true;
             }
+        }
+        let attribution_changed = apply_attribution_results(&self._mediation, &mut self.findings);
+        if finding_received || attribution_changed {
+            changed = true;
         }
         let verification_due = elapsed >= self.next_verification;
         if verification_due {
@@ -2551,7 +2561,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         &mut self,
         elapsed: Duration,
         finding_timeout: Duration,
-    ) -> Result<(), DnsMediationError> {
+    ) -> Result<bool, DnsMediationError> {
         let mut changed = false;
         for failure in self._mediation.drain_worker_failures() {
             let _worker = failure.worker;
@@ -2568,19 +2578,32 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         if apply_attribution_results(&self._mediation, &mut self.findings) {
             changed = true;
         }
-        match self.reader.next_event(finding_timeout) {
-            Ok(Some(event)) => {
-                record_connection_event(&self._mediation, &mut self.findings, event);
-                changed = true;
-            }
-            Ok(None) => {}
+        let mut finding_received = false;
+        let reader = &self.reader;
+        let mediation = &self._mediation;
+        let findings = &mut self.findings;
+        let more_findings_pending = match drain_connection_events(
+            finding_timeout,
+            &mut |timeout| reader.next_event(timeout).map_err(|_| ()),
+            &mut |event| {
+                record_connection_event(mediation, findings, event);
+                finding_received = true;
+            },
+        ) {
+            Ok(ConnectionEventDrain::Exhausted) => false,
+            Ok(ConnectionEventDrain::Pending) => true,
             Err(_) => {
                 self.record_critical(
                     "dns_block_nflog_failure",
                     "DNS-mediated block NFLOG collection failed after readiness",
                 );
                 changed = true;
+                false
             }
+        };
+        let attribution_changed = apply_attribution_results(&self._mediation, &mut self.findings);
+        if finding_received || attribution_changed {
+            changed = true;
         }
 
         let mut root_refresh_error = None;
@@ -2852,7 +2875,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 let _ = self.runtime.replace_report(&self.evidence);
             }
         }
-        Ok(())
+        Ok(more_findings_pending)
     }
 
     fn collect_materialization_requests(&mut self) -> Vec<MaterializationRequest> {
@@ -2981,8 +3004,9 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             )?;
             let start = Instant::now();
             loop {
-                session.poll_once(start.elapsed(), Duration::ZERO)?;
-                session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+                if !session.poll_once(start.elapsed(), Duration::ZERO)? {
+                    session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+                }
             }
         }
         _ => Err(DnsMediationError::new(
@@ -3050,8 +3074,9 @@ pub fn run_selected_profile_runtime_test_service(
     }
     let start = Instant::now();
     loop {
-        session.poll_once(start.elapsed(), Duration::ZERO)?;
-        session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+        if !session.poll_once(start.elapsed(), Duration::ZERO)? {
+            session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+        }
     }
 }
 
