@@ -1355,6 +1355,7 @@ test("preserves a validated critical report during final evidence settlement", (
 test("does not delay or reread an already critical resident report", () => {
   const critical = {
     ...report,
+    counters: { total_violations: 1, sampled_violations: 1 },
     network_verification_status: "critical_drift",
     resident_health: residentHealth({ status: "critical" }),
     critical_findings: [{
@@ -1381,6 +1382,101 @@ test("does not delay or reread an already critical resident report", () => {
 
   assert.equal(settled, critical);
   assert.equal(serviceChecks, 1);
+});
+
+test("rejects malformed initial critical counters without delaying settlement", () => {
+  const critical = {
+    ...report,
+    network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "dns_block_network_drift",
+      message: "DNS-mediated owned nftables state drifted after readiness",
+    }],
+  };
+
+  for (const counters of [
+    undefined,
+    null,
+    [],
+    { total_violations: -1, sampled_violations: 0 },
+    { total_violations: Number.MAX_SAFE_INTEGER + 1, sampled_violations: 0 },
+    { total_violations: 0, sampled_violations: "0" },
+  ]) {
+    let serviceChecks = 0;
+    assert.throws(() => settleResidentReport(
+      "/run/fence/test/report.json",
+      "fence-test.service",
+      { ...critical, counters },
+      {
+        now: () => {
+          throw new Error("malformed critical evidence must not start a settlement clock");
+        },
+        pause: () => {
+          throw new Error("malformed critical evidence must not be delayed");
+        },
+        read: () => {
+          throw new Error("malformed critical evidence must not be reread");
+        },
+        verifyService: () => {
+          serviceChecks += 1;
+        },
+      },
+    ), /bounded network counters/);
+    assert.equal(serviceChecks, 1);
+  }
+});
+
+test("rejects malformed or decreasing newly critical counters before reporting", () => {
+  const initial = {
+    ...report,
+    counters: { total_violations: 4, sampled_violations: 3 },
+  };
+  const critical = {
+    ...initial,
+    network_verification_status: "critical_drift",
+    resident_health: residentHealth({ status: "critical" }),
+    critical_findings: [{
+      timestamp: "unix-ms:1",
+      code: "dns_block_network_drift",
+      message: "DNS-mediated owned nftables state drifted after readiness",
+    }],
+  };
+  const invalidSnapshots: Array<[any, RegExp]> = [
+    [{ ...critical, counters: undefined }, /bounded network counters/],
+    [{ ...critical, counters: null }, /bounded network counters/],
+    [{ ...critical, counters: { total_violations: -1, sampled_violations: 3 } }, /bounded network counters/],
+    [{ ...critical, counters: { total_violations: 4, sampled_violations: "3" } }, /bounded network counters/],
+    [{ ...critical, counters: { total_violations: 3, sampled_violations: 3 } }, /counters decreased/],
+    [{ ...critical, counters: { total_violations: 4, sampled_violations: 2 } }, /counters decreased/],
+  ];
+
+  for (const [snapshot, expected] of invalidSnapshots) {
+    let elapsed = 0n;
+    let reads = 0;
+    let serviceChecks = 0;
+    assert.throws(() => settleResidentReport(
+      "/run/fence/test/report.json",
+      "fence-test.service",
+      initial,
+      {
+        now: () => elapsed,
+        pause: (milliseconds: number) => {
+          elapsed += BigInt(milliseconds) * 1_000_000n;
+        },
+        read: () => {
+          reads += 1;
+          return snapshot;
+        },
+        verifyService: () => {
+          serviceChecks += 1;
+        },
+      },
+    ), expected);
+    assert.equal(reads, 1);
+    assert.equal(serviceChecks, 1);
+  }
 });
 
 test("rejects malformed initial counters and an unverifiable final resident service", () => {

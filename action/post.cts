@@ -113,11 +113,11 @@ function settleResidentReport(
   const verifyService = controls.verifyService || validateResidentService;
   let report = validateReport(initialReport, false);
   verifyService(unit, report.resident_health.resident_pid);
+  let counters = networkEvidenceCounters(report);
   if (report.critical_findings.length > 0) {
     return report;
   }
 
-  let counters = networkEvidenceCounters(report);
   const started = now();
   const deadline = started + EVIDENCE_SETTLE_TIMEOUT_NANOSECONDS;
   const identityFields = [
@@ -149,16 +149,16 @@ function settleResidentReport(
     ) {
       throw new Error("Fence resident report identity changed during final evidence settlement");
     }
-    if (next.critical_findings.length > 0) {
-      verifyService(unit, next.resident_health.resident_pid);
-      return next;
-    }
     const nextCounters = networkEvidenceCounters(next);
     if (
       nextCounters.total < counters.total ||
       nextCounters.sampled < counters.sampled
     ) {
       throw new Error("Fence resident network counters decreased during final evidence settlement");
+    }
+    if (next.critical_findings.length > 0) {
+      verifyService(unit, next.resident_health.resident_pid);
+      return next;
     }
     counters = nextCounters;
     report = next;
