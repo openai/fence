@@ -8,6 +8,8 @@ Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ub
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.
 
+`local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries acquisition failures within a fixed limit and still requires a complete, stable inventory in both audit and block mode. The `Fence local control inspection` log line shows the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
+
 For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
 
 ## A Network Request Is Blocked

@@ -187,6 +187,40 @@ function fenceErrorCodeFromJournal(output: string): string | undefined {
   return undefined;
 }
 
+function localControlDiagnosticFromJournal(output: string): string | undefined {
+  const unavailableReasons = new Set([
+    "cgroup_identity", "ipv4_table", "ipv6_table", "malformed_rows", "proc", "proc_scan",
+    "process_fd_readlink", "process_fd_scan", "process_identity", "process_identity_drift",
+    "socket_ownership", "unix_reachability", "unix_table",
+  ]);
+  const boundReasons = new Set([
+    "container_processes", "fds_per_process", "processes", "socket_owners",
+    "tcp_listeners", "total_fds", "unix_listeners",
+  ]);
+  const validReasons = (values: unknown, allowed: Set<string>): values is string[] =>
+    Array.isArray(values) && values.length <= allowed.size &&
+    values.every((value) => typeof value === "string" && allowed.has(value)) &&
+    new Set(values).size === values.length;
+  for (const line of output.split(/\r?\n/).reverse()) {
+    if (line.length === 0 || line.length > 4096) continue;
+    try {
+      const diagnostic = JSON.parse(line)?.fence_local_control;
+      if (
+        !diagnostic || !["unavailable", "unstable", "bounds_exceeded"].includes(diagnostic.status) ||
+        !Number.isSafeInteger(diagnostic.attempts) || diagnostic.attempts < 1 ||
+        !validReasons(diagnostic.unavailable_inputs, unavailableReasons) ||
+        !validReasons(diagnostic.bounds_exceeded, boundReasons)
+      ) continue;
+      return `status=${diagnostic.status}; attempts=${diagnostic.attempts}; ` +
+        `unavailable=${diagnostic.unavailable_inputs.join(",") || "none"}; ` +
+        `bounds=${diagnostic.bounds_exceeded.join(",") || "none"}`;
+    } catch {
+      // Ignore other journal messages and never forward their contents.
+    }
+  }
+  return undefined;
+}
+
 function captureServiceStatus(unit: string): ReturnType<typeof capture> {
   return capture("/usr/bin/systemctl", [
     "show",
@@ -230,6 +264,10 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
   const errorCode = fenceErrorCodeFromJournal(journal.stdout);
   if (errorCode !== undefined) {
     log.warning(`Fence resident error code: ${errorCode}`);
+  }
+  const localControlDiagnostic = localControlDiagnosticFromJournal(journal.stdout);
+  if (localControlDiagnostic !== undefined) {
+    log.warning(`Fence local control inspection: ${localControlDiagnostic}`);
   }
   log.debugGroup("Fence debug: service journal", [
     `unit=${paths.unit}`,
@@ -632,4 +670,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { fenceErrorCodeFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
+module.exports = { fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };

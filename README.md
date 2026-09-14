@@ -107,6 +107,8 @@ Fence runs before the rest of your job and controls which network destinations t
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
+Fence briefly retries incomplete local service inspections before failing. If startup still fails, check the inspection reason codes in the log; see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
+
 ## Network Reports 📋
 
 Fence adds a network activity table to the job summary and post-job log. Each log also includes one `FENCE_REPORT_JSON=` line that you can fetch through the GitHub API:
