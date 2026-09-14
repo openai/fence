@@ -47,6 +47,7 @@ const actionLog = require("./log.cts");
 const { settleResidentReport } = require("./post.cts");
 const {
   fenceErrorCodeFromJournal,
+  localControlDiagnosticFromJournal,
   residentServiceArgs,
   run,
   terminalServiceStatus,
@@ -1101,6 +1102,39 @@ test("recognizes terminal service state and only bounded structured Fence error 
   ]) {
     assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
   }
+});
+
+test("local control diagnostics expose only bounded fixed reason codes", () => {
+  const diagnostic = {
+    status: "unavailable", attempts: 2,
+    unavailable_inputs: ["process_identity_drift", "socket_ownership"], bounds_exceeded: [],
+  };
+  const line = (value: unknown) => JSON.stringify({ fence_local_control: value });
+  const expected = "status=unavailable; attempts=2; unavailable=process_identity_drift,socket_ownership; bounds=none";
+  assert.equal(localControlDiagnosticFromJournal(`systemd message\n${line(diagnostic)}\n`), expected);
+  assert.equal(localControlDiagnosticFromJournal(line({
+    ...diagnostic, message: "::error::secret", path: "/private/process", token: "ghp_do_not_print",
+  })), expected);
+  assert.equal(localControlDiagnosticFromJournal(line({
+    ...diagnostic, status: "bounds_exceeded", unavailable_inputs: [], bounds_exceeded: ["total_fds"],
+  })), "status=bounds_exceeded; attempts=2; unavailable=none; bounds=total_fds");
+  assert.equal(localControlDiagnosticFromJournal(line({
+    ...diagnostic, status: "unstable", unavailable_inputs: [],
+  })), "status=unstable; attempts=2; unavailable=none; bounds=none");
+  for (const invalid of [
+    undefined, null, {}, { ...diagnostic, status: "stable" },
+    { ...diagnostic, status: "unavailable\n::error::injected" },
+    ...[0, -1, 1.5, "2", null, Number.MAX_SAFE_INTEGER + 1].map((attempts) => ({ ...diagnostic, attempts })),
+    ...[null, "proc", ["proc", "proc"], ["unknown"], ["proc\u0000"], ["::error::secret"],
+      ["ghp_do_not_print"], ["/private/process"], Array(100).fill("proc")]
+      .map((unavailable_inputs) => ({ ...diagnostic, unavailable_inputs })),
+    { ...diagnostic, bounds_exceeded: ["unknown"] },
+    { ...diagnostic, bounds_exceeded: ["total_fds", "total_fds"] },
+  ]) {
+    assert.equal(localControlDiagnosticFromJournal(line(invalid)), undefined);
+  }
+  assert.equal(localControlDiagnosticFromJournal(`${line(diagnostic)}\nnot JSON`), expected);
+  assert.equal(localControlDiagnosticFromJournal(line({ ...diagnostic, extra: "x".repeat(4096) })), undefined);
 });
 
 test("derives only bounded fixed runtime paths", () => {

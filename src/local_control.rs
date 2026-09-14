@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
@@ -1229,10 +1229,29 @@ pub fn observe_local_control_inventory(
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
 ) -> LocalControlObservation {
-    observe_local_control_with(
+    let observed = observe_local_control_with(
         || collect_private_snapshot(proc_root, socket_access, current_fence),
         || thread::sleep(Duration::from_millis(STABILITY_INTERVAL_MILLISECONDS)),
-    )
+    );
+    if let Some(diagnostic) = local_control_failure_diagnostic(&observed) {
+        let _ = writeln!(std::io::stderr().lock(), "{diagnostic}");
+    }
+    observed
+}
+
+fn local_control_failure_diagnostic(
+    observed: &LocalControlObservation,
+) -> Option<serde_json::Value> {
+    (observed.status != ObservationStatus::Stable).then(|| {
+        serde_json::json!({
+            "fence_local_control": {
+                "status": observed.status,
+                "attempts": observed.attempts,
+                "unavailable_inputs": observed.snapshot.unavailable_inputs,
+                "bounds_exceeded": observed.snapshot.bounds_exceeded,
+            }
+        })
+    })
 }
 
 fn observe_local_control_with<C, S>(mut capture: C, mut sleep: S) -> LocalControlObservation
@@ -1253,6 +1272,19 @@ where
                 ScanStatus::BoundsExceeded => ObservationStatus::BoundsExceeded,
                 ScanStatus::Unavailable => ObservationStatus::Unavailable,
             };
+            // Matching acquisition failures are not a complete inventory. Use the
+            // remaining attempts, without retrying malformed rows or over-budget scans.
+            if status == ObservationStatus::Unavailable
+                && attempt < STABILITY_ATTEMPTS
+                && snapshot.bounds_exceeded.is_empty()
+                && snapshot.malformed_row_count == 0
+                && snapshot
+                    .unavailable_inputs
+                    .iter()
+                    .any(|reason| reason.is_acquisition())
+            {
+                continue;
+            }
             return LocalControlObservation {
                 status,
                 stable: true,
@@ -3062,6 +3094,141 @@ mod tests {
         );
         assert_eq!(ambiguous.unresolved_root_inodes, inodes);
         assert!(ambiguous.known_nonroot_drift_inodes.is_empty());
+    }
+
+    fn observe_samples(
+        samples: impl IntoIterator<Item = PrivateSnapshot>,
+    ) -> LocalControlObservation {
+        let mut samples = samples.into_iter();
+        let observed = observe_local_control_with(|| samples.next().unwrap(), || {});
+        assert!(samples.next().is_none(), "unused inventory retry samples");
+        observed
+    }
+
+    #[test]
+    fn matching_acquisition_failures_use_remaining_attempts() {
+        let unavailable = PrivateSnapshot::unavailable(UnavailableReason::ProcessIdentityDrift);
+        for failed_attempts in 1..STABILITY_ATTEMPTS {
+            let samples = std::iter::repeat_n(unavailable.clone(), (failed_attempts * 2) as usize)
+                .chain([empty_private(), empty_private()]);
+            let observed = observe_samples(samples);
+            assert_eq!(observed.status, ObservationStatus::Stable);
+            assert_eq!(observed.attempts, failed_attempts + 1);
+            verify_local_control_observation(&public_snapshot(empty_private()), &observed).unwrap();
+            assert!(local_control_failure_diagnostic(&observed).is_none());
+        }
+    }
+
+    #[test]
+    fn persistent_acquisition_failures_remain_unavailable() {
+        let observed = observe_samples(std::iter::repeat_n(
+            PrivateSnapshot::unavailable(UnavailableReason::ProcessFdScan),
+            (STABILITY_ATTEMPTS * 2) as usize,
+        ));
+        assert_eq!(observed.status, ObservationStatus::Unavailable);
+        assert_eq!(observed.attempts, STABILITY_ATTEMPTS);
+        assert_eq!(
+            verify_complete_local_control_observation(&observed)
+                .unwrap_err()
+                .code,
+            "local_control_inventory_unavailable"
+        );
+        assert_eq!(
+            local_control_failure_diagnostic(&observed).unwrap(),
+            serde_json::json!({"fence_local_control": {
+                "status": "unavailable", "attempts": STABILITY_ATTEMPTS,
+                "unavailable_inputs": ["process_fd_scan", "socket_ownership"],
+                "bounds_exceeded": [],
+            }})
+        );
+    }
+
+    #[test]
+    fn retries_still_require_two_complete_matching_snapshots() {
+        let samples = (0..STABILITY_ATTEMPTS).flat_map(|_| {
+            [
+                PrivateSnapshot::unavailable(UnavailableReason::ProcessIdentityDrift),
+                empty_private(),
+            ]
+        });
+        let observed = observe_samples(samples);
+        assert_eq!(observed.status, ObservationStatus::Unstable);
+        assert_eq!(observed.attempts, STABILITY_ATTEMPTS);
+        assert_eq!(
+            verify_complete_local_control_observation(&observed)
+                .unwrap_err()
+                .code,
+            "local_control_inventory_unstable"
+        );
+    }
+
+    #[test]
+    fn bounds_malformed_rows_and_unreviewed_owners_do_not_gain_retries() {
+        let mut bounded = PrivateSnapshot::unavailable(UnavailableReason::ProcScan);
+        bounded.bounds_exceeded.insert(BoundReason::Processes);
+        let mut malformed = PrivateSnapshot::unavailable(UnavailableReason::Ipv4Table);
+        malformed.malformed_row_count = 1;
+        let mut unreviewed = empty_private();
+        let owner = private_owner(0, false, &[10]);
+        unreviewed.root_container_processes.push(PrivateContainer {
+            key: owner.key,
+            identity_complete: false,
+            process_pin: owner.process_pins.into_iter().next().unwrap(),
+        });
+        for snapshot in [bounded, malformed, unreviewed] {
+            let observed = observe_samples([snapshot.clone(), snapshot]);
+            assert_eq!(observed.attempts, 1);
+            assert!(verify_complete_local_control_observation(&observed).is_err());
+        }
+    }
+
+    #[test]
+    fn recovered_acquisition_does_not_hide_added_root_listeners() {
+        let mut added = empty_private();
+        added.tcp_listeners.push(PrivateTcpListener {
+            socket_inode: 43,
+            socket_uid: 0,
+            family: InternetAddressFamily::Ipv4,
+            bind_class: BindClass::Loopback,
+            port: 443,
+            owners: vec![private_owner(0, true, &[10])],
+            ownership_complete: true,
+        });
+        let unavailable = PrivateSnapshot::unavailable(UnavailableReason::ProcessIdentityDrift);
+        let observed = observe_samples([unavailable.clone(), unavailable, added.clone(), added]);
+        assert_eq!(
+            verify_local_control_observation(&public_snapshot(empty_private()), &observed)
+                .unwrap_err()
+                .kind,
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
+        );
+    }
+
+    #[test]
+    fn failure_diagnostics_omit_inventory_details() {
+        let mut private = empty_private();
+        let mut owner = private_owner(0, false, &[10]);
+        owner.key.executable_basename = "private-process".into();
+        owner.key.canonical_executable = "/private/executable".into();
+        private.tcp_listeners.push(PrivateTcpListener {
+            socket_inode: 43,
+            socket_uid: 0,
+            family: InternetAddressFamily::Ipv4,
+            bind_class: BindClass::Loopback,
+            port: 8443,
+            owners: vec![owner],
+            ownership_complete: false,
+        });
+        let observed = observe_samples([private.clone(), private]);
+        assert_eq!(
+            local_control_failure_diagnostic(&observed).unwrap(),
+            serde_json::json!({
+                "fence_local_control": {
+                    "status": "unavailable", "attempts": 1,
+                    "unavailable_inputs": ["socket_ownership"], "bounds_exceeded": [],
+                }
+            })
+        );
     }
 
     #[test]
