@@ -24,6 +24,8 @@ case "${1:-}" in
     ;;
 esac
 
+bash script/test-generated-paths
+
 if [[ -z "${1:-}" ]]; then
   cargo test --frozen
   exit 0

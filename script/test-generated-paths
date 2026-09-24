@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-generated-paths"
+fi
+
+tmp_root="$(make_temp_dir fence-generated-paths "$RUNNER_TEMP")"
+link="$DIR/target/generated-path-symlink-$$"
+cleanup() {
+  remove_generated_path "$link" "generated-path regression link" 2>/dev/null || true
+  remove_generated_path "$tmp_root" "generated-path regression root" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+mkdir -p "$tmp_root/outside" "$DIR/target"
+printf '%s\n' "outside" > "$tmp_root/outside/victim"
+ln -s "$tmp_root/outside" "$link"
+
+output=""
+if output="$(clear_generated_dir "$link" "generated-path regression directory" 2>&1)"; then
+  die "clear_generated_dir unexpectedly accepted a symbolic-link directory"
+fi
+if ! grep -Fq "must not traverse a symbolic link" <<< "$output"; then
+  die "clear_generated_dir did not report the symbolic-link failure"
+fi
+
+output=""
+if output="$(clear_generated_dir "$link/nested" "generated-path nested regression directory" 2>&1)"; then
+  die "clear_generated_dir unexpectedly traversed a symbolic-link ancestor"
+fi
+if ! grep -Fq "must not traverse a symbolic link" <<< "$output"; then
+  die "clear_generated_dir did not report the symbolic-link ancestor failure"
+fi
+
+output=""
+if output="$(remove_generated_path "$link/victim" "generated-path nested removal" 2>&1)"; then
+  die "remove_generated_path unexpectedly traversed a symbolic-link ancestor"
+fi
+if ! grep -Fq "must not traverse a symbolic link" <<< "$output"; then
+  die "remove_generated_path did not report the symbolic-link ancestor failure"
+fi
+if [[ "$(cat "$tmp_root/outside/victim")" != "outside" ]]; then
+  die "generated-path regression modified a file through a symbolic-link ancestor"
+fi
+
+remove_generated_path "$link" "generated-path regression link"
+if [[ -e "$link" || -L "$link" ]]; then
+  die "remove_generated_path did not remove the final symbolic link"
+fi
+if [[ ! -f "$tmp_root/outside/victim" ]]; then
+  die "removing the final symbolic link changed its target"
+fi
+
+echo -e "${GREEN}generated path symlink regression passed${OFF}"
