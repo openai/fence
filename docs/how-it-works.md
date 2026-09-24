@@ -55,6 +55,8 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
   | jq .
 ```
 
+Reports are retrievable only while the job log exists; GitHub applies a retention window to workflow logs, so consumers that need a durable record should capture the report when they observe it rather than re-fetching it later.
+
 The job log stores the report on one line. `jq` formats it like this:
 
 ```json
