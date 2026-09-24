@@ -53,7 +53,7 @@ Add destinations your workflow needs to the `allowlist`:
       cidr 192.0.2.0/24 udp 123
 ```
 
-Bare hostnames default to TCP port `443`. Fence also supports IPv6, custom ports, TCP, UDP, CIDR ranges, and one- or two-level hostname wildcards. An allowlist can contain up to 64 unique entries.
+Bare hostnames default to TCP port `443`. Fence also supports IPv6, custom ports, TCP, UDP, CIDR ranges, and one- or two-level hostname wildcards. The multiline `allowlist` input can contain up to 64 unique normalized entries; the advanced JSON `config` input accepts at most 64 array entries before deduplication.
 
 See [allowlist syntax](docs/allowlist.md) for all supported formats.
 
