@@ -56,6 +56,12 @@ Critical drift means a required protection changed or a Fence component stopped 
 
 Check the job summary and debug logs to identify what changed. Expanding the allowlist will not fix a broken protection.
 
+## Post-Job Evidence Validation Fails
+
+A `Fence failure diagnostic (unverified)` line shows the evidence source, reported resident status, verification sequence, heartbeat age, and at most five recognized critical codes. Unknown values are omitted or marked unavailable; unknown codes appear as `unrecognized`. These details help explain rejected evidence and do not prove that protection remained healthy.
+
+A stale heartbeat can follow an earlier critical finding because failed verification does not advance the last successful timestamp. Check the diagnostic codes before treating staleness as a timing issue. Missing or unreadable evidence may leave only the original error. Fence still fails the job and leaves its controls in place.
+
 ## The Agent Cannot Run Directly
 
 `fence check-support` and `fence render-plan` are inspection commands. Running `fence run` directly returns `trusted_launcher_required`; production protection must start through the GitHub Action.

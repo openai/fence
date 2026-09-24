@@ -44,7 +44,7 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
-const { settleResidentReport } = require("./post.cts");
+const { postFailureDiagnostic, validatePostEvidence, settleResidentReport } = require("./post.cts");
 const {
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
@@ -4283,4 +4283,76 @@ test("validates generated release bundle metadata and binary identity", () => {
 
 test("bounds fixed privileged child command execution", () => {
   assert.throws(() => run("/bin/sleep", ["1"], undefined, false, 1), /ETIMEDOUT|timed out/i);
+});
+
+test("reports stale critical evidence without accepting it", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  const stale = {
+    ...report,
+    resident_health: residentHealth({
+      status: "critical",
+      last_successful_verification_unix_milliseconds: Date.now() - 60_000,
+    }),
+    critical_findings: [{ code: "dns_block_network_drift", message: "not for logs" }],
+  };
+  assert.throws(() => validateReport(stale, false), /stale/);
+  assert.throws(() => settleResidentReport("unused", "unused", stale), /stale/);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /unverified/);
+  assert.match(lines[0], /dns_block_network_drift/);
+  assert.doesNotMatch(lines[0], /not for logs|FENCE_REPORT_JSON|verified protection/);
+  const failure = new Error("original validation failure");
+  assert.throws(() => validatePostEvidence(stale, "dns", () => { throw failure; }), (error: unknown) => error === failure);
+  t.mock.method(actionLog, "info", () => { throw new Error("logging failed"); });
+  assert.throws(() => validatePostEvidence(stale, "resident", () => { throw failure; }), (error: unknown) => error === failure);
+});
+
+test("bounds failure diagnostics and excludes arbitrary evidence", () => {
+  const secret = "private_fixture_value";
+  const input = {
+    resident_health: { status: secret, verification_sequence: secret, last_successful_verification_unix_milliseconds: secret },
+    critical_findings: Array.from({ length: 64 }, (_, i) => ({ code: i === 0 ? "dns_audit_network_drift" : secret, message: secret })),
+    critical_findings_truncated: true,
+    findings: [{ message: secret }],
+  };
+  const line = postFailureDiagnostic(input, "resident", 100_000);
+  assert.ok(Buffer.byteLength(line) < 2048);
+  assert.match(line, /dns_audit_network_drift/);
+  assert.match(line, /"critical_codes_omitted":59/);
+  assert.doesNotMatch(line, /private_fixture_value/);
+  for (const malformed of [null, [], "bad", { resident_health: [] }, { critical_findings: [null, [], { code: "::error::injected\n" }] }, { critical_findings: Array(65).fill({ code: secret }) }]) {
+    const diagnostic = postFailureDiagnostic(malformed, "dns", 100_000);
+    assert.ok(Buffer.byteLength(diagnostic) < 2048);
+    assert.doesNotMatch(diagnostic, /private_fixture_value|::error::|injected|\n/);
+  }
+  const future = postFailureDiagnostic({ resident_health: residentHealth({ last_successful_verification_unix_milliseconds: 106_000 }) }, "resident", 100_000);
+  assert.match(future, /"heartbeat_age_ms":-6000/);
+});
+
+test("successful evidence validation emits no failure diagnostic", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  assert.equal(validatePostEvidence(report, "resident", (value: any) => validateReport(value, false)), report);
+  assert.deepEqual(lines, []);
+});
+
+test("reports stale evidence encountered during settlement and DNS validation", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  const staleHealth = residentHealth({ last_successful_verification_unix_milliseconds: Date.now() - 60_000 });
+  const initial = { ...report, counters: { total_violations: 0, sampled_violations: 0 } };
+  let elapsed = 0n;
+  assert.throws(() => settleResidentReport("unused", "unused", initial, {
+    now: () => elapsed,
+    pause: (milliseconds: number) => { elapsed += BigInt(milliseconds) * 1_000_000n; },
+    read: () => ({ ...initial, resident_health: staleHealth }),
+    verifyService: () => {},
+  }), /stale/);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /"source":"resident"/);
+  const staleDns = { ...dnsEvidenceFor(report), resident_health: staleHealth };
+  assert.throws(() => validatePostEvidence(staleDns, "dns", (value: any) => validateDnsEvidence(value, report)), /stale/);
+  assert.equal(lines.length, 2);
+  assert.match(lines[1], /"source":"dns"/);
 });

@@ -109,9 +109,11 @@ See [how Fence works](docs/how-it-works.md) for more detail.
 
 Fence briefly retries incomplete local service inspections before failing. If startup still fails, check the inspection reason codes in the log; see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
 
+If post-job evidence validation fails, Fence prints bounded, unverified failure details when readable evidence is available and still fails the job. See [post-job troubleshooting](docs/troubleshooting.md#post-job-evidence-validation-fails).
+
 ## Network Reports 📋
 
-Fence adds a network activity table to the job summary and post-job log. Each log also includes one `FENCE_REPORT_JSON=` line that you can fetch through the GitHub API:
+After evidence validation, Fence adds a network activity table to the job summary and post-job log. Each verified report also includes one `FENCE_REPORT_JSON=` line that you can fetch through the GitHub API:
 
 ```bash
 gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \

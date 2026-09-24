@@ -44,6 +44,82 @@ const CHILD_ENV = {
   PATH: "/usr/bin:/usr/sbin:/bin:/sbin",
 };
 
+// Failure output is a projection of rejected evidence, never a verified report.
+// Keep codes closed so malformed evidence cannot turn diagnostics into a data dump.
+const FAILURE_CRITICAL_CODES = new Set([
+  "dns_audit_container_drift",
+  "dns_audit_counter_read_failed",
+  "dns_audit_evidence_persistence_failed",
+  "dns_audit_evidence_write_failed",
+  "dns_audit_network_drift",
+  "dns_audit_nflog_failure",
+  "dns_audit_report_write_failed",
+  "dns_audit_routing_drift",
+  "dns_audit_sudo_drift",
+  "dns_audit_worker_unhealthy",
+  "dns_block_container_drift",
+  "dns_block_counter_read_failed",
+  "dns_block_dynamic_update_failed",
+  "dns_block_evidence_persistence_failed",
+  "dns_block_evidence_write_failed",
+  "dns_block_network_drift",
+  "dns_block_nflog_failure",
+  "dns_block_report_write_failed",
+  "dns_block_root_refresh_failed",
+  "dns_block_root_refresh_integrity_failed",
+  "dns_block_routing_drift",
+  "dns_block_sudo_drift",
+  "dns_block_worker_unhealthy",
+  "local_control_inventory_additive_drift",
+  "local_control_inventory_bounds_exceeded",
+  "local_control_inventory_incomplete",
+  "local_control_inventory_unavailable",
+  "local_control_inventory_unreviewed_reduction",
+  "local_control_inventory_unstable",
+  "resident_worker_channel_disconnected",
+  "resident_worker_exited",
+  "resident_worker_panicked",
+]);
+
+type EvidenceSource = "resident" | "dns";
+
+function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date.now()): string {
+  const health = evidence?.resident_health;
+  const verifiedAt = health?.last_successful_verification_unix_milliseconds;
+  const sequence = health?.verification_sequence;
+  const age = Number.isSafeInteger(verifiedAt) && verifiedAt > 0 && Number.isSafeInteger(now)
+    ? now - verifiedAt
+    : null;
+  const findings = Array.isArray(evidence?.critical_findings) && evidence.critical_findings.length <= 64
+    ? evidence.critical_findings
+    : null;
+  return `Fence failure diagnostic (unverified): ${JSON.stringify({
+    source,
+    reported_resident_status: ["healthy", "critical", "starting"].includes(health?.status) ? health.status : "unavailable",
+    verification_sequence: Number.isSafeInteger(sequence) && sequence >= 1 ? sequence : null,
+    heartbeat_age_ms: Number.isSafeInteger(age) ? age : null,
+    critical_findings: findings === null ? null : findings.length,
+    critical_codes: findings === null ? [] : findings.slice(0, 5).map((finding: any) =>
+      FAILURE_CRITICAL_CODES.has(finding?.code) ? finding.code : "unrecognized"),
+    critical_codes_omitted: findings === null ? null : Math.max(0, findings.length - 5),
+    critical_findings_truncated: typeof evidence?.critical_findings_truncated === "boolean"
+      ? evidence.critical_findings_truncated : null,
+  })}`;
+}
+
+function validatePostEvidence(evidence: any, source: EvidenceSource, validate: (value: any) => any): any {
+  try {
+    return validate(evidence);
+  } catch (error) {
+    try {
+      log.info(postFailureDiagnostic(evidence, source));
+    } catch {
+      // Diagnostics must never replace the original validation failure.
+    }
+    throw error;
+  }
+}
+
 function emitError(error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
   log.error(`Fence post-job evidence failed: ${message}`);
@@ -114,7 +190,7 @@ function settleResidentReport(
   const read = controls.read || ((file: string) =>
     readJsonBounded(file, MAX_REPORT_BYTES, "Fence report"));
   const verifyService = controls.verifyService || validateResidentService;
-  let report = validateReport(initialReport, false);
+  let report = validatePostEvidence(initialReport, "resident", (value: any) => validateReport(value, false));
   verifyService(unit, report.resident_health.resident_pid);
   let counters = networkEvidenceCounters(report);
   if (report.critical_findings.length > 0) {
@@ -145,7 +221,7 @@ function settleResidentReport(
     }
     const remainingMilliseconds = Number((remaining + 999_999n) / 1_000_000n);
     pause(Math.min(EVIDENCE_SETTLE_INTERVAL_MILLISECONDS, remainingMilliseconds));
-    const next = validateReport(read(reportPath), false);
+    const next = validatePostEvidence(read(reportPath), "resident", (value: any) => validateReport(value, false));
     if (
       identityFields.some((field) => next[field] !== initialReport[field]) ||
       next.resident_health.resident_pid !== initialReport.resident_health.resident_pid
@@ -219,17 +295,15 @@ function main(): void {
     pathGuards,
   );
   validateBundle(MANIFEST, BINARY);
-  const initialReport = validateReport(
-    readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report"),
-    false,
-  );
+  const initialReport = readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report");
   const report = settleResidentReport(reportPath, paths.unit, initialReport);
   let dnsEvidence;
   const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
   if (fs.existsSync(effectiveDnsReportPath)) {
-    dnsEvidence = validateDnsEvidence(
+    dnsEvidence = validatePostEvidence(
       readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report"),
-      report,
+      "dns",
+      (value: any) => validateDnsEvidence(value, report),
     );
   } else if (report.mode === "block") {
     throw new Error("Fence block-mode DNS evidence is missing");
@@ -339,4 +413,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, settleResidentReport };
+module.exports = { main, postFailureDiagnostic, validatePostEvidence, settleResidentReport };
