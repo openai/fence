@@ -31,7 +31,7 @@ This shows the operating system, architecture, available backend, and reference 
 fence render-plan --config policy.json
 ```
 
-This validates a JSON configuration and prints the firewall rules without applying them.
+This validates a JSON configuration and prints the firewall rules without applying them. Exact hostname allowlist entries are resolved through the system resolver while the plan is built, so a preview that contains hostnames can perform DNS lookups and can fail if resolution is unavailable.
 
 ## Run The Agent
 
