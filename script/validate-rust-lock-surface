@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+
+import pathlib
+import sys
+import tempfile
+import tomllib
+
+
+def parse_csv(value: str) -> list[str]:
+    return [item for item in value.split(",") if item]
+
+
+def validate(path: pathlib.Path, hosts: list[str], targets: list[str], components: list[str]) -> None:
+    with path.open("rb") as source:
+        document = tomllib.load(source)
+    rust = document.get("rust")
+    if not isinstance(rust, dict):
+        raise ValueError("Rust toolchain lock is missing its rust table")
+    expected = {
+        "hosts": hosts,
+        "targets": targets,
+        "host_components": components,
+    }
+    for field, value in expected.items():
+        if rust.get(field) != value:
+            raise ValueError(f"Rust toolchain lock {field} declaration does not match the reviewed surface")
+
+
+def self_test() -> None:
+    hosts = ["host-a", "host-b"]
+    targets = ["target-a", "target-b"]
+    components = ["rustc", "cargo"]
+    with tempfile.TemporaryDirectory(prefix="fence-rust-lock-surface-") as temporary:
+        path = pathlib.Path(temporary) / "lock.toml"
+        path.write_text(
+            "[rust]\n"
+            'hosts = ["host-a", "host-b"]\n'
+            'targets = ["target-a", "target-b"]\n'
+            'host_components = ["rustc", "cargo"]\n',
+            encoding="utf-8",
+        )
+        validate(path, hosts, targets, components)
+
+        for field, replacement in (
+            ("hosts", '["host-a"]'),
+            ("targets", '["target-b", "target-a"]'),
+            ("host_components", '["rustc", "cargo", "rustfmt"]'),
+        ):
+            original = path.read_text(encoding="utf-8")
+            lines = [
+                f"{field} = {replacement}" if line.startswith(f"{field} = ") else line
+                for line in original.splitlines()
+            ]
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            try:
+                validate(path, hosts, targets, components)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"mismatched {field} declaration was accepted")
+            path.write_text(original, encoding="utf-8")
+
+
+def main() -> None:
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        return
+    if len(sys.argv) != 5:
+        raise SystemExit(
+            "usage: script/validate-rust-lock-surface <lockfile> <hosts-csv> <targets-csv> <components-csv>"
+        )
+    validate(
+        pathlib.Path(sys.argv[1]),
+        parse_csv(sys.argv[2]),
+        parse_csv(sys.argv[3]),
+        parse_csv(sys.argv[4]),
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, tomllib.TOMLDecodeError, AssertionError) as error:
+        raise SystemExit(str(error)) from None
