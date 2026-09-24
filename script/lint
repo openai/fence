@@ -27,6 +27,9 @@ if [[ $# -gt 1 ]]; then
   exit 2
 fi
 
+python3 -B -E "$DIR/script/validate-workflow-surface"
+python3 -B -E "$DIR/script/validate-workflow-surface" --self-test
+
 if [[ "$CHECK_FORMAT" == "true" ]]; then
   cargo fmt --all -- --check
 else
