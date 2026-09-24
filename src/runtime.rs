@@ -387,6 +387,11 @@ fn replace_report(
 ) -> Result<(), RuntimeError> {
     let bytes = bounded_json(value)?;
     let pending = directory.join("report.json.next");
+    match fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("runtime_atomic_write_failed", error)),
+    }
     write_bytes_exclusive(&pending, &bytes, 0o644)?;
     fs::rename(&pending, report).map_err(|error| io_error("runtime_atomic_write_failed", error))
 }
@@ -497,6 +502,28 @@ mod tests {
             fs::metadata(&store.report).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovers_from_stale_pending_report_file() {
+        let root = root();
+        let _ = fs::remove_dir_all(&root);
+        let store = TestRuntimeStore::create(&root, "resident-proof").unwrap();
+        let pending = store.directory.join("report.json.next");
+        fs::write(&pending, br#"{"value":"stale"}"#).unwrap();
+
+        store
+            .replace_report(&Document {
+                value: "fresh".to_owned(),
+            })
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&store.report).unwrap(),
+            r#"{"value":"fresh"}"#
+        );
+        assert!(!pending.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
