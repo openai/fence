@@ -4356,3 +4356,28 @@ test("reports stale evidence encountered during settlement and DNS validation", 
   assert.equal(lines.length, 2);
   assert.match(lines[1], /"source":"dns"/);
 });
+
+test("retains supervised worker failure codes after the heartbeat becomes stale", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  for (const code of [
+    "attribution_request_channel_disconnected",
+    "attribution_result_channel_failed",
+    "dns_tcp_client_panicked",
+    "dns_tcp_client_spawn_failed",
+    "dns_tcp_listener_failed",
+    "dns_udp_listener_failed",
+    "runner_worker_identity_drift",
+  ]) {
+    const stale = {
+      ...report,
+      resident_health: residentHealth({
+        status: "critical",
+        last_successful_verification_unix_milliseconds: Date.now() - 60_000,
+      }),
+      critical_findings: [{ code }],
+    };
+    assert.throws(() => settleResidentReport("unused", "unused", stale), /stale/);
+    assert.match(lines.pop(), new RegExp(code));
+  }
+});

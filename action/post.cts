@@ -47,6 +47,8 @@ const CHILD_ENV = {
 // Failure output is a projection of rejected evidence, never a verified report.
 // Keep codes closed so malformed evidence cannot turn diagnostics into a data dump.
 const FAILURE_CRITICAL_CODES = new Set([
+  "attribution_request_channel_disconnected",
+  "attribution_result_channel_failed",
   "dns_audit_container_drift",
   "dns_audit_counter_read_failed",
   "dns_audit_evidence_persistence_failed",
@@ -70,6 +72,10 @@ const FAILURE_CRITICAL_CODES = new Set([
   "dns_block_routing_drift",
   "dns_block_sudo_drift",
   "dns_block_worker_unhealthy",
+  "dns_tcp_client_panicked",
+  "dns_tcp_client_spawn_failed",
+  "dns_tcp_listener_failed",
+  "dns_udp_listener_failed",
   "local_control_inventory_additive_drift",
   "local_control_inventory_bounds_exceeded",
   "local_control_inventory_incomplete",
@@ -79,6 +85,7 @@ const FAILURE_CRITICAL_CODES = new Set([
   "resident_worker_channel_disconnected",
   "resident_worker_exited",
   "resident_worker_panicked",
+  "runner_worker_identity_drift",
 ]);
 
 type EvidenceSource = "resident" | "dns";
