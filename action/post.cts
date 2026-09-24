@@ -14,6 +14,8 @@ const {
   materializationRequestRejections,
   materializationEvidenceCounter,
   materializationWarning,
+  MAX_CRITICAL_FINDINGS,
+  MAX_STRUCTURED_CRITICAL_CODES,
   MAX_REPORT_BYTES,
   networkReportLines,
   readJsonBounded,
@@ -97,7 +99,7 @@ function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date
   const age = Number.isSafeInteger(verifiedAt) && verifiedAt > 0 && Number.isSafeInteger(now)
     ? now - verifiedAt
     : null;
-  const findings = Array.isArray(evidence?.critical_findings) && evidence.critical_findings.length <= 64
+  const findings = Array.isArray(evidence?.critical_findings) && evidence.critical_findings.length <= MAX_CRITICAL_FINDINGS
     ? evidence.critical_findings
     : null;
   return `Fence failure diagnostic (unverified): ${JSON.stringify({
@@ -106,9 +108,9 @@ function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date
     verification_sequence: Number.isSafeInteger(sequence) && sequence >= 1 ? sequence : null,
     heartbeat_age_ms: Number.isSafeInteger(age) ? age : null,
     critical_findings: findings === null ? null : findings.length,
-    critical_codes: findings === null ? [] : findings.slice(0, 5).map((finding: any) =>
+    critical_codes: findings === null ? [] : findings.slice(0, MAX_STRUCTURED_CRITICAL_CODES).map((finding: any) =>
       FAILURE_CRITICAL_CODES.has(finding?.code) ? finding.code : "unrecognized"),
-    critical_codes_omitted: findings === null ? null : Math.max(0, findings.length - 5),
+    critical_codes_omitted: findings === null ? null : Math.max(0, findings.length - MAX_STRUCTURED_CRITICAL_CODES),
     critical_findings_truncated: typeof evidence?.critical_findings_truncated === "boolean"
       ? evidence.critical_findings_truncated : null,
   })}`;

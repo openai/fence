@@ -8,6 +8,8 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   ACTION_RUNTIME_FILES,
+  MAX_CRITICAL_FINDINGS,
+  MAX_STRUCTURED_CRITICAL_CODES,
   MAX_STRUCTURED_REPORT_BYTES,
   actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
@@ -4312,16 +4314,18 @@ test("bounds failure diagnostics and excludes arbitrary evidence", () => {
   const secret = "private_fixture_value";
   const input = {
     resident_health: { status: secret, verification_sequence: secret, last_successful_verification_unix_milliseconds: secret },
-    critical_findings: Array.from({ length: 64 }, (_, i) => ({ code: i === 0 ? "dns_audit_network_drift" : secret, message: secret })),
+    critical_findings: Array.from({ length: MAX_CRITICAL_FINDINGS }, (_, i) => ({ code: i === 0 ? "dns_audit_network_drift" : secret, message: secret })),
     critical_findings_truncated: true,
     findings: [{ message: secret }],
   };
   const line = postFailureDiagnostic(input, "resident", 100_000);
   assert.ok(Buffer.byteLength(line) < 2048);
   assert.match(line, /dns_audit_network_drift/);
-  assert.match(line, /"critical_codes_omitted":59/);
+  const diagnostic = JSON.parse(line.slice(line.indexOf(": ") + 2));
+  assert.equal(diagnostic.critical_codes.length, MAX_STRUCTURED_CRITICAL_CODES);
+  assert.equal(diagnostic.critical_codes_omitted, MAX_CRITICAL_FINDINGS - MAX_STRUCTURED_CRITICAL_CODES);
   assert.doesNotMatch(line, /private_fixture_value/);
-  for (const malformed of [null, [], "bad", { resident_health: [] }, { critical_findings: [null, [], { code: "::error::injected\n" }] }, { critical_findings: Array(65).fill({ code: secret }) }]) {
+  for (const malformed of [null, [], "bad", { resident_health: [] }, { critical_findings: [null, [], { code: "::error::injected\n" }] }, { critical_findings: Array(MAX_CRITICAL_FINDINGS + 1).fill({ code: secret }) }]) {
     const diagnostic = postFailureDiagnostic(malformed, "dns", 100_000);
     assert.ok(Buffer.byteLength(diagnostic) < 2048);
     assert.doesNotMatch(diagnostic, /private_fixture_value|::error::|injected|\n/);

@@ -109,7 +109,7 @@ See [how Fence works](docs/how-it-works.md) for more detail.
 
 Fence briefly retries incomplete local service inspections before failing. If startup still fails, check the inspection reason codes in the log; see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
 
-If post-job evidence validation fails, Fence prints bounded, unverified failure details when readable evidence is available and still fails the job. See [post-job troubleshooting](docs/troubleshooting.md#post-job-evidence-validation-fails).
+Failed evidence validation may include [bounded, unverified diagnostics](docs/troubleshooting.md#post-job-evidence-validation-fails); the job still fails.
 
 ## Network Reports 📋
 
