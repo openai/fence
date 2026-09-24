@@ -6,9 +6,11 @@ source script/env "$@"
 
 ensure_rust_toolchain
 require_cmd cargo
+require_cmd python3
 
 echo -e "Rust version: ${GREEN}${RUST_VERSION}${OFF}"
 
+python3 -B -E "$DIR/script/lib/cargo_dependency_pins.py" "$DIR/Cargo.toml"
 ensure_vendor_cache
 
 # This validates that the deps are available so the project can be built offline.
