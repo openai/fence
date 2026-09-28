@@ -9,7 +9,9 @@ ensure_rust_toolchain
 script/validate-release-tools
 script/validate-test-tools
 script/test-action-release
+python3 -B -E "$DIR/script/lib/dns_evidence.py" --self-test
 python3 -B -E "$DIR/script/lib/protected_finalization.py" --self-test
+python3 -B -E "$DIR/script/lib/block_evidence.py" --self-test
 script/test-rust-toolchain-preparation
 
 case "${1:-}" in

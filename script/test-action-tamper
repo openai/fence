@@ -245,6 +245,42 @@ require(
 )
 PY
 
+# Critical health never advances its successful heartbeat. Wait only until it
+# crosses the freshness limit, with a separate monotonic test deadline.
+python3 -E - "$report" <<'PYWAIT'
+import json
+import pathlib
+import sys
+import time
+
+report_path = pathlib.Path(sys.argv[1])
+deadline = time.monotonic() + 25
+while time.monotonic() < deadline:
+    evidence = json.loads(report_path.read_text(encoding="utf-8"))
+    health = evidence["resident_health"]
+    if health["status"] != "critical":
+        raise SystemExit("Tamper evidence lost critical resident status")
+    age = time.time() * 1000 - health["last_successful_verification_unix_milliseconds"]
+    if age > 21_000:
+        break
+    time.sleep(0.1)
+else:
+    raise SystemExit("Critical resident heartbeat did not become stale")
+PYWAIT
+
+if STATE_invocation_id="$invocation" \
+  STATE_report_path="$report" \
+  STATE_launcher_integrity_path="$launcher_integrity" \
+  GITHUB_STEP_SUMMARY="$summary" \
+  node action/post.cts >"$post_stdout" 2>"$post_stderr"; then
+  die "Action post hook unexpectedly accepted stale critical evidence"
+fi
+grep -q "Fence resident health evidence is stale or has an invalid timestamp" "$post_stderr"
+grep -q 'Fence failure diagnostic (unverified): .*"reported_resident_status":"critical".*dns_audit_network_drift' "$post_stdout"
+if grep -q 'FENCE_REPORT_JSON=\|Fence evidence verified' "$post_stdout"; then
+  die "Stale critical evidence produced a verified report"
+fi
+
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
   die "Action post hook unexpectedly restored inet fence_v0"
 fi

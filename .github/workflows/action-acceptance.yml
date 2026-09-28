@@ -97,7 +97,7 @@ jobs:
           echo "acceptance_runner=$acceptance_runner" >> "$GITHUB_OUTPUT"
 
       - name: checkout candidate source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ steps.candidate.outputs.action_ref }}
           fetch-depth: 0
@@ -167,7 +167,7 @@ jobs:
           path: |
             ${{ runner.temp }}/fence-action-candidate/action/bin/fence
             ${{ runner.temp }}/fence-action-candidate/action/bundle-manifest.json
-          retention-days: 1
+          retention-days: 30
           if-no-files-found: error
 
   action:
@@ -204,7 +204,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -275,7 +275,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -318,7 +318,7 @@ jobs:
 
     steps:
       - name: checkout into nested Action path
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           path: target/action-layout/owner/project/revision
@@ -369,7 +369,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -395,7 +395,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -439,7 +439,7 @@ jobs:
 
     steps:
       - name: checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false
@@ -488,7 +488,7 @@ jobs:
       - name: checkout
         id: finalization-checkout
         if: ${{ needs.prepare-candidate.result == 'success' && needs.action-finalization.result == 'success' }}
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # pin@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
         with:
           ref: ${{ needs.prepare-candidate.outputs.action_ref }}
           persist-credentials: false

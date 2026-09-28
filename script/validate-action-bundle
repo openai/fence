@@ -63,6 +63,8 @@ for directory in (manifest_path.parent, binary_path.parent):
         raise SystemExit(f"unsafe Action bundle directory: {directory}")
 if not manifest_path.is_file() or manifest_path.is_symlink():
     raise SystemExit(f"missing Action bundle manifest: {manifest_path}")
+if not 0 < manifest_path.stat().st_size <= 16 * 1024:
+    raise SystemExit(f"Action bundle manifest size is invalid: {manifest_path}")
 if not binary_path.is_file() or binary_path.is_symlink():
     raise SystemExit(f"missing Action bundle binary: {binary_path}")
 if not 0 < binary_path.stat().st_size <= 64 * 1024 * 1024:

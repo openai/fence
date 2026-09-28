@@ -572,10 +572,44 @@ pub struct DnsMediationEvidence {
     pub blocked_non_profile_query_count: u64,
     pub materialization_batch_count: u64,
     pub materialization_request_rejections: u64,
+    pub materialization_rejection_reasons: MaterializationRejectionReasons,
     pub materialization_update_max_milliseconds: u64,
     pub hostname_refresh_warnings: u64,
     pub upstream_request_failures: u64,
     pub limitations: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize)]
+pub struct MaterializationRejectionReasons {
+    pub invalid_response: u64,
+    pub authorization_changed: u64,
+    pub capacity: u64,
+    pub queue_unavailable: u64,
+    pub firewall_update_failed: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MaterializationRejectionReason {
+    InvalidResponse,
+    AuthorizationChanged,
+    Capacity,
+    QueueUnavailable,
+    FirewallUpdateFailed,
+}
+
+impl MaterializationRejectionReasons {
+    fn record(&mut self, reason: MaterializationRejectionReason) {
+        let counter = match reason {
+            MaterializationRejectionReason::InvalidResponse => &mut self.invalid_response,
+            MaterializationRejectionReason::AuthorizationChanged => &mut self.authorization_changed,
+            MaterializationRejectionReason::Capacity => &mut self.capacity,
+            MaterializationRejectionReason::QueueUnavailable => &mut self.queue_unavailable,
+            MaterializationRejectionReason::FirewallUpdateFailed => {
+                &mut self.firewall_update_failed
+            }
+        };
+        *counter = counter.saturating_add(1);
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -746,6 +780,7 @@ struct ObservationState {
     blocked_non_profile_query_count: u64,
     materialization_batch_count: u64,
     materialization_request_rejections: u64,
+    materialization_rejection_reasons: MaterializationRejectionReasons,
     materialization_update_max_milliseconds: u64,
     hostname_refresh_warnings: u64,
     upstream_request_failures: u64,
@@ -798,6 +833,7 @@ struct ValidatedDnsResponse {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DnsResponseValidationError {
     Invalid,
+    AuthorizationChanged,
     Capacity,
 }
 
@@ -834,6 +870,8 @@ struct MaterializationRequest {
     response: ValidatedDnsResponse,
     completion: SyncSender<MaterializationCompletion>,
 }
+
+type RejectedMaterializationRequest = (MaterializationRequest, MaterializationRejectionReason);
 
 #[derive(Debug, Clone)]
 struct MaterializationSubmitter {
@@ -1248,6 +1286,7 @@ impl ObservationRecorder {
                 .unwrap_or_default()
         };
         let mut block_validation = None;
+        let mut rejection_reason = MaterializationRejectionReason::InvalidResponse;
         if let Some(records) = records.as_ref() {
             let now = Instant::now();
             let mut authorizations = self
@@ -1272,6 +1311,10 @@ impl ObservationRecorder {
                 }
                 Err(DnsResponseValidationError::Capacity) => {
                     authorizations.truncated = true;
+                    rejection_reason = MaterializationRejectionReason::Capacity;
+                }
+                Err(DnsResponseValidationError::AuthorizationChanged) => {
+                    rejection_reason = MaterializationRejectionReason::AuthorizationChanged;
                 }
                 Err(DnsResponseValidationError::Invalid) => {}
             }
@@ -1288,7 +1331,7 @@ impl ObservationRecorder {
         let disposition = if !forwardable_block_response {
             DnsResponseDisposition::ForwardOriginal
         } else if block_validation.is_none() {
-            self.record_materialization_rejection();
+            self.record_materialization_rejection(rejection_reason);
             DnsResponseDisposition::RetryableFailure
         } else if block_validation
             .as_ref()
@@ -1307,13 +1350,13 @@ impl ObservationRecorder {
                     DnsResponseDisposition::ForwardOriginal
                 }
                 Ok(MaterializationCompletion::Failed) => DnsResponseDisposition::RetryableFailure,
-                Err(()) => {
-                    self.record_materialization_rejection();
+                Err(reason) => {
+                    self.record_materialization_rejection(reason);
                     DnsResponseDisposition::RetryableFailure
                 }
             }
         } else {
-            self.record_materialization_rejection();
+            self.record_materialization_rejection(MaterializationRejectionReason::QueueUnavailable);
             DnsResponseDisposition::RetryableFailure
         };
 
@@ -1327,10 +1370,11 @@ impl ObservationRecorder {
         disposition
     }
 
-    fn record_materialization_rejection(&self) {
+    fn record_materialization_rejection(&self, reason: MaterializationRejectionReason) {
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         state.materialization_request_rejections =
             state.materialization_request_rejections.saturating_add(1);
+        state.materialization_rejection_reasons.record(reason);
     }
 
     fn record_materialization_batch(&self, elapsed: Duration) {
@@ -2820,13 +2864,15 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         } else {
             true
         };
-        let update_succeeded = publish_verified_materialization_transaction(
+        let update_result = publish_verified_materialization_transaction(
             verification_succeeded,
+            materialization_bound_exceeded,
             &mut authorizations,
             &mut self.active,
             proposed_authorizations,
             proposed,
         );
+        let update_succeeded = update_result.is_ok();
         if update_succeeded && transaction_requires_verification {
             self.expected_state = expected;
             self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
@@ -2835,17 +2881,21 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         drop(authorizations);
 
         if rejected_request_count > 0 {
-            for _ in 0..rejected_request_count {
-                self._mediation.recorder.record_materialization_rejection();
+            for (_, reason) in &rejected_requests {
+                self._mediation
+                    .recorder
+                    .record_materialization_rejection(*reason);
             }
             changed = true;
         }
         if materialization_capacity_rejected || materialization_bound_exceeded {
             self.evidence.materializations_truncated = true;
         }
-        if !update_succeeded {
+        if let Err(reason) = update_result {
             for _ in 0..accepted_request_count {
-                self._mediation.recorder.record_materialization_rejection();
+                self._mediation
+                    .recorder
+                    .record_materialization_rejection(reason);
             }
             if refresh_attempted {
                 self.evidence.hostname_refresh_warnings =
@@ -2880,7 +2930,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         } else {
             complete_materialization_requests(accepted_requests, MaterializationCompletion::Failed);
         }
-        complete_materialization_requests(rejected_requests, MaterializationCompletion::Failed);
+        complete_materialization_requests(
+            rejected_requests.into_iter().map(|(request, _)| request),
+            MaterializationCompletion::Failed,
+        );
         if batch_has_work || merge.rules_changed || merge.metadata_changed {
             changed = true;
         }
@@ -4032,13 +4085,16 @@ fn submit_materialization_request(
     queried_hostname: String,
     mut response: ValidatedDnsResponse,
     shutdown: &AtomicBool,
-) -> Result<MaterializationCompletion, ()> {
+) -> Result<MaterializationCompletion, MaterializationRejectionReason> {
     response.materializations = coalesce_pending_materializations(response.materializations)
         .into_iter()
         .collect();
     let materialization_count = response.materializations.len();
-    if materialization_count == 0 || materialization_count > MAX_MATERIALIZATIONS_PER_UPDATE {
-        return Err(());
+    if materialization_count == 0 {
+        return Err(MaterializationRejectionReason::InvalidResponse);
+    }
+    if materialization_count > MAX_MATERIALIZATIONS_PER_UPDATE {
+        return Err(MaterializationRejectionReason::Capacity);
     }
     let (completion, result) = mpsc::sync_channel(1);
     let request = MaterializationRequest {
@@ -4052,11 +4108,12 @@ fn submit_materialization_request(
                 Ok(completion) => break Ok(completion),
                 Err(mpsc::RecvTimeoutError::Timeout) if !shutdown.load(Ordering::Relaxed) => {}
                 Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-                    break Err(());
+                    break Err(MaterializationRejectionReason::QueueUnavailable);
                 }
             }
         },
-        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => Err(()),
+        Err(TrySendError::Full(_)) => Err(MaterializationRejectionReason::Capacity),
+        Err(TrySendError::Disconnected(_)) => Err(MaterializationRejectionReason::QueueUnavailable),
     }
 }
 
@@ -4070,7 +4127,7 @@ fn stage_materialization_transactions(
     CnameAuthorizationState,
     BTreeSet<PendingMaterialization>,
     Vec<MaterializationRequest>,
-    Vec<MaterializationRequest>,
+    Vec<RejectedMaterializationRequest>,
     bool,
 ) {
     let mut authorizations = current_authorizations.clone();
@@ -4080,7 +4137,7 @@ fn stage_materialization_transactions(
     let mut materialization_capacity_rejected = false;
     for request in requests {
         let mut proposed_authorizations = authorizations.clone();
-        if !commit_staged_dns_response(
+        if let Err(reason) = commit_staged_dns_response(
             &mut proposed_authorizations,
             &request.queried_hostname,
             request.response.clone(),
@@ -4088,7 +4145,7 @@ fn stage_materialization_transactions(
             hostname_policy,
         ) {
             authorizations.truncated |= proposed_authorizations.truncated;
-            rejected.push(request);
+            rejected.push((request, reason));
             continue;
         }
         let combined = coalesce_pending_materializations(
@@ -4099,7 +4156,7 @@ fn stage_materialization_transactions(
         );
         if combined.len() > MAX_MATERIALIZATIONS_PER_UPDATE {
             materialization_capacity_rejected = true;
-            rejected.push(request);
+            rejected.push((request, MaterializationRejectionReason::Capacity));
         } else {
             authorizations = proposed_authorizations;
             materializations = combined;
@@ -4131,17 +4188,21 @@ fn materialization_candidate_requires_verification(
 
 fn publish_verified_materialization_transaction(
     verification_succeeded: bool,
+    materialization_bound_exceeded: bool,
     authorizations: &mut CnameAuthorizationState,
     active: &mut BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
     proposed_authorizations: CnameAuthorizationState,
     proposed_active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
-) -> bool {
+) -> Result<(), MaterializationRejectionReason> {
+    if materialization_bound_exceeded {
+        return Err(MaterializationRejectionReason::Capacity);
+    }
     if !verification_succeeded {
-        return false;
+        return Err(MaterializationRejectionReason::FirewallUpdateFailed);
     }
     *active = proposed_active;
     *authorizations = proposed_authorizations;
-    true
+    Ok(())
 }
 
 fn coalesce_pending_materializations(
@@ -5578,7 +5639,7 @@ fn validate_dns_response_lineage(
     hostname_policy: &RuntimeHostnamePolicy,
 ) -> Result<ValidatedDnsResponse, DnsResponseValidationError> {
     let policy = hostname_policy_for_authorized_name(queried_hostname, state, hostname_policy)
-        .ok_or(DnsResponseValidationError::Invalid)?;
+        .ok_or(DnsResponseValidationError::AuthorizationChanged)?;
     let requires_runner_provenance =
         requires_runner_results_storage_provenance(queried_hostname, state, hostname_policy);
     let mut forbidden = BTreeSet::from([queried_hostname.to_owned()]);
@@ -5589,7 +5650,7 @@ fn validate_dns_response_lineage(
         let authorization = state
             .active
             .get(queried_hostname)
-            .ok_or(DnsResponseValidationError::Invalid)?;
+            .ok_or(DnsResponseValidationError::AuthorizationChanged)?;
         depth = authorization.depth;
         lineage_expiry = Some(authorization.expires_at);
         if authorization
@@ -5597,7 +5658,7 @@ fn validate_dns_response_lineage(
             .saturating_duration_since(now)
             .is_zero()
         {
-            return Err(DnsResponseValidationError::Invalid);
+            return Err(DnsResponseValidationError::AuthorizationChanged);
         }
         root_authorization = Some(authorization.clone());
     }
@@ -5751,7 +5812,7 @@ fn commit_staged_dns_response(
     response: ValidatedDnsResponse,
     now: Instant,
     hostname_policy: &RuntimeHostnamePolicy,
-) -> bool {
+) -> Result<(), MaterializationRejectionReason> {
     remove_expired_cname_authorizations(state, now);
     let root_is_unchanged = match response.root_authorization.as_ref() {
         Some(expected) => {
@@ -5769,7 +5830,7 @@ fn commit_staged_dns_response(
         || requires_runner_results_storage_provenance(queried_hostname, state, hostname_policy)
             != response.requires_runner_provenance
     {
-        return false;
+        return Err(MaterializationRejectionReason::AuthorizationChanged);
     }
     let new_authorizations = response
         .authorizations
@@ -5780,9 +5841,13 @@ fn commit_staged_dns_response(
         .len();
     if state.active.len().saturating_add(new_authorizations) > MAX_DERIVED_CNAME_AUTHORIZATIONS {
         state.truncated = true;
-        return false;
+        return Err(MaterializationRejectionReason::Capacity);
     }
-    commit_dns_response_authorizations(state, response)
+    if commit_dns_response_authorizations(state, response) {
+        Ok(())
+    } else {
+        Err(MaterializationRejectionReason::AuthorizationChanged)
+    }
 }
 
 fn commit_dns_response_authorizations(
@@ -6202,6 +6267,7 @@ fn evidence_from_state_and_authorizations(
         blocked_non_profile_query_count: state.blocked_non_profile_query_count,
         materialization_batch_count: state.materialization_batch_count,
         materialization_request_rejections: state.materialization_request_rejections,
+        materialization_rejection_reasons: state.materialization_rejection_reasons,
         materialization_update_max_milliseconds: state.materialization_update_max_milliseconds,
         hostname_refresh_warnings: state.hostname_refresh_warnings,
         upstream_request_failures: state.upstream_request_failures,
@@ -6598,6 +6664,24 @@ mod tests {
         (recorder, report_path)
     }
 
+    fn assert_materialization_rejections(
+        recorder: &ObservationRecorder,
+        expected: MaterializationRejectionReasons,
+    ) {
+        let state = recorder.state.lock().unwrap();
+        assert_eq!(state.materialization_rejection_reasons, expected);
+        let total = [
+            expected.invalid_response,
+            expected.authorization_changed,
+            expected.capacity,
+            expected.queue_unavailable,
+            expected.firewall_update_failed,
+        ]
+        .into_iter()
+        .fold(0_u64, u64::saturating_add);
+        assert_eq!(state.materialization_request_rejections, total);
+    }
+
     fn query(name: &str, query_type: u16) -> Vec<u8> {
         let mut bytes = vec![0_u8; 12];
         bytes[4..6].copy_from_slice(&1_u16.to_be_bytes());
@@ -6924,13 +7008,17 @@ mod tests {
             materializations.clone(),
             Instant::now(),
         );
-        assert!(!publish_verified_materialization_transaction(
-            false,
-            &mut authorizations,
-            &mut active,
-            staged,
-            proposed_active,
-        ));
+        assert_eq!(
+            publish_verified_materialization_transaction(
+                false,
+                false,
+                &mut authorizations,
+                &mut active,
+                staged,
+                proposed_active,
+            ),
+            Err(MaterializationRejectionReason::FirewallUpdateFailed),
+        );
         assert!(authorizations.active.is_empty());
         assert!(active.is_empty());
         complete_materialization_requests(accepted, MaterializationCompletion::Failed);
@@ -6952,13 +7040,15 @@ mod tests {
         assert_eq!(accepted.len(), 1);
         let mut proposed_active = active.clone();
         merge_materializations(&mut proposed_active, materializations, Instant::now());
-        assert!(publish_verified_materialization_transaction(
+        publish_verified_materialization_transaction(
             true,
+            false,
             &mut authorizations,
             &mut active,
             staged,
             proposed_active,
-        ));
+        )
+        .unwrap();
         assert!(!authorizations.active.is_empty());
         assert!(!active.is_empty());
         drop(authorizations);
@@ -7270,6 +7360,7 @@ mod tests {
         let (submitter, requests) = materialization_request_channel();
         let (recorder, report_path) =
             test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
+        let observations = recorder.clone();
         let caller = thread::spawn(move || {
             recorder.record_response(
                 "github.com",
@@ -7288,6 +7379,22 @@ mod tests {
         assert_eq!(
             caller.join().unwrap(),
             DnsResponseDisposition::ForwardOriginal
+        );
+        assert_materialization_rejections(
+            &observations,
+            MaterializationRejectionReasons::default(),
+        );
+        let evidence: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(evidence["materialization_request_rejections"], 0);
+        assert_eq!(
+            evidence["materialization_rejection_reasons"],
+            serde_json::json!({
+                "invalid_response": 0,
+                "authorization_changed": 0,
+                "capacity": 0,
+                "queue_unavailable": 0,
+                "firewall_update_failed": 0,
+            }),
         );
         let _ = fs::remove_file(report_path);
     }
@@ -7500,13 +7607,51 @@ mod tests {
             DnsResponseDisposition::RetryableFailure
         );
         assert!(matches!(requests.try_recv(), Err(TryRecvError::Empty)));
-        assert_eq!(
-            recorder
-                .state
-                .lock()
+        assert_materialization_rejections(
+            &recorder,
+            MaterializationRejectionReasons {
+                invalid_response: 2,
+                ..MaterializationRejectionReasons::default()
+            },
+        );
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
+    fn expired_dns_authorization_is_not_reported_as_a_malformed_response() {
+        let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        let now = Instant::now();
+        {
+            let mut authorizations = recorder.cname_authorizations.lock().unwrap();
+            commit_test_cname_lineage(
+                &mut authorizations,
+                "github.com",
+                "expired.example",
+                1,
+                now,
+                &recorder.hostname_policy,
+            );
+            authorizations
+                .active
+                .get_mut("expired.example")
                 .unwrap()
-                .materialization_request_rejections,
-            2
+                .expires_at = now;
+        }
+        assert_eq!(
+            recorder.record_response(
+                "expired.example",
+                1,
+                &response_with_address("expired.example", 1, 60, &[192, 0, 2, 12]),
+                None,
+            ),
+            DnsResponseDisposition::RetryableFailure,
+        );
+        assert_materialization_rejections(
+            &recorder,
+            MaterializationRejectionReasons {
+                authorization_changed: 1,
+                ..MaterializationRejectionReasons::default()
+            },
         );
         let _ = fs::remove_file(report_path);
     }
@@ -7849,6 +7994,13 @@ mod tests {
         assert!(block_authorizations.active.is_empty());
         assert!(block_authorizations.truncated);
         drop(block_authorizations);
+        assert_materialization_rejections(
+            &block,
+            MaterializationRejectionReasons {
+                capacity: 1,
+                ..MaterializationRejectionReasons::default()
+            },
+        );
 
         let (audit, audit_report) =
             test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
@@ -7860,6 +8012,7 @@ mod tests {
         assert!(audit_authorizations.active.is_empty());
         assert!(audit_authorizations.truncated);
         drop(audit_authorizations);
+        assert_materialization_rejections(&audit, MaterializationRejectionReasons::default());
 
         let _ = fs::remove_file(block_report);
         let _ = fs::remove_file(audit_report);
@@ -7948,18 +8101,12 @@ mod tests {
             caller.join().unwrap(),
             DnsResponseDisposition::RetryableFailure
         );
-        assert_eq!(
-            recorder
-                .state
-                .lock()
-                .unwrap()
-                .materialization_request_rejections,
-            0
-        );
+        assert_materialization_rejections(&recorder, MaterializationRejectionReasons::default());
 
         let (abandoned, abandoned_requests) = materialization_request_channel();
         let (abandoned_recorder, abandoned_report) =
             test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(abandoned));
+        let abandoned_observations = abandoned_recorder.clone();
         let abandoned_caller = thread::spawn(move || {
             abandoned_recorder.record_response(
                 "api.github.com",
@@ -7972,6 +8119,13 @@ mod tests {
         assert_eq!(
             abandoned_caller.join().unwrap(),
             DnsResponseDisposition::RetryableFailure
+        );
+        assert_materialization_rejections(
+            &abandoned_observations,
+            MaterializationRejectionReasons {
+                queue_unavailable: 1,
+                ..MaterializationRejectionReasons::default()
+            },
         );
 
         let (disconnected, receiver) = materialization_request_channel();
@@ -7986,6 +8140,13 @@ mod tests {
                 None,
             ),
             DnsResponseDisposition::RetryableFailure
+        );
+        assert_materialization_rejections(
+            &disconnected_recorder,
+            MaterializationRejectionReasons {
+                queue_unavailable: 1,
+                ..MaterializationRejectionReasons::default()
+            },
         );
 
         let (saturated, _receiver) = materialization_request_channel();
@@ -8019,13 +8180,12 @@ mod tests {
             ),
             DnsResponseDisposition::RetryableFailure
         );
-        assert_eq!(
-            saturated_recorder
-                .state
-                .lock()
-                .unwrap()
-                .materialization_request_rejections,
-            1
+        assert_materialization_rejections(
+            &saturated_recorder,
+            MaterializationRejectionReasons {
+                capacity: 1,
+                ..MaterializationRejectionReasons::default()
+            },
         );
         let _ = fs::remove_file(report_path);
         let _ = fs::remove_file(abandoned_report);
@@ -8036,27 +8196,68 @@ mod tests {
     #[test]
     fn materialization_evidence_counters_saturate_and_remain_bounded() {
         let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        let reasons = [
+            MaterializationRejectionReason::InvalidResponse,
+            MaterializationRejectionReason::AuthorizationChanged,
+            MaterializationRejectionReason::Capacity,
+            MaterializationRejectionReason::QueueUnavailable,
+            MaterializationRejectionReason::FirewallUpdateFailed,
+        ];
+        for reason in reasons {
+            recorder.record_materialization_rejection(reason);
+        }
+        assert_materialization_rejections(
+            &recorder,
+            MaterializationRejectionReasons {
+                invalid_response: 1,
+                authorization_changed: 1,
+                capacity: 1,
+                queue_unavailable: 1,
+                firewall_update_failed: 1,
+            },
+        );
+        let saturated_reasons = MaterializationRejectionReasons {
+            invalid_response: u64::MAX,
+            authorization_changed: u64::MAX,
+            capacity: u64::MAX,
+            queue_unavailable: u64::MAX,
+            firewall_update_failed: u64::MAX,
+        };
         {
             let mut state = recorder.state.lock().unwrap();
             state.materialization_batch_count = u64::MAX;
             state.materialization_request_rejections = u64::MAX;
+            state.materialization_rejection_reasons = saturated_reasons;
             state.materialization_update_max_milliseconds = u64::MAX - 1;
             state.hostname_refresh_warnings = u64::MAX;
             state.upstream_request_failures = u64::MAX;
         }
-        recorder.record_materialization_rejection();
+        for reason in reasons {
+            recorder.record_materialization_rejection(reason);
+        }
         recorder.record_materialization_batch(Duration::from_millis(u64::MAX));
         recorder.record_hostname_refresh_warning();
         recorder.record_upstream_request_failure();
         let state = recorder.state.lock().unwrap();
         assert_eq!(state.materialization_batch_count, u64::MAX);
-        assert_eq!(state.materialization_request_rejections, u64::MAX);
         assert_eq!(state.materialization_update_max_milliseconds, u64::MAX);
         assert_eq!(state.hostname_refresh_warnings, u64::MAX);
         assert_eq!(state.upstream_request_failures, u64::MAX);
         drop(state);
+        assert_materialization_rejections(&recorder, saturated_reasons);
         let evidence: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
         assert_eq!(evidence["materialization_batch_count"], u64::MAX);
+        assert_eq!(evidence["materialization_request_rejections"], u64::MAX);
+        assert_eq!(
+            evidence["materialization_rejection_reasons"],
+            serde_json::json!({
+                "invalid_response": u64::MAX,
+                "authorization_changed": u64::MAX,
+                "capacity": u64::MAX,
+                "queue_unavailable": u64::MAX,
+                "firewall_update_failed": u64::MAX,
+            }),
+        );
         assert_eq!(evidence["upstream_request_failures"], u64::MAX);
         assert_eq!(
             evidence["materialization_update_max_milliseconds"],
@@ -9959,13 +10160,16 @@ mod tests {
         )
         .unwrap();
         assert!(response.authorizations.is_empty());
-        assert!(!commit_staged_dns_response(
-            &mut staged_root,
-            "edge.example",
-            response,
-            now + Duration::from_secs(2),
-            &policy,
-        ));
+        assert_eq!(
+            commit_staged_dns_response(
+                &mut staged_root,
+                "edge.example",
+                response,
+                now + Duration::from_secs(2),
+                &policy,
+            ),
+            Err(MaterializationRejectionReason::AuthorizationChanged),
+        );
         assert!(staged_root.active.contains_key("edge.example"));
 
         let mut active_root = CnameAuthorizationState::default();
@@ -9995,13 +10199,16 @@ mod tests {
         let changed_root = active_root.active.get_mut("edge.example").unwrap();
         changed_root.depth = MAX_DERIVED_CNAME_DEPTH;
         changed_root.expires_at = now + Duration::from_secs(15);
-        assert!(!commit_staged_dns_response(
-            &mut active_root,
-            "edge.example",
-            response,
-            now + Duration::from_secs(10),
-            &policy,
-        ));
+        assert_eq!(
+            commit_staged_dns_response(
+                &mut active_root,
+                "edge.example",
+                response,
+                now + Duration::from_secs(10),
+                &policy,
+            ),
+            Err(MaterializationRejectionReason::AuthorizationChanged),
+        );
         assert!(!active_root.active.contains_key("terminal.example"));
 
         let mut active_root = CnameAuthorizationState::default();
@@ -10017,13 +10224,14 @@ mod tests {
             validate_dns_response_lineage("edge.example", &extension, &active_root, now, &policy)
                 .unwrap();
         let initial_expiry = response.authorizations[0].1.expires_at;
-        assert!(commit_staged_dns_response(
+        commit_staged_dns_response(
             &mut active_root,
             "edge.example",
             response,
             now + Duration::from_secs(10),
             &policy,
-        ));
+        )
+        .unwrap();
         assert_eq!(
             active_root
                 .active
@@ -10147,7 +10355,14 @@ mod tests {
         assert!(accepted.is_empty());
         assert_eq!(rejected.len(), 1);
         assert!(!capacity_rejected);
-        complete_materialization_requests(rejected, MaterializationCompletion::Failed);
+        assert_eq!(
+            rejected[0].1,
+            MaterializationRejectionReason::AuthorizationChanged
+        );
+        complete_materialization_requests(
+            rejected.into_iter().map(|(request, _)| request),
+            MaterializationCompletion::Failed,
+        );
         assert_eq!(
             result.try_recv().unwrap(),
             MaterializationCompletion::Failed
@@ -10729,6 +10944,7 @@ mod tests {
         assert!(!materialization_capacity_rejected);
         assert_eq!(accepted.len(), 1);
         assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].1, MaterializationRejectionReason::Capacity);
         assert_eq!(materializations.len(), 1);
         assert_eq!(
             materializations.iter().next().unwrap().address,
@@ -10771,6 +10987,10 @@ mod tests {
         assert!(materializations.is_empty());
         assert!(accepted.is_empty());
         assert_eq!(rejected.len(), 1);
+        assert_eq!(
+            rejected[0].1,
+            MaterializationRejectionReason::AuthorizationChanged
+        );
         assert!(!materialization_capacity_rejected);
 
         let expired = direct_test_validated_response(
@@ -10792,6 +11012,10 @@ mod tests {
         assert!(materializations.is_empty());
         assert!(accepted.is_empty());
         assert_eq!(rejected.len(), 1);
+        assert_eq!(
+            rejected[0].1,
+            MaterializationRejectionReason::AuthorizationChanged
+        );
         assert!(!materialization_capacity_rejected);
 
         let mut current_authorizations = CnameAuthorizationState::default();
@@ -10827,24 +11051,45 @@ mod tests {
             }],
             now,
         );
-        assert!(!publish_verified_materialization_transaction(
+        let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        for (bound_exceeded, expected_reason) in [
+            (false, MaterializationRejectionReason::FirewallUpdateFailed),
+            (true, MaterializationRejectionReason::Capacity),
+        ] {
+            let reason = publish_verified_materialization_transaction(
+                false,
+                bound_exceeded,
+                &mut current_authorizations,
+                &mut current_active,
+                proposed_authorizations.clone(),
+                proposed_active.clone(),
+            )
+            .unwrap_err();
+            assert_eq!(reason, expected_reason);
+            recorder.record_materialization_rejection(reason);
+        }
+        assert_materialization_rejections(
+            &recorder,
+            MaterializationRejectionReasons {
+                capacity: 1,
+                firewall_update_failed: 1,
+                ..MaterializationRejectionReasons::default()
+            },
+        );
+        assert!(current_authorizations.active.is_empty());
+        assert!(current_active.is_empty());
+        publish_verified_materialization_transaction(
+            true,
             false,
             &mut current_authorizations,
             &mut current_active,
             proposed_authorizations.clone(),
             proposed_active.clone(),
-        ));
-        assert!(current_authorizations.active.is_empty());
-        assert!(current_active.is_empty());
-        assert!(publish_verified_materialization_transaction(
-            true,
-            &mut current_authorizations,
-            &mut current_active,
-            proposed_authorizations.clone(),
-            proposed_active.clone(),
-        ));
+        )
+        .unwrap();
         assert_eq!(current_authorizations, proposed_authorizations);
         assert_eq!(current_active, proposed_active);
+        let _ = fs::remove_file(report_path);
     }
 
     #[test]
@@ -10887,6 +11132,7 @@ mod tests {
         assert_eq!(materializations.len(), MAX_MATERIALIZATIONS_PER_UPDATE);
         assert!(accepted.is_empty());
         assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].1, MaterializationRejectionReason::Capacity);
         assert!(capacity_rejected);
 
         let address = "192.0.2.62".parse().unwrap();
@@ -10958,13 +11204,17 @@ mod tests {
         assert!(materialization_candidate_requires_verification(0, &merge));
 
         let mut current_authorizations = CnameAuthorizationState::default();
-        assert!(!publish_verified_materialization_transaction(
-            false,
-            &mut current_authorizations,
-            &mut current_active,
-            CnameAuthorizationState::default(),
-            proposed_active,
-        ));
+        assert_eq!(
+            publish_verified_materialization_transaction(
+                false,
+                false,
+                &mut current_authorizations,
+                &mut current_active,
+                CnameAuthorizationState::default(),
+                proposed_active,
+            ),
+            Err(MaterializationRejectionReason::FirewallUpdateFailed),
+        );
         assert_eq!(current_active, original_active);
         assert!(current_authorizations.active.is_empty());
     }

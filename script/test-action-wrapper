@@ -7,7 +7,7 @@ source script/env "$@"
 require_cmd node
 
 node -e 'require("./action/lib.cts"); require("./action/main.cts"); require("./action/post.cts")'
-node --test action/test.cts
+node --test action/test.cts action/log-sanitization.test.cts
 python3 -B -E script/lib/host_observation.py --self-test
 python3 -B -E script/lib/action_bundle_host.py --self-test
 script/test-action-bundle-provenance

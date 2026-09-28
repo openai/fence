@@ -42,16 +42,17 @@ function truncateUtf8(value: string, maximumBytes: number): string {
 
 function sanitizeLogText(value: unknown, maximumBytes = MAX_LOG_LINE_BYTES): string {
   const sanitized = String(value)
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "_")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F\u2028\u2029]/gu, "_")
     .replace(/[\r\n]+/g, " ");
   return truncateUtf8(sanitized.startsWith("::") ? `_${sanitized}` : sanitized, maximumBytes);
 }
 
 function workflowEscape(value: unknown): string {
-  return sanitizeLogText(value, MAX_DEBUG_LINE_BYTES)
+  const escaped = sanitizeLogText(value, MAX_DEBUG_LINE_BYTES)
     .replace(/%/g, "%25")
     .replace(/\r/g, "%0D")
     .replace(/\n/g, "%0A");
+  return truncateUtf8(escaped, MAX_DEBUG_LINE_BYTES);
 }
 
 function colorize(value: string, color: ColorName, environment: LogEnvironment = process.env): string {

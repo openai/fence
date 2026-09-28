@@ -107,9 +107,13 @@ Fence runs before the rest of your job and controls which network destinations t
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
+Fence briefly retries incomplete local service inspections before failing. If startup still fails, check the inspection reason codes in the log; see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
+
+Failed evidence validation may include [bounded, unverified diagnostics](docs/troubleshooting.md#post-job-evidence-validation-fails); the job still fails.
+
 ## Network Reports 📋
 
-Fence adds a network activity table to the job summary and post-job log. Each log also includes one `FENCE_REPORT_JSON=` line that you can fetch through the GitHub API:
+After evidence validation, Fence adds a network activity table to the job summary and post-job log. Each verified report also includes one `FENCE_REPORT_JSON=` line that you can fetch through the GitHub API:
 
 ```bash
 gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \
@@ -120,7 +124,7 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
   | jq .
 ```
 
-The report includes network destinations, allowed or blocked activity, and warnings. Audit reports also suggest allowlist entries. Anyone who can read the job log can read the report.
+The report includes network destinations, allowed or blocked activity, and warnings. A DNS warning can mean Fence safely refused an answer; it does not always mean protection failed. Audit reports also suggest allowlist entries. Anyone who can read the job log can read the report.
 
 See [Network reports](docs/how-it-works.md#network-reports) for an example.
 
@@ -137,6 +141,10 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 
 See the [security guide](docs/security.md) for more details.
 
+## Development 🛠️
+
+See [Local development](docs/development.md) for build and test instructions. Hosted CI allows a bounded wait for complete blocked-event evidence without changing enforcement or the protected-finalization deadline.
+
 ## Further Reading 📚
 
 - [Getting started](docs/getting-started.md)
@@ -146,7 +154,6 @@ See the [security guide](docs/security.md) for more details.
 - [Security guide](docs/security.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Release provenance](docs/release-provenance.md)
-- [Local development](docs/development.md)
 - [CLI reference](docs/cli.md)
 - [Security policy](SECURITY.md)
 - [Fence v0 specification](docs/v0.md)

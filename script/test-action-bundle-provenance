@@ -174,6 +174,20 @@ expect_manifest_rejected wrong-path set bundle_path '"action/bin/other"'
 expect_manifest_rejected malformed-digest set artifact_sha256 '"not-a-sha256"'
 expect_manifest_rejected mismatched-release-url set release_url '"https://github.com/openai/fence/releases/tag/v9.9.9"'
 
+oversized_manifest_state="$tmpdir/oversized-manifest-state"
+cp -R "$candidate_one" "$oversized_manifest_state"
+python3 -B -E - "$oversized_manifest_state/action/bundle-manifest.json" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+with path.open("a", encoding="utf-8") as manifest:
+    manifest.write(" " * (16 * 1024))
+PY
+if script/validate-action-bundle --root "$oversized_manifest_state" > "$tmpdir/oversized-manifest.output" 2>&1; then
+  die "Action bundle validator accepted a manifest above the runtime 16 KiB bound"
+fi
+
 printf '%s' "tampered" >> "$checksum_state/action/bin/fence"
 if script/validate-action-bundle --root "$checksum_state" > "$tmpdir/checksum-state.output" 2>&1; then
   die "Action bundle validator accepted a binary checksum mismatch"

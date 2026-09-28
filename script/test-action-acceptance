@@ -50,102 +50,12 @@ import sys
 if sys.flags.optimize != 0:
     raise SystemExit("Python optimization must be disabled")
 
-import json
-import pathlib
-import re
-import socket
-import time
+from pathlib import Path
 
+sys.path.insert(0, "script/lib")
+from block_evidence import assert_block_evidence_drains
 
-def require(condition, message):
-    if not condition:
-        raise SystemExit(message)
-
-
-report_path = pathlib.Path(sys.argv[1])
-initial = json.loads(report_path.read_text(encoding="utf-8"))
-require(initial.get("mode") == "block", "bounded blocked-event evidence requires block mode")
-counters = initial.get("counters")
-require(isinstance(counters, dict), "bounded blocked-event evidence requires network counters")
-before_total = counters.get("total_violations")
-before_sampled = counters.get("sampled_violations")
-require(
-    isinstance(before_total, int)
-    and not isinstance(before_total, bool)
-    and before_total >= 0
-    and isinstance(before_sampled, int)
-    and not isinstance(before_sampled, bool)
-    and before_sampled >= 0,
-    "bounded blocked-event evidence requires valid initial counters",
-)
-before_ruleset_hash = initial.get("ruleset_hash")
-require(
-    isinstance(before_ruleset_hash, str)
-    and re.fullmatch(r"[0-9a-f]{64}", before_ruleset_hash) is not None,
-    "bounded blocked-event evidence requires a valid initial firewall epoch",
-)
-
-destinations = tuple(f"192.0.2.{index}" for index in range(10, 50))
-for destination in destinations:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-        try:
-            probe.sendto(b"fence-action-block-probe", (destination, 443))
-        except OSError:
-            pass
-
-deadline = time.monotonic() + 1.0
-while True:
-    current = json.loads(report_path.read_text(encoding="utf-8"))
-    current_counters = current.get("counters")
-    current_ruleset_hash = current.get("ruleset_hash")
-    findings = current.get("findings")
-    if (
-        current.get("mode") == "block"
-        and current.get("network_verification_status") == "verified"
-        and current.get("critical_findings") == []
-        and isinstance(current_counters, dict)
-        and isinstance(current_counters.get("total_violations"), int)
-        and not isinstance(current_counters.get("total_violations"), bool)
-        and isinstance(current_counters.get("sampled_violations"), int)
-        and not isinstance(current_counters.get("sampled_violations"), bool)
-        and current_counters["total_violations"] >= 0
-        and isinstance(current_ruleset_hash, str)
-        and re.fullmatch(r"[0-9a-f]{64}", current_ruleset_hash) is not None
-        and (
-            current_ruleset_hash != before_ruleset_hash
-            or current_counters["total_violations"] >= before_total + len(destinations)
-        )
-        and current_counters["sampled_violations"] >= before_sampled + len(destinations)
-        and isinstance(findings, list)
-        and set(destinations).issubset({
-            finding.get("remote_address")
-            for finding in findings
-            if isinstance(finding, dict)
-            and finding.get("classification") == "rejected"
-            and finding.get("protocol") == "udp"
-            and finding.get("remote_port") == 443
-        })
-    ):
-        require(
-            "fence-action-block-probe" not in json.dumps(current, sort_keys=True),
-            "bounded blocked-event evidence retained packet payload",
-        )
-        break
-    if time.monotonic() >= deadline:
-        raise SystemExit("bounded blocked-event burst was not persisted before its deadline")
-    time.sleep(0.01)
-
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-    try:
-        probe.sendto(b"fence-action-final-block-probe", ("192.0.2.1", 443))
-    except OSError:
-        pass
-
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
-    try:
-        probe.sendto(b"fence-action-post-block-probe", ("192.0.2.2", 443))
-    except OSError:
-        pass
+assert_block_evidence_drains(Path(sys.argv[1]))
 PY
 }
 
@@ -510,6 +420,45 @@ case "$scenario" in
     ;;
 esac
 
+if [[ "$scenario" != "audit" ]]; then
+  if [[ "$scenario" == "standard-opt-out" ]]; then
+    probe_https_once https://productionresultssa19.blob.core.windows.net
+  else
+    probe_https_once https://github.com
+  fi
+  python3 -E - "$scenario" <<'PY'
+import random
+import socket
+import struct
+import sys
+
+hostnames = ["outside-policy.fence.invalid"]
+if sys.argv[1] == "standard-opt-out":
+    hostnames.append("github.com")
+for hostname in hostnames:
+    identifier = random.randrange(65536)
+    question = b"".join(bytes([len(label)]) + label for label in hostname.encode("ascii").split(b"."))
+    question += b"\x00" + struct.pack("!HH", 1, 1)
+    packet = struct.pack("!HHHHHH", identifier, 0x0100, 1, 0, 0, 0) + question
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+        connection.settimeout(2)
+        connection.connect(("127.0.0.1", 53))
+        connection.send(packet)
+        response = connection.recv(4096)
+    if len(response) < 12:
+        raise SystemExit(f"Fence DNS refusal was incomplete: {hostname}")
+    observed_id, flags, questions, answers, authority, additional = struct.unpack("!HHHHHH", response[:12])
+    if not (
+        observed_id == identifier
+        and flags & 0x8000
+        and flags & 0x000F == 5
+        and (questions, answers, authority, additional) == (1, 0, 0, 0)
+        and response[12:] == question
+    ):
+        raise SystemExit(f"Fence did not refuse the outside-policy DNS request: {hostname}")
+PY
+fi
+
 if [[ "$scenario" == "wildcard-docker" ]]; then
   probe_https_once https://auth.docker.io
   probe_https_once https://registry-1.docker.io
@@ -545,6 +494,9 @@ import json
 import pathlib
 import sys
 import time
+
+sys.path.insert(0, "script/lib")
+from dns_evidence import validate_materialization_rejections
 
 expected_workers = [
     {"name": "host_tcp_dns", "status": "running"},
@@ -586,16 +538,7 @@ require(dns["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require(dns["hostname_policy"]["allow_github_artifacts"] is (scenario == "github-artifacts"))
 require("fence-action-audit-probe" not in json.dumps(report, sort_keys=True))
 require("fence-action-audit-probe" not in json.dumps(dns, sort_keys=True))
-materialization_rejections = dns.get("materialization_request_rejections")
-require(
-    type(materialization_rejections) is int
-    and 0 <= materialization_rejections <= (1 << 53) - 1,
-    "Fence DNS materialization rejection count must be a bounded nonnegative integer",
-)
-require(
-    materialization_rejections == 0,
-    "Fence Action acceptance must not reject verified DNS materializations",
-)
+validate_materialization_rejections(dns)
 require(dns["user_wildcard_request_rejections"] == 0)
 require(dns["bounded_user_wildcard_authorizations_truncated"] is False)
 wildcard_authorizations = dns["bounded_user_wildcard_authorizations"]

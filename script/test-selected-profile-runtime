@@ -111,6 +111,9 @@ import re
 import sys
 import time
 
+sys.path.insert(0, "script/lib")
+from dns_evidence import validate_materialization_rejections
+
 trusted_results_storage_hostnames = [
     "productionresultssa19.blob.core.windows.net",
     "productionresultssa13.blob.core.windows.net",
@@ -210,7 +213,7 @@ require(dns["authorized_domain_patterns"] == [
 require(dns["bootstrap_hostnames"] == expected_bootstrap_hostnames)
 require(isinstance(dns["materialization_batch_count"], int))
 require(dns["materialization_batch_count"] >= 0)
-require(dns["materialization_request_rejections"] == 0)
+validate_materialization_rejections(dns)
 require(dns["results_storage_authorization_count"] >= 0)
 require(dns["results_storage_attribution_failures"] == 0)
 require(dns["results_storage_request_rejections"] == 0)
@@ -436,6 +439,9 @@ import json
 import pathlib
 import sys
 
+sys.path.insert(0, "script/lib")
+from dns_evidence import validate_materialization_rejections
+
 report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:4])
 scenario = sys.argv[4]
 report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -458,6 +464,7 @@ else:
     require(report["resident_health"]["status"] == "healthy")
     require(report["resident_health"]["verification_sequence"] >= 2)
 require(dns["blocked_non_profile_query_count"] >= 4)
+validate_materialization_rejections(dns)
 require(dns["results_storage_request_rejections"] >= 1)
 require(dns["results_storage_attribution_failures"] == 0)
 if scenario != "healthy":

@@ -900,7 +900,7 @@ require(
     == {
         "name": "${{ steps.candidate.outputs.artifact_name }}",
         "path": "|",
-        "retention-days": "1",
+        "retention-days": "30",
         "if-no-files-found": "error",
     }
     and re.findall(r"(?m)^            ([^\n]+)$", candidate_upload_with)
@@ -908,7 +908,7 @@ require(
         "${{ runner.temp }}/fence-action-candidate/action/bin/fence",
         "${{ runner.temp }}/fence-action-candidate/action/bundle-manifest.json",
     ],
-    "Action acceptance may upload only the bounded source candidate bundle",
+    "Action acceptance must retain only the bounded source candidate bundle for 30-day reruns",
 )
 select_candidate = indented_block(
     prepare,

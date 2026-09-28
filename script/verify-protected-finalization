@@ -36,8 +36,8 @@ sys.path.insert(0, os.path.join(sys.argv[1], "script", "lib"))
 
 from protected_finalization import (
     ACTION_ZERO_INPUT_BURST_JOB,
+    validate_action_finalization_report,
     validate_action_zero_input_burst_job,
-    validate_action_zero_input_burst_report,
     validate_finalization_jobs,
 )
 
@@ -50,16 +50,6 @@ authorization_marker = b"fence-results-storage-authorization-observed"
 authorization_observed = False
 structured_report_prefix = b"FENCE_REPORT_JSON="
 max_structured_report_bytes = 16 * 1024
-structured_report_fields = {
-    "schema_version",
-    "mode",
-    "result",
-    "controls",
-    "network",
-    "warnings",
-    "omissions",
-    "suggested_allowlist",
-}
 
 
 def request(path):
@@ -150,54 +140,10 @@ def action_structured_reports(payload, job_name):
             raise SystemExit(
                 f"protected finalization structured report was invalid JSON: {job_name}"
             ) from None
-        if not isinstance(report, dict) or set(report) != structured_report_fields:
-            raise SystemExit(
-                f"protected finalization structured report schema was invalid: {job_name}"
-            )
-        if type(report["schema_version"]) is not int or report["schema_version"] != 1:
-            raise SystemExit(
-                f"protected finalization structured report version was invalid: {job_name}"
-            )
-        expected_result = (
-            "warning" if job_name == ACTION_ZERO_INPUT_BURST_JOB else "healthy"
-        )
-        if report["mode"] != "block" or report["result"] != expected_result:
-            raise SystemExit(
-                f"protected finalization structured report was not expected block evidence: "
-                f"{job_name}"
-            )
-        controls = report["controls"]
-        if (
-            not isinstance(controls, dict)
-            or controls.get("network") != "verified"
-            or controls.get("sudo") != "disabled_verified"
-            or controls.get("containers") != "disabled_verified"
-            or controls.get("protection_available") is not True
-            or controls.get("readiness") != "ready"
-            or controls.get("resident_health") != "healthy"
-        ):
-            raise SystemExit(
-                f"protected finalization structured report controls were invalid: {job_name}"
-            )
-        network = report["network"]
-        if (
-            not isinstance(network, list)
-            or len(network) > 20
-            or any(not isinstance(row, dict) for row in network)
-        ):
-            raise SystemExit(
-                f"protected finalization structured network evidence was invalid: {job_name}"
-            )
-        if not isinstance(report["warnings"], dict) or not isinstance(report["omissions"], dict):
-            raise SystemExit(
-                f"protected finalization structured report metadata was invalid: {job_name}"
-            )
-        suggestions = report["suggested_allowlist"]
-        if not isinstance(suggestions, list) or len(suggestions) > 20:
-            raise SystemExit(
-                f"protected finalization structured allowlist suggestions were invalid: "
-                f"{job_name}"
-            )
+        try:
+            validate_action_finalization_report(report, job_name)
+        except ValueError as error:
+            raise SystemExit(f"{error}: {job_name}") from None
         reports.append(report)
         if len(reports) > 1:
             raise SystemExit(
@@ -260,11 +206,6 @@ for name in sorted(jobs):
         raise SystemExit(
             f"protected finalization job must contain exactly one structured report: {name}"
         )
-    if job_set == "action" and name == ACTION_ZERO_INPUT_BURST_JOB:
-        try:
-            validate_action_zero_input_burst_report(reports[0])
-        except ValueError as error:
-            raise SystemExit(str(error)) from None
     if job_set == "integration" and name.startswith("protected finalization "):
         authorization_observed = authorization_observed or marker_observed
 

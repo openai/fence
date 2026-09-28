@@ -8,6 +8,8 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   ACTION_RUNTIME_FILES,
+  MAX_CRITICAL_FINDINGS,
+  MAX_STRUCTURED_CRITICAL_CODES,
   MAX_STRUCTURED_REPORT_BYTES,
   actionMountRecordFromMountInfo,
   actionPathGuardIdentities,
@@ -18,7 +20,9 @@ const {
   defaultInlineConfig,
   findingAttributionDebugLines,
   launcherIntegrityDocument,
+  materializationRejectionReasons,
   materializationRequestRejections,
+  materializationWarning,
   materializationWarningLines,
   mountIdFromFdInfo,
   networkReportLines,
@@ -42,9 +46,10 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
-const { settleResidentReport } = require("./post.cts");
+const { postFailureDiagnostic, validatePostEvidence, settleResidentReport } = require("./post.cts");
 const {
   fenceErrorCodeFromJournal,
+  localControlDiagnosticFromJournal,
   residentServiceArgs,
   run,
   terminalServiceStatus,
@@ -96,6 +101,17 @@ const githubArtifactCompatibilityLimitations = [
   "github_artifact_uploads_remain_an_intentional_data_egress_channel",
 ];
 
+function rejectionReasons(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    invalid_response: 0,
+    authorization_changed: 0,
+    capacity: 0,
+    queue_unavailable: 0,
+    firewall_update_failed: 0,
+    ...overrides,
+  };
+}
+
 function dnsEvidenceFor(
   currentReport: any = report,
   overrides: Record<string, unknown> = {},
@@ -123,6 +139,8 @@ function dnsEvidenceFor(
     },
     observations: [],
     observations_truncated: false,
+    materialization_request_rejections: 0,
+    materialization_rejection_reasons: rejectionReasons(),
     bounded_user_wildcard_authorizations: [],
     bounded_user_wildcard_authorizations_truncated: false,
     user_wildcard_request_rejections: 0,
@@ -1086,6 +1104,39 @@ test("recognizes terminal service state and only bounded structured Fence error 
   ]) {
     assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
   }
+});
+
+test("local control diagnostics expose only bounded fixed reason codes", () => {
+  const diagnostic = {
+    status: "unavailable", attempts: 2,
+    unavailable_inputs: ["process_identity_drift", "socket_ownership"], bounds_exceeded: [],
+  };
+  const line = (value: unknown) => JSON.stringify({ fence_local_control: value });
+  const expected = "status=unavailable; attempts=2; unavailable=process_identity_drift,socket_ownership; bounds=none";
+  assert.equal(localControlDiagnosticFromJournal(`systemd message\n${line(diagnostic)}\n`), expected);
+  assert.equal(localControlDiagnosticFromJournal(line({
+    ...diagnostic, message: "::error::secret", path: "/private/process", token: "ghp_do_not_print",
+  })), expected);
+  assert.equal(localControlDiagnosticFromJournal(line({
+    ...diagnostic, status: "bounds_exceeded", unavailable_inputs: [], bounds_exceeded: ["total_fds"],
+  })), "status=bounds_exceeded; attempts=2; unavailable=none; bounds=total_fds");
+  assert.equal(localControlDiagnosticFromJournal(line({
+    ...diagnostic, status: "unstable", unavailable_inputs: [],
+  })), "status=unstable; attempts=2; unavailable=none; bounds=none");
+  for (const invalid of [
+    undefined, null, {}, { ...diagnostic, status: "stable" },
+    { ...diagnostic, status: "unavailable\n::error::injected" },
+    ...[0, -1, 1.5, "2", null, Number.MAX_SAFE_INTEGER + 1].map((attempts) => ({ ...diagnostic, attempts })),
+    ...[null, "proc", ["proc", "proc"], ["unknown"], ["proc\u0000"], ["::error::secret"],
+      ["ghp_do_not_print"], ["/private/process"], Array(100).fill("proc")]
+      .map((unavailable_inputs) => ({ ...diagnostic, unavailable_inputs })),
+    { ...diagnostic, bounds_exceeded: ["unknown"] },
+    { ...diagnostic, bounds_exceeded: ["total_fds", "total_fds"] },
+  ]) {
+    assert.equal(localControlDiagnosticFromJournal(line(invalid)), undefined);
+  }
+  assert.equal(localControlDiagnosticFromJournal(`${line(diagnostic)}\nnot JSON`), expected);
+  assert.equal(localControlDiagnosticFromJournal(line({ ...diagnostic, extra: "x".repeat(4096) })), undefined);
 });
 
 test("derives only bounded fixed runtime paths", () => {
@@ -3363,6 +3414,7 @@ test("reports bounded firewall, wildcard, and results-storage warning counters",
     observations: [],
     observations_truncated: false,
     materialization_request_rejections: 2,
+    materialization_rejection_reasons: rejectionReasons({ capacity: 2 }),
     user_wildcard_request_rejections: 3,
     bounded_user_wildcard_authorizations_truncated: true,
     results_storage_attribution_failures: 4,
@@ -3373,6 +3425,7 @@ test("reports bounded firewall, wildcard, and results-storage warning counters",
   const document = parsedStructuredNetworkReport(report, dnsEvidence);
   assert.equal(document.result, "warning");
   assert.equal(document.warnings.materialization_rejections, 2);
+  assert.deepEqual(document.warnings.materialization_rejection_reasons, rejectionReasons({ capacity: 2 }));
   assert.equal(document.warnings.wildcard_rejections, 3);
   assert.equal(document.warnings.wildcard_authorizations_truncated, true);
   assert.equal(document.warnings.results_storage_attribution_failures, 4);
@@ -3928,24 +3981,126 @@ test("renders DNS materialization request rejection evidence as a non-critical w
     observations: [],
     observations_truncated: false,
     materialization_request_rejections: 2,
+    materialization_rejection_reasons: rejectionReasons({
+      invalid_response: 1,
+      authorization_changed: 1,
+    }),
   };
   const structured = parsedStructuredNetworkReport(report, dnsEvidence);
   assert.equal(structured.result, "warning");
   assert.equal(structured.warnings.materialization_rejections, 2);
+  assert.deepEqual(structured.warnings.materialization_rejection_reasons, dnsEvidence.materialization_rejection_reasons);
   assert.equal(structured.warnings.critical_findings, 0);
   assert.equal(materializationRequestRejections(dnsEvidence), 2);
   assert.equal(materializationRequestRejections({ materialization_request_rejections: -1 }), 0);
   assert.equal(materializationRequestRejections({ materialization_request_rejections: "2" }), 0);
+  assert.equal(materializationWarning(undefined), undefined);
+  assert.equal(
+    materializationWarning(dnsEvidence),
+    "Fence withheld 2 DNS answer(s) after safety checks (invalid DNS reply: 1; expired or changed authorization: 1)",
+  );
   assert.match(
     materializationWarningLines(dnsEvidence).join("\n"),
-    /DNS answers withheld while firewall updates were unavailable \| `2`/,
+    /DNS answers withheld by safety checks .*invalid DNS reply: 1; expired or changed authorization: 1.* \| `2`/,
   );
   const summary = summaryLines(report, dnsEvidence).join("\n");
   assert.match(summary, /^### 🟡 Fence Summary/);
   assert.doesNotMatch(summary, /🟢/);
   assert.match(summary, /#### Warnings/);
-  assert.match(summary, /DNS answers withheld while firewall updates were unavailable/);
+  assert.match(summary, /DNS answers withheld by safety checks/);
   assert.doesNotMatch(summary, /Critical findings/);
+});
+
+test("validates fixed DNS rejection reasons and preserves critical firewall failures", () => {
+  const valid = dnsEvidenceFor(report, {
+    materialization_request_rejections: 3,
+    materialization_rejection_reasons: rejectionReasons({ invalid_response: 1, capacity: 2 }),
+  });
+  validateDnsEvidence(valid, report);
+  for (const reasons of [
+    undefined,
+    null,
+    [],
+    {},
+    rejectionReasons({ extra: 0 }),
+    rejectionReasons({ invalid_response: -1 }),
+    rejectionReasons({ invalid_response: "3" }),
+    rejectionReasons({ invalid_response: true }),
+    rejectionReasons({ invalid_response: Number.MAX_SAFE_INTEGER + 1 }),
+  ]) {
+    assert.throws(() => validateDnsEvidence({ ...valid, materialization_rejection_reasons: reasons }, report), /invalid rejection reasons/);
+  }
+  for (const [total, reasons] of [
+    [2, rejectionReasons({ invalid_response: 3 })],
+    [Number.MAX_SAFE_INTEGER, rejectionReasons({ invalid_response: Number.MAX_SAFE_INTEGER, capacity: 1 })],
+  ]) {
+    assert.throws(() => validateDnsEvidence({
+      ...valid,
+      materialization_request_rejections: total,
+      materialization_rejection_reasons: reasons,
+    }, report), /do not match the total/);
+  }
+  for (const total of [undefined, -1, "3", true, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => validateDnsEvidence({ ...valid, materialization_request_rejections: total }, report), /invalid rejection reasons/);
+  }
+
+  const reasons = rejectionReasons({ firewall_update_failed: 1 });
+  assert.throws(() => validateDnsEvidence(dnsEvidenceFor(report, {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: reasons,
+  }), report), /missing its critical finding/);
+  const critical = {
+    ...report,
+    network_verification_status: "critical_dynamic_update_failed",
+    critical_findings: [{ code: "dns_block_dynamic_update_failed" }],
+    resident_health: residentHealth({ status: "critical" }),
+  };
+  const criticalDns = dnsEvidenceFor(critical, {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: reasons,
+  });
+  validateDnsEvidence(criticalDns, critical);
+  const structured = parsedStructuredNetworkReport(critical, criticalDns);
+  assert.equal(structured.result, "critical");
+  assert.equal(structured.warnings.materialization_rejection_reasons.firewall_update_failed, 1);
+  assert.throws(() => validateReport(critical), /critical resident findings/);
+
+  const truncatedCritical = {
+    ...critical,
+    network_verification_status: "verified",
+    critical_findings: Array.from({ length: 64 }, (_, index) => ({ code: `earlier_failure_${index}` })),
+    critical_findings_truncated: true,
+  };
+  const truncatedDns = dnsEvidenceFor(truncatedCritical, {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: reasons,
+  });
+  validateReport(truncatedCritical, false);
+  validateDnsEvidence(truncatedDns, truncatedCritical);
+  const truncated = parsedStructuredNetworkReport(truncatedCritical, truncatedDns);
+  assert.equal(truncated.result, "critical");
+  assert.equal(truncated.omissions.source_truncated, true);
+  assert.equal(truncated.warnings.materialization_rejection_reasons.firewall_update_failed, 1);
+  assert.throws(() => validateReport(truncatedCritical), /critical resident findings/);
+});
+
+test("never renders untrusted DNS rejection labels or values", () => {
+  const injected = {
+    materialization_request_rejections: 1,
+    materialization_rejection_reasons: {
+      ...rejectionReasons({ capacity: 1 }),
+      invalid_response: "\n::warning::secret-value",
+      "https://example.com/?token=secret-value": 1,
+    },
+  };
+  assert.deepEqual(materializationRejectionReasons(injected), rejectionReasons({ capacity: 1 }));
+  const output = [
+    materializationWarning(injected),
+    ...materializationWarningLines(injected),
+    structuredReportLine(report, injected),
+  ].join("\n");
+  assert.match(output, /capacity limit reached: 1/);
+  assert.doesNotMatch(output, /secret-value|::warning::|https:\/\//);
 });
 
 test("renders bounded results-storage provenance warnings without a healthy indicator", () => {
@@ -3953,6 +4108,7 @@ test("renders bounded results-storage provenance warnings without a healthy indi
     observations: [],
     observations_truncated: false,
     materialization_request_rejections: 1,
+    materialization_rejection_reasons: rejectionReasons({ invalid_response: 1 }),
     results_storage_attribution_failures: 2,
     results_storage_request_rejections: 3,
     runner_authorized_results_storage_truncated: true,
@@ -4129,4 +4285,103 @@ test("validates generated release bundle metadata and binary identity", () => {
 
 test("bounds fixed privileged child command execution", () => {
   assert.throws(() => run("/bin/sleep", ["1"], undefined, false, 1), /ETIMEDOUT|timed out/i);
+});
+
+test("reports stale critical evidence without accepting it", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  const stale = {
+    ...report,
+    resident_health: residentHealth({
+      status: "critical",
+      last_successful_verification_unix_milliseconds: Date.now() - 60_000,
+    }),
+    critical_findings: [{ code: "dns_block_network_drift", message: "not for logs" }],
+  };
+  assert.throws(() => validateReport(stale, false), /stale/);
+  assert.throws(() => settleResidentReport("unused", "unused", stale), /stale/);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /unverified/);
+  assert.match(lines[0], /dns_block_network_drift/);
+  assert.doesNotMatch(lines[0], /not for logs|FENCE_REPORT_JSON|verified protection/);
+  const failure = new Error("original validation failure");
+  assert.throws(() => validatePostEvidence(stale, "dns", () => { throw failure; }), (error: unknown) => error === failure);
+  t.mock.method(actionLog, "info", () => { throw new Error("logging failed"); });
+  assert.throws(() => validatePostEvidence(stale, "resident", () => { throw failure; }), (error: unknown) => error === failure);
+});
+
+test("bounds failure diagnostics and excludes arbitrary evidence", () => {
+  const secret = "private_fixture_value";
+  const input = {
+    resident_health: { status: secret, verification_sequence: secret, last_successful_verification_unix_milliseconds: secret },
+    critical_findings: Array.from({ length: MAX_CRITICAL_FINDINGS }, (_, i) => ({ code: i === 0 ? "dns_audit_network_drift" : secret, message: secret })),
+    critical_findings_truncated: true,
+    findings: [{ message: secret }],
+  };
+  const line = postFailureDiagnostic(input, "resident", 100_000);
+  assert.ok(Buffer.byteLength(line) < 2048);
+  assert.match(line, /dns_audit_network_drift/);
+  const diagnostic = JSON.parse(line.slice(line.indexOf(": ") + 2));
+  assert.equal(diagnostic.critical_codes.length, MAX_STRUCTURED_CRITICAL_CODES);
+  assert.equal(diagnostic.critical_codes_omitted, MAX_CRITICAL_FINDINGS - MAX_STRUCTURED_CRITICAL_CODES);
+  assert.doesNotMatch(line, /private_fixture_value/);
+  for (const malformed of [null, [], "bad", { resident_health: [] }, { critical_findings: [null, [], { code: "::error::injected\n" }] }, { critical_findings: Array(MAX_CRITICAL_FINDINGS + 1).fill({ code: secret }) }]) {
+    const diagnostic = postFailureDiagnostic(malformed, "dns", 100_000);
+    assert.ok(Buffer.byteLength(diagnostic) < 2048);
+    assert.doesNotMatch(diagnostic, /private_fixture_value|::error::|injected|\n/);
+  }
+  const future = postFailureDiagnostic({ resident_health: residentHealth({ last_successful_verification_unix_milliseconds: 106_000 }) }, "resident", 100_000);
+  assert.match(future, /"heartbeat_age_ms":-6000/);
+});
+
+test("successful evidence validation emits no failure diagnostic", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  assert.equal(validatePostEvidence(report, "resident", (value: any) => validateReport(value, false)), report);
+  assert.deepEqual(lines, []);
+});
+
+test("reports stale evidence encountered during settlement and DNS validation", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  const staleHealth = residentHealth({ last_successful_verification_unix_milliseconds: Date.now() - 60_000 });
+  const initial = { ...report, counters: { total_violations: 0, sampled_violations: 0 } };
+  let elapsed = 0n;
+  assert.throws(() => settleResidentReport("unused", "unused", initial, {
+    now: () => elapsed,
+    pause: (milliseconds: number) => { elapsed += BigInt(milliseconds) * 1_000_000n; },
+    read: () => ({ ...initial, resident_health: staleHealth }),
+    verifyService: () => {},
+  }), /stale/);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /"source":"resident"/);
+  const staleDns = { ...dnsEvidenceFor(report), resident_health: staleHealth };
+  assert.throws(() => validatePostEvidence(staleDns, "dns", (value: any) => validateDnsEvidence(value, report)), /stale/);
+  assert.equal(lines.length, 2);
+  assert.match(lines[1], /"source":"dns"/);
+});
+
+test("retains supervised worker failure codes after the heartbeat becomes stale", (t: any) => {
+  const lines: string[] = [];
+  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  for (const code of [
+    "attribution_request_channel_disconnected",
+    "attribution_result_channel_failed",
+    "dns_tcp_client_panicked",
+    "dns_tcp_client_spawn_failed",
+    "dns_tcp_listener_failed",
+    "dns_udp_listener_failed",
+    "runner_worker_identity_drift",
+  ]) {
+    const stale = {
+      ...report,
+      resident_health: residentHealth({
+        status: "critical",
+        last_successful_verification_unix_milliseconds: Date.now() - 60_000,
+      }),
+      critical_findings: [{ code }],
+    };
+    assert.throws(() => settleResidentReport("unused", "unused", stale), /stale/);
+    assert.match(lines.pop(), new RegExp(code));
+  }
 });

@@ -199,7 +199,7 @@ fn send_config_and_wait_for_ack(socket: &Socket, bytes: &[u8]) -> Result<(), Nfl
 fn receive_datagram(socket: &Socket) -> std::io::Result<Vec<u8>> {
     let mut bytes = vec![0_u8; RECEIVE_BUFFER_BYTES];
     let mut output = &mut bytes[..];
-    let length = socket.recv(&mut output, 0)?;
+    let length = socket.recv(&mut output, libc::MSG_TRUNC)?;
     if length > RECEIVE_BUFFER_BYTES {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
@@ -392,6 +392,37 @@ mod tests {
         let length = bytes.len() as u32;
         bytes[..4].copy_from_slice(&length.to_ne_bytes());
         bytes
+    }
+
+    #[test]
+    fn rejects_truncated_datagrams() {
+        use netlink_sys::constants::NETLINK_USERSOCK;
+
+        let mut sender = Socket::new(NETLINK_USERSOCK).unwrap();
+        let mut receiver = Socket::new(NETLINK_USERSOCK).unwrap();
+        let sender_address = sender.bind_auto().unwrap();
+        let receiver_address = receiver.bind_auto().unwrap();
+        sender.connect(&receiver_address).unwrap();
+        receiver.connect(&sender_address).unwrap();
+        sender.set_non_blocking(true).unwrap();
+        receiver.set_non_blocking(true).unwrap();
+
+        let send = |bytes: &[u8]| {
+            assert_eq!(sender.send(bytes, libc::MSG_DONTWAIT).unwrap(), bytes.len());
+        };
+
+        let exact = vec![0x5a; RECEIVE_BUFFER_BYTES];
+        send(&exact);
+        assert_eq!(receive_datagram(&receiver).unwrap(), exact);
+
+        send(&vec![0x5a; RECEIVE_BUFFER_BYTES + 1]);
+        assert_eq!(
+            receive_datagram(&receiver).unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+
+        send(b"next");
+        assert_eq!(receive_datagram(&receiver).unwrap(), b"next");
     }
 
     #[test]

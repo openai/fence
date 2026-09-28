@@ -36,6 +36,8 @@ Fence reports network activity in two places:
 
 The report lists allowed, blocked, or observed destinations, the status of Fence's protections, and any warnings. Audit reports also suggest allowlist entries. Reports include at most 20 destinations, stay under 16 KiB, and never contain secrets, environment variables, command arguments, or packet contents.
 
+If Fence withholds a DNS answer, the warning explains why. The JSON report also includes fixed reason counts under `warnings.materialization_rejection_reasons`. An invalid reply, expired permission, or full queue does not by itself mean protection was lost. A failed firewall update is critical and fails the job.
+
 ### Fetch A Report
 
 First, find the job ID:
@@ -101,6 +103,13 @@ The job log stores the report on one line. `jq` formats it like this:
     "critical_findings": 0,
     "critical_codes": [],
     "materialization_rejections": 0,
+    "materialization_rejection_reasons": {
+      "invalid_response": 0,
+      "authorization_changed": 0,
+      "capacity": 0,
+      "queue_unavailable": 0,
+      "firewall_update_failed": 0
+    },
     "wildcard_rejections": 0,
     "wildcard_authorizations_truncated": false,
     "results_storage_attribution_failures": 0,

@@ -8,6 +8,8 @@ Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ub
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.
 
+`local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries acquisition failures within a fixed limit and still requires a complete, stable inventory in both audit and block mode. The `Fence local control inspection` log line shows the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
+
 For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
 
 ## A Network Request Is Blocked
@@ -53,6 +55,12 @@ Keeping Docker available weakens runner isolation. Image pulls may also require 
 Critical drift means a required protection changed or a Fence component stopped working. Fence fails the job because it cannot confirm that the original protections still hold.
 
 Check the job summary and debug logs to identify what changed. Expanding the allowlist will not fix a broken protection.
+
+## Post-Job Evidence Validation Fails
+
+A `Fence failure diagnostic (unverified)` line shows the evidence source, reported resident status, verification sequence, heartbeat age, and at most five recognized critical codes. Unknown values are omitted or marked unavailable; unknown codes appear as `unrecognized`. These details help explain rejected evidence and do not prove that protection remained healthy.
+
+A stale heartbeat can follow an earlier critical finding because failed verification does not advance the last successful timestamp. Check the diagnostic codes before treating staleness as a timing issue. Missing or unreadable evidence may leave only the original error. Fence still fails the job and leaves its controls in place.
 
 ## The Agent Cannot Run Directly
 

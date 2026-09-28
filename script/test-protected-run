@@ -54,6 +54,9 @@ import json
 import pathlib
 import sys
 
+sys.path.insert(0, "script/lib")
+from dns_evidence import MATERIALIZATION_REJECTION_REASONS, MAX_U64
+
 report_path = pathlib.Path(sys.argv[1])
 dns_path = pathlib.Path(sys.argv[2])
 hostname = sys.argv[3]
@@ -66,6 +69,13 @@ def read_document(path):
 
 report = read_document(report_path)
 dns = read_document(dns_path)
+raw_reasons = dns.get("materialization_rejection_reasons")
+if not isinstance(raw_reasons, dict):
+    raw_reasons = {}
+reasons = {}
+for reason in MATERIALIZATION_REJECTION_REASONS:
+    count = raw_reasons.get(reason)
+    reasons[reason] = count if type(count) is int and 0 <= count <= MAX_U64 else None
 materializations = [
     {
         "address": item.get("address"),
@@ -106,6 +116,7 @@ diagnostic = {
     "hostname": hostname,
     "hostname_refresh_warnings": dns.get("hostname_refresh_warnings"),
     "materialization_request_rejections": dns.get("materialization_request_rejections"),
+    "materialization_rejection_reasons": reasons,
     "materialized_allowances": materializations,
     "rejected_tcp_443_findings": findings,
     "upstream_request_failures": dns.get("upstream_request_failures"),
@@ -241,6 +252,9 @@ import re
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, "script/lib")
+from dns_evidence import validate_materialization_rejections
 
 scenario = sys.argv[1]
 report_path, dns_path, ready_path = (pathlib.Path(item) for item in sys.argv[2:5])
@@ -468,7 +482,7 @@ require(dns["docker_dns_routing"] == "local_root_resident_mediator")
 require(dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"])
 require(isinstance(dns["materialization_batch_count"], int))
 require(dns["materialization_batch_count"] >= 0)
-require(dns["materialization_request_rejections"] == 0)
+validate_materialization_rejections(dns)
 require(isinstance(dns["results_storage_authorization_count"], int))
 require(dns["results_storage_authorization_count"] >= 0)
 require(dns["results_storage_attribution_failures"] == 0)
@@ -557,6 +571,9 @@ case "$scenario" in
   wildcard-docker)
     probe_https_once https://auth.docker.io
     probe_https_once https://registry-1.docker.io
+    ;;
+  unsafe-preserve|audit)
+    probe_https_once https://github.com
     ;;
 esac
 
@@ -648,6 +665,9 @@ import json
 import pathlib
 import sys
 
+sys.path.insert(0, "script/lib")
+from dns_evidence import validate_materialization_rejections
+
 scenario = sys.argv[1]
 report_path, dns_path, host_observation_path, wireserver_observation_path = (
     pathlib.Path(item) for item in sys.argv[2:]
@@ -705,7 +725,7 @@ require(report["resident_health"]["verification_sequence"] >= 2)
 require(dns["status"] == expected["status"])
 require(isinstance(dns["materialization_batch_count"], int))
 require(dns["materialization_batch_count"] >= 0)
-require(dns["materialization_request_rejections"] == 0)
+validate_materialization_rejections(dns)
 require(dns["results_storage_attribution_failures"] == 0)
 require(dns["user_wildcard_request_rejections"] == 0)
 require(dns["bounded_user_wildcard_authorizations_truncated"] is False)

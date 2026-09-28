@@ -117,6 +117,13 @@ const MAX_NETWORK_ACTIVITY_ROWS = 20;
 const MAX_STRUCTURED_ACTIVITIES_PER_ROW = 8;
 const MAX_STRUCTURED_ACTORS_PER_ROW = 4;
 const MAX_STRUCTURED_CRITICAL_CODES = 5;
+const MATERIALIZATION_REJECTION_REASONS = {
+  invalid_response: "invalid DNS reply",
+  authorization_changed: "expired or changed authorization",
+  capacity: "capacity limit reached",
+  queue_unavailable: "resident queue unavailable",
+  firewall_update_failed: "firewall update failed",
+} as const;
 const ALLOWED_DNS_CLASSIFICATIONS = new Set([
   "artifact_authorized_results_storage",
   "artifact_authorized_results_storage_cname_derived",
@@ -1646,7 +1653,39 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
     fail("Fence DNS evidence worker set does not match its container routing");
   }
   validateDnsProvenanceEvidence(dnsEvidence);
+  validateMaterializationRejections(dnsEvidence, report);
   return dnsEvidence;
+}
+
+function validateMaterializationRejections(dnsEvidence: any, report: any): void {
+  const total = dnsEvidence.materialization_request_rejections;
+  const reasons = dnsEvidence.materialization_rejection_reasons;
+  if (
+    !isNonnegativeSafeInteger(total) ||
+    reasons === null ||
+    Array.isArray(reasons) ||
+    typeof reasons !== "object" ||
+    Object.keys(reasons).sort().join(",") !==
+      Object.keys(MATERIALIZATION_REJECTION_REASONS).sort().join(",") ||
+    Object.values(reasons).some((count) => !isNonnegativeSafeInteger(count))
+  ) {
+    fail("Fence DNS evidence contains invalid rejection reasons");
+  }
+  const sum = Object.values(reasons).reduce((count: number, value: any) => count + value, 0);
+  if (!Number.isSafeInteger(sum) || sum !== total) {
+    fail("Fence DNS rejection reasons do not match the total");
+  }
+  if (
+    reasons.firewall_update_failed > 0 &&
+    !report.critical_findings.some((finding: any) => finding.code === "dns_block_dynamic_update_failed") &&
+    !(
+      report.critical_findings_truncated === true &&
+      report.critical_findings.length === MAX_CRITICAL_FINDINGS &&
+      report.resident_health.status === "critical"
+    )
+  ) {
+    fail("Fence DNS firewall failure is missing its critical finding");
+  }
 }
 
 function compareStrings(left: string, right: string): number {
@@ -2086,14 +2125,38 @@ function materializationRequestRejections(dnsEvidence: any): number {
   return materializationEvidenceCounter(dnsEvidence, "materialization_request_rejections");
 }
 
+function materializationRejectionReasons(dnsEvidence: any): Record<string, number> {
+  return Object.fromEntries(Object.keys(MATERIALIZATION_REJECTION_REASONS).map((reason) => [
+    reason,
+    materializationEvidenceCounter(dnsEvidence?.materialization_rejection_reasons, reason),
+  ]));
+}
+
+function materializationRejectionDetails(dnsEvidence: any): string {
+  return Object.entries(materializationRejectionReasons(dnsEvidence))
+    .filter(([, count]) => count > 0)
+    .map(([reason, count]) => `${MATERIALIZATION_REJECTION_REASONS[reason as keyof typeof MATERIALIZATION_REJECTION_REASONS]}: ${count}`)
+    .join("; ");
+}
+
+function materializationWarning(dnsEvidence: any): string | undefined {
+  const count = materializationRequestRejections(dnsEvidence);
+  if (count === 0) {
+    return undefined;
+  }
+  const details = materializationRejectionDetails(dnsEvidence);
+  return `Fence withheld ${count} DNS answer(s) after safety checks${details ? ` (${details})` : ""}`;
+}
+
 function materializationWarningLines(dnsEvidence: any): string[] {
   return warningTableLines(materializationWarningRows(dnsEvidence));
 }
 
 function materializationWarningRows(dnsEvidence: any): string[] {
   const count = materializationRequestRejections(dnsEvidence);
+  const details = materializationRejectionDetails(dnsEvidence);
   return count === 0 ? [] : [
-    `| ⚠️ DNS answers withheld while firewall updates were unavailable | ${markdownCode(count)} |`,
+    `| ⚠️ DNS answers withheld by safety checks${details ? ` (${details})` : ""} | ${markdownCode(count)} |`,
   ];
 }
 
@@ -2747,6 +2810,7 @@ function structuredNetworkReport(report: any, dnsEvidence: any = undefined): any
     critical_findings: report.critical_findings.length,
     critical_codes: criticalCodes,
     materialization_rejections: materializationRequestRejections(dnsEvidence),
+    materialization_rejection_reasons: materializationRejectionReasons(dnsEvidence),
     wildcard_rejections: materializationEvidenceCounter(
       dnsEvidence,
       "user_wildcard_request_rejections",
@@ -2898,6 +2962,8 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 
 module.exports = {
   ACTION_RUNTIME_FILES,
+  MAX_CRITICAL_FINDINGS,
+  MAX_STRUCTURED_CRITICAL_CODES,
   MAX_REPORT_BYTES,
   MAX_STRUCTURED_REPORT_BYTES,
   activeActionMountEvidence,
@@ -2910,8 +2976,10 @@ module.exports = {
   findingAttributionDebugLines,
   controlsSummary,
   defaultInlineConfig,
+  materializationRejectionReasons,
   materializationRequestRejections,
   materializationEvidenceCounter,
+  materializationWarning,
   materializationWarningLines,
   mountIdFromFdInfo,
   networkActivitySummary,

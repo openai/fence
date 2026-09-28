@@ -5,6 +5,12 @@ import datetime
 import sys
 import unittest
 
+from dns_evidence import (
+    MATERIALIZATION_REJECTION_REASONS,
+    MAX_SAFE_INTEGER,
+    validate_materialization_rejections,
+)
+
 
 MAX_PROTECTED_SECONDS = 180
 ACTION_ZERO_INPUT_BURST_JOB = "action zero-input standard"
@@ -23,6 +29,91 @@ EXPECTED_FINALIZATION_STEPS = {
         "action finalization quiet-3": "activate bundled Fence agent without post-ready warming",
     },
 }
+STRUCTURED_REPORT_FIELDS = {
+    "schema_version", "mode", "result", "controls", "network", "warnings",
+    "omissions", "suggested_allowlist",
+}
+PROTECTED_CONTROLS = {
+    "network": "verified",
+    "sudo": "disabled_verified",
+    "containers": "disabled_verified",
+    "protection_available": True,
+    "readiness": "ready",
+    "resident_health": "healthy",
+}
+QUIET_WARNINGS = {
+    "critical_findings": 0,
+    "critical_codes": [],
+    "wildcard_rejections": 0,
+    "wildcard_authorizations_truncated": False,
+    "results_storage_attribution_failures": 0,
+    "results_storage_authorizations_truncated": False,
+    "github_artifact_uploads_enabled": False,
+    "github_artifact_authorizations": 0,
+}
+QUIET_OMISSIONS = {
+    "network_rows": 0,
+    "hostname_recommendations": 0,
+    "ip_recommendations": 0,
+    "actor_entries": 0,
+    "activity_entries": 0,
+    "critical_codes": 0,
+    "unparsed_findings": 0,
+    "dns_evidence_missing": False,
+    "source_truncated": False,
+    "byte_budget_exceeded": False,
+}
+
+
+def _exact_fields(value, expected):
+    return (
+        isinstance(value, dict)
+        and set(value) == set(expected)
+        and all(type(value[key]) is type(item) and value[key] == item for key, item in expected.items())
+    )
+
+
+def validate_action_finalization_report(report, job_name):
+    if job_name not in EXPECTED_FINALIZATION_STEPS["action"] and job_name != ACTION_ZERO_INPUT_BURST_JOB:
+        raise ValueError("protected finalization report job was unknown")
+    if not isinstance(report, dict) or set(report) != STRUCTURED_REPORT_FIELDS:
+        raise ValueError("protected finalization structured report schema was invalid")
+    if type(report["schema_version"]) is not int or report["schema_version"] != 1:
+        raise ValueError("protected finalization structured report version was invalid")
+    if report["mode"] != "block":
+        raise ValueError("protected finalization structured report was not block evidence")
+    if not _exact_fields(report["controls"], PROTECTED_CONTROLS):
+        raise ValueError("protected finalization structured report controls were invalid")
+    network = report["network"]
+    if not isinstance(network, list) or len(network) > 20 or any(not isinstance(row, dict) for row in network):
+        raise ValueError("protected finalization structured network evidence was invalid")
+    warnings, omissions = report["warnings"], report["omissions"]
+    if not isinstance(warnings, dict) or not isinstance(omissions, dict):
+        raise ValueError("protected finalization structured report metadata was invalid")
+    suggestions = report["suggested_allowlist"]
+    if not isinstance(suggestions, list) or len(suggestions) > 20:
+        raise ValueError("protected finalization structured allowlist suggestions were invalid")
+    reasons = validate_materialization_rejections(warnings, public=True)
+    if job_name == ACTION_ZERO_INPUT_BURST_JOB:
+        return validate_action_zero_input_burst_report(report)
+
+    total = warnings["materialization_rejections"]
+    storage_rejections = warnings.get("results_storage_rejections")
+    if type(storage_rejections) is not int or not 0 <= storage_rejections <= MAX_SAFE_INTEGER:
+        raise ValueError("quiet finalization results-storage rejection count was invalid")
+    expected_warnings = {
+        **QUIET_WARNINGS,
+        "materialization_rejections": total,
+        "materialization_rejection_reasons": reasons,
+        "results_storage_rejections": storage_rejections,
+    }
+    if not _exact_fields(warnings, expected_warnings):
+        raise ValueError("quiet finalization report contained other warnings")
+    if not _exact_fields(omissions, QUIET_OMISSIONS) or suggestions:
+        raise ValueError("quiet finalization report omitted evidence or suggested an allowlist")
+    if report["result"] != ("warning" if total else "healthy"):
+        raise ValueError("quiet finalization report result did not match its DNS refusals")
+    return report
 
 
 def _timestamp(value, description):
@@ -377,6 +468,102 @@ class ProtectedFinalizationTests(unittest.TestCase):
                 for destination in ACTION_ZERO_INPUT_BURST_DESTINATIONS
             ],
         }
+
+    def action_quiet_report(self, **counts):
+        reasons = dict.fromkeys(MATERIALIZATION_REJECTION_REASONS, 0)
+        reasons.update(counts)
+        total = sum(reasons.values())
+        return {
+            "schema_version": 1,
+            "mode": "block",
+            "result": "warning" if total else "healthy",
+            "controls": copy.deepcopy(PROTECTED_CONTROLS),
+            "network": [],
+            "warnings": {
+                **copy.deepcopy(QUIET_WARNINGS),
+                "materialization_rejections": total,
+                "materialization_rejection_reasons": reasons,
+                "results_storage_rejections": 0,
+            },
+            "omissions": copy.deepcopy(QUIET_OMISSIONS),
+            "suggested_allowlist": [],
+        }
+
+    def test_quiet_reports_allow_only_classified_noncritical_dns_refusals(self):
+        for name in EXPECTED_FINALIZATION_STEPS["action"]:
+            for reason in (None, *MATERIALIZATION_REJECTION_REASONS[:-1]):
+                with self.subTest(name=name, reason=reason):
+                    report = self.action_quiet_report(**({reason: 1} if reason else {}))
+                    self.assertIs(validate_action_finalization_report(report, name), report)
+
+    def test_quiet_reports_reject_other_warnings_omissions_and_lost_controls(self):
+        name = next(iter(EXPECTED_FINALIZATION_STEPS["action"]))
+        invalid = []
+        for section, defaults in (
+            ("warnings", QUIET_WARNINGS),
+            ("omissions", QUIET_OMISSIONS),
+            ("controls", PROTECTED_CONTROLS),
+        ):
+            for field, default in defaults.items():
+                candidate = self.action_quiet_report(capacity=1)
+                candidate[section][field] = (
+                    not default if type(default) is bool
+                    else 1 if type(default) is int
+                    else ["unexpected"] if isinstance(default, list)
+                    else "unexpected"
+                )
+                invalid.append(candidate)
+            candidate = self.action_quiet_report(capacity=1)
+            candidate[section]["unknown"] = 0
+            invalid.append(candidate)
+        for field, value in (
+            ("schema_version", True),
+            ("schema_version", 2),
+            ("mode", "audit"),
+            ("result", "critical"),
+            ("result", "healthy"),
+            ("network", [None]),
+            ("network", [{}] * 21),
+            ("suggested_allowlist", ["github.com"]),
+        ):
+            candidate = self.action_quiet_report(capacity=1)
+            candidate[field] = value
+            invalid.append(candidate)
+        candidate = self.action_quiet_report()
+        candidate["result"] = "warning"
+        invalid.append(candidate)
+        candidate = self.action_quiet_report(capacity=1)
+        candidate["warnings"]["materialization_rejection_reasons"]["unknown"] = 0
+        invalid.append(candidate)
+        invalid.append(self.action_quiet_report(firewall_update_failed=1))
+        for value in (-1, True, "1", MAX_SAFE_INTEGER + 1):
+            candidate = self.action_quiet_report(capacity=1)
+            candidate["warnings"]["results_storage_rejections"] = value
+            invalid.append(candidate)
+        for candidate in invalid:
+            with self.subTest(report=repr(candidate)), self.assertRaises(ValueError):
+                validate_action_finalization_report(candidate, name)
+        with self.assertRaisesRegex(ValueError, "job was unknown"):
+            validate_action_finalization_report(self.action_quiet_report(), "other job")
+
+    def test_quiet_reports_allow_safe_results_storage_denials(self):
+        name = next(iter(EXPECTED_FINALIZATION_STEPS["action"]))
+        for counts in ({}, {"authorization_changed": 1}):
+            report = self.action_quiet_report(**counts)
+            report["warnings"]["results_storage_rejections"] = 3
+            self.assertIs(validate_action_finalization_report(report, name), report)
+
+    def test_full_blocked_burst_report_still_requires_burst_evidence(self):
+        report = self.action_quiet_report()
+        burst = self.action_burst_report()
+        report["result"] = burst["result"]
+        report["network"] = burst["network"]
+        report["omissions"].update(burst["omissions"])
+        self.assertIs(validate_action_finalization_report(report, ACTION_ZERO_INPUT_BURST_JOB), report)
+        report["warnings"]["materialization_rejections"] = 1
+        report["warnings"]["materialization_rejection_reasons"]["firewall_update_failed"] = 1
+        with self.assertRaisesRegex(ValueError, "firewall update failed"):
+            validate_action_finalization_report(report, ACTION_ZERO_INPUT_BURST_JOB)
 
     def test_blocked_burst_job_preserves_exactly_three_quiet_replicas(self):
         for prefix in ("", "release verification"):
