@@ -68,8 +68,24 @@ pub fn failure(command: &str, error: ErrorDetail, exit_code: i32) -> CommandOutp
         data: None,
         error: Some(error),
     };
+    let json = serialize_envelope(&envelope);
+    let json = if json.len() > MAX_REPORT_BYTES {
+        serialize_envelope(&Envelope {
+            schema_version: RESPONSE_SCHEMA_VERSION,
+            command: "response".to_owned(),
+            status: "error",
+            fence_version: env!("CARGO_PKG_VERSION"),
+            data: None,
+            error: Some(ErrorDetail::new(
+                "report_too_large",
+                "serialized response exceeds the fixed report limit",
+            )),
+        })
+    } else {
+        json
+    };
     CommandOutput {
-        json: serialize_envelope(&envelope),
+        json,
         exit_code,
         stderr: true,
     }
@@ -102,6 +118,22 @@ mod tests {
 
         assert_eq!(output.exit_code, 1);
         assert!(output.stderr);
+        assert!(output.json.contains("\"code\":\"report_too_large\""));
+    }
+
+    #[test]
+    fn bounds_failure_output_and_oversized_command_before_emission() {
+        let oversized = "x".repeat(MAX_REPORT_BYTES);
+        let output = failure(
+            &oversized,
+            ErrorDetail::new("invalid", "invalid").field(&oversized),
+            2,
+        );
+
+        assert_eq!(output.exit_code, 2);
+        assert!(output.stderr);
+        assert!(output.json.len() <= MAX_REPORT_BYTES);
+        assert!(output.json.contains("\"command\":\"response\""));
         assert!(output.json.contains("\"code\":\"report_too_large\""));
     }
 }
