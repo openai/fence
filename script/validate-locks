@@ -1054,11 +1054,6 @@ action_entries = re.findall(
     r"(?ms)^          - scenario: ([^\n]+)\n(.*?)(?=^          - scenario:|\Z)",
     action_strategy,
 )
-require(
-    [scenario for scenario, _ in action_entries]
-    == ["standard-opt-out", "wildcard-docker", "github-artifacts"],
-    "Action acceptance matrix must contain its three unique native-input scenarios",
-)
 expected_action_entries = {
     "standard-opt-out": {
         "mode": "block",
@@ -1084,7 +1079,29 @@ expected_action_entries = {
         "allow_github_artifacts": "'true'",
         "allowlist": "''",
     },
+    "azure-cli-block": {
+        "lifecycle": "standard",
+        "mode": "block",
+        "invocation_id": "action-azure-cli-block",
+        "container_policy": "disable",
+        "disable_broad_github_domains": "'false'",
+        "allow_github_artifacts": "'false'",
+        "allowlist": "''",
+    },
+    "azure-cli-audit": {
+        "lifecycle": "audit",
+        "mode": "audit",
+        "invocation_id": "action-azure-cli-audit",
+        "container_policy": "disable",
+        "disable_broad_github_domains": "'false'",
+        "allow_github_artifacts": "'false'",
+        "allowlist": "''",
+    },
 }
+require(
+    [scenario for scenario, _ in action_entries] == list(expected_action_entries),
+    "Action acceptance matrix must contain every unique reviewed native-input scenario",
+)
 for scenario, entry in action_entries:
     require(
         scalar_mapping(entry, 12) == expected_action_entries[scenario],
@@ -1112,6 +1129,7 @@ expected_action_steps = {
         "classify bundled Action host compatibility",
         "require bundled Action activation",
         "activate bundled Fence agent",
+        "exercise Azure CLI and UUID service activation",
         "create bounded GitHub artifact fixture",
         "upload bounded GitHub artifact under Fence",
         "verify Action lifecycle",
@@ -1283,8 +1301,23 @@ action_lifecycle = require_step_contract(
     action_job_blocks["action"],
     "verify Action lifecycle",
     ["env", "run"],
-    {"run": 'script/test-action-acceptance "${{ matrix.scenario }}" "${{ matrix.invocation_id }}"'},
+    {"run": 'script/test-action-acceptance "${{ matrix.lifecycle || matrix.scenario }}" "${{ matrix.invocation_id }}"'},
     "Action acceptance native-input lifecycle verification",
+)
+azure_cli = require_step_contract(
+    action_job_blocks["action"],
+    "exercise Azure CLI and UUID service activation",
+    ["if", "run"],
+    {
+        "if": "${{ matrix.scenario == 'azure-cli-block' || matrix.scenario == 'azure-cli-audit' }}",
+        "run": "|",
+    },
+    "Action acceptance Azure CLI exercise",
+)
+require(
+    literal_run_body(azure_cli, "Azure CLI exercise must use a literal run body")
+    == "          az version\n          systemctl is-active --quiet uuidd.service\n",
+    "Azure CLI acceptance must check real UUID activation in both modes",
 )
 action_lifecycle_env = indented_block(
     action_lifecycle,
