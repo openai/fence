@@ -1092,7 +1092,7 @@ expected_action_entries = {
         "lifecycle": "audit",
         "mode": "audit",
         "invocation_id": "action-azure-cli-audit",
-        "container_policy": "disable",
+        "container_policy": "''",
         "disable_broad_github_domains": "'false'",
         "allow_github_artifacts": "'false'",
         "allowlist": "''",
