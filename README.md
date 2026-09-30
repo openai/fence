@@ -69,6 +69,8 @@ Not sure what your workflow needs? Start with audit mode:
 
 Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. It may still restore root ownership of `/etc` and `/usr`. Use the job summary to build your allowlist, then switch back to block mode.
 
+On supported runners, Fence accepts normal Ubuntu UUID service activation (for example, by `az version`) in audit and block modes. Incomplete socket observations or unexpected owners still fail the job.
+
 ## GitHub Artifacts And Pages 📦
 
 Artifact uploads, GitHub Pages, and caches sometimes need access to storage endpoints used by GitHub Actions:
