@@ -35,6 +35,10 @@ const UNIX_SEQPACKET: u64 = 5;
 const TCP_LISTEN_STATE: u8 = 0x0a;
 const UNREVIEWED_EXECUTABLE_PATH: &str = "unreviewed_executable_path";
 const UNREVIEWED_CGROUP: &str = "unreviewed_cgroup";
+// SHA-256 in the existing fence-unix-name-v1 domain for /run/uuidd/request.
+const UUIDD_SOCKET_NAME_SHA256: &str =
+    "e84916b142c7b55bdf364843e9360867ec403fc602cfb662c95d6299ebfb8e77";
+const UUIDD_EXECUTABLE: &str = "/usr/sbin/uuidd";
 
 const REVIEWED_EXECUTABLE_PATHS: &[&str] = &[
     "/usr/bin/containerd",
@@ -524,8 +528,10 @@ pub(crate) fn verify_no_additive_local_control_since(
     });
     if non_container_tcp_projection(&snapshot.tcp_listeners, reviewed_containers)
         != non_container_tcp_projection(&accepted.tcp_listeners, reviewed_containers)
-        || non_container_unix_projection(&snapshot.unix_listeners, reviewed_containers)
-            != accepted_unix_projection
+        || !unix_listener_snapshots_match(
+            &accepted_unix_projection,
+            &non_container_unix_projection(&snapshot.unix_listeners, reviewed_containers),
+        )
     {
         return Err(verification_error(
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed),
@@ -666,7 +672,8 @@ fn unix_listeners_are_subset(observed: &[UnixListener], accepted: &[UnixListener
                 || !item.ownership_complete
                 || !accepted.iter().any(|expected| {
                     same_unix_key(item, expected)
-                        && owners_are_subset(&item.owners, &expected.owners)
+                        && (owners_are_subset(&item.owners, &expected.owners)
+                            || reviewed_uuidd_transition(expected, item))
                 })
         })
     {
@@ -678,6 +685,51 @@ fn unix_listeners_are_subset(observed: &[UnixListener], accepted: &[UnixListener
         .map(|item| u64::from(item.instances))
         .sum::<u64>()
         <= MAX_UNIX_LISTENERS as u64
+}
+
+// Systemd keeps the original socket open after activating uuidd. Require that
+// exact owner in both observations, even when the non-root service has exited.
+// Ubuntu allocates system accounts below 1000; the dedicated service cgroup
+// and protected executable distinguish uuidd from other system accounts.
+fn reviewed_uuidd_listener(listener: &UnixListener) -> bool {
+    let Some((systemd, service)) = listener.owners.split_first() else {
+        return false;
+    };
+    listener.socket_type == UnixSocketType::Stream
+        && listener.name_kind == UnixNameKind::Filesystem
+        && listener.name_sha256 == UUIDD_SOCKET_NAME_SHA256
+        && listener.instances == 1
+        && listener.runner_reachable
+        && listener.ownership_complete
+        && systemd.uid == 0
+        && systemd.executable_basename == "systemd"
+        && systemd.canonical_executable == "/usr/lib/systemd/systemd"
+        && systemd.unified_cgroup == "/init.scope"
+        && systemd.processes == 1
+        && service.len() <= 1
+        && service.iter().all(|owner| {
+            (1..1000).contains(&owner.uid)
+                && owner.executable_basename == "uuidd"
+                && owner.canonical_executable == UUIDD_EXECUTABLE
+                && owner.unified_cgroup == "/system.slice/uuidd.service"
+                && owner.processes == 1
+        })
+}
+
+fn reviewed_uuidd_transition(before: &UnixListener, after: &UnixListener) -> bool {
+    // Only one socket-activation/idle transition. If already active, changed
+    // daemon identity is drift, just like any other resident-baseline change.
+    before.owners.len() != after.owners.len()
+        && reviewed_uuidd_listener(before)
+        && reviewed_uuidd_listener(after)
+}
+
+fn unix_listener_snapshots_match(accepted: &[UnixListener], observed: &[UnixListener]) -> bool {
+    accepted.len() == observed.len()
+        && accepted
+            .iter()
+            .zip(observed)
+            .all(|(before, after)| before == after || reviewed_uuidd_transition(before, after))
 }
 
 fn owners_are_subset(observed: &[LocalControlOwner], accepted: &[LocalControlOwner]) -> bool {
@@ -994,7 +1046,7 @@ fn local_control_snapshots_match(
         && accepted.reachability_complete == observed.reachability_complete
         && accepted.ownership_complete == observed.ownership_complete
         && accepted.root_container_processes == observed.root_container_processes
-        && accepted.unix_listeners == observed.unix_listeners
+        && unix_listener_snapshots_match(&accepted.unix_listeners, &observed.unix_listeners)
         && accepted.tcp_listeners == observed.tcp_listeners
 }
 
@@ -2345,6 +2397,11 @@ fn safe_basename(path: &[u8]) -> String {
 }
 
 fn reviewed_executable(path: &[u8]) -> String {
+    // Capture the identity so it can be validated in the one reviewed Unix
+    // listener. Do not add it to the general TCP/Unix owner allowlist.
+    if path == UUIDD_EXECUTABLE.as_bytes() {
+        return UUIDD_EXECUTABLE.to_string();
+    }
     REVIEWED_EXECUTABLE_PATHS
         .iter()
         .find(|candidate| candidate.as_bytes() == path)
@@ -2458,10 +2515,9 @@ fn public_snapshot(private: PrivateSnapshot) -> LocalControlSnapshot {
     let identities_reviewed = root_container_processes
         .iter()
         .all(root_container_identity_reviewed)
-        && unix_listeners
-            .iter()
-            .flat_map(|listener| &listener.owners)
-            .all(owner_identity_reviewed)
+        && unix_listeners.iter().all(|listener| {
+            listener.owners.iter().all(owner_identity_reviewed) || reviewed_uuidd_listener(listener)
+        })
         && tcp_listeners
             .iter()
             .flat_map(|listener| &listener.owners)
@@ -2755,6 +2811,188 @@ mod tests {
 
     fn systemd_owner() -> LocalControlOwner {
         owner(0, "systemd", "/usr/lib/systemd/systemd", "/init.scope")
+    }
+
+    fn uuid_listener(observed: &mut LocalControlObservation) -> &mut UnixListener {
+        observed
+            .snapshot
+            .unix_listeners
+            .iter_mut()
+            .find(|listener| {
+                listener.name_sha256
+                    == "e84916b142c7b55bdf364843e9360867ec403fc602cfb662c95d6299ebfb8e77"
+            })
+            .unwrap()
+    }
+
+    fn active_uuid_observation() -> LocalControlObservation {
+        let mut active = accepted_observation();
+        uuid_listener(&mut active).owners.push(owner(
+            103,
+            "uuidd",
+            "/usr/sbin/uuidd",
+            "/system.slice/uuidd.service",
+        ));
+        active
+    }
+
+    #[test]
+    fn uuid_activation_and_idle_are_valid_at_startup_lockdown_and_resident_checks() {
+        let inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let idle = accepted_observation();
+        let active = active_uuid_observation();
+        // Startup can encounter either state. Both modes also verify during setup
+        // and continuously after readiness, including a daemon timeout to idle.
+        for observation in [&idle, &active] {
+            verify_reviewed_local_control_observation(&inventory, observation).unwrap();
+        }
+        for (before, after) in [(&idle, &active), (&active, &idle), (&active, &active)] {
+            verify_local_control_observation(&before.snapshot, after).unwrap();
+            verify_no_additive_local_control_since(&inventory, &before.snapshot, after).unwrap();
+        }
+    }
+
+    #[test]
+    fn uuid_acquisition_reviews_the_complete_endpoint_not_just_the_executable() {
+        let mut private = empty_private();
+        let systemd = private_owner(0, true, &[1]);
+        let mut uuidd = private_owner(103, true, &[42]);
+        uuidd.key.executable_basename = "uuidd".to_string();
+        uuidd.key.canonical_executable = reviewed_executable(b"/usr/sbin/uuidd");
+        uuidd.key.unified_cgroup = "/system.slice/uuidd.service".to_string();
+        private.unix_listeners.push(PrivateUnixListener {
+            socket_inode: 10,
+            socket_type: UnixSocketType::Stream,
+            name_kind: UnixNameKind::Filesystem,
+            name_sha256: unix_name_sha256(b"/run/uuidd/request"),
+            owners: vec![systemd, uuidd.clone()],
+            ownership_complete: true,
+        });
+        assert_eq!(
+            public_snapshot(private.clone()).scan_status,
+            ScanStatus::WithinBounds
+        );
+        private.unix_listeners[0].name_sha256 = unix_name_sha256(b"/run/other/request");
+        assert!(
+            public_snapshot(private.clone())
+                .unavailable_inputs
+                .contains(&UnavailableReason::SocketOwnership)
+        );
+        private.unix_listeners.clear();
+        private.tcp_listeners.push(PrivateTcpListener {
+            socket_inode: 11,
+            socket_uid: 0,
+            family: InternetAddressFamily::Ipv4,
+            bind_class: BindClass::Loopback,
+            port: 22,
+            owners: vec![uuidd],
+            ownership_complete: true,
+        });
+        assert!(
+            public_snapshot(private)
+                .unavailable_inputs
+                .contains(&UnavailableReason::SocketOwnership)
+        );
+    }
+
+    #[test]
+    fn uuid_transition_never_hides_unreviewed_socket_or_owner_changes() {
+        let inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let idle = accepted_observation();
+        type Change = fn(&mut UnixListener);
+        let changes: &[(&str, Change)] = &[
+            ("missing systemd", |l| {
+                l.owners.remove(0);
+            }),
+            ("empty", |l| l.owners.clear()),
+            ("uuid root", |l| l.owners[1].uid = 0),
+            ("uuid user uid", |l| l.owners[1].uid = 1001),
+            ("uuid uid upper boundary", |l| l.owners[1].uid = 1000),
+            ("wrong executable", |l| {
+                l.owners[1].canonical_executable = "/tmp/uuidd".into()
+            }),
+            ("wrong basename", |l| {
+                l.owners[1].executable_basename = "other".into()
+            }),
+            ("other service", |l| {
+                l.owners[1].unified_cgroup = "/system.slice/other.service".into()
+            }),
+            ("child cgroup", |l| {
+                l.owners[1].unified_cgroup.push_str("/child")
+            }),
+            ("uuid twice", |l| l.owners[1].processes = 2),
+            ("zero uuid", |l| l.owners[1].processes = 0),
+            ("duplicate uuid", |l| l.owners.push(l.owners[1].clone())),
+            ("wrong systemd uid", |l| l.owners[0].uid = 1),
+            ("wrong systemd group", |l| {
+                l.owners[0].unified_cgroup = "/system.slice/other.service".into()
+            }),
+            ("systemd twice", |l| l.owners[0].processes = 2),
+            ("socket incomplete", |l| l.ownership_complete = false),
+            ("socket unreachable", |l| l.runner_reachable = false),
+            ("duplicate socket", |l| l.instances = 2),
+            ("no socket", |l| l.instances = 0),
+            ("abstract", |l| l.name_kind = UnixNameKind::Abstract),
+            ("seqpacket", |l| l.socket_type = UnixSocketType::Seqpacket),
+            ("other socket", |l| {
+                l.name_sha256 = unix_name_sha256(b"/run/other/request")
+            }),
+        ];
+        for &(label, change) in changes {
+            let mut observed = active_uuid_observation();
+            change(uuid_listener(&mut observed));
+            assert!(
+                verify_reviewed_local_control_observation(&inventory, &observed).is_err(),
+                "startup: {label}"
+            );
+            assert!(
+                verify_local_control_observation(&idle.snapshot, &observed).is_err(),
+                "resident: {label}"
+            );
+            assert!(
+                verify_no_additive_local_control_since(&inventory, &idle.snapshot, &observed)
+                    .is_err(),
+                "lockdown: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn uuid_activation_cannot_authorize_new_endpoints_or_mask_unrelated_drift() {
+        let inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let idle = accepted_observation();
+        let active = active_uuid_observation();
+        let mut absent = idle.clone();
+        absent
+            .snapshot
+            .unix_listeners
+            .retain(|l| l.name_sha256 != unix_name_sha256(b"/run/uuidd/request"));
+        assert!(verify_local_control_observation(&absent.snapshot, &active).is_err());
+        assert!(
+            verify_no_additive_local_control_since(&inventory, &absent.snapshot, &active).is_err()
+        );
+        assert!(verify_local_control_observation(&active.snapshot, &absent).is_err());
+        let mut changed = active.clone();
+        changed.snapshot.tcp_listeners[0].port += 1;
+        assert!(verify_local_control_observation(&idle.snapshot, &changed).is_err());
+        let mut changed = active.clone();
+        changed.snapshot.unix_listeners[0].owners[0].processes += 1;
+        assert!(verify_local_control_observation(&idle.snapshot, &changed).is_err());
+        let mut changed = active.clone();
+        uuid_listener(&mut changed).owners[1].uid += 1;
+        assert!(verify_local_control_observation(&active.snapshot, &changed).is_err());
+        let mut changed = active;
+        changed
+            .snapshot
+            .unavailable_inputs
+            .push(UnavailableReason::SocketOwnership);
+        assert!(verify_local_control_observation(&idle.snapshot, &changed).is_err());
     }
 
     fn accepted_observation() -> LocalControlObservation {
