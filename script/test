@@ -9,6 +9,7 @@ ensure_rust_toolchain
 script/validate-release-tools
 script/validate-test-tools
 script/test-action-release
+script/test-build-arguments
 python3 -B -E "$DIR/script/lib/dns_evidence.py" --self-test
 python3 -B -E "$DIR/script/lib/protected_finalization.py" --self-test
 python3 -B -E "$DIR/script/lib/block_evidence.py" --self-test
