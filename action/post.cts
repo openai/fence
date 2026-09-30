@@ -40,6 +40,8 @@ const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
 const EVIDENCE_SETTLE_INTERVAL_MILLISECONDS = 40;
 const EVIDENCE_SETTLE_MAX_READS = 4;
 const EVIDENCE_SETTLE_TIMEOUT_NANOSECONDS = 160_000_000n;
+const MAX_RETAINED_DNS_OBSERVATIONS = 256;
+const MAX_RETAINED_ADDRESSES_PER_OBSERVATION = 32;
 const CHILD_ENV = {
   LANG: "C.UTF-8",
   LC_ALL: "C.UTF-8",
@@ -186,6 +188,25 @@ function networkEvidenceCounters(report: any): { total: number; sampled: number 
   };
 }
 
+function validateDnsEvidenceBounds(dnsEvidence: any): any {
+  const observations = dnsEvidence?.observations;
+  if (!Array.isArray(observations) || observations.length > MAX_RETAINED_DNS_OBSERVATIONS) {
+    throw new Error("Fence DNS report exceeds retained DNS evidence bounds");
+  }
+  for (const observation of observations) {
+    if (
+      observation !== null &&
+      !Array.isArray(observation) &&
+      typeof observation === "object" &&
+      Array.isArray(observation.resolved_addresses) &&
+      observation.resolved_addresses.length > MAX_RETAINED_ADDRESSES_PER_OBSERVATION
+    ) {
+      throw new Error("Fence DNS report exceeds retained DNS evidence bounds");
+    }
+  }
+  return dnsEvidence;
+}
+
 function settleResidentReport(
   reportPath: string,
   unit: string,
@@ -312,7 +333,7 @@ function main(): void {
     dnsEvidence = validatePostEvidence(
       readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report"),
       "dns",
-      (value: any) => validateDnsEvidence(value, report),
+      (value: any) => validateDnsEvidenceBounds(validateDnsEvidence(value, report)),
     );
   } else if (report.mode === "block") {
     throw new Error("Fence block-mode DNS evidence is missing");
@@ -422,4 +443,10 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, postFailureDiagnostic, validatePostEvidence, settleResidentReport };
+module.exports = {
+  main,
+  postFailureDiagnostic,
+  validatePostEvidence,
+  settleResidentReport,
+  validateDnsEvidenceBounds,
+};
