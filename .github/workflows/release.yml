@@ -881,7 +881,7 @@ jobs:
 
       - name: attest final release assets
         if: needs.create-candidate.outputs.existing_release != 'true'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # pin@v4.1.1
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # pin@v4.2.2
         with:
           subject-path: release-assets/*
 
