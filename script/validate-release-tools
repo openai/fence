@@ -45,6 +45,7 @@ if ! diff -u <(release_tools_zig_entries "$lockfile" | sort) <(release_tools_zig
 fi
 
 zig_count=0
+zig_platforms="|"
 while IFS='|' read -r platform arch os version url path sha256; do
   zig_count=$((zig_count + 1))
   if [[ -z "$platform" || -z "$arch" || -z "$os" || -z "$version" || -z "$url" || -z "$path" || -z "$sha256" ]]; then
@@ -52,6 +53,25 @@ while IFS='|' read -r platform arch os version url path sha256; do
   fi
   if [[ "$version" != "$zig_version" ]]; then
     die "Zig entry version mismatch for ${platform}"
+  fi
+  case "${platform}|${arch}|${os}" in
+    "macos-x86_64|x86_64|macos"|\
+    "macos-aarch64|aarch64|macos"|\
+    "linux-x86_64|x86_64|linux"|\
+    "linux-aarch64|aarch64|linux") ;;
+    *) die "unexpected Zig platform identity: ${platform}|${arch}|${os}" ;;
+  esac
+  if [[ "$zig_platforms" == *"|${platform}|"* ]]; then
+    die "duplicate Zig platform entry: ${platform}"
+  fi
+  zig_platforms+="${platform}|"
+  expected_zig_url="https://ziglang.org/download/${version}/zig-${arch}-${os}-${version}.tar.xz"
+  expected_zig_path="vendor/release-tools/zig/zig-${arch}-${os}-${version}.tar.xz"
+  if [[ "$url" != "$expected_zig_url" ]]; then
+    die "Zig artifact URL mismatch for ${platform}"
+  fi
+  if [[ "$path" != "$expected_zig_path" ]]; then
+    die "Zig artifact path mismatch for ${platform}"
   fi
   reject_unsafe_relative_path "$path" "Zig manifest path for ${platform}"
   artifact="$DIR/$path"
@@ -80,6 +100,14 @@ if [[ -z "$lock_cargo_entry_version" || -z "$lock_cargo_entry_url" || -z "$lock_
 fi
 if [[ "$lock_cargo_entry_version" != "$cargo_zigbuild_version" ]]; then
   die "${RELEASE_TOOLS_LOCK#$DIR/} cargo-zigbuild entry version mismatch (expected ${cargo_zigbuild_version}, found ${lock_cargo_entry_version})"
+fi
+expected_cargo_entry_url="https://static.crates.io/crates/cargo-zigbuild/cargo-zigbuild-${cargo_zigbuild_version}.crate"
+expected_cargo_entry_path="vendor/release-tools/cargo-zigbuild/cargo-zigbuild-${cargo_zigbuild_version}.crate"
+if [[ "$lock_cargo_entry_url" != "$expected_cargo_entry_url" ]]; then
+  die "${RELEASE_TOOLS_LOCK#$DIR/} cargo-zigbuild crate URL mismatch"
+fi
+if [[ "$lock_cargo_entry_path" != "$expected_cargo_entry_path" ]]; then
+  die "${RELEASE_TOOLS_LOCK#$DIR/} cargo-zigbuild crate path mismatch"
 fi
 reject_unsafe_relative_path "$lock_cargo_entry_path" "${RELEASE_TOOLS_LOCK#$DIR/} cargo-zigbuild crate path"
 
