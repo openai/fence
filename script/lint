@@ -27,6 +27,8 @@ if [[ $# -gt 1 ]]; then
   exit 2
 fi
 
+python3 -B -E "$DIR/script/lib/cargo_dependency_pins.py" --self-test
+
 if [[ "$CHECK_FORMAT" == "true" ]]; then
   cargo fmt --all -- --check
 else
