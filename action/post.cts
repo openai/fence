@@ -40,6 +40,7 @@ const MANIFEST = path.join(ACTION_ROOT, "bundle-manifest.json");
 const EVIDENCE_SETTLE_INTERVAL_MILLISECONDS = 40;
 const EVIDENCE_SETTLE_MAX_READS = 4;
 const EVIDENCE_SETTLE_TIMEOUT_NANOSECONDS = 160_000_000n;
+const MAX_RETAINED_FINDINGS = 1024;
 const CHILD_ENV = {
   LANG: "C.UTF-8",
   LC_ALL: "C.UTF-8",
@@ -186,6 +187,22 @@ function networkEvidenceCounters(report: any): { total: number; sampled: number 
   };
 }
 
+function validateFindingEvidenceBounds(report: any): any {
+  const findings = report.findings;
+  const counters = networkEvidenceCounters(report);
+  if (
+    !Array.isArray(findings) ||
+    findings.length > MAX_RETAINED_FINDINGS ||
+    typeof report.findings_truncated !== "boolean" ||
+    (report.findings_truncated && findings.length !== MAX_RETAINED_FINDINGS) ||
+    (!report.findings_truncated && counters.sampled !== findings.length) ||
+    (report.findings_truncated && counters.sampled <= findings.length)
+  ) {
+    throw new Error("Fence resident report does not contain bounded network findings");
+  }
+  return report;
+}
+
 function settleResidentReport(
   reportPath: string,
   unit: string,
@@ -305,7 +322,7 @@ function main(): void {
   );
   validateBundle(MANIFEST, BINARY);
   const initialReport = readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report");
-  const report = settleResidentReport(reportPath, paths.unit, initialReport);
+  const report = validateFindingEvidenceBounds(settleResidentReport(reportPath, paths.unit, initialReport));
   let dnsEvidence;
   const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
   if (fs.existsSync(effectiveDnsReportPath)) {
@@ -403,7 +420,7 @@ function main(): void {
   for (const warning of resultsStorageWarnings(dnsEvidence)) {
     log.warning(warning);
   }
-  validateReport(report, true);
+  validateFindingEvidenceBounds(validateReport(report, true));
   const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;
   const evidenceLine = log.postEvidenceLine(report, auditDestinationCount);
   if (evidenceLine) {
@@ -422,4 +439,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, postFailureDiagnostic, validatePostEvidence, settleResidentReport };
+module.exports = { main, postFailureDiagnostic, validatePostEvidence, settleResidentReport, validateFindingEvidenceBounds };
