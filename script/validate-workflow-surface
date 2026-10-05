@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+
+import pathlib
+import sys
+import tempfile
+
+EXPECTED_WORKFLOWS = {
+    "acceptance.yml",
+    "action-acceptance-ubuntu-latest.yml",
+    "action-acceptance.yml",
+    "action-drift-canary.yml",
+    "build.yml",
+    "integration.yml",
+    "lint.yml",
+    "release.yml",
+    "test.yml",
+}
+
+
+def validate(directory: pathlib.Path) -> None:
+    if not directory.is_dir() or directory.is_symlink():
+        raise ValueError("workflow directory is missing or unsafe")
+    observed = {
+        path.name
+        for path in directory.iterdir()
+        if path.suffix in {".yml", ".yaml"}
+    }
+    if observed != EXPECTED_WORKFLOWS:
+        missing = sorted(EXPECTED_WORKFLOWS - observed)
+        unexpected = sorted(observed - EXPECTED_WORKFLOWS)
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected: {', '.join(unexpected)}")
+        raise ValueError(f"workflow file surface changed ({'; '.join(details)})")
+    for name in EXPECTED_WORKFLOWS:
+        path = directory / name
+        if not path.is_file() or path.is_symlink():
+            raise ValueError(f"workflow file is missing or unsafe: {name}")
+
+
+def self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="fence-workflow-surface-") as temporary:
+        root = pathlib.Path(temporary)
+        for name in EXPECTED_WORKFLOWS:
+            (root / name).write_text("name: fixture\n", encoding="utf-8")
+        validate(root)
+
+        extra = root / "unreviewed.yml"
+        extra.write_text("name: unreviewed\n", encoding="utf-8")
+        try:
+            validate(root)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("extra workflow was accepted")
+        extra.unlink()
+
+        missing = root / "build.yml"
+        missing.unlink()
+        try:
+            validate(root)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("missing workflow was accepted")
+
+
+def main() -> None:
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        return
+    if sys.argv[1:]:
+        raise SystemExit("usage: script/validate-workflow-surface [--self-test]")
+    root = pathlib.Path(__file__).resolve().parents[1]
+    validate(root / ".github" / "workflows")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, AssertionError) as error:
+        raise SystemExit(str(error)) from None
