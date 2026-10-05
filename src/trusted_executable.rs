@@ -1,6 +1,7 @@
 use crate::hosted_runner::{
     AcceptedTrustedExecutableV2, hosted_runner_fingerprint_requirement, reviewed_ubuntu_os_release,
 };
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +23,8 @@ const MAX_PROC_SELF_STAT_BYTES: u64 = 4 * 1024;
 const MAX_HOST_IDENTITY_FILE_BYTES: u64 = 256 * 1024;
 const REVIEWED_HOST_ANCESTORS: [&str; 2] = ["/etc", "/usr"];
 
-#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TrustedExecutable {
     Docker,
     Id,

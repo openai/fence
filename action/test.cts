@@ -50,6 +50,7 @@ const { postFailureDiagnostic, validatePostEvidence, settleResidentReport } = re
 const {
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
+  lockdownCommandDiagnosticFromJournal,
   residentServiceArgs,
   run,
   terminalServiceStatus,
@@ -1137,6 +1138,32 @@ test("local control diagnostics expose only bounded fixed reason codes", () => {
   }
   assert.equal(localControlDiagnosticFromJournal(`${line(diagnostic)}\nnot JSON`), expected);
   assert.equal(localControlDiagnosticFromJournal(line({ ...diagnostic, extra: "x".repeat(4096) })), undefined);
+});
+
+test("host command diagnostics exclude arbitrary data and accept only known programs, principals and bounds", () => {
+  const diagnostic = {
+    executable: "docker", principal: "runner", code: "lockdown_command_timeout", timeout_ms: 5000,
+  };
+  const line = (value: unknown) => JSON.stringify({ fence_lockdown_command: value });
+  const expected = "executable=docker; principal=runner; code=lockdown_command_timeout; timeout_ms=5000";
+  assert.equal(lockdownCommandDiagnosticFromJournal(`unrelated\n${line(diagnostic)}\n`), expected);
+  assert.equal(lockdownCommandDiagnosticFromJournal(line({
+    ...diagnostic, message: "::error::secret", path: "/private/example", output: "do_not_print",
+  })), expected);
+  assert.equal(lockdownCommandDiagnosticFromJournal(line({
+    executable: "systemd_run", principal: "root", code: "lockdown_command_output_too_large", timeout_ms: 30000,
+  })), "executable=systemd_run; principal=root; code=lockdown_command_output_too_large; timeout_ms=30000");
+  for (const invalid of [
+    undefined, null, {},
+    ...["/usr/bin/docker", "unknown", "docker\n::error::injected", null, ["sudo"]].map((executable) => ({ ...diagnostic, executable })),
+    ...["root\n::error::injected", "other", null].map((principal) => ({ ...diagnostic, principal })),
+    ...["unsupported_host_fingerprint", "::error::secret", null].map((code) => ({ ...diagnostic, code })),
+    ...[-1, 0.1, 30001, "5000", null, Number.MAX_SAFE_INTEGER + 1].map((timeout_ms) => ({ ...diagnostic, timeout_ms })),
+    { ...diagnostic, extra: "x".repeat(4096) },
+  ]) {
+    assert.equal(lockdownCommandDiagnosticFromJournal(line(invalid)), undefined);
+  }
+  assert.equal(lockdownCommandDiagnosticFromJournal(`${line(diagnostic)}\nnot JSON`), expected);
 });
 
 test("derives only bounded fixed runtime paths", () => {

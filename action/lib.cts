@@ -1283,7 +1283,7 @@ function activeActionMountEvidence(
         fs.constants.O_NOFOLLOW,
     );
   } catch {
-    fail("Fence active Action mount evidence is unavailable");
+    fail("Fence active Action mount evidence is unavailable; setup may not have reached readiness, or the protected mount was removed");
   }
   try {
     const mountId = mountIdFromFdInfo(
@@ -1299,7 +1299,7 @@ function activeActionMountEvidence(
       mountId,
     };
   } catch {
-    fail("Fence active Action mount evidence is unavailable");
+    fail("Fence active Action mount evidence is unavailable; setup may not have reached readiness, or the protected mount was removed");
   } finally {
     fs.closeSync(descriptor);
   }

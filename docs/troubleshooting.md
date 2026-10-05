@@ -10,6 +10,8 @@ Run Fence first. Checkout, setup actions, and other commands can change the runn
 
 `local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries acquisition failures within a fixed limit and still requires a complete, stable inventory in both audit and block mode. The `Fence local control inspection` log line shows the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
 
+`lockdown_command_timeout` means a trusted host command did not complete within its deadline. `lockdown_command_output_too_large` means the command produced more than 8 KiB total output. Fence drains stdout and stderr during execution and fails either check in both modes. The `Fence host command` line identifies the trusted executable, root or runner principal, error code, and deadline in milliseconds; it never includes command arguments, job paths, or command output. Check this line before considering a retry. These are host verification failures, so an allowlist change will not fix them.
+
 For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
 
 ## A Network Request Is Blocked
@@ -57,6 +59,8 @@ Critical drift means a required protection changed or a Fence component stopped 
 Check the job summary and debug logs to identify what changed. Expanding the allowlist will not fix a broken protection.
 
 ## Post-Job Evidence Validation Fails
+
+Missing active Action mount evidence can follow a setup failure before readiness, when provisional mounts have already been removed. Check the earlier Fence setup log first. The same missing evidence can also mean a protected mount was removed after readiness; Fence cannot safely distinguish these cases using job-writable state, so it still fails post-job verification and never claims protection succeeded.
 
 A `Fence failure diagnostic (unverified)` line shows the evidence source, reported resident status, verification sequence, heartbeat age, and at most five recognized critical codes. Unknown values are omitted or marked unavailable; unknown codes appear as `unrecognized`. These details help explain rejected evidence and do not prove that protection remained healthy.
 

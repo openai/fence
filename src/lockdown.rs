@@ -17,6 +17,7 @@ use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1838,7 +1839,13 @@ pub(crate) fn runner_path_writable(
         .runner_command(TrustedExecutable::Test, &[])
         .map_err(|_| unsupported_fingerprint())?;
     command.arg("-w").arg(path);
-    let output = run_fixed_command_with_timeout(command, &[], timeout)?;
+    let output = run_fixed_command_with_timeout(
+        command,
+        &[],
+        timeout,
+        TrustedExecutable::Test,
+        CommandPrincipal::Runner,
+    )?;
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
@@ -1899,7 +1906,13 @@ fn fixed_command_with_timeout(
     let command = executables
         .command(executable)
         .map_err(|_| unsupported_fingerprint())?;
-    run_fixed_command_with_timeout(command, arguments, timeout)
+    run_fixed_command_with_timeout(
+        command,
+        arguments,
+        timeout,
+        executable,
+        CommandPrincipal::Root,
+    )
 }
 
 fn runner_command(
@@ -1910,50 +1923,132 @@ fn runner_command(
     let command = executables
         .runner_command(executable, arguments)
         .map_err(|_| unsupported_fingerprint())?;
-    run_fixed_command_with_timeout(command, &[], COMMAND_TIMEOUT)
+    run_fixed_command_with_timeout(
+        command,
+        &[],
+        COMMAND_TIMEOUT,
+        executable,
+        CommandPrincipal::Runner,
+    )
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CommandPrincipal {
+    Root,
+    Runner,
 }
 
 fn run_fixed_command_with_timeout(
     mut command: Command,
     arguments: &[&str],
     timeout: Duration,
+    executable: TrustedExecutable,
+    principal: CommandPrincipal,
 ) -> Result<Output, LockdownError> {
+    // Nonblocking sockets let us bound both capture and elapsed time, including when
+    // a descendant retains stdout after the direct child exits. Blocking reader
+    // threads or wait_with_output could otherwise outlive the deadline.
+    let (mut stdout, child_stdout) = UnixStream::pair().map_err(|_| unsupported_fingerprint())?;
+    let (mut stderr, child_stderr) = UnixStream::pair().map_err(|_| unsupported_fingerprint())?;
+    stdout
+        .set_nonblocking(true)
+        .map_err(|_| unsupported_fingerprint())?;
+    stderr
+        .set_nonblocking(true)
+        .map_err(|_| unsupported_fingerprint())?;
     let mut child = command
         .args(arguments)
         .env_clear()
         .env("LANG", "C")
         .env("LC_ALL", "C")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(OwnedFd::from(child_stdout)))
+        .stderr(Stdio::from(OwnedFd::from(child_stderr)))
         .spawn()
         .map_err(|_| unsupported_fingerprint())?;
+    // Command retains its configured descriptors after spawn; close those copies.
+    drop(command);
     let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|_| unsupported_fingerprint())?;
-                if output.stdout.len() + output.stderr.len() > MAX_COMMAND_OUTPUT_BYTES {
-                    return Err(LockdownError::new(
-                        "lockdown_command_output_too_large",
-                        "fixed lockdown command output exceeded its bound",
-                    ));
-                }
-                return Ok(output);
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+    let result = (|| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let (mut out_eof, mut err_eof) = (false, false);
+        loop {
+            if Instant::now() >= deadline {
                 return Err(LockdownError::new(
                     "lockdown_command_timeout",
                     "fixed lockdown command exceeded its deadline",
                 ));
             }
-            Err(_) => return Err(unsupported_fingerprint()),
+            let previous_size = out.len() + err.len();
+            drain_command_stream(&mut stdout, &mut out, err.len(), &mut out_eof)?;
+            drain_command_stream(&mut stderr, &mut err, out.len(), &mut err_eof)?;
+            if let Some(status) = child.try_wait().map_err(|_| unsupported_fingerprint())?
+                && out_eof
+                && err_eof
+            {
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            if previous_size == out.len() + err.len() {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    })();
+    if let Err(error) = &result {
+        let _ = child.kill();
+        let _ = child.wait();
+        if matches!(
+            error.code,
+            "lockdown_command_timeout" | "lockdown_command_output_too_large"
+        ) {
+            // Never emit args, paths, output, or environment: they may contain job data.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "fence_lockdown_command": {
+                        "executable": executable,
+                        "principal": principal,
+                        "code": error.code,
+                        "timeout_ms": timeout.as_millis(),
+                    }
+                })
+            );
         }
     }
+    result
+}
+
+fn drain_command_stream(
+    stream: &mut UnixStream,
+    captured: &mut Vec<u8>,
+    other_size: usize,
+    eof: &mut bool,
+) -> Result<(), LockdownError> {
+    if *eof {
+        return Ok(());
+    }
+    let mut buffer = [0; 4096];
+    let limit = buffer
+        .len()
+        .min(MAX_COMMAND_OUTPUT_BYTES - captured.len() - other_size + 1);
+    match stream.read(&mut buffer[..limit]) {
+        Ok(0) => *eof = true,
+        Ok(size) => {
+            if captured.len() + other_size + size > MAX_COMMAND_OUTPUT_BYTES {
+                return Err(LockdownError::new(
+                    "lockdown_command_output_too_large",
+                    "fixed lockdown command output exceeded its bound",
+                ));
+            }
+            captured.extend_from_slice(&buffer[..size]);
+        }
+        Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+        Err(_) => return Err(unsupported_fingerprint()),
+    }
+    Ok(())
 }
 
 fn require_success(
@@ -2004,6 +2099,68 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+    // Synthetic subprocesses exercise the IO boundary without requiring root or
+    // weakening the production trusted-executable boundary.
+    fn synthetic_command(script: &str, timeout: Duration) -> Result<Output, LockdownError> {
+        run_fixed_command_with_timeout(
+            Command::new("/bin/sh"),
+            &["-c", script],
+            timeout,
+            TrustedExecutable::Test,
+            CommandPrincipal::Runner,
+        )
+    }
+
+    #[test]
+    fn fixed_command_preserves_status_and_both_streams_at_combined_bound() {
+        let output = synthetic_command(
+            "printf '%4096s' out; printf '%4096s' err >&2; exit 7",
+            COMMAND_TIMEOUT,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout.len(), 4096);
+        assert_eq!(output.stderr.len(), 4096);
+        assert!(output.stdout.ends_with(b"out"));
+        assert!(output.stderr.ends_with(b"err"));
+    }
+
+    #[test]
+    fn fixed_command_rejects_combined_overflow_and_large_writes_without_timing_out() {
+        for script in [
+            "printf '%4096s' out; printf '%4097s' err >&2",
+            "printf '%1048576s' out",
+            "printf '%1048576s' err >&2",
+        ] {
+            assert_eq!(
+                synthetic_command(script, COMMAND_TIMEOUT).unwrap_err().code,
+                "lockdown_command_output_too_large",
+                "{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_command_bounds_wait_after_direct_child_exits_with_streams_still_open() {
+        // sleep inherits both streams; waiting for EOF must obey the same deadline.
+        assert_eq!(
+            synthetic_command("sleep 2 & exit 0", Duration::from_millis(100))
+                .unwrap_err()
+                .code,
+            "lockdown_command_timeout"
+        );
+    }
+
+    #[test]
+    fn fixed_command_times_out_and_reaps_a_running_child() {
+        assert_eq!(
+            synthetic_command("exec /bin/sleep 2", Duration::from_millis(100))
+                .unwrap_err()
+                .code,
+            "lockdown_command_timeout"
+        );
+    }
 
     struct FakeControl {
         operations: Rc<RefCell<Vec<&'static str>>>,
