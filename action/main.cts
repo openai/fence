@@ -221,6 +221,29 @@ function localControlDiagnosticFromJournal(output: string): string | undefined {
   return undefined;
 }
 
+function lockdownCommandDiagnosticFromJournal(output: string): string | undefined {
+  // Match only the native closed enums. Never render journal text or program arguments.
+  const executables = new Set([
+    "docker", "id", "mount", "nft", "stat", "sudo", "systemctl", "systemd_run",
+    "test", "true", "umount", "visudo",
+  ]);
+  for (const line of output.split(/\r?\n/).reverse()) {
+    if (line.length === 0 || line.length > 4096) continue;
+    try {
+      const d = JSON.parse(line)?.fence_lockdown_command;
+      if (
+        !d || !executables.has(d.executable) || !["root", "runner"].includes(d.principal) ||
+        !["lockdown_command_timeout", "lockdown_command_output_too_large"].includes(d.code) ||
+        !Number.isSafeInteger(d.timeout_ms) || d.timeout_ms < 0 || d.timeout_ms > 30_000
+      ) continue;
+      return `executable=${d.executable}; principal=${d.principal}; code=${d.code}; timeout_ms=${d.timeout_ms}`;
+    } catch {
+      // Ignore unrelated or malformed entries without forwarding them.
+    }
+  }
+  return undefined;
+}
+
 function captureServiceStatus(unit: string): ReturnType<typeof capture> {
   return capture("/usr/bin/systemctl", [
     "show",
@@ -268,6 +291,10 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
   const localControlDiagnostic = localControlDiagnosticFromJournal(journal.stdout);
   if (localControlDiagnostic !== undefined) {
     log.warning(`Fence local control inspection: ${localControlDiagnostic}`);
+  }
+  const lockdownDiagnostic = lockdownCommandDiagnosticFromJournal(journal.stdout);
+  if (lockdownDiagnostic !== undefined) {
+    log.warning(`Fence host command: ${lockdownDiagnostic}`);
   }
   log.debugGroup("Fence debug: service journal", [
     `unit=${paths.unit}`,
@@ -670,4 +697,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
+module.exports = { fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
