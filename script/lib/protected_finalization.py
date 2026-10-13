@@ -3,7 +3,10 @@
 import copy
 import datetime
 import sys
+import time
 import unittest
+import urllib.error
+from unittest import mock
 
 from dns_evidence import (
     MATERIALIZATION_REJECTION_REASONS,
@@ -13,6 +16,7 @@ from dns_evidence import (
 
 
 MAX_PROTECTED_SECONDS = 180
+METADATA_ATTEMPTS = 3
 ACTION_ZERO_INPUT_BURST_JOB = "action zero-input standard"
 ACTION_ZERO_INPUT_BURST_ACTIVATION = "activate bundled Fence agent with strict defaults"
 ACTION_ZERO_INPUT_BURST_DESTINATIONS = ("192.0.2.1", "192.0.2.2")
@@ -59,6 +63,16 @@ QUIET_OMISSIONS = {
     "activity_entries": 0,
     "critical_codes": 0,
     "unparsed_findings": 0,
+    "unparsed_finding_reasons": {
+        "short_header": 0,
+        "invalid_ipv4_header": 0,
+        "ipv4_fragment": 0,
+        "unsupported_ipv4_protocol": 0,
+        "unsupported_ipv6_header": 0,
+        "unknown_ip_version": 0,
+        "invalid_port": 0,
+        "unrecognized": 0,
+    },
     "dns_evidence_missing": False,
     "source_truncated": False,
     "byte_budget_exceeded": False,
@@ -69,7 +83,11 @@ def _exact_fields(value, expected):
     return (
         isinstance(value, dict)
         and set(value) == set(expected)
-        and all(type(value[key]) is type(item) and value[key] == item for key, item in expected.items())
+        and all(
+            type(value[key]) is type(item)
+            and (_exact_fields(value[key], item) if isinstance(item, dict) else value[key] == item)
+            for key, item in expected.items()
+        )
     )
 
 
@@ -150,6 +168,43 @@ def _successful_step(step, job_name, description):
     return started, completed
 
 
+class MetadataPending(ValueError):
+    pass
+
+
+def _bounded_job_steps(job, started, completed, name):
+    # The required preflight locks mandatory workflow steps and the Action post hook.
+    # Only absent/empty metadata may use this stricter, whole-job timing proof.
+    steps = job.get("steps", [])
+    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
+        raise ValueError(f"protected finalization job steps were invalid: {name}")
+    if not steps and (completed - started).total_seconds() > MAX_PROTECTED_SECONDS:
+        raise MetadataPending(
+            f"protected finalization activation step metadata was empty and job exceeded "
+            f"{MAX_PROTECTED_SECONDS} seconds: {name}"
+        )
+    return steps
+
+
+def verified_finalization_jobs(fetch, job_set):
+    for attempt in range(METADATA_ATTEMPTS):
+        try:
+            document = fetch()
+            jobs = validate_finalization_jobs(document, job_set)
+            if job_set == "action":
+                jobs[ACTION_ZERO_INPUT_BURST_JOB] = validate_action_zero_input_burst_job(document)
+            return jobs
+        except urllib.error.HTTPError as error:
+            if error.code not in {502, 503, 504}:
+                raise
+            if attempt == METADATA_ATTEMPTS - 1:
+                raise ValueError(f"protected finalization metadata unavailable: HTTP {error.code}") from None
+        except MetadataPending:
+            if attempt == METADATA_ATTEMPTS - 1:
+                raise
+        time.sleep(5)
+
+
 def validate_finalization_jobs(document, job_set):
     if not isinstance(job_set, str) or job_set not in EXPECTED_FINALIZATION_STEPS:
         raise ValueError("protected finalization job set was invalid")
@@ -208,9 +263,11 @@ def validate_finalization_jobs(document, job_set):
 
         started = _timestamp(job.get("started_at"), f"job start for {name}")
         completed = _timestamp(job.get("completed_at"), f"job completion for {name}")
-        steps = job.get("steps")
-        if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
-            raise ValueError(f"protected finalization job steps were invalid: {name}")
+        if completed < started:
+            raise ValueError(f"protected finalization job timestamps were out of order: {name}")
+        steps = _bounded_job_steps(job, started, completed, name)
+        if not steps:
+            continue
 
         activation_name = expected[name]
         activations = [step for step in steps if step.get("name") == activation_name]
@@ -281,9 +338,11 @@ def validate_action_zero_input_burst_job(document):
         raise ValueError("blocked-burst job did not complete successfully")
     started = _timestamp(job.get("started_at"), "blocked-burst job start")
     completed = _timestamp(job.get("completed_at"), "blocked-burst job completion")
-    steps = job.get("steps")
-    if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
-        raise ValueError("blocked-burst job steps were invalid")
+    if completed < started:
+        raise ValueError("blocked-burst job timestamps were out of order")
+    steps = _bounded_job_steps(job, started, completed, ACTION_ZERO_INPUT_BURST_JOB)
+    if not steps:
+        return job
 
     ordered_steps = []
     for name, description in (
@@ -413,8 +472,8 @@ class ProtectedFinalizationTests(unittest.TestCase):
             )
         return {"jobs": jobs}
 
-    def action_burst_document(self, prefix=""):
-        document = self.document("action")
+    def action_burst_document(self, prefix="", *, setup_seconds=155, protected_seconds=45):
+        document = self.document("action", protected_seconds, setup_seconds)
         job = copy.deepcopy(document["jobs"][0])
         job["id"] = 99
         job["name"] = (
@@ -436,6 +495,192 @@ class ProtectedFinalizationTests(unittest.TestCase):
         job["steps"] = [activation, evidence, post]
         document["jobs"].append(job)
         return document
+
+    @mock.patch("time.sleep")
+    def test_transient_metadata_errors_retry_but_remain_bounded(self, sleep):
+        for status in (502, 503, 504):
+            with self.subTest(status=status):
+                sleep.reset_mock()
+                error = urllib.error.HTTPError("https://api.github.com/", status, "unavailable", {}, None)
+                fetch = mock.Mock(side_effect=[error, self.document()])
+                self.assertEqual(set(verified_finalization_jobs(fetch, "integration")),
+                                 set(EXPECTED_FINALIZATION_STEPS["integration"]))
+                self.assertEqual(fetch.call_count, 2)
+                sleep.assert_called_once_with(5)
+
+                sleep.reset_mock()
+                fetch = mock.Mock(side_effect=error)
+                with self.assertRaisesRegex(ValueError, f"metadata unavailable: HTTP {status}"):
+                    verified_finalization_jobs(fetch, "integration")
+                self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+                self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_empty_expected_steps_must_become_available_for_all_job_sets(self, sleep):
+        for job_set, document in (
+            ("integration", self.document()),
+            ("action", self.action_burst_document()),
+            ("action", self.action_burst_document("ubuntu-latest action acceptance")),
+        ):
+            for index in range(len(document["jobs"])):
+                with self.subTest(job_set=job_set, name=document["jobs"][index]["name"]):
+                    sleep.reset_mock()
+                    pending = copy.deepcopy(document)
+                    pending["jobs"][index]["steps"] = []
+                    fetch = mock.Mock(side_effect=[pending, document])
+                    result = verified_finalization_jobs(fetch, job_set)
+                    self.assertEqual(len(result), len(document["jobs"]))
+                    self.assertEqual(fetch.call_count, 2)
+                    sleep.assert_called_once_with(5)
+
+                    sleep.reset_mock()
+                    fetch = mock.Mock(return_value=pending)
+                    with self.assertRaisesRegex(MetadataPending, "step metadata was empty"):
+                        verified_finalization_jobs(fetch, job_set)
+                    self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+                    self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_missing_step_metadata_accepts_only_an_entire_job_within_budget(self, sleep):
+        for job_set, document in (
+            ("integration", self.document("integration", MAX_PROTECTED_SECONDS, 0)),
+            ("action", self.action_burst_document(
+                setup_seconds=0, protected_seconds=MAX_PROTECTED_SECONDS
+            )),
+            ("action", self.action_burst_document(
+                "ubuntu-latest action acceptance", setup_seconds=0,
+                protected_seconds=MAX_PROTECTED_SECONDS
+            )),
+        ):
+            for shape in ("empty", "absent"):
+                with self.subTest(job_set=job_set, shape=shape):
+                    pending = copy.deepcopy(document)
+                    for job in pending["jobs"]:
+                        if shape == "empty":
+                            job["steps"] = []
+                        else:
+                            del job["steps"]
+                    fetch = mock.Mock(return_value=pending)
+                    result = verified_finalization_jobs(fetch, job_set)
+                    self.assertEqual({job["id"] for job in result.values()},
+                                     {job["id"] for job in pending["jobs"]})
+                    fetch.assert_called_once()
+                    sleep.assert_not_called()
+
+                    # The whole-job proof includes every post hook and the final second.
+                    for index in range(len(pending["jobs"])):
+                        sleep.reset_mock()
+                        too_slow = copy.deepcopy(pending)
+                        job = too_slow["jobs"][index]
+                        completed = _timestamp(job["completed_at"], "test job")
+                        job["completed_at"] = (completed + datetime.timedelta(seconds=1)).isoformat()
+                        with self.subTest(name=job["name"]):
+                            fetch = mock.Mock(return_value=too_slow)
+                            with self.assertRaisesRegex(MetadataPending, "job exceeded 180 seconds"):
+                                verified_finalization_jobs(fetch, job_set)
+                            self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+                            self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+                    sleep.reset_mock()
+
+    @mock.patch("time.sleep")
+    def test_short_jobs_cannot_use_fallback_to_hide_bad_evidence(self, sleep):
+        cases = (
+            ("id", None), ("id", True), ("id", "1"),
+            ("status", "queued"), ("status", "in_progress"),
+            ("conclusion", "failure"), ("conclusion", "cancelled"),
+            ("conclusion", "skipped"), ("conclusion", None),
+            ("started_at", None), ("started_at", "2026-07-23T00:00:00"),
+            ("started_at", "2026-07-23T00:04:00Z"),
+            ("completed_at", "invalid"), ("completed_at", "2026-07-23T00:00:00+25:00"),
+            ("steps", None), ("steps", False), ("steps", ""), ("steps", {}),
+            ("steps", [None]), ("steps", [{"name": "Post wrong"}]),
+        )
+        for job_set, document in (
+            ("integration", self.document("integration", 45, 0)),
+            ("action", self.action_burst_document(setup_seconds=0)),
+        ):
+            for index in range(len(document["jobs"])):
+                for field, value in cases:
+                    with self.subTest(job_set=job_set, index=index, field=field, value=value):
+                        invalid = copy.deepcopy(document)
+                        job = invalid["jobs"][index]
+                        job["steps"] = []
+                        job[field] = value
+                        fetch = mock.Mock(return_value=invalid)
+                        with self.assertRaises(ValueError) as failure:
+                            verified_finalization_jobs(fetch, job_set)
+                        self.assertNotIsInstance(failure.exception, MetadataPending)
+                        fetch.assert_called_once()
+                        sleep.assert_not_called()
+
+    @mock.patch("time.sleep")
+    def test_nonempty_steps_are_always_validated_even_for_short_jobs(self, sleep):
+        for job_set, document in (
+            ("integration", self.document("integration", 45, 0)),
+            ("action", self.action_burst_document("release verification", setup_seconds=0)),
+        ):
+            for index, job in enumerate(document["jobs"]):
+                for step_index in range(len(job["steps"])):
+                    for field, value in (
+                        ("name", "unexpected"), ("status", "in_progress"),
+                        ("conclusion", "failure"), ("conclusion", "cancelled"),
+                        ("conclusion", "skipped"), ("started_at", None),
+                        ("completed_at", "2026-07-23T00:02:00Z"),
+                    ):
+                        # Integration has no required post hook, but any known one must be valid.
+                        if job_set == "integration" and step_index == 1 and field == "name":
+                            continue
+                        with self.subTest(job_set=job_set, index=index, step_index=step_index, field=field):
+                            invalid = copy.deepcopy(document)
+                            invalid["jobs"][index]["steps"][step_index][field] = value
+                            fetch = mock.Mock(return_value=invalid)
+                            with self.assertRaises(ValueError):
+                                verified_finalization_jobs(fetch, job_set)
+                            fetch.assert_called_once()
+                            sleep.assert_not_called()
+                    with self.subTest(job_set=job_set, index=index, duplicate=step_index):
+                        invalid = copy.deepcopy(document)
+                        invalid["jobs"][index]["steps"].append(copy.deepcopy(job["steps"][step_index]))
+                        fetch = mock.Mock(return_value=invalid)
+                        with self.assertRaises(ValueError):
+                            verified_finalization_jobs(fetch, job_set)
+                        fetch.assert_called_once()
+                        sleep.assert_not_called()
+
+    @mock.patch("time.sleep")
+    def test_finalization_never_retries_failed_or_invalid_evidence(self, sleep):
+        for status in (401, 403, 404, 429, 500):
+            fetch = mock.Mock(side_effect=urllib.error.HTTPError(
+                "https://api.github.com/", status, "rejected", {}, None
+            ))
+            with self.subTest(status=status), self.assertRaises(urllib.error.HTTPError):
+                verified_finalization_jobs(fetch, "action")
+            fetch.assert_called_once()
+            sleep.assert_not_called()
+
+        cases = [
+            ("conclusion", "failure"), ("status", "cancelled"),
+            ("started_at", None), ("completed_at", "invalid"),
+            ("steps", None), ("steps", [{"name": "Post wrong"}]),
+        ]
+        for index in (0, -1):
+            for field, value in cases:
+                with self.subTest(index=index, field=field, value=value):
+                    document = self.action_burst_document()
+                    document["jobs"][index][field] = value
+                    fetch = mock.Mock(side_effect=[document, self.action_burst_document()])
+                    with self.assertRaises(ValueError):
+                        verified_finalization_jobs(fetch, "action")
+                    fetch.assert_called_once()
+                    sleep.assert_not_called()
+
+        document = self.action_burst_document()
+        document["jobs"][0]["steps"].append(copy.deepcopy(document["jobs"][0]["steps"][0]))
+        fetch = mock.Mock(return_value=document)
+        with self.assertRaisesRegex(ValueError, "missing or duplicated"):
+            verified_finalization_jobs(fetch, "action")
+        fetch.assert_called_once()
+        sleep.assert_not_called()
 
     def action_burst_report(self):
         return {
@@ -545,6 +790,31 @@ class ProtectedFinalizationTests(unittest.TestCase):
                 validate_action_finalization_report(candidate, name)
         with self.assertRaisesRegex(ValueError, "job was unknown"):
             validate_action_finalization_report(self.action_quiet_report(), "other job")
+
+    def test_quiet_reports_reject_unparsed_reason_count_changes(self):
+        for name in EXPECTED_FINALIZATION_STEPS["action"]:
+            for field in QUIET_OMISSIONS["unparsed_finding_reasons"]:
+                for value in (1, -1, True, False, "0", None, MAX_SAFE_INTEGER + 1):
+                    report = self.action_quiet_report()
+                    report["omissions"]["unparsed_finding_reasons"][field] = value
+                    with self.subTest(name=name, field=field, value=value), self.assertRaisesRegex(
+                        ValueError, "omitted evidence"
+                    ):
+                        validate_action_finalization_report(report, name)
+
+                report = self.action_quiet_report()
+                del report["omissions"]["unparsed_finding_reasons"][field]
+                with self.subTest(name=name, missing=field), self.assertRaisesRegex(
+                    ValueError, "omitted evidence"
+                ):
+                    validate_action_finalization_report(report, name)
+
+            report = self.action_quiet_report()
+            report["omissions"]["unparsed_finding_reasons"]["unexpected"] = 0
+            with self.subTest(name=name, extra=True), self.assertRaisesRegex(
+                ValueError, "omitted evidence"
+            ):
+                validate_action_finalization_report(report, name)
 
     def test_quiet_reports_allow_safe_results_storage_denials(self):
         name = next(iter(EXPECTED_FINALIZATION_STEPS["action"]))

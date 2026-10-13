@@ -35,10 +35,8 @@ import zipfile
 sys.path.insert(0, os.path.join(sys.argv[1], "script", "lib"))
 
 from protected_finalization import (
-    ACTION_ZERO_INPUT_BURST_JOB,
     validate_action_finalization_report,
-    validate_action_zero_input_burst_job,
-    validate_finalization_jobs,
+    verified_finalization_jobs,
 )
 
 repository = os.environ["GITHUB_REPOSITORY"]
@@ -152,16 +150,16 @@ def action_structured_reports(payload, job_name):
     return reports
 
 
-with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page=100"), timeout=15) as response:
-    body = response.read(1024 * 1024 + 1)
-if len(body) > 1024 * 1024:
-    raise SystemExit("protected finalization job metadata exceeded its fixed bound")
-document = json.loads(body)
+def job_metadata():
+    with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page=100"), timeout=15) as response:
+        body = response.read(1024 * 1024 + 1)
+    if len(body) > 1024 * 1024:
+        raise SystemExit("protected finalization job metadata exceeded its fixed bound")
+    return json.loads(body)
+
 
 try:
-    jobs = validate_finalization_jobs(document, job_set)
-    if job_set == "action":
-        jobs[ACTION_ZERO_INPUT_BURST_JOB] = validate_action_zero_input_burst_job(document)
+    jobs = verified_finalization_jobs(job_metadata, job_set)
 except ValueError as error:
     raise SystemExit(str(error)) from None
 

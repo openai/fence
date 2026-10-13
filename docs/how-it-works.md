@@ -38,6 +38,8 @@ The report lists allowed, blocked, or observed destinations, the status of Fence
 
 If Fence withholds a DNS answer, the warning explains why. The JSON report also includes fixed reason counts under `warnings.materialization_rejection_reasons`. An invalid reply, expired permission, or full queue does not by itself mean protection was lost. A failed firewall update is critical and fails the job.
 
+In audit mode, some packets cannot be mapped to an allowlist entry. `omissions.unparsed_findings` counts those observations; `omissions.unparsed_finding_reasons` breaks the same total down by fixed reason. The summary and log show only reasons with nonzero counts. Missing or unknown reasons count as `unrecognized`; Fence never prints the original reason text or packet bytes. These omissions alone do not mean protection failed, but do not treat the observed destinations as a complete allowlist.
+
 ### Fetch A Report
 
 First, find the job ID:
@@ -126,6 +128,16 @@ The job log stores the report on one line. `jq` formats it like this:
     "activity_entries": 0,
     "critical_codes": 0,
     "unparsed_findings": 0,
+    "unparsed_finding_reasons": {
+      "short_header": 0,
+      "invalid_ipv4_header": 0,
+      "ipv4_fragment": 0,
+      "unsupported_ipv4_protocol": 0,
+      "unsupported_ipv6_header": 0,
+      "unknown_ip_version": 0,
+      "invalid_port": 0,
+      "unrecognized": 0
+    },
     "dns_evidence_missing": false,
     "source_truncated": false,
     "byte_budget_exceeded": false

@@ -67,6 +67,7 @@ type AuditSummary = {
   omittedHostnameRows: number;
   omittedIpRows: number;
   unparsedCount: number;
+  unparsedReasons: Record<keyof typeof UNPARSED_FINDING_REASONS, number>;
   sourceTruncated: boolean;
 };
 type NetworkDecision = "allowed" | "blocked" | "would_block";
@@ -123,6 +124,16 @@ const MATERIALIZATION_REJECTION_REASONS = {
   capacity: "capacity limit reached",
   queue_unavailable: "resident queue unavailable",
   firewall_update_failed: "firewall update failed",
+} as const;
+const UNPARSED_FINDING_REASONS = {
+  short_header: "short packet header",
+  invalid_ipv4_header: "invalid IPv4 header",
+  ipv4_fragment: "IPv4 fragment",
+  unsupported_ipv4_protocol: "non-TCP/UDP IPv4 packet",
+  unsupported_ipv6_header: "unsupported IPv6 next header",
+  unknown_ip_version: "unknown IP version",
+  invalid_port: "invalid destination port",
+  unrecognized: "reason unavailable",
 } as const;
 const ALLOWED_DNS_CLASSIFICATIONS = new Set([
   "artifact_authorized_results_storage",
@@ -2036,6 +2047,9 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
   const ipRows = new Map<string, AuditFindingRow>();
   const addressMap = dnsAddressHostnameMap(dnsEvidence, OUTSIDE_POLICY_DNS_CLASSIFICATIONS);
   let unparsedCount = 0;
+  const unparsedReasons = Object.fromEntries(
+    Object.keys(UNPARSED_FINDING_REASONS).map((key) => [key, 0]),
+  ) as AuditSummary["unparsedReasons"];
 
   for (const finding of Array.isArray(report.findings) ? report.findings : []) {
     if (
@@ -2053,6 +2067,21 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
       !isValidPort(finding.remote_port)
     ) {
       unparsedCount += 1;
+      let reason: keyof typeof UNPARSED_FINDING_REASONS = "unrecognized";
+      if (
+        typeof finding.remote_address === "string" &&
+        net.isIP(finding.remote_address) !== 0 &&
+        isSupportedProtocol(finding.protocol) &&
+        !isValidPort(finding.remote_port)
+      ) {
+        reason = "invalid_port";
+      } else if (
+        typeof finding.unparsed_reason === "string" &&
+        Object.hasOwn(UNPARSED_FINDING_REASONS, finding.unparsed_reason)
+      ) {
+        reason = finding.unparsed_reason as keyof typeof UNPARSED_FINDING_REASONS;
+      }
+      unparsedReasons[reason] += 1;
       continue;
     }
 
@@ -2085,9 +2114,17 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
     omittedHostnameRows: Math.max(0, allHostnameRows.length - MAX_AUDIT_HOSTNAME_ROWS),
     omittedIpRows: Math.max(0, allIpRows.length - MAX_AUDIT_IP_ROWS),
     unparsedCount,
+    unparsedReasons,
     sourceTruncated: report.findings_truncated === true ||
       Boolean(dnsEvidence && dnsEvidence.observations_truncated === true),
   };
+}
+
+function unparsedFindingDetails(reasons: AuditSummary["unparsedReasons"]): string {
+  return Object.entries(UNPARSED_FINDING_REASONS)
+    .filter(([reason]) => reasons[reason as keyof typeof reasons] > 0)
+    .map(([reason, label]) => `${label}: ${reasons[reason as keyof typeof reasons]}`)
+    .join("; ");
 }
 
 function summaryHeading(summaryState: { healthy: boolean; critical: boolean }): string {
@@ -2616,24 +2653,23 @@ function networkActivitySummary(
   const lines = ["", "#### Network activity", ""];
   if (activity.rows.length === 0) {
     lines.push("_No reportable network activity was observed._");
-    return lines;
-  }
-
-  const hasAttribution = activity.rows.some((row) => row.actors.size > 0);
-  lines.push(hasAttribution
-    ? "| Destination | Result | Activity | Actor |"
-    : "| Destination | Result | Activity |");
-  lines.push(hasAttribution ? "| --- | --- | ---: | --- |" : "| --- | --- | ---: |");
-  for (const row of activity.rows) {
-    const actor = row.actors.size > 0 ? boundedText(actorLabel(row)) : "➖";
+  } else {
+    const hasAttribution = activity.rows.some((row) => row.actors.size > 0);
     lines.push(hasAttribution
-      ? `| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} | ${actor} |`
-      : `| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} |`);
-  }
-  if (activity.omittedRows > 0) {
-    lines.push(hasAttribution
-      ? `| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) | ➖ |`
-      : `| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) |`);
+      ? "| Destination | Result | Activity | Actor |"
+      : "| Destination | Result | Activity |");
+    lines.push(hasAttribution ? "| --- | --- | ---: | --- |" : "| --- | --- | ---: |");
+    for (const row of activity.rows) {
+      const actor = row.actors.size > 0 ? boundedText(actorLabel(row)) : "➖";
+      lines.push(hasAttribution
+        ? `| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} | ${actor} |`
+        : `| ${markdownCode(row.destination)} | ${decisionLabel(row.decision)} | ${boundedText(activityLabel(row))} |`);
+    }
+    if (activity.omittedRows > 0) {
+      lines.push(hasAttribution
+        ? `| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) | ➖ |`
+        : `| ${markdownCode("additional_destinations_omitted")} | ⚠️ Review local evidence | ${activity.omittedRows} more row(s) |`);
+    }
   }
   lines.push("");
 
@@ -2641,7 +2677,7 @@ function networkActivitySummary(
     lines.push("⚠️ DNS evidence was unavailable; IP-level findings may require manual review.", "");
   }
   if (auditSummary.unparsedCount > 0) {
-    lines.push(`⚠️ ${auditSummary.unparsedCount} would-block finding(s) could not be mapped to an endpoint.`);
+    lines.push(`⚠️ ${auditSummary.unparsedCount} would-block finding(s) could not be mapped to an endpoint. ${unparsedFindingDetails(auditSummary.unparsedReasons)}.`);
     lines.push("");
   }
   if (auditSummary.sourceTruncated || auditSummary.omittedHostnameRows > 0 || auditSummary.omittedIpRows > 0) {
@@ -2802,6 +2838,7 @@ function structuredNetworkReport(report: any, dnsEvidence: any = undefined): any
     activity_entries: 0,
     critical_codes: Math.max(0, report.critical_findings.length - MAX_STRUCTURED_CRITICAL_CODES),
     unparsed_findings: audit.unparsedCount,
+    unparsed_finding_reasons: audit.unparsedReasons,
     dns_evidence_missing: audit.dnsMissing,
     source_truncated: audit.sourceTruncated || report.critical_findings_truncated,
     byte_budget_exceeded: false,
@@ -2921,7 +2958,7 @@ function networkReportLines(report: any, dnsEvidence: any = undefined): string[]
     lines.push(`Additional network rows omitted: ${document.omissions.network_rows}`);
   }
   if (document.omissions.unparsed_findings > 0) {
-    lines.push(`Unparsed network findings: ${document.omissions.unparsed_findings}`);
+    lines.push(`Unparsed network findings: ${document.omissions.unparsed_findings} (${unparsedFindingDetails(document.omissions.unparsed_finding_reasons)})`);
   }
   if (document.omissions.source_truncated || document.omissions.byte_budget_exceeded) {
     lines.push("Network evidence was truncated");
