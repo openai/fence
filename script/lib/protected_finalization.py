@@ -18,6 +18,7 @@ from dns_evidence import (
 MAX_PROTECTED_SECONDS = 180
 MAX_JOB_COUNT = 100
 METADATA_ATTEMPTS = 3
+LOG_ARCHIVE_ATTEMPTS = 6
 ACTION_ZERO_INPUT_BURST_JOB = "action zero-input standard"
 ACTION_ZERO_INPUT_BURST_ACTIVATION = "activate bundled Fence agent with strict defaults"
 ACTION_ZERO_INPUT_BURST_DESTINATIONS = ("192.0.2.1", "192.0.2.2")
@@ -250,6 +251,24 @@ def verified_finalization_jobs(fetch, job_set):
         except MetadataPending:
             if attempt == METADATA_ATTEMPTS - 1:
                 raise
+        time.sleep(5)
+
+
+def fetch_log_archive(fetch, job_name):
+    for attempt in range(LOG_ARCHIVE_ATTEMPTS):
+        try:
+            return fetch()
+        except Exception as error:
+            # A transport error can contain a signed URL, so never show its text.
+            if isinstance(error, urllib.error.HTTPError):
+                retryable = error.code in {404, 502, 503, 504}
+            else:
+                reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                retryable = isinstance(reason, (TimeoutError, ConnectionResetError))
+            if not retryable:
+                raise ValueError(f"protected finalization log archive download failed: {job_name}") from None
+            if attempt == LOG_ARCHIVE_ATTEMPTS - 1:
+                raise ValueError(f"protected finalization log archive was unavailable: {job_name}") from None
         time.sleep(5)
 
 
@@ -544,6 +563,48 @@ class ProtectedFinalizationTests(unittest.TestCase):
         job["steps"] = [activation, evidence, post]
         document["jobs"].append(job)
         return document
+
+    @mock.patch("time.sleep")
+    def test_log_archive_retries_only_transient_download_failures(self, sleep):
+        errors = [
+            *(urllib.error.HTTPError("https://example.invalid/?signed=secret", code, "unavailable", {}, None)
+              for code in (404, 502, 503, 504)),
+            TimeoutError("signed=secret"),
+            urllib.error.URLError(TimeoutError("signed=secret")),
+            ConnectionResetError("signed=secret"),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
+                sleep.reset_mock()
+                fetch = mock.Mock(side_effect=[error, b"verified log"])
+                self.assertEqual(fetch_log_archive(fetch, "selected job"), b"verified log")
+                self.assertEqual(fetch.call_count, 2)
+                sleep.assert_called_once_with(5)
+
+        sleep.reset_mock()
+        fetch = mock.Mock(side_effect=errors[0])
+        with self.assertRaises(ValueError) as caught:
+            fetch_log_archive(fetch, "selected job")
+        self.assertEqual(str(caught.exception), "protected finalization log archive was unavailable: selected job")
+        self.assertEqual(fetch.call_count, LOG_ARCHIVE_ATTEMPTS)
+        self.assertEqual(sleep.call_count, LOG_ARCHIVE_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_log_archive_fails_immediately_without_disclosing_error_details(self, sleep):
+        errors = (
+            urllib.error.HTTPError("https://example.invalid/?signed=secret", 302, "redirect", {}, None),
+            urllib.error.HTTPError("https://example.invalid/?signed=secret", 403, "forbidden", {}, None),
+            urllib.error.URLError("signed=secret"),
+            ValueError("signed=secret"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                fetch = mock.Mock(side_effect=error)
+                with self.assertRaises(ValueError) as caught:
+                    fetch_log_archive(fetch, "selected job")
+                self.assertEqual(str(caught.exception), "protected finalization log archive download failed: selected job")
+                fetch.assert_called_once_with()
+                sleep.assert_not_called()
 
     @mock.patch("time.sleep")
     def test_transient_metadata_errors_retry_but_remain_bounded(self, sleep):

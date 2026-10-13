@@ -26,7 +26,6 @@ import io
 import json
 import os
 import sys
-import time
 import urllib.error
 import urllib.request
 import urllib.parse
@@ -36,6 +35,7 @@ sys.path.insert(0, os.path.join(sys.argv[1], "script", "lib"))
 
 from protected_finalization import (
     MAX_JOB_COUNT,
+    fetch_log_archive,
     validate_action_finalization_report,
     validate_job_listing,
     verified_finalization_jobs,
@@ -72,15 +72,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def log_archive(job_id):
     opener = urllib.request.build_opener(NoRedirect)
     try:
-        opener.open(request(f"/actions/jobs/{job_id}/logs"), timeout=15)
+        with opener.open(request(f"/actions/jobs/{job_id}/logs"), timeout=15):
+            raise RuntimeError("job log endpoint did not return an immutable archive redirect")
     except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
         if error.code not in {301, 302, 303, 307, 308}:
             raise
         location = error.headers.get("Location", "")
-    else:
-        raise RuntimeError("job log endpoint did not return an immutable archive redirect")
     parsed = urllib.parse.urlparse(location)
     hostname = parsed.hostname or ""
     accepted_suffixes = (
@@ -95,15 +92,8 @@ def log_archive(job_id):
         headers={"User-Agent": "fence-finalization-verifier"},
     )
     unsigned_opener = urllib.request.build_opener(NoRedirect)
-    try:
-        with unsigned_opener.open(unsigned, timeout=20) as response:
-            return response.read(8 * 1024 * 1024 + 1)
-    except urllib.error.HTTPError as error:
-        if error.code == 404:
-            return None
-        raise RuntimeError("job log archive download failed") from None
-    except urllib.error.URLError:
-        raise RuntimeError("job log archive download failed") from None
+    with unsigned_opener.open(unsigned, timeout=20) as response:
+        return response.read(8 * 1024 * 1024 + 1)
 
 
 def unique_json_object(pairs):
@@ -167,14 +157,10 @@ except ValueError as error:
 
 for name in sorted(jobs):
     job = jobs[name]
-    archive = None
-    for attempt in range(6):
-        archive = log_archive(job["id"])
-        if archive is not None:
-            break
-        if attempt == 5:
-            raise SystemExit(f"protected finalization log archive was unavailable: {name}")
-        time.sleep(5)
+    try:
+        archive = fetch_log_archive(lambda: log_archive(job["id"]), name)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
     if not archive or len(archive) > 8 * 1024 * 1024:
         raise SystemExit(f"protected finalization job log was empty or oversized: {name}")
     reports = []

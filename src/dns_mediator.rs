@@ -58,6 +58,7 @@ use crate::platform_profile::{
 };
 use crate::runtime::{
     ProductionRuntimeStore, RuntimeDocumentStore, RuntimeError, TestRuntimeStore,
+    atomic_replace_report,
 };
 use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
 use serde::Serialize;
@@ -6469,10 +6470,7 @@ fn write_report(path: &Path, evidence: &DnsMediationEvidence) -> Result<(), DnsM
             "DNS mediation evidence exceeds the fixed report limit",
         ));
     }
-    let pending = path.with_extension("json.next");
-    let _ = fs::remove_file(&pending);
-    write_new_file(&pending, &bytes, 0o644)?;
-    fs::rename(&pending, path).map_err(|_| {
+    atomic_replace_report(path, |file| file.write_all(&bytes)).map_err(|_| {
         DnsMediationError::new(
             "dns_evidence_write_failed",
             "failed to atomically publish DNS mediation evidence",
@@ -6749,6 +6747,39 @@ mod tests {
             trusted_runner_worker: None,
         };
         (recorder, report_path)
+    }
+
+    #[test]
+    fn dns_report_publication_preserves_a_preexisting_pending_file() {
+        let (recorder, report) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        let pending = report.with_added_extension("next");
+        fs::write(&pending, b"unrelated").unwrap();
+
+        assert_eq!(
+            recorder.refresh_report().unwrap_err().code,
+            "dns_evidence_write_failed"
+        );
+        assert_eq!(fs::read(&pending).unwrap(), b"unrelated");
+        assert!(!report.exists());
+
+        fs::remove_file(pending).unwrap();
+    }
+
+    #[test]
+    fn failed_dns_report_publication_does_not_block_later_updates() {
+        let (recorder, report) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        fs::create_dir(&report).unwrap();
+
+        assert_eq!(
+            recorder.refresh_report().unwrap_err().code,
+            "dns_evidence_write_failed"
+        );
+        assert!(!report.with_added_extension("next").exists());
+        fs::remove_dir(&report).unwrap();
+        recorder.refresh_report().unwrap();
+        assert!(report.is_file());
+
+        fs::remove_file(report).unwrap();
     }
 
     fn assert_materialization_rejections(

@@ -71,7 +71,7 @@ impl TestRuntimeStore {
     }
 
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        replace_report(&self.directory, &self.report, value)
+        replace_report(&self.report, value)
     }
 
     pub fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError> {
@@ -175,7 +175,7 @@ impl ProductionRuntimeStore {
     }
 
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        replace_report(&self.directory, &self.report, value)
+        replace_report(&self.report, value)
     }
 
     pub fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError> {
@@ -362,6 +362,7 @@ fn write_json_exclusive(
 ) -> Result<(), RuntimeError> {
     let bytes = bounded_json(value)?;
     write_and_sync(&mut create_exclusive(path, mode)?, &bytes)
+        .map_err(|error| io_error("runtime_write_failed", error))
 }
 
 fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, RuntimeError> {
@@ -380,17 +381,24 @@ fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, RuntimeError> {
     Ok(bytes)
 }
 
-fn replace_report(
-    directory: &Path,
-    report: &Path,
-    value: &impl Serialize,
-) -> Result<(), RuntimeError> {
+fn replace_report(report: &Path, value: &impl Serialize) -> Result<(), RuntimeError> {
     let bytes = bounded_json(value)?;
-    let pending = directory.join("report.json.next");
+    atomic_replace_report(report, |file| write_and_sync(file, &bytes))
+}
+
+/// Replaces a report in a trusted runtime directory; the writer controls syncing.
+pub(crate) fn atomic_replace_report(
+    report: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<(), RuntimeError> {
+    let pending = report.with_added_extension("next");
     let mut file = create_exclusive(&pending, 0o644)?;
-    let result = write_and_sync(&mut file, &bytes).and_then(|()| {
-        fs::rename(&pending, report).map_err(|error| io_error("runtime_atomic_write_failed", error))
-    });
+    let result = write(&mut file)
+        .map_err(|error| io_error("runtime_write_failed", error))
+        .and_then(|()| {
+            fs::rename(&pending, report)
+                .map_err(|error| io_error("runtime_atomic_write_failed", error))
+        });
     if result.is_err() {
         remove_created_file(&pending, &file);
     }
@@ -407,11 +415,9 @@ fn create_exclusive(path: &Path, mode: u32) -> Result<fs::File, RuntimeError> {
         .map_err(|error| io_error("runtime_write_failed", error))
 }
 
-fn write_and_sync(file: &mut fs::File, bytes: &[u8]) -> Result<(), RuntimeError> {
-    file.write_all(bytes)
-        .map_err(|error| io_error("runtime_write_failed", error))?;
+fn write_and_sync(file: &mut fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    file.write_all(bytes)?;
     file.sync_all()
-        .map_err(|error| io_error("runtime_write_failed", error))
 }
 
 fn remove_created_file(path: &Path, file: &fs::File) {
@@ -533,6 +539,16 @@ mod tests {
         assert!(!store.directory.join("report.json.next").exists());
         fs::remove_dir(&store.report).unwrap();
         store.replace_report(&document).unwrap();
+        assert_eq!(
+            atomic_replace_report(&store.report, |file| {
+                file.write_all(b"partial")?;
+                Err(std::io::ErrorKind::WriteZero.into())
+            })
+            .unwrap_err()
+            .code,
+            "runtime_write_failed"
+        );
+        assert!(!store.directory.join("report.json.next").exists());
         assert_eq!(
             fs::read_to_string(&store.report).unwrap(),
             r#"{"value":"recovered"}"#

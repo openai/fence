@@ -60,6 +60,10 @@ Critical drift means a required protection changed or a Fence component stopped 
 
 Check the job summary and debug logs to identify what changed. Expanding the allowlist will not fix a broken protection.
 
+## Job Summary Unavailable
+
+If Fence cannot write the job summary, look in the post-job log for the network report. A summary warning alone does not mean protection failed.
+
 ## Post-Job Evidence Validation Fails
 
 Missing active Action mount evidence can follow a setup failure before readiness, when provisional mounts have already been removed. Check the earlier Fence setup log first. The same missing evidence can also mean a protected mount was removed after readiness; Fence cannot safely distinguish these cases using job-writable state, so it still fails post-job verification and never claims protection succeeded.

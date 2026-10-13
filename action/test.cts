@@ -930,7 +930,7 @@ test("formats audit and degraded log wording accurately", () => {
   );
   assert.equal(
     actionLog.postEvidenceLine(auditReport, 2),
-    "👀 Audit observed 2 would-block destinations; see Fence Summary",
+    "👀 Audit observed 2 would-block destinations; see the Fence report",
   );
 
   const degraded = {
@@ -3650,17 +3650,18 @@ test("counts only fixed reasons for unmappable audit findings without changing d
 });
 
 test("publishes post evidence from one fresh report and rejects stale or critical evidence", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-summary-"));
+  const summaryPath = path.join(temporary, "summary");
+  fs.writeFileSync(summaryPath, "");
   const verifiedAt = 1_000_000;
   const currentReport = {
     ...report,
     resident_health: { ...report.resident_health, last_successful_verification_unix_milliseconds: verifiedAt },
   };
   let clockCalls = 0;
-  let summaryWrites = 0;
   t.mock.method(Date, "now", () => verifiedAt + (clockCalls++ === 0 ? 19_999 : 20_001));
-  t.mock.method(fs, "appendFileSync", () => { summaryWrites += 1; });
   const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
-  process.env.GITHUB_STEP_SUMMARY = "fence-test-summary";
+  process.env.GITHUB_STEP_SUMMARY = summaryPath;
   try {
     const paths = runtimePaths("action-test");
     const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
@@ -3670,13 +3671,14 @@ test("publishes post evidence from one fresh report and rejects stale or critica
     assert.match(output, new RegExp(`Fence network report: ${document.result}`));
     assert.match(output, /Fence evidence verified/);
     assert.equal(clockCalls, 1);
-    assert.equal(summaryWrites, 1);
+    const healthySummary = summaryLines(currentReport, { observations: [] }).join("\n");
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), healthySummary);
 
     const staleOutput = captureStdout(() => {
       assert.throws(() => publishPostEvidence(currentReport, { observations: [] }, paths), /stale/);
     });
     assert.equal(staleOutput, "");
-    assert.equal(summaryWrites, 1);
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), healthySummary);
 
     const criticalReport = {
       ...currentReport,
@@ -3689,10 +3691,53 @@ test("publishes post evidence from one fresh report and rejects stale or critica
     });
     assert.match(criticalOutput, /FENCE_REPORT_JSON=.*"result":"critical"/);
     assert.doesNotMatch(criticalOutput, /Fence evidence verified/);
-    assert.equal(summaryWrites, 2);
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), healthySummary + summaryLines(criticalReport, { observations: [] }).join("\n"));
   } finally {
     if (previousSummaryPath === undefined) delete process.env.GITHUB_STEP_SUMMARY;
     else process.env.GITHUB_STEP_SUMMARY = previousSummaryPath;
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("keeps the verified job-log report available when the job summary cannot be written", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-summary-"));
+  const summaryPath = path.join(temporary, "summary");
+  const linkPath = path.join(temporary, "symlink");
+  const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
+  const paths = runtimePaths("action-test");
+  const currentReport = { ...report, resident_health: residentHealth() };
+  try {
+    fs.writeFileSync(summaryPath, "unchanged");
+    fs.symlinkSync(summaryPath, linkPath);
+    for (const unavailablePath of [path.join(temporary, "missing"), linkPath, "/dev/null"]) {
+      process.env.GITHUB_STEP_SUMMARY = unavailablePath;
+      const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
+      assert.equal(output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON=")).length, 1);
+      assert.match(output, /could not write the job summary; see the job log for the report/);
+      assert.match(output, /Fence evidence verified/);
+      assert.doesNotMatch(output, /ENOENT|ELOOP|\/dev\/null|fence-post-summary-/);
+    }
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), "unchanged");
+
+    process.env.GITHUB_STEP_SUMMARY = summaryPath;
+    t.mock.method(fs, "appendFileSync", () => { throw new Error("sensitive filesystem detail"); });
+    const criticalReport = {
+      ...currentReport,
+      network_verification_status: "critical_drift",
+      resident_health: residentHealth({ status: "critical" }),
+      critical_findings: [{ code: "owned_nftables_state_missing", message: "Verified drift" }],
+    };
+    const output = captureStdout(() => {
+      assert.throws(() => publishPostEvidence(criticalReport, { observations: [] }, paths), /critical resident findings/);
+    });
+    assert.equal(output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON=")).length, 1);
+    assert.match(output, /"result":"critical"/);
+    assert.match(output, /could not write the job summary/);
+    assert.doesNotMatch(output, /Fence evidence verified|sensitive filesystem detail/);
+  } finally {
+    if (previousSummaryPath === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+    else process.env.GITHUB_STEP_SUMMARY = previousSummaryPath;
+    fs.rmSync(temporary, { recursive: true, force: true });
   }
 });
 

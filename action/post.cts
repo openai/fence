@@ -320,6 +320,23 @@ function main(): void {
   publishPostEvidence(report, dnsEvidence, paths);
 }
 
+function writeJobSummary(filePath: string, report: any, dnsEvidence: any): void {
+  try {
+    const summary = summaryLines(report, dnsEvidence).join("\n");
+    const file = fs.openSync(filePath, fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    try {
+      if (!fs.fstatSync(file).isFile()) {
+        throw new Error("Fence job summary is not a regular file");
+      }
+      fs.appendFileSync(file, summary, "utf8");
+    } finally {
+      fs.closeSync(file);
+    }
+  } catch {
+    log.warning("Fence could not write the job summary; see the job log for the report");
+  }
+}
+
 function publishPostEvidence(report: any, dnsEvidence: any, paths: { report: string; dnsReport: string }): void {
   const networkReport = renderNetworkReport(report, dnsEvidence);
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
@@ -379,15 +396,13 @@ function publishPostEvidence(report: any, dnsEvidence: any, paths: { report: str
     `resident_last_verified_unix_milliseconds=${report.resident_health?.last_successful_verification_unix_milliseconds ?? "not_available"}`,
     ...findingAttributionDebugLines(report),
   ]);
-  if (process.env.GITHUB_STEP_SUMMARY) {
-    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summaryLines(report, dnsEvidence).join("\n"), {
-      encoding: "utf8",
-    });
-  }
   for (const line of networkReport.lines) {
     log.info(line);
   }
   log.structuredRecord(networkReport.record);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    writeJobSummary(process.env.GITHUB_STEP_SUMMARY, report, dnsEvidence);
+  }
   if (report.allow_github_artifacts) {
     log.warning(
       `Fence GitHub artifact compatibility permitted ${githubArtifactAuthorizationCount} of 4 storage accounts; artifact uploads are an intentional data-egress channel`,

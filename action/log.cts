@@ -193,7 +193,7 @@ function readyLine(report: any): string {
 
 function postEvidenceLine(report: any, auditDestinationCount = 0): string | undefined {
   if (report.mode === "audit") {
-    return `👀 Audit observed ${auditDestinationCount} would-block ${pluralize(auditDestinationCount, "destination")}; see Fence Summary`;
+    return `👀 Audit observed ${auditDestinationCount} would-block ${pluralize(auditDestinationCount, "destination")}; see the Fence report`;
   }
   if (report.status === "protected_host_block_degraded") {
     return "⚠️ Limited assurance: Docker/container access was preserved";

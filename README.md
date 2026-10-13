@@ -117,7 +117,7 @@ Failed evidence validation may include [bounded, unverified diagnostics](docs/tr
 
 ## Network Reports 📋
 
-After evidence validation, Fence adds a network activity table to the job summary and post-job log. The log's table and `FENCE_REPORT_JSON=` line share one validated report, which you can fetch through the GitHub API:
+After evidence validation, Fence writes a network activity table and a `FENCE_REPORT_JSON=` line to the post-job log. It also adds the activity table to the job summary when available. You can fetch the report through the GitHub API:
 
 ```bash
 gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \
