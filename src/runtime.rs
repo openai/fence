@@ -361,7 +361,7 @@ fn write_json_exclusive(
     mode: u32,
 ) -> Result<(), RuntimeError> {
     let bytes = bounded_json(value)?;
-    write_bytes_exclusive(path, &bytes, mode)
+    write_and_sync(&mut create_exclusive(path, mode)?, &bytes)
 }
 
 fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, RuntimeError> {
@@ -387,22 +387,40 @@ fn replace_report(
 ) -> Result<(), RuntimeError> {
     let bytes = bounded_json(value)?;
     let pending = directory.join("report.json.next");
-    write_bytes_exclusive(&pending, &bytes, 0o644)?;
-    fs::rename(&pending, report).map_err(|error| io_error("runtime_atomic_write_failed", error))
+    let mut file = create_exclusive(&pending, 0o644)?;
+    let result = write_and_sync(&mut file, &bytes).and_then(|()| {
+        fs::rename(&pending, report).map_err(|error| io_error("runtime_atomic_write_failed", error))
+    });
+    if result.is_err() {
+        remove_created_file(&pending, &file);
+    }
+    result
 }
 
-fn write_bytes_exclusive(path: &Path, bytes: &[u8], mode: u32) -> Result<(), RuntimeError> {
-    let mut file = OpenOptions::new()
+fn create_exclusive(path: &Path, mode: u32) -> Result<fs::File, RuntimeError> {
+    OpenOptions::new()
         .write(true)
         .create_new(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .mode(mode)
         .open(path)
-        .map_err(|error| io_error("runtime_write_failed", error))?;
+        .map_err(|error| io_error("runtime_write_failed", error))
+}
+
+fn write_and_sync(file: &mut fs::File, bytes: &[u8]) -> Result<(), RuntimeError> {
     file.write_all(bytes)
         .map_err(|error| io_error("runtime_write_failed", error))?;
     file.sync_all()
         .map_err(|error| io_error("runtime_write_failed", error))
+}
+
+fn remove_created_file(path: &Path, file: &fs::File) {
+    let (Ok(created), Ok(current)) = (file.metadata(), fs::symlink_metadata(path)) else {
+        return;
+    };
+    if created.dev() == current.dev() && created.ino() == current.ino() {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn set_directory_mode(path: &Path, mode: u32) -> Result<(), RuntimeError> {
@@ -497,6 +515,51 @@ mod tests {
             fs::metadata(&store.report).unwrap().permissions().mode() & 0o777,
             0o644
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_report_replacement_does_not_block_later_updates() {
+        let root = root();
+        let store = TestRuntimeStore::create(&root, "resident-proof").unwrap();
+        let document = Document {
+            value: "recovered".to_owned(),
+        };
+        fs::create_dir(&store.report).unwrap();
+        assert_eq!(
+            store.replace_report(&document).unwrap_err().code,
+            "runtime_atomic_write_failed"
+        );
+        assert!(!store.directory.join("report.json.next").exists());
+        fs::remove_dir(&store.report).unwrap();
+        store.replace_report(&document).unwrap();
+        assert_eq!(
+            fs::read_to_string(&store.report).unwrap(),
+            r#"{"value":"recovered"}"#
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn report_cleanup_and_creation_preserve_an_unrelated_pending_file() {
+        let root = root();
+        let store = TestRuntimeStore::create(&root, "resident-proof").unwrap();
+        let pending = store.directory.join("report.json.next");
+        let created = create_exclusive(&pending, 0o644).unwrap();
+        fs::remove_file(&pending).unwrap();
+        fs::write(&pending, "untouched").unwrap();
+        remove_created_file(&pending, &created);
+        assert_eq!(
+            store
+                .replace_report(&Document {
+                    value: "replacement".to_owned(),
+                })
+                .unwrap_err()
+                .code,
+            "runtime_write_failed"
+        );
+        assert_eq!(fs::read_to_string(&pending).unwrap(), "untouched");
+        assert!(!store.report.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

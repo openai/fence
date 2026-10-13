@@ -48,6 +48,7 @@ const actionLog = require("./log.cts");
 const { postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport } = require("./post.cts");
 const {
   dnsStartupDiagnosticFromJournal,
+  emitCapturedServiceDiagnostics,
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
@@ -1112,6 +1113,35 @@ test("recognizes terminal service state and only bounded structured Fence error 
     "not JSON",
   ]) {
     assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
+  }
+});
+
+test("service diagnostics never emit raw command output, even in debug mode", () => {
+  const sensitive = "sensitive_marker";
+  const status = {
+    status: 0, error: false,
+    stdout: `LoadState=loaded\nActiveState=failed\nResult=${sensitive}\nEnvironment=${sensitive}`,
+  };
+  const journal = {
+    status: 0, error: false,
+    stdout: [
+      `arbitrary journal text ${sensitive}`,
+      JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code: "dns_proxy_bind_failed", message: sensitive } }),
+      JSON.stringify({ fence_dns_startup: { listener: "host", protocol: "udp", operation: "bind", reason: "address_in_use", detail: sensitive } }),
+    ].join("\n"),
+  };
+  const previousDebug = process.env.RUNNER_DEBUG;
+  process.env.RUNNER_DEBUG = "1";
+  try {
+    const output = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    assert.match(output, /Fence service state for fence-example\.service: LoadState=loaded; ActiveState=failed/);
+    assert.match(output, /Fence debug: service diagnostics/);
+    assert.match(output, /Fence resident error code: dns_proxy_bind_failed/);
+    assert.match(output, /Fence DNS startup: host UDP bind: address already in use/);
+    assert.ok(!output.includes(sensitive));
+  } finally {
+    if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
+    else process.env.RUNNER_DEBUG = previousDebug;
   }
 });
 

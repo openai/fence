@@ -39,6 +39,15 @@ const CHILD_ENV = {
   LC_ALL: "C.UTF-8",
   PATH: "/usr/bin:/usr/sbin:/bin:/sbin",
 };
+const SERVICE_STATUS_PROPERTIES = new Map<string, RegExp>([
+  ["LoadState", /^(?:loaded|not-found|masked|error|bad-setting)$/],
+  ["ActiveState", /^(?:active|inactive|failed|activating|deactivating|reloading|maintenance)$/],
+  ["SubState", /^(?:running|dead|failed|start|stop|auto-restart|exited)$/],
+  ["Result", /^(?:success|exit-code|signal|core-dump|timeout|watchdog|resources|protocol|start-limit-hit|oom-kill)$/],
+  ["ExecMainCode", /^(?:[0-9]{1,10}|exited|killed|dumped)$/],
+  ["ExecMainStatus", /^[0-9]{1,10}$/],
+  ["MainPID", /^[0-9]{1,10}$/],
+]);
 
 let diagnosticPaths: { unit: string } | undefined;
 let serviceLaunchAttempted = false;
@@ -84,30 +93,20 @@ function capture(
   executable: string,
   args: string[],
   timeout = 2 * 1000,
-): { status: number | null; stdout: string; stderr: string; error: string | undefined } {
+): { status: number | null; stdout: string; error: boolean } {
   const result = spawnSync(executable, args, {
     encoding: "utf8",
     env: CHILD_ENV,
     killSignal: "SIGKILL",
     maxBuffer: 32 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "ignore"],
     timeout,
   });
   return {
     status: result.status,
     stdout: String(result.stdout || ""),
-    stderr: String(result.stderr || ""),
-    error: result.error ? result.error.message : undefined,
+    error: Boolean(result.error),
   };
-}
-
-function compactServiceStatus(output: string): string {
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .slice(0, 12)
-    .join("; ");
 }
 
 function parseServiceProperties(output: string): Record<string, string> {
@@ -119,25 +118,19 @@ function parseServiceProperties(output: string): Record<string, string> {
     }
     const name = line.slice(0, separator);
     const value = line.slice(separator + 1);
-    if (
-      !new Set([
-        "ActiveState",
-        "ExecMainCode",
-        "ExecMainStatus",
-        "LoadState",
-        "MainPID",
-        "Result",
-        "SubState",
-      ]).has(name) ||
-      name in properties ||
-      value.length > 128 ||
-      /[^A-Za-z0-9_.:-]/.test(value)
-    ) {
+    if (name in properties || !SERVICE_STATUS_PROPERTIES.get(name)?.test(value)) {
       continue;
     }
     properties[name] = value;
   }
   return properties;
+}
+
+function formatServiceProperties(properties: Record<string, string>): string {
+  return [...SERVICE_STATUS_PROPERTIES.keys()]
+    .filter((name) => name in properties)
+    .map((name) => `${name}=${properties[name]}`)
+    .join("; ");
 }
 
 function terminalServiceStatus(output: string): string | undefined {
@@ -149,18 +142,7 @@ function terminalServiceStatus(output: string): string | undefined {
   if (!terminal) {
     return undefined;
   }
-  return [
-    "LoadState",
-    "ActiveState",
-    "SubState",
-    "Result",
-    "ExecMainCode",
-    "ExecMainStatus",
-    "MainPID",
-  ]
-    .filter((name) => name in properties)
-    .map((name) => `${name}=${properties[name]}`)
-    .join("; ");
+  return formatServiceProperties(properties);
 }
 
 function fenceErrorCodeFromJournal(output: string): string | undefined {
@@ -272,13 +254,7 @@ function captureServiceStatus(unit: string): ReturnType<typeof capture> {
     "show",
     unit,
     "--no-pager",
-    "--property=LoadState",
-    "--property=ActiveState",
-    "--property=SubState",
-    "--property=Result",
-    "--property=ExecMainCode",
-    "--property=ExecMainStatus",
-    "--property=MainPID",
+    ...[...SERVICE_STATUS_PROPERTIES.keys()].map((name) => `--property=${name}`),
   ]);
 }
 
@@ -287,17 +263,6 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
     return;
   }
   const status = captureServiceStatus(paths.unit);
-  const compactStatus = compactServiceStatus(`${status.stdout}\n${status.stderr}`);
-  if (compactStatus.length > 0) {
-    log.warning(`Fence service state for ${paths.unit}: ${compactStatus}`);
-  }
-  log.debugGroup("Fence debug: service status", [
-    `unit=${paths.unit}`,
-    `status=${status.status}`,
-    `error=${status.error || "none"}`,
-    ...`${status.stdout}\n${status.stderr}`.split(/\r?\n/).filter((line) => line.length > 0),
-  ]);
-
   const journal = capture("/usr/bin/journalctl", [
     "--no-pager",
     "--unit",
@@ -307,6 +272,23 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
     "--output",
     "cat",
   ]);
+  emitCapturedServiceDiagnostics(paths.unit, status, journal);
+}
+
+function emitCapturedServiceDiagnostics(
+  unit: string,
+  status: ReturnType<typeof capture>,
+  journal: ReturnType<typeof capture>,
+): void {
+  const serviceStatus = !status.error && status.status === 0
+    ? formatServiceProperties(parseServiceProperties(status.stdout))
+    : "";
+  if (serviceStatus) log.warning(`Fence service state for ${unit}: ${serviceStatus}`);
+  log.debugGroup("Fence debug: service diagnostics", [
+    `service_status_exit=${status.status ?? "unavailable"}`,
+    `journal_exit=${journal.status ?? "unavailable"}`,
+  ]);
+  if (journal.error || journal.status !== 0) return;
   const errorCode = fenceErrorCodeFromJournal(journal.stdout);
   if (errorCode !== undefined) {
     log.warning(`Fence resident error code: ${errorCode}`);
@@ -325,12 +307,6 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
       log.warning(`Fence DNS startup: ${dnsDiagnostic}`);
     }
   }
-  log.debugGroup("Fence debug: service journal", [
-    `unit=${paths.unit}`,
-    `status=${journal.status}`,
-    `error=${journal.error || "none"}`,
-    ...`${journal.stdout}\n${journal.stderr}`.split(/\r?\n/).filter((line) => line.length > 0),
-  ]);
 }
 
 function sleep(milliseconds: number): void {
@@ -726,4 +702,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { dnsStartupDiagnosticFromJournal, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
+module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };

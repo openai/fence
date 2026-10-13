@@ -99,7 +99,7 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 
 ## How It Works 🔧
 
-If Fence fails during setup, see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start) for the host and DNS diagnostics it can report.
+If Fence fails during setup, it can report recognized [host and DNS diagnostics](docs/troubleshooting.md#fence-fails-to-start) without copying raw service logs into the job log.
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 

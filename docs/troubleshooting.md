@@ -14,7 +14,7 @@ Run Fence first. Checkout, setup actions, and other commands can change the runn
 
 `lockdown_command_timeout` means a trusted host command did not complete within its deadline. `lockdown_command_output_too_large` means the command produced more than 8 KiB total output. Fence drains stdout and stderr during execution and fails either check in both modes. The `Fence host command` line identifies the trusted executable, root or runner principal, error code, and deadline in milliseconds; it never includes command arguments, job paths, or command output. Check this line before considering a retry. These are host verification failures, so an allowlist change will not fix them.
 
-For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
+For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job. Fence does not include raw service journal text, even in debug logs.
 
 ## A Network Request Is Blocked
 
