@@ -3512,6 +3512,106 @@ test("reports bounded firewall, wildcard, and results-storage warning counters",
   assert.match(networkReportLines(report, dnsEvidence).join("\n"), /Fence network report: warning/);
 });
 
+test("counts only fixed reasons for unmappable audit findings without changing decisions", () => {
+  const nativeReasons = [
+    "short_header",
+    "invalid_ipv4_header",
+    "ipv4_fragment",
+    "unsupported_ipv4_protocol",
+    "unsupported_ipv6_header",
+    "unknown_ip_version",
+  ];
+  const unavailable = {
+    mode: "audit",
+    classification: "would_block",
+    family: "ipv6",
+    protocol: "unknown_or_unparsed",
+    remote_address: null,
+    remote_port: null,
+    rule_class: "endpoint_unavailable_from_prefix",
+  };
+  const hostileReasons = [
+    "::error::credential-example\n::set-env name=EXAMPLE::unsafe",
+    "__proto__", "constructor", "toString",
+    { ipv4_fragment: 999 }, null, undefined,
+  ];
+  const available = {
+    ...unavailable,
+    family: "ipv4",
+    protocol: "tcp",
+    remote_address: "192.0.2.10",
+    remote_port: 443,
+    // A reason on a usable tuple must not hide or reclassify it.
+    unparsed_reason: "short_header",
+  };
+  const audit = {
+    ...report,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      ...nativeReasons.map((unparsed_reason) => ({ ...unavailable, unparsed_reason })),
+      ...hostileReasons.map((unparsed_reason) => ({ ...unavailable, unparsed_reason })),
+      { ...available, remote_port: 0 },
+      available,
+    ],
+  };
+  const dns = { observations: [], observations_truncated: false };
+  const document = parsedStructuredNetworkReport(audit, dns);
+  const reasons = document.omissions.unparsed_finding_reasons;
+  assert.deepEqual(reasons, {
+    ...Object.fromEntries(nativeReasons.map((reason) => [reason, 1])),
+    invalid_port: 1,
+    unrecognized: hostileReasons.length,
+  });
+  assert.equal(Object.values(reasons).reduce((sum: number, count: any) => sum + count, 0), document.omissions.unparsed_findings);
+  assert.equal(document.result, "healthy");
+  assert.deepEqual(document.suggested_allowlist, ["ip 192.0.2.10 tcp 443"]);
+  assert.equal(document.network[0].decision, "would_block");
+  assert.deepEqual(document.network[0].activities, [{ kind: "connection_attempt", protocol: "tcp", port: 443, count: 1 }]);
+
+  const line = structuredReportLine(audit, dns);
+  const human = networkReportLines(audit, dns).join("\n");
+  const summary = summaryLines(audit, dns).join("\n");
+  for (const text of [line, human, summary]) {
+    assert.doesNotMatch(text, /credential-example|set-env|__proto__|constructor|toString|999/);
+  }
+  assert.match(human, /non-TCP\/UDP IPv4 packet: 1/);
+  assert.match(human, /reason unavailable:/);
+  assert.match(summary, /unsupported IPv6 next header: 1/);
+  assert.equal(line, structuredReportLine(audit, dns));
+
+  const onlyUnavailable = { ...audit, findings: [audit.findings[0]] };
+  const emptySummary = summaryLines(onlyUnavailable, dns).join("\n");
+  assert.match(emptySummary, /No reportable network activity/);
+  assert.match(emptySummary, /could not be mapped to an endpoint.*short packet header: 1/);
+  assert.doesNotMatch(emptySummary, /IPv4 fragment: 0|View allowlist example/);
+
+  // The pre-existing count covers would-block observations only, even in degraded block.
+  for (const standardBlock of [true, false]) {
+    const block = {
+      ...report,
+      ...(standardBlock ? {} : {
+        status: "protected_host_block_degraded",
+        readiness_status: "ready_degraded",
+        setup_status: "resident_degraded",
+        container_status: "preserved_unsafe",
+        protection_available: false,
+      }),
+      findings: audit.findings.map((finding) => ({ ...finding, mode: "block", classification: "rejected" })),
+    };
+    const result = parsedStructuredNetworkReport(block, dns);
+    assert.equal(result.omissions.unparsed_findings, 0);
+    assert.ok(Object.values(result.omissions.unparsed_finding_reasons).every((count) => count === 0));
+    assert.equal(result.network[0].decision, "blocked");
+    assert.doesNotMatch(networkReportLines(block, dns).join("\n"), /Unparsed network findings|packet header/);
+  }
+});
+
 test("preserves the fixed byte budget by pruning whole network rows explicitly", () => {
   const hostnames = Array.from({ length: 20 }, (_, index) =>
     `${"a".repeat(63)}.${"b".repeat(63)}.${"c".repeat(63)}.host-${index}.example.com`
@@ -3559,6 +3659,28 @@ test("preserves the fixed byte budget by pruning whole network rows explicitly",
   const humanReport = networkReportLines(currentReport, dnsEvidence).join("\n");
   assert.match(humanReport, /omitt/i);
   assert.match(humanReport, /truncat/i);
+
+  const audit = {
+    ...currentReport,
+    status: "protected_host_audit_observation",
+    mode: "audit",
+    readiness_status: "ready_observation_only",
+    setup_status: "resident_observation_only",
+    protection_available: false,
+    sudo_status: "preserved_verified",
+    container_status: "preserved_verified",
+    findings: [
+      ...currentReport.findings.map((finding) => ({ ...finding, mode: "audit", classification: "would_block" })),
+      { mode: "audit", classification: "would_block", unparsed_reason: "ipv4_fragment" },
+    ],
+  };
+  const auditLine = structuredReportLine(audit, dnsEvidence);
+  const bounded = parsedStructuredNetworkReport(audit, dnsEvidence);
+  assert.ok(Buffer.byteLength(auditLine, "utf8") <= MAX_STRUCTURED_REPORT_BYTES);
+  assert.equal(bounded.omissions.byte_budget_exceeded, true);
+  assert.equal(bounded.omissions.unparsed_findings, 1);
+  assert.equal(bounded.omissions.unparsed_finding_reasons.ipv4_fragment, 1);
+  assert.equal(Object.values(bounded.omissions.unparsed_finding_reasons).reduce((sum: number, count: any) => sum + count, 0), bounded.omissions.unparsed_findings);
 });
 
 test("reports missing DNS evidence and unretained observations without inventing hostnames", () => {

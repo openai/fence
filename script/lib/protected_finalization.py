@@ -59,6 +59,16 @@ QUIET_OMISSIONS = {
     "activity_entries": 0,
     "critical_codes": 0,
     "unparsed_findings": 0,
+    "unparsed_finding_reasons": {
+        "short_header": 0,
+        "invalid_ipv4_header": 0,
+        "ipv4_fragment": 0,
+        "unsupported_ipv4_protocol": 0,
+        "unsupported_ipv6_header": 0,
+        "unknown_ip_version": 0,
+        "invalid_port": 0,
+        "unrecognized": 0,
+    },
     "dns_evidence_missing": False,
     "source_truncated": False,
     "byte_budget_exceeded": False,
@@ -69,7 +79,11 @@ def _exact_fields(value, expected):
     return (
         isinstance(value, dict)
         and set(value) == set(expected)
-        and all(type(value[key]) is type(item) and value[key] == item for key, item in expected.items())
+        and all(
+            type(value[key]) is type(item)
+            and (_exact_fields(value[key], item) if isinstance(item, dict) else value[key] == item)
+            for key, item in expected.items()
+        )
     )
 
 
@@ -545,6 +559,31 @@ class ProtectedFinalizationTests(unittest.TestCase):
                 validate_action_finalization_report(candidate, name)
         with self.assertRaisesRegex(ValueError, "job was unknown"):
             validate_action_finalization_report(self.action_quiet_report(), "other job")
+
+    def test_quiet_reports_reject_unparsed_reason_count_changes(self):
+        for name in EXPECTED_FINALIZATION_STEPS["action"]:
+            for field in QUIET_OMISSIONS["unparsed_finding_reasons"]:
+                for value in (1, -1, True, False, "0", None, MAX_SAFE_INTEGER + 1):
+                    report = self.action_quiet_report()
+                    report["omissions"]["unparsed_finding_reasons"][field] = value
+                    with self.subTest(name=name, field=field, value=value), self.assertRaisesRegex(
+                        ValueError, "omitted evidence"
+                    ):
+                        validate_action_finalization_report(report, name)
+
+                report = self.action_quiet_report()
+                del report["omissions"]["unparsed_finding_reasons"][field]
+                with self.subTest(name=name, missing=field), self.assertRaisesRegex(
+                    ValueError, "omitted evidence"
+                ):
+                    validate_action_finalization_report(report, name)
+
+            report = self.action_quiet_report()
+            report["omissions"]["unparsed_finding_reasons"]["unexpected"] = 0
+            with self.subTest(name=name, extra=True), self.assertRaisesRegex(
+                ValueError, "omitted evidence"
+            ):
+                validate_action_finalization_report(report, name)
 
     def test_quiet_reports_allow_safe_results_storage_denials(self):
         name = next(iter(EXPECTED_FINALIZATION_STEPS["action"]))

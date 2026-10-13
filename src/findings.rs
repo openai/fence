@@ -21,6 +21,17 @@ pub enum FindingClassification {
     WouldBlock,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnparsedReason {
+    ShortHeader,
+    InvalidIpv4Header,
+    Ipv4Fragment,
+    UnsupportedIpv4Protocol,
+    UnsupportedIpv6Header,
+    UnknownIpVersion,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ConnectionFinding {
     pub timestamp: String,
@@ -33,6 +44,8 @@ pub struct ConnectionFinding {
     pub rule_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_attribution: Option<LocalProcessAttribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unparsed_reason: Option<UnparsedReason>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -147,7 +160,20 @@ pub(crate) fn connection_event_from_prefix(
     match prefix.first().map(|byte| byte >> 4) {
         Some(4) => ipv4_event(mode, classification, timestamp, prefix),
         Some(6) => ipv6_event(mode, classification, timestamp, prefix),
-        _ => unavailable_event(mode, classification, timestamp, "unknown_or_unparsed"),
+        None => unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "unknown_or_unparsed",
+            UnparsedReason::ShortHeader,
+        ),
+        _ => unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "unknown_or_unparsed",
+            UnparsedReason::UnknownIpVersion,
+        ),
     }
 }
 
@@ -158,20 +184,55 @@ fn ipv4_event(
     prefix: &[u8],
 ) -> ConnectionEvent {
     if prefix.len() < 20 {
-        return unavailable_event(mode, classification, timestamp, "ipv4");
+        return unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "ipv4",
+            UnparsedReason::ShortHeader,
+        );
     }
     let header_length = usize::from(prefix[0] & 0x0f) * 4;
     let fragmented = (u16::from_be_bytes([prefix[6], prefix[7]]) & 0x3fff) != 0;
-    if header_length < 20 || fragmented {
-        return unavailable_event(mode, classification, timestamp, "ipv4");
+    if header_length < 20 {
+        return unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "ipv4",
+            UnparsedReason::InvalidIpv4Header,
+        );
+    }
+    if fragmented {
+        return unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "ipv4",
+            UnparsedReason::Ipv4Fragment,
+        );
     }
     let (protocol, socket_protocol) = match prefix[9] {
         6 => ("tcp", SocketProtocol::Tcp),
         17 => ("udp", SocketProtocol::Udp),
-        _ => return unavailable_event(mode, classification, timestamp, "ipv4"),
+        _ => {
+            return unavailable_event(
+                mode,
+                classification,
+                timestamp,
+                "ipv4",
+                UnparsedReason::UnsupportedIpv4Protocol,
+            );
+        }
     };
     let Some(port_bytes) = prefix.get(header_length..header_length + 4) else {
-        return unavailable_event(mode, classification, timestamp, "ipv4");
+        return unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "ipv4",
+            UnparsedReason::ShortHeader,
+        );
     };
     let local_address = Ipv4Addr::new(prefix[12], prefix[13], prefix[14], prefix[15]);
     let remote_address = Ipv4Addr::new(prefix[16], prefix[17], prefix[18], prefix[19]);
@@ -198,12 +259,26 @@ fn ipv6_event(
     prefix: &[u8],
 ) -> ConnectionEvent {
     if prefix.len() < 44 {
-        return unavailable_event(mode, classification, timestamp, "ipv6");
+        return unavailable_event(
+            mode,
+            classification,
+            timestamp,
+            "ipv6",
+            UnparsedReason::ShortHeader,
+        );
     }
     let (protocol, socket_protocol) = match prefix[6] {
         6 => ("tcp", SocketProtocol::Tcp),
         17 => ("udp", SocketProtocol::Udp),
-        _ => return unavailable_event(mode, classification, timestamp, "ipv6"),
+        _ => {
+            return unavailable_event(
+                mode,
+                classification,
+                timestamp,
+                "ipv6",
+                UnparsedReason::UnsupportedIpv6Header,
+            );
+        }
     };
     let source: [u8; 16] = prefix[8..24].try_into().expect("fixed checked IPv6 length");
     let destination: [u8; 16] = prefix[24..40]
@@ -253,6 +328,7 @@ fn endpoint_event(
             remote_port: Some(remote_port),
             rule_class: RULE_CLASS_EGRESS.to_owned(),
             local_attribution: None,
+            unparsed_reason: None,
         },
         tuple: Some(SocketTuple {
             family: socket_family,
@@ -270,6 +346,7 @@ fn unavailable_event(
     classification: FindingClassification,
     timestamp: String,
     family: &'static str,
+    reason: UnparsedReason,
 ) -> ConnectionEvent {
     ConnectionEvent {
         finding: ConnectionFinding {
@@ -282,6 +359,7 @@ fn unavailable_event(
             remote_port: None,
             rule_class: RULE_CLASS_UNAVAILABLE.to_owned(),
             local_attribution: None,
+            unparsed_reason: Some(reason),
         },
         tuple: None,
     }
@@ -454,6 +532,7 @@ mod tests {
         assert_eq!(v4.protocol, "tcp");
         assert_eq!(v4.remote_address.as_deref(), Some("192.0.2.10"));
         assert_eq!(v4.remote_port, Some(443));
+        assert_eq!(v4.unparsed_reason, None);
 
         let v6 = finding_from_prefix(Mode::Audit, "t2".to_owned(), &ipv6_prefix(17, 53));
         assert_eq!(v6.classification, FindingClassification::WouldBlock);
@@ -461,6 +540,7 @@ mod tests {
         assert_eq!(v6.protocol, "udp");
         assert_eq!(v6.remote_address.as_deref(), Some("2001:db8::10"));
         assert_eq!(v6.remote_port, Some(53));
+        assert_eq!(v6.unparsed_reason, None);
 
         let event =
             connection_event_from_prefix(Mode::Block, "t3".to_owned(), &ipv4_prefix(6, 443, b""));
@@ -475,11 +555,29 @@ mod tests {
                 remote_port: 443,
             })
         );
-        assert!(
-            !serde_json::to_string(&event.finding)
-                .unwrap()
-                .contains("10.0.0.2")
+        let json = serde_json::to_string(&event.finding).unwrap();
+        assert!(!json.contains("10.0.0.2"));
+        assert!(!json.contains("unparsed_reason"));
+        assert_eq!(
+            serde_json::from_str::<ConnectionFinding>(&json).unwrap(),
+            event.finding
         );
+
+        // The packet parser still reports a transport endpoint with port zero.
+        // The Action decides whether it can recommend that endpoint.
+        let event = connection_event_from_prefix(Mode::Audit, "t4".to_owned(), &ipv6_prefix(17, 0));
+        assert_eq!(
+            event.tuple,
+            Some(SocketTuple {
+                family: SocketFamily::Ipv6,
+                protocol: SocketProtocol::Udp,
+                local_address: "2001:db8::1".parse().unwrap(),
+                local_port: 53_000,
+                remote_address: "2001:db8::10".parse().unwrap(),
+                remote_port: 0,
+            })
+        );
+        assert_eq!(event.finding.unparsed_reason, None);
     }
 
     #[test]
@@ -494,53 +592,73 @@ mod tests {
         assert_eq!(extension.protocol, "unknown_or_unparsed");
         assert_eq!(extension.remote_address, None);
         assert_eq!(extension.remote_port, None);
+        assert_eq!(
+            extension.unparsed_reason,
+            Some(UnparsedReason::UnsupportedIpv6Header)
+        );
     }
 
     #[test]
-    fn unparseable_or_incomplete_headers_emit_only_unavailable_metadata() {
-        let unknown = finding_from_prefix(Mode::Audit, "t".to_owned(), &[]);
-        assert_eq!(unknown.family, "unknown_or_unparsed");
-
-        let short_v4 = finding_from_prefix(Mode::Audit, "t".to_owned(), &[0x45]);
-        assert_eq!(short_v4.family, "ipv4");
-        assert_eq!(short_v4.rule_class, RULE_CLASS_UNAVAILABLE);
-
-        let mut malformed_v4 = ipv4_prefix(6, 443, b"");
-        malformed_v4[0] = 0x44;
-        assert_eq!(
-            finding_from_prefix(Mode::Audit, "t".to_owned(), &malformed_v4).rule_class,
-            RULE_CLASS_UNAVAILABLE
-        );
-        malformed_v4[0] = 0x45;
-        malformed_v4[7] = 1;
-        assert_eq!(
-            finding_from_prefix(Mode::Audit, "t".to_owned(), &malformed_v4).rule_class,
-            RULE_CLASS_UNAVAILABLE
-        );
-        malformed_v4[7] = 0;
-        malformed_v4[6] = 0x20;
-        assert_eq!(
-            finding_from_prefix(Mode::Audit, "t".to_owned(), &malformed_v4).rule_class,
-            RULE_CLASS_UNAVAILABLE
-        );
-
-        let unsupported_v4 = ipv4_prefix(1, 0, b"");
-        assert_eq!(
-            finding_from_prefix(Mode::Audit, "t".to_owned(), &unsupported_v4).protocol,
-            "unknown_or_unparsed"
-        );
+    fn unparseable_headers_emit_only_fixed_reasons_in_both_modes() {
+        let marker = b"::error::do-not-retain-payload-marker";
+        let mut invalid_v4 = ipv4_prefix(6, 443, marker);
+        invalid_v4[0] = 0x44;
+        let mut fragment_offset = ipv4_prefix(6, 443, marker);
+        fragment_offset[7] = 1;
+        let mut more_fragments = ipv4_prefix(17, 9, marker);
+        more_fragments[6] = 0x20;
         let mut missing_v4_port = ipv4_prefix(6, 443, b"");
         missing_v4_port[0] = 0x46;
-        assert_eq!(
-            finding_from_prefix(Mode::Audit, "t".to_owned(), &missing_v4_port).remote_port,
-            None
-        );
+        let mut extension = ipv6_prefix(44, 7);
+        extension.extend_from_slice(marker);
+        let cases = [
+            (vec![], "unknown_or_unparsed", "short_header"),
+            (vec![0x70], "unknown_or_unparsed", "unknown_ip_version"),
+            (vec![0x45], "ipv4", "short_header"),
+            (invalid_v4, "ipv4", "invalid_ipv4_header"),
+            (fragment_offset, "ipv4", "ipv4_fragment"),
+            (more_fragments, "ipv4", "ipv4_fragment"),
+            (
+                ipv4_prefix(1, 0, marker),
+                "ipv4",
+                "unsupported_ipv4_protocol",
+            ),
+            (missing_v4_port, "ipv4", "short_header"),
+            (vec![0x60; 40], "ipv6", "short_header"),
+            (extension, "ipv6", "unsupported_ipv6_header"),
+        ];
+        for (prefix, family, reason) in cases {
+            for (mode, classification) in [
+                (Mode::Block, FindingClassification::Rejected),
+                (Mode::Audit, FindingClassification::WouldBlock),
+            ] {
+                let event = connection_event_from_prefix(mode, "t".to_owned(), &prefix);
+                assert_eq!(event.tuple, None);
+                assert_eq!(event.finding.classification, classification);
+                assert_eq!(event.finding.family, family);
+                assert_eq!(event.finding.rule_class, RULE_CLASS_UNAVAILABLE);
+                assert_eq!(event.finding.protocol, "unknown_or_unparsed");
+                assert_eq!(event.finding.remote_address, None);
+                assert_eq!(event.finding.remote_port, None);
 
-        let short_v6 = [0x60; 40];
-        assert_eq!(
-            finding_from_prefix(Mode::Audit, "t".to_owned(), &short_v6).family,
-            "ipv6"
-        );
+                let json = serde_json::to_string(&event.finding).unwrap();
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(value["unparsed_reason"], reason);
+                for forbidden in [
+                    "do-not-retain-payload-marker",
+                    "::error::",
+                    "192.0.2.10",
+                    "2001:db8::10",
+                    "10.0.0.2",
+                ] {
+                    assert!(!json.contains(forbidden));
+                }
+                assert_eq!(
+                    serde_json::from_str::<ConnectionFinding>(&json).unwrap(),
+                    event.finding
+                );
+            }
+        }
         assert_eq!(
             finding_from_prefix(Mode::Audit, "t".to_owned(), &ipv6_prefix(6, 443)).protocol,
             "tcp"
