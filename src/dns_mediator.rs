@@ -144,6 +144,8 @@ const DNS_TCP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const UPSTREAM_DNS: &str = GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_UPSTREAM_DNS;
 const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
+const HOST_UDP_BIND_TIMEOUT: Duration = Duration::from_secs(2);
+const HOST_UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
 const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
 const REVIEWED_RESOLVER_TARGETS: [&str; 2] = [
@@ -4526,15 +4528,30 @@ fn bind_dns_listeners(
     listener_kind: DnsListenerKind,
     diagnostics: &mut dyn Write,
 ) -> Result<(UdpSocket, TcpListener), DnsMediationError> {
-    let udp = UdpSocket::bind(address).map_err(|error| {
-        dns_startup_error(
-            listener_kind,
-            Protocol::Udp,
-            DnsStartupOperation::Bind,
-            error,
-            diagnostics,
-        )
-    })?;
+    let deadline = Instant::now() + HOST_UDP_BIND_TIMEOUT;
+    let udp = loop {
+        match UdpSocket::bind(address) {
+            Ok(socket) => break socket,
+            Err(error) => {
+                if listener_kind == DnsListenerKind::Host && error.kind() == ErrorKind::AddrInUse {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        thread::sleep(HOST_UDP_BIND_RETRY_INTERVAL.min(remaining));
+                        if Instant::now() < deadline {
+                            continue;
+                        }
+                    }
+                }
+                return Err(dns_startup_error(
+                    listener_kind,
+                    Protocol::Udp,
+                    DnsStartupOperation::Bind,
+                    error,
+                    diagnostics,
+                ));
+            }
+        }
+    };
     let tcp = TcpListener::bind(address).map_err(|error| {
         dns_startup_error(
             listener_kind,
@@ -7208,8 +7225,14 @@ mod tests {
             let occupied_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
             let address = occupied_udp.local_addr().unwrap().to_string();
             let mut diagnostics = Vec::new();
+            let start = Instant::now();
             let failure =
                 bind_dns_listeners(&address, listener_kind, &mut diagnostics).unwrap_err();
+            if listener_kind == DnsListenerKind::Host {
+                assert!(start.elapsed() >= HOST_UDP_BIND_TIMEOUT);
+            } else {
+                assert!(start.elapsed() < HOST_UDP_BIND_TIMEOUT);
+            }
             assert_eq!(failure.code, "dns_proxy_bind_failed");
             assert_eq!(
                 failure.message,
@@ -7226,8 +7249,10 @@ mod tests {
             let occupied_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = occupied_tcp.local_addr().unwrap().to_string();
             diagnostics.clear();
+            let start = Instant::now();
             let failure =
                 bind_dns_listeners(&address, listener_kind, &mut diagnostics).unwrap_err();
+            assert!(start.elapsed() < HOST_UDP_BIND_TIMEOUT);
             assert_eq!(failure.code, "dns_proxy_bind_failed");
             assert_eq!(
                 failure.message,
@@ -7243,6 +7268,45 @@ mod tests {
             // A failed TCP bind must not retain the UDP listener from partial setup.
             UdpSocket::bind(&address).unwrap();
         }
+    }
+
+    #[test]
+    fn host_udp_startup_retries_a_released_conflict_without_sharing_the_socket() {
+        let occupied_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = occupied_udp.local_addr().unwrap().to_string();
+        let release = thread::spawn(move || {
+            thread::sleep(HOST_UDP_BIND_RETRY_INTERVAL * 2);
+            drop(occupied_udp);
+        });
+        let mut diagnostics = Vec::new();
+        let (udp, tcp) =
+            bind_dns_listeners(&address, DnsListenerKind::Host, &mut diagnostics).unwrap();
+        release.join().unwrap();
+        assert!(diagnostics.is_empty());
+        assert_eq!(udp.local_addr().unwrap().to_string(), address);
+        assert_eq!(tcp.local_addr().unwrap().to_string(), address);
+        assert_eq!(
+            UdpSocket::bind(&address).unwrap_err().kind(),
+            ErrorKind::AddrInUse
+        );
+    }
+
+    #[test]
+    fn host_udp_startup_does_not_retry_other_bind_errors() {
+        // Reserved documentation address cannot be a hosted runner's local interface.
+        let mut diagnostics = Vec::new();
+        let start = Instant::now();
+        let failure =
+            bind_dns_listeners("192.0.2.1:0", DnsListenerKind::Host, &mut diagnostics).unwrap_err();
+        assert!(start.elapsed() < HOST_UDP_BIND_TIMEOUT);
+        assert_eq!(failure.code, "dns_proxy_bind_failed");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&diagnostics).unwrap(),
+            serde_json::json!({"fence_dns_startup": {
+                "listener": "host", "protocol": "udp", "operation": "bind",
+                "reason": "address_unavailable",
+            }})
+        );
     }
 
     #[test]
