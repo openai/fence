@@ -207,6 +207,35 @@ def require_step_contract(job, name, expected_keys, expected_scalars, message):
     )
     return step
 
+def require_action_post_binding(source):
+    # This is a deliberately narrow subset of Action YAML, like the workflow locks
+    # below. Do not allow a second quoted, explicit, or merged top-level runs key.
+    top_level = [
+        line for line in source.splitlines()
+        if line.strip() and not line.startswith((" ", "\t", "#"))
+    ]
+    require(
+        all(re.match(r"^[A-Za-z][A-Za-z0-9_-]*:", line) for line in top_level),
+        "Action metadata must use explicit unquoted top-level mapping keys",
+    )
+    direct_mapping_keys(source, 0)
+    runs = indented_block(source, "runs:", "Action must define exactly one runs mapping")
+    content = [
+        re.sub(r"[ \t]+#.*$", "", line).rstrip()
+        for line in runs.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    require(
+        content == [
+            "runs:",
+            "  using: node24",
+            "  main: action/main.cts",
+            "  post: action/post.cts",
+            "  post-if: always()",
+        ],
+        "Action must run its reviewed entrypoints with an unconditional post hook",
+    )
+
 def literal_run_body(step, message):
     marker = "        run: |\n"
     require(step.count(marker) == 1, message)
@@ -231,6 +260,31 @@ def require_no_write_permissions(source, message):
     )
 
 root = pathlib.Path(sys.argv[1])
+action_source = (root / "action.yml").read_text(encoding="utf-8")
+require_action_post_binding(action_source)
+# Exercise the lock with the checked-in metadata, not a second copy of the Action.
+for original, replacement in [
+    ("runs:", "not-runs:"),
+    ("runs:", 'runs:\n  post-if: never()\n"runs":'),
+    ("  using: node24", "  using: composite"),
+    ("  main: action/main.cts", "  main: action/other.cts"),
+    ("  post: action/post.cts", ""),
+    ("  post: action/post.cts", "  post: action/other.cts"),
+    ("  post-if: always()", ""),
+    ("  post-if: always()", "  post-if: false"),
+    ("  post-if: always()", "  post-if: success()"),
+    ("  post-if: always()", "  post-if: always()\n  post-if: false"),
+    ("  post-if: always()", '  post-if: always()\n  "post-if": false'),
+    ("  post-if: always()", "  post-if:\n    always()"),
+    ("  post-if: always()", "    post-if: always()"),
+]:
+    require(original in action_source, "Action metadata fixture no longer applies")
+    try:
+        require_action_post_binding(action_source.replace(original, replacement))
+    except SystemExit:
+        continue
+    raise SystemExit("Action metadata lock accepted a missing or changed post hook binding")
+
 workflow_dir = root / ".github/workflows"
 workflow_paths = sorted(
     [*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")],
