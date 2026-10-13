@@ -6,6 +6,8 @@ Fence must pass the "airplane test": a normal developer or CI worker should be a
 
 Local-control scans use the existing bounded attempts even when consecutive acquisition failures match. Success still requires two complete matching snapshots and all existing inventory checks; malformed rows, exceeded bounds, and incomplete ownership alone do not gain retries. Failed observations emit only status, attempt count, and fixed acquisition/bound reason codes to the service journal, which the Action validates before showing a concise diagnostic. Never include raw inventory details in these diagnostics.
 
+DNS listener startup failures keep `dns_proxy_bind_failed` and report only fixed listener, protocol, operation, and reason values. Keep native values and the Action whitelist in sync; never include addresses or raw system errors, retry, or proceed without the required listeners.
+
 Fixed host commands bound combined stdout/stderr capture while running and enforce the deadline even after the direct child exits. Timeout/overflow diagnostics carry only the trusted executable enum, principal, fixed code, and deadline; keep the Action whitelist in sync with native enums. Never infer successful pre-ready cleanup from job-writable state or skip post verification for missing mounts.
 
 The only permitted non-container baseline transition is the already-present, fully observed UUID socket at `/run/uuidd/request`. Require exactly one unchanged root systemd owner in `/init.scope` and at most one non-root system UID owner of `/usr/sbin/uuidd` in exactly `/system.slice/uuidd.service`. Never generalize that exception to other endpoints or cgroups; use the acceptance matrix's Azure CLI cases in both modes for hosted proof.

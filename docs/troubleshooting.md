@@ -10,6 +10,8 @@ Run Fence first. Checkout, setup actions, and other commands can change the runn
 
 `local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries acquisition failures within a fixed limit and still requires a complete, stable inventory in both audit and block mode. The `Fence local control inspection` log line shows the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
 
+`dns_proxy_bind_failed` means Fence could not start a required DNS listener. The `Fence DNS startup` line tells you whether it was for the host or Docker, used UDP or TCP, and failed while binding or configuring the socket. For example, `docker UDP bind: address unavailable` means the required Docker address was not available. The reason may also be `address already in use`, `permission denied`, or `other system error`. This is a setup failure in either mode; changing the allowlist will not fix it.
+
 `lockdown_command_timeout` means a trusted host command did not complete within its deadline. `lockdown_command_output_too_large` means the command produced more than 8 KiB total output. Fence drains stdout and stderr during execution and fails either check in both modes. The `Fence host command` line identifies the trusted executable, root or runner principal, error code, and deadline in milliseconds; it never includes command arguments, job paths, or command output. Check this line before considering a retry. These are host verification failures, so an allowlist change will not fix them.
 
 For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.

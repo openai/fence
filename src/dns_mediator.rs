@@ -898,10 +898,18 @@ enum DnsQueryDispatch {
     RetryableFailure(Option<&'static str>),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum DnsListenerKind {
     Host,
     Docker,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DnsStartupOperation {
+    Bind,
+    Configure,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -4455,31 +4463,7 @@ fn start_dns_proxy(
         if listener_kind == DnsListenerKind::Docker && !docker_available {
             continue;
         }
-        let udp = UdpSocket::bind(address).map_err(|_| {
-            DnsMediationError::new(
-                "dns_proxy_bind_failed",
-                "failed to bind a fixed local DNS proxy listener",
-            )
-        })?;
-        let tcp = TcpListener::bind(address).map_err(|_| {
-            DnsMediationError::new(
-                "dns_proxy_bind_failed",
-                "failed to bind a fixed local DNS proxy stream listener",
-            )
-        })?;
-        udp.set_read_timeout(Some(Duration::from_millis(250)))
-            .map_err(|_| {
-                DnsMediationError::new(
-                    "dns_proxy_bind_failed",
-                    "failed to configure a fixed local DNS proxy listener",
-                )
-            })?;
-        tcp.set_nonblocking(true).map_err(|_| {
-            DnsMediationError::new(
-                "dns_proxy_bind_failed",
-                "failed to configure a fixed local DNS proxy stream listener",
-            )
-        })?;
+        let (udp, tcp) = bind_dns_listeners(address, listener_kind, &mut std::io::stderr().lock())?;
         listeners.push((listener_kind, udp_worker, udp, tcp_worker, tcp));
     }
 
@@ -4535,6 +4519,92 @@ fn start_dns_proxy(
         supervisor: ResidentWorkerSupervisor::new(receiver, docker_available),
         attribution,
     })
+}
+
+fn bind_dns_listeners(
+    address: &str,
+    listener_kind: DnsListenerKind,
+    diagnostics: &mut dyn Write,
+) -> Result<(UdpSocket, TcpListener), DnsMediationError> {
+    let udp = UdpSocket::bind(address).map_err(|error| {
+        dns_startup_error(
+            listener_kind,
+            Protocol::Udp,
+            DnsStartupOperation::Bind,
+            error,
+            diagnostics,
+        )
+    })?;
+    let tcp = TcpListener::bind(address).map_err(|error| {
+        dns_startup_error(
+            listener_kind,
+            Protocol::Tcp,
+            DnsStartupOperation::Bind,
+            error,
+            diagnostics,
+        )
+    })?;
+    udp.set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|error| {
+            dns_startup_error(
+                listener_kind,
+                Protocol::Udp,
+                DnsStartupOperation::Configure,
+                error,
+                diagnostics,
+            )
+        })?;
+    tcp.set_nonblocking(true).map_err(|error| {
+        dns_startup_error(
+            listener_kind,
+            Protocol::Tcp,
+            DnsStartupOperation::Configure,
+            error,
+            diagnostics,
+        )
+    })?;
+    Ok((udp, tcp))
+}
+
+fn dns_startup_error(
+    listener_kind: DnsListenerKind,
+    protocol: Protocol,
+    operation: DnsStartupOperation,
+    error: std::io::Error,
+    diagnostics: &mut dyn Write,
+) -> DnsMediationError {
+    // Error text, addresses and errno are not journal diagnostics: they may contain job data.
+    let reason = match error.kind() {
+        ErrorKind::AddrInUse => "address_in_use",
+        ErrorKind::AddrNotAvailable => "address_unavailable",
+        ErrorKind::PermissionDenied => "permission_denied",
+        _ => "other",
+    };
+    let _ = writeln!(
+        diagnostics,
+        "{}",
+        serde_json::json!({"fence_dns_startup": {
+            "listener": listener_kind,
+            "protocol": protocol,
+            "operation": operation,
+            "reason": reason,
+        }})
+    );
+    let message = match (operation, protocol) {
+        (DnsStartupOperation::Bind, Protocol::Udp) => {
+            "failed to bind a fixed local DNS proxy listener"
+        }
+        (DnsStartupOperation::Bind, Protocol::Tcp) => {
+            "failed to bind a fixed local DNS proxy stream listener"
+        }
+        (DnsStartupOperation::Configure, Protocol::Udp) => {
+            "failed to configure a fixed local DNS proxy listener"
+        }
+        (DnsStartupOperation::Configure, Protocol::Tcp) => {
+            "failed to configure a fixed local DNS proxy stream listener"
+        }
+    };
+    DnsMediationError::new("dns_proxy_bind_failed", message)
 }
 
 fn spawn_supervised_worker<F>(
@@ -7127,6 +7197,93 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn dns_startup_bind_failures_identify_the_listener_and_preserve_the_failure() {
+        for (listener_kind, listener_name) in [
+            (DnsListenerKind::Host, "host"),
+            (DnsListenerKind::Docker, "docker"),
+        ] {
+            let occupied_udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let address = occupied_udp.local_addr().unwrap().to_string();
+            let mut diagnostics = Vec::new();
+            let failure =
+                bind_dns_listeners(&address, listener_kind, &mut diagnostics).unwrap_err();
+            assert_eq!(failure.code, "dns_proxy_bind_failed");
+            assert_eq!(
+                failure.message,
+                "failed to bind a fixed local DNS proxy listener"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&diagnostics).unwrap(),
+                serde_json::json!({"fence_dns_startup": {
+                    "listener": listener_name, "protocol": "udp", "operation": "bind",
+                    "reason": "address_in_use",
+                }})
+            );
+
+            let occupied_tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = occupied_tcp.local_addr().unwrap().to_string();
+            diagnostics.clear();
+            let failure =
+                bind_dns_listeners(&address, listener_kind, &mut diagnostics).unwrap_err();
+            assert_eq!(failure.code, "dns_proxy_bind_failed");
+            assert_eq!(
+                failure.message,
+                "failed to bind a fixed local DNS proxy stream listener"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&diagnostics).unwrap(),
+                serde_json::json!({"fence_dns_startup": {
+                    "listener": listener_name, "protocol": "tcp", "operation": "bind",
+                    "reason": "address_in_use",
+                }})
+            );
+            // A failed TCP bind must not retain the UDP listener from partial setup.
+            UdpSocket::bind(&address).unwrap();
+        }
+    }
+
+    #[test]
+    fn dns_startup_diagnostics_only_contain_closed_values() {
+        for (listener_kind, listener_name) in [
+            (DnsListenerKind::Host, "host"),
+            (DnsListenerKind::Docker, "docker"),
+        ] {
+            for (protocol, protocol_name) in [(Protocol::Udp, "udp"), (Protocol::Tcp, "tcp")] {
+                for (operation, operation_name) in [
+                    (DnsStartupOperation::Bind, "bind"),
+                    (DnsStartupOperation::Configure, "configure"),
+                ] {
+                    for (kind, reason) in [
+                        (ErrorKind::AddrInUse, "address_in_use"),
+                        (ErrorKind::AddrNotAvailable, "address_unavailable"),
+                        (ErrorKind::PermissionDenied, "permission_denied"),
+                        (ErrorKind::InvalidInput, "other"),
+                        (ErrorKind::Other, "other"),
+                    ] {
+                        let mut diagnostics = Vec::new();
+                        let failure = dns_startup_error(
+                            listener_kind,
+                            protocol,
+                            operation,
+                            std::io::Error::new(kind, "secret\n::error::injected /tmp/private"),
+                            &mut diagnostics,
+                        );
+                        assert_eq!(failure.code, "dns_proxy_bind_failed");
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&diagnostics).unwrap(),
+                            serde_json::json!({"fence_dns_startup": {
+                                "listener": listener_name, "protocol": protocol_name,
+                                "operation": operation_name, "reason": reason,
+                            }})
+                        );
+                        assert_eq!(diagnostics.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
