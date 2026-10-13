@@ -25,12 +25,11 @@ const {
   materializationWarning,
   materializationWarningLines,
   mountIdFromFdInfo,
-  networkReportLines,
+  renderNetworkReport,
   nativeInputsFromEnvironment,
   registeredActionPathGuardPaths,
   resultsStorageWarnings,
   runtimePaths,
-  structuredReportLine,
   summaryLines,
   validateBundle,
   validatedActionRuntimeSnapshot,
@@ -46,9 +45,10 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
-const { postFailureDiagnostic, validatePostEvidence, settleResidentReport } = require("./post.cts");
+const { postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport } = require("./post.cts");
 const {
   dnsStartupDiagnosticFromJournal,
+  emitCapturedServiceDiagnostics,
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
@@ -73,6 +73,14 @@ function residentHealth(overrides: Record<string, unknown> = {}): Record<string,
     ],
     ...overrides,
   };
+}
+
+function networkReportLines(currentReport: any, dnsEvidence: any = undefined): string[] {
+  return renderNetworkReport(currentReport, dnsEvidence).lines;
+}
+
+function structuredReportLine(currentReport: any, dnsEvidence: any = undefined): string {
+  return renderNetworkReport(currentReport, dnsEvidence).record;
 }
 
 const report = {
@@ -922,7 +930,7 @@ test("formats audit and degraded log wording accurately", () => {
   );
   assert.equal(
     actionLog.postEvidenceLine(auditReport, 2),
-    "👀 Audit observed 2 would-block destinations; see Fence Summary",
+    "👀 Audit observed 2 would-block destinations; see the Fence report",
   );
 
   const degraded = {
@@ -1105,6 +1113,35 @@ test("recognizes terminal service state and only bounded structured Fence error 
     "not JSON",
   ]) {
     assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
+  }
+});
+
+test("service diagnostics never emit raw command output, even in debug mode", () => {
+  const sensitive = "sensitive_marker";
+  const status = {
+    status: 0, error: false,
+    stdout: `LoadState=loaded\nActiveState=failed\nResult=${sensitive}\nEnvironment=${sensitive}`,
+  };
+  const journal = {
+    status: 0, error: false,
+    stdout: [
+      `arbitrary journal text ${sensitive}`,
+      JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code: "dns_proxy_bind_failed", message: sensitive } }),
+      JSON.stringify({ fence_dns_startup: { listener: "host", protocol: "udp", operation: "bind", reason: "address_in_use", detail: sensitive } }),
+    ].join("\n"),
+  };
+  const previousDebug = process.env.RUNNER_DEBUG;
+  process.env.RUNNER_DEBUG = "1";
+  try {
+    const output = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    assert.match(output, /Fence service state for fence-example\.service: LoadState=loaded; ActiveState=failed/);
+    assert.match(output, /Fence debug: service diagnostics/);
+    assert.match(output, /Fence resident error code: dns_proxy_bind_failed/);
+    assert.match(output, /Fence DNS startup: host UDP bind: address already in use/);
+    assert.ok(!output.includes(sensitive));
+  } finally {
+    if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
+    else process.env.RUNNER_DEBUG = previousDebug;
   }
 });
 
@@ -3609,6 +3646,98 @@ test("counts only fixed reasons for unmappable audit findings without changing d
     assert.ok(Object.values(result.omissions.unparsed_finding_reasons).every((count) => count === 0));
     assert.equal(result.network[0].decision, "blocked");
     assert.doesNotMatch(networkReportLines(block, dns).join("\n"), /Unparsed network findings|packet header/);
+  }
+});
+
+test("publishes post evidence from one fresh report and rejects stale or critical evidence", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-summary-"));
+  const summaryPath = path.join(temporary, "summary");
+  fs.writeFileSync(summaryPath, "");
+  const verifiedAt = 1_000_000;
+  const currentReport = {
+    ...report,
+    resident_health: { ...report.resident_health, last_successful_verification_unix_milliseconds: verifiedAt },
+  };
+  let clockCalls = 0;
+  t.mock.method(Date, "now", () => verifiedAt + (clockCalls++ === 0 ? 19_999 : 20_001));
+  const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
+  process.env.GITHUB_STEP_SUMMARY = summaryPath;
+  try {
+    const paths = runtimePaths("action-test");
+    const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
+    const records = output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON="));
+    assert.equal(records.length, 1);
+    const document = JSON.parse(records[0].slice("FENCE_REPORT_JSON=".length));
+    assert.match(output, new RegExp(`Fence network report: ${document.result}`));
+    assert.match(output, /Fence evidence verified/);
+    assert.equal(clockCalls, 1);
+    const healthySummary = summaryLines(currentReport, { observations: [] }).join("\n");
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), healthySummary);
+
+    const staleOutput = captureStdout(() => {
+      assert.throws(() => publishPostEvidence(currentReport, { observations: [] }, paths), /stale/);
+    });
+    assert.equal(staleOutput, "");
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), healthySummary);
+
+    const criticalReport = {
+      ...currentReport,
+      network_verification_status: "critical_drift",
+      resident_health: { ...currentReport.resident_health, status: "critical", last_successful_verification_unix_milliseconds: verifiedAt + 20_000 },
+      critical_findings: [{ code: "owned_nftables_state_missing", message: "Verified drift" }],
+    };
+    const criticalOutput = captureStdout(() => {
+      assert.throws(() => publishPostEvidence(criticalReport, { observations: [] }, paths), /critical resident findings/);
+    });
+    assert.match(criticalOutput, /FENCE_REPORT_JSON=.*"result":"critical"/);
+    assert.doesNotMatch(criticalOutput, /Fence evidence verified/);
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), healthySummary + summaryLines(criticalReport, { observations: [] }).join("\n"));
+  } finally {
+    if (previousSummaryPath === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+    else process.env.GITHUB_STEP_SUMMARY = previousSummaryPath;
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("keeps the verified job-log report available when the job summary cannot be written", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-summary-"));
+  const summaryPath = path.join(temporary, "summary");
+  const linkPath = path.join(temporary, "symlink");
+  const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
+  const paths = runtimePaths("action-test");
+  const currentReport = { ...report, resident_health: residentHealth() };
+  try {
+    fs.writeFileSync(summaryPath, "unchanged");
+    fs.symlinkSync(summaryPath, linkPath);
+    for (const unavailablePath of [path.join(temporary, "missing"), linkPath, "/dev/null"]) {
+      process.env.GITHUB_STEP_SUMMARY = unavailablePath;
+      const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
+      assert.equal(output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON=")).length, 1);
+      assert.match(output, /could not write the job summary; see the job log for the report/);
+      assert.match(output, /Fence evidence verified/);
+      assert.doesNotMatch(output, /ENOENT|ELOOP|\/dev\/null|fence-post-summary-/);
+    }
+    assert.equal(fs.readFileSync(summaryPath, "utf8"), "unchanged");
+
+    process.env.GITHUB_STEP_SUMMARY = summaryPath;
+    t.mock.method(fs, "appendFileSync", () => { throw new Error("sensitive filesystem detail"); });
+    const criticalReport = {
+      ...currentReport,
+      network_verification_status: "critical_drift",
+      resident_health: residentHealth({ status: "critical" }),
+      critical_findings: [{ code: "owned_nftables_state_missing", message: "Verified drift" }],
+    };
+    const output = captureStdout(() => {
+      assert.throws(() => publishPostEvidence(criticalReport, { observations: [] }, paths), /critical resident findings/);
+    });
+    assert.equal(output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON=")).length, 1);
+    assert.match(output, /"result":"critical"/);
+    assert.match(output, /could not write the job summary/);
+    assert.doesNotMatch(output, /Fence evidence verified|sensitive filesystem detail/);
+  } finally {
+    if (previousSummaryPath === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+    else process.env.GITHUB_STEP_SUMMARY = previousSummaryPath;
+    fs.rmSync(temporary, { recursive: true, force: true });
   }
 });
 

@@ -16,7 +16,9 @@ from dns_evidence import (
 
 
 MAX_PROTECTED_SECONDS = 180
+MAX_JOB_COUNT = 100
 METADATA_ATTEMPTS = 3
+LOG_ARCHIVE_ATTEMPTS = 6
 ACTION_ZERO_INPUT_BURST_JOB = "action zero-input standard"
 ACTION_ZERO_INPUT_BURST_ACTIVATION = "activate bundled Fence agent with strict defaults"
 ACTION_ZERO_INPUT_BURST_DESTINATIONS = ("192.0.2.1", "192.0.2.2")
@@ -150,7 +152,47 @@ def _timestamp(value, description):
     return parsed
 
 
-def _successful_step(step, job_name, description):
+class MetadataPending(ValueError):
+    def __init__(self, message, *, unfinished_job=None):
+        super().__init__(message)
+        self.unfinished_job = unfinished_job
+
+
+def _defer_metadata(error, pending):
+    if pending is None:
+        raise error
+    pending.append(error)
+
+
+def _ordered_step_times(job_started, job_completed, *intervals):
+    times = [
+        job_started,
+        *(value for interval in intervals for value in interval if value is not None),
+        job_completed,
+    ]
+    return all(previous <= current for previous, current in zip(times, times[1:]))
+
+
+def _successful_step(step, job_name, description, job_started, job_completed, pending=None):
+    if (
+        step.get("status") in ("pending", "in_progress")
+        and {"conclusion", "started_at", "completed_at"} <= step.keys()
+        and step["conclusion"] is None
+        and step["completed_at"] is None
+    ):
+        started = None
+        if step["started_at"] is not None:
+            started = _timestamp(step["started_at"], f"{description} start for {job_name}")
+            if not job_started <= started <= job_completed:
+                raise ValueError(f"protected finalization {description} start was outside the job: {job_name}")
+        _defer_metadata(
+            MetadataPending(
+                f"protected finalization {description} metadata was unfinished: {job_name}",
+                unfinished_job=job_name,
+            ),
+            pending,
+        )
+        return started, None
     if step.get("status") != "completed" or step.get("conclusion") != "success":
         raise ValueError(
             f"protected finalization {description} did not complete successfully: "
@@ -168,31 +210,38 @@ def _successful_step(step, job_name, description):
     return started, completed
 
 
-class MetadataPending(ValueError):
-    pass
-
-
-def _bounded_job_steps(job, started, completed, name):
+def _bounded_job_steps(job, started, completed, name, pending=None):
     # The required preflight locks mandatory workflow steps and the Action post hook.
     # Only absent/empty metadata may use this stricter, whole-job timing proof.
     steps = job.get("steps", [])
     if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
         raise ValueError(f"protected finalization job steps were invalid: {name}")
     if not steps and (completed - started).total_seconds() > MAX_PROTECTED_SECONDS:
-        raise MetadataPending(
-            f"protected finalization activation step metadata was empty and job exceeded "
-            f"{MAX_PROTECTED_SECONDS} seconds: {name}"
+        _defer_metadata(
+            MetadataPending(
+                f"protected finalization activation step metadata was empty and job exceeded "
+                f"{MAX_PROTECTED_SECONDS} seconds: {name}"
+            ),
+            pending,
         )
     return steps
 
 
 def verified_finalization_jobs(fetch, job_set):
+    unfinished_jobs = set()
     for attempt in range(METADATA_ATTEMPTS):
         try:
             document = fetch()
-            jobs = validate_finalization_jobs(document, job_set)
+            pending = []
+            jobs = validate_finalization_jobs(document, job_set, pending=pending)
             if job_set == "action":
-                jobs[ACTION_ZERO_INPUT_BURST_JOB] = validate_action_zero_input_burst_job(document)
+                jobs[ACTION_ZERO_INPUT_BURST_JOB] = validate_action_zero_input_burst_job(document, pending=pending)
+            unfinished_jobs.update(error.unfinished_job for error in pending if error.unfinished_job is not None)
+            if pending:
+                raise pending[0]
+            for name in sorted(unfinished_jobs):
+                if not jobs[name].get("steps"):
+                    raise MetadataPending(f"protected finalization previously unfinished step metadata was absent: {name}")
             return jobs
         except urllib.error.HTTPError as error:
             if error.code not in {502, 503, 504}:
@@ -205,7 +254,37 @@ def verified_finalization_jobs(fetch, job_set):
         time.sleep(5)
 
 
-def validate_finalization_jobs(document, job_set):
+def fetch_log_archive(fetch, job_name):
+    for attempt in range(LOG_ARCHIVE_ATTEMPTS):
+        try:
+            return fetch()
+        except Exception as error:
+            # A transport error can contain a signed URL, so never show its text.
+            if isinstance(error, urllib.error.HTTPError):
+                retryable = error.code in {404, 502, 503, 504}
+            else:
+                reason = error.reason if isinstance(error, urllib.error.URLError) else error
+                retryable = isinstance(reason, (TimeoutError, ConnectionResetError))
+            if not retryable:
+                raise ValueError(f"protected finalization log archive download failed: {job_name}") from None
+            if attempt == LOG_ARCHIVE_ATTEMPTS - 1:
+                raise ValueError(f"protected finalization log archive was unavailable: {job_name}") from None
+        time.sleep(5)
+
+
+def validate_job_listing(document):
+    if (
+        not isinstance(document, dict)
+        or not isinstance(document.get("jobs"), list)
+        or type(document.get("total_count")) is not int
+        or not 0 <= document["total_count"] <= MAX_JOB_COUNT
+        or document["total_count"] != len(document["jobs"])
+    ):
+        raise ValueError("protected finalization job listing was incomplete or exceeded its fixed bound")
+    return document
+
+
+def validate_finalization_jobs(document, job_set, *, pending=None):
     if not isinstance(job_set, str) or job_set not in EXPECTED_FINALIZATION_STEPS:
         raise ValueError("protected finalization job set was invalid")
     if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
@@ -265,7 +344,7 @@ def validate_finalization_jobs(document, job_set):
         completed = _timestamp(job.get("completed_at"), f"job completion for {name}")
         if completed < started:
             raise ValueError(f"protected finalization job timestamps were out of order: {name}")
-        steps = _bounded_job_steps(job, started, completed, name)
+        steps = _bounded_job_steps(job, started, completed, name, pending)
         if not steps:
             continue
 
@@ -275,15 +354,15 @@ def validate_finalization_jobs(document, job_set):
             raise ValueError(
                 f"protected finalization activation step was missing or duplicated: {name}"
             )
-        activated, activation_completed = _successful_step(
-            activations[0], name, "activation step"
+        activation = _successful_step(
+            activations[0], name, "activation step", started, completed, pending
         )
-        if not started <= activated <= activation_completed <= completed:
+        if not _ordered_step_times(started, completed, activation):
             raise ValueError(
                 f"protected finalization job and activation timestamps were out of order: "
                 f"{name}"
             )
-        if (completed - activated).total_seconds() > MAX_PROTECTED_SECONDS:
+        if activation[0] is not None and (completed - activation[0]).total_seconds() > MAX_PROTECTED_SECONDS:
             raise ValueError(f"protected finalization exceeded 180 seconds: {name}")
 
         post_steps = [
@@ -294,10 +373,10 @@ def validate_finalization_jobs(document, job_set):
         if len(post_steps) > 1:
             raise ValueError(f"protected finalization post hook was duplicated: {name}")
         if post_steps:
-            post_started, post_completed = _successful_step(
-                post_steps[0], name, "post hook"
+            post = _successful_step(
+                post_steps[0], name, "post hook", started, completed, pending
             )
-            if not activation_completed <= post_started <= post_completed <= completed:
+            if not _ordered_step_times(started, completed, activation, post):
                 raise ValueError(
                     f"protected finalization post-hook timestamps were out of order: {name}"
                 )
@@ -305,7 +384,7 @@ def validate_finalization_jobs(document, job_set):
     return jobs
 
 
-def validate_action_zero_input_burst_job(document):
+def validate_action_zero_input_burst_job(document, *, pending=None):
     if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
         raise ValueError("blocked-burst job metadata was invalid")
 
@@ -340,7 +419,7 @@ def validate_action_zero_input_burst_job(document):
     completed = _timestamp(job.get("completed_at"), "blocked-burst job completion")
     if completed < started:
         raise ValueError("blocked-burst job timestamps were out of order")
-    steps = _bounded_job_steps(job, started, completed, ACTION_ZERO_INPUT_BURST_JOB)
+    steps = _bounded_job_steps(job, started, completed, ACTION_ZERO_INPUT_BURST_JOB, pending)
     if not steps:
         return job
 
@@ -353,22 +432,11 @@ def validate_action_zero_input_burst_job(document):
         matches = [step for step in steps if step.get("name") == name]
         if len(matches) != 1:
             raise ValueError(f"{description} was missing or duplicated")
-        ordered_steps.append(_successful_step(matches[0], ACTION_ZERO_INPUT_BURST_JOB, description))
+        ordered_steps.append(
+            _successful_step(matches[0], ACTION_ZERO_INPUT_BURST_JOB, description, started, completed, pending)
+        )
 
-    (activated, activation_completed), (evidence_started, evidence_completed), (
-        post_started,
-        post_completed,
-    ) = ordered_steps
-    if not (
-        started
-        <= activated
-        <= activation_completed
-        <= evidence_started
-        <= evidence_completed
-        <= post_started
-        <= post_completed
-        <= completed
-    ):
+    if not _ordered_step_times(started, completed, *ordered_steps):
         raise ValueError("blocked-burst job and post-hook timestamps were out of order")
     return job
 
@@ -497,6 +565,48 @@ class ProtectedFinalizationTests(unittest.TestCase):
         return document
 
     @mock.patch("time.sleep")
+    def test_log_archive_retries_only_transient_download_failures(self, sleep):
+        errors = [
+            *(urllib.error.HTTPError("https://example.invalid/?signed=secret", code, "unavailable", {}, None)
+              for code in (404, 502, 503, 504)),
+            TimeoutError("signed=secret"),
+            urllib.error.URLError(TimeoutError("signed=secret")),
+            ConnectionResetError("signed=secret"),
+        ]
+        for error in errors:
+            with self.subTest(error=type(error).__name__, code=getattr(error, "code", None)):
+                sleep.reset_mock()
+                fetch = mock.Mock(side_effect=[error, b"verified log"])
+                self.assertEqual(fetch_log_archive(fetch, "selected job"), b"verified log")
+                self.assertEqual(fetch.call_count, 2)
+                sleep.assert_called_once_with(5)
+
+        sleep.reset_mock()
+        fetch = mock.Mock(side_effect=errors[0])
+        with self.assertRaises(ValueError) as caught:
+            fetch_log_archive(fetch, "selected job")
+        self.assertEqual(str(caught.exception), "protected finalization log archive was unavailable: selected job")
+        self.assertEqual(fetch.call_count, LOG_ARCHIVE_ATTEMPTS)
+        self.assertEqual(sleep.call_count, LOG_ARCHIVE_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_log_archive_fails_immediately_without_disclosing_error_details(self, sleep):
+        errors = (
+            urllib.error.HTTPError("https://example.invalid/?signed=secret", 302, "redirect", {}, None),
+            urllib.error.HTTPError("https://example.invalid/?signed=secret", 403, "forbidden", {}, None),
+            urllib.error.URLError("signed=secret"),
+            ValueError("signed=secret"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                fetch = mock.Mock(side_effect=error)
+                with self.assertRaises(ValueError) as caught:
+                    fetch_log_archive(fetch, "selected job")
+                self.assertEqual(str(caught.exception), "protected finalization log archive download failed: selected job")
+                fetch.assert_called_once_with()
+                sleep.assert_not_called()
+
+    @mock.patch("time.sleep")
     def test_transient_metadata_errors_retry_but_remain_bounded(self, sleep):
         for status in (502, 503, 504):
             with self.subTest(status=status):
@@ -514,6 +624,133 @@ class ProtectedFinalizationTests(unittest.TestCase):
                     verified_finalization_jobs(fetch, "integration")
                 self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
                 self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_unfinished_selected_steps_are_retried_within_the_metadata_budget(self, sleep):
+        for job_set, document, job_index, step_index in (
+            ("integration", self.document(), 0, 0),
+            ("action", self.action_burst_document(), 0, 0),
+            ("action", self.action_burst_document(), 0, 1),
+            ("action", self.action_burst_document(), -1, 1),
+        ):
+            for status in ("pending", "in_progress"):
+                with self.subTest(job_set=job_set, job_index=job_index, step_index=step_index, status=status):
+                    sleep.reset_mock()
+                    stale = copy.deepcopy(document)
+                    step = stale["jobs"][job_index]["steps"][step_index]
+                    step.update(status=status, conclusion=None, completed_at=None)
+                    if status == "pending":
+                        step["started_at"] = None
+                    fetch = mock.Mock(side_effect=[stale, document])
+                    self.assertEqual(len(verified_finalization_jobs(fetch, job_set)), len(document["jobs"]))
+                    self.assertEqual(fetch.call_count, 2)
+                    sleep.assert_called_once_with(5)
+
+                    sleep.reset_mock()
+                    fetch = mock.Mock(return_value=stale)
+                    with self.assertRaisesRegex(MetadataPending, "metadata was unfinished"):
+                        verified_finalization_jobs(fetch, job_set)
+                    self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+                    self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_unfinished_step_cannot_disappear_into_the_whole_job_fallback(self, sleep):
+        for job_index in (0, -1):
+            with self.subTest(job_index=job_index):
+                complete = self.action_burst_document(setup_seconds=0)
+                complete["jobs"][1]["steps"] = []
+                unfinished = copy.deepcopy(complete)
+                unfinished["jobs"][job_index]["steps"][0].update(
+                    status="pending", conclusion=None, started_at=None, completed_at=None
+                )
+                empty = copy.deepcopy(complete)
+                empty["jobs"][job_index]["steps"] = []
+
+                fetch = mock.Mock(side_effect=[unfinished, *[empty] * (METADATA_ATTEMPTS - 1)])
+                with self.assertRaisesRegex(MetadataPending, "previously unfinished"):
+                    verified_finalization_jobs(fetch, "action")
+                self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+
+                fetch = mock.Mock(side_effect=[unfinished, empty, complete])
+                self.assertEqual(len(verified_finalization_jobs(fetch, "action")), len(complete["jobs"]))
+                self.assertEqual(fetch.call_count, 3)
+
+                failed = copy.deepcopy(complete)
+                failed["jobs"][job_index]["steps"][0]["conclusion"] = "failure"
+                fetch = mock.Mock(side_effect=[unfinished, failed, complete])
+                with self.assertRaises(ValueError) as failure:
+                    verified_finalization_jobs(fetch, "action")
+                self.assertNotIsInstance(failure.exception, MetadataPending)
+                self.assertEqual(fetch.call_count, 2)
+
+    @mock.patch("time.sleep")
+    def test_invalid_evidence_takes_precedence_over_unfinished_metadata(self, sleep):
+        for pending_job, invalid_job in ((0, 0), (0, 1), (0, -1), (-1, -1)):
+            with self.subTest(pending_job=pending_job, invalid_job=invalid_job):
+                document = self.action_burst_document(setup_seconds=0)
+                document["jobs"][pending_job]["steps"][0].update(
+                    status="in_progress", conclusion=None, completed_at=None
+                )
+                document["jobs"][invalid_job]["steps"][1]["conclusion"] = "failure"
+                fetch = mock.Mock(return_value=document)
+                with self.assertRaisesRegex(ValueError, "did not complete successfully") as failure:
+                    verified_finalization_jobs(fetch, "action")
+                self.assertNotIsInstance(failure.exception, MetadataPending)
+                fetch.assert_called_once()
+                sleep.assert_not_called()
+
+    @mock.patch("time.sleep")
+    def test_each_unfinished_job_must_supply_successful_step_records(self, sleep):
+        complete = self.action_burst_document(setup_seconds=0)
+        unfinished = copy.deepcopy(complete)
+        for job in unfinished["jobs"][:2]:
+            job["steps"][0].update(status="in_progress", conclusion=None, completed_at=None)
+        incomplete = copy.deepcopy(complete)
+        incomplete["jobs"][1]["steps"] = []
+        fetch = mock.Mock(side_effect=[unfinished, *[incomplete] * (METADATA_ATTEMPTS - 1)])
+        with self.assertRaisesRegex(MetadataPending, "previously unfinished"):
+            verified_finalization_jobs(fetch, "action")
+        self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+
+    def test_job_listing_is_complete_and_bounded(self):
+        for count in (0, MAX_JOB_COUNT):
+            document = {"total_count": count, "jobs": [{}] * count}
+            self.assertIs(validate_job_listing(document), document)
+        for document in (
+            None,
+            {},
+            {"total_count": True, "jobs": [{}]},
+            {"total_count": -1, "jobs": []},
+            {"total_count": 1, "jobs": []},
+            {"total_count": MAX_JOB_COUNT + 1, "jobs": [{}] * MAX_JOB_COUNT},
+            {"total_count": MAX_JOB_COUNT + 1, "jobs": [{}] * (MAX_JOB_COUNT + 1)},
+        ):
+            with self.subTest(document=document), self.assertRaisesRegex(ValueError, "job listing was incomplete"):
+                validate_job_listing(document)
+
+    @mock.patch("time.sleep")
+    def test_malformed_unfinished_step_metadata_is_not_retried(self, sleep):
+        for changes in (
+            {"conclusion": "failure"},
+            {"conclusion": "cancelled"},
+            {"conclusion": "skipped"},
+            {"completed_at": "2026-07-23T00:00:30Z"},
+            {"started_at": "invalid"},
+            {"started_at": "2026-07-23T00:04:00Z"},
+            {"status": "queued"},
+            {"status": []},
+        ):
+            with self.subTest(changes=changes):
+                document = self.document()
+                step = document["jobs"][0]["steps"][0]
+                step.update(status="in_progress", conclusion=None, completed_at=None)
+                step.update(changes)
+                fetch = mock.Mock(return_value=document)
+                with self.assertRaises(ValueError) as failure:
+                    verified_finalization_jobs(fetch, "integration")
+                self.assertNotIsInstance(failure.exception, MetadataPending)
+                fetch.assert_called_once()
+                sleep.assert_not_called()
 
     @mock.patch("time.sleep")
     def test_empty_expected_steps_must_become_available_for_all_job_sets(self, sleep):

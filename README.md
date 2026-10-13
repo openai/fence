@@ -99,7 +99,7 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 
 ## How It Works 🔧
 
-If Fence fails during setup, see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start) for the host and DNS diagnostics it can report.
+If Fence fails during setup, it can report recognized [host and DNS diagnostics](docs/troubleshooting.md#fence-fails-to-start) without copying raw service logs into the job log.
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 
@@ -117,7 +117,7 @@ Failed evidence validation may include [bounded, unverified diagnostics](docs/tr
 
 ## Network Reports 📋
 
-After evidence validation, Fence adds a network activity table to the job summary and post-job log. Each verified report also includes one `FENCE_REPORT_JSON=` line that you can fetch through the GitHub API:
+After evidence validation, Fence writes a network activity table and a `FENCE_REPORT_JSON=` line to the post-job log. It also adds the activity table to the job summary when available. You can fetch the report through the GitHub API:
 
 ```bash
 gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \

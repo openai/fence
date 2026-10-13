@@ -14,7 +14,7 @@ Run Fence first. Checkout, setup actions, and other commands can change the runn
 
 `lockdown_command_timeout` means a trusted host command did not complete within its deadline. `lockdown_command_output_too_large` means the command produced more than 8 KiB total output. Fence drains stdout and stderr during execution and fails either check in both modes. The `Fence host command` line identifies the trusted executable, root or runner principal, error code, and deadline in milliseconds; it never includes command arguments, job paths, or command output. Check this line before considering a retry. These are host verification failures, so an allowlist change will not fix them.
 
-For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job.
+For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job. Fence does not include raw service journal text, even in debug logs.
 
 ## A Network Request Is Blocked
 
@@ -59,6 +59,10 @@ Keeping Docker available weakens runner isolation. Image pulls may also require 
 Critical drift means a required protection changed or a Fence component stopped working. Fence fails the job because it cannot confirm that the original protections still hold.
 
 Check the job summary and debug logs to identify what changed. Expanding the allowlist will not fix a broken protection.
+
+## Job Summary Unavailable
+
+If Fence cannot write the job summary, look in the post-job log for the network report. A summary warning alone does not mean protection failed.
 
 ## Post-Job Evidence Validation Fails
 
