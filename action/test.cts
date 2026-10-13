@@ -48,6 +48,7 @@ const {
 const actionLog = require("./log.cts");
 const { postFailureDiagnostic, validatePostEvidence, settleResidentReport } = require("./post.cts");
 const {
+  dnsStartupDiagnosticFromJournal,
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
@@ -1164,6 +1165,55 @@ test("host command diagnostics exclude arbitrary data and accept only known prog
     assert.equal(lockdownCommandDiagnosticFromJournal(line(invalid)), undefined);
   }
   assert.equal(lockdownCommandDiagnosticFromJournal(`${line(diagnostic)}\nnot JSON`), expected);
+});
+
+test("DNS startup diagnostics accept fixed listener, operation and reason values", () => {
+  const line = (value: unknown) => JSON.stringify({ fence_dns_startup: value });
+  for (const listener of ["host", "docker"]) {
+    for (const protocol of ["udp", "tcp"]) {
+      for (const operation of ["bind", "configure"]) {
+        for (const [reason, label] of [
+          ["address_in_use", "address already in use"],
+          ["address_unavailable", "address unavailable"],
+          ["permission_denied", "permission denied"],
+          ["other", "other system error"],
+        ]) {
+          assert.equal(
+            dnsStartupDiagnosticFromJournal(line({ listener, protocol, operation, reason })),
+            `${listener} ${protocol.toUpperCase()} ${operation}: ${label}`,
+          );
+        }
+      }
+    }
+  }
+  const earlier = { listener: "host", protocol: "udp", operation: "bind", reason: "address_in_use" };
+  const last = { listener: "docker", protocol: "tcp", operation: "configure", reason: "other" };
+  assert.equal(
+    dnsStartupDiagnosticFromJournal(`${line(earlier)}\nnoise\n${line(last)}\nnot JSON`),
+    "docker TCP configure: other system error",
+  );
+});
+
+test("DNS startup diagnostics never forward arbitrary error details or injected journal values", () => {
+  const d = { listener: "docker", protocol: "udp", operation: "bind", reason: "address_unavailable" };
+  const line = (value: unknown) => JSON.stringify({ fence_dns_startup: value });
+  assert.equal(dnsStartupDiagnosticFromJournal(line({
+    ...d, message: "::error::do_not_print", path: "/private/example", token: "ghp_do_not_print",
+  })), "docker UDP bind: address unavailable");
+  for (const value of [undefined, null, {}, [], "not an object", 1]) {
+    assert.equal(dnsStartupDiagnosticFromJournal(line(value)), undefined);
+  }
+  for (const field of Object.keys(d)) {
+    for (const value of [
+      undefined, null, 0, true, [], ["host"], {}, "__proto__", "constructor",
+      "/private/example", "host\n::error::injected", "ghp_do_not_print", "bind\u0000", "unknown",
+    ]) {
+      assert.equal(dnsStartupDiagnosticFromJournal(line({ ...d, [field]: value })), undefined);
+    }
+  }
+  assert.equal(dnsStartupDiagnosticFromJournal(line({ ...d, extra: "x".repeat(4096) })), undefined);
+  assert.equal(dnsStartupDiagnosticFromJournal(`${line(d)}\n${line({ ...d, reason: "::error::secret" })}`),
+    "docker UDP bind: address unavailable");
 });
 
 test("derives only bounded fixed runtime paths", () => {

@@ -244,6 +244,29 @@ function lockdownCommandDiagnosticFromJournal(output: string): string | undefine
   return undefined;
 }
 
+function dnsStartupDiagnosticFromJournal(output: string): string | undefined {
+  const reasons = new Map([
+    ["address_in_use", "address already in use"],
+    ["address_unavailable", "address unavailable"],
+    ["permission_denied", "permission denied"],
+    ["other", "other system error"],
+  ]);
+  for (const line of output.split(/\r?\n/).reverse()) {
+    if (line.length === 0 || line.length > 4096) continue;
+    try {
+      const d = JSON.parse(line)?.fence_dns_startup;
+      if (
+        !d || !["host", "docker"].includes(d.listener) || !["udp", "tcp"].includes(d.protocol) ||
+        !["bind", "configure"].includes(d.operation) || !reasons.has(d.reason)
+      ) continue;
+      return `${d.listener} ${d.protocol.toUpperCase()} ${d.operation}: ${reasons.get(d.reason)}`;
+    } catch {
+      // Never forward journal text or unknown fields.
+    }
+  }
+  return undefined;
+}
+
 function captureServiceStatus(unit: string): ReturnType<typeof capture> {
   return capture("/usr/bin/systemctl", [
     "show",
@@ -295,6 +318,12 @@ function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
   const lockdownDiagnostic = lockdownCommandDiagnosticFromJournal(journal.stdout);
   if (lockdownDiagnostic !== undefined) {
     log.warning(`Fence host command: ${lockdownDiagnostic}`);
+  }
+  if (errorCode === "dns_proxy_bind_failed") {
+    const dnsDiagnostic = dnsStartupDiagnosticFromJournal(journal.stdout);
+    if (dnsDiagnostic !== undefined) {
+      log.warning(`Fence DNS startup: ${dnsDiagnostic}`);
+    }
   }
   log.debugGroup("Fence debug: service journal", [
     `unit=${paths.unit}`,
@@ -697,4 +726,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
+module.exports = { dnsStartupDiagnosticFromJournal, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
