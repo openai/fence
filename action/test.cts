@@ -25,12 +25,11 @@ const {
   materializationWarning,
   materializationWarningLines,
   mountIdFromFdInfo,
-  networkReportLines,
+  renderNetworkReport,
   nativeInputsFromEnvironment,
   registeredActionPathGuardPaths,
   resultsStorageWarnings,
   runtimePaths,
-  structuredReportLine,
   summaryLines,
   validateBundle,
   validatedActionRuntimeSnapshot,
@@ -46,7 +45,7 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
-const { postFailureDiagnostic, validatePostEvidence, settleResidentReport } = require("./post.cts");
+const { postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport } = require("./post.cts");
 const {
   dnsStartupDiagnosticFromJournal,
   fenceErrorCodeFromJournal,
@@ -73,6 +72,14 @@ function residentHealth(overrides: Record<string, unknown> = {}): Record<string,
     ],
     ...overrides,
   };
+}
+
+function networkReportLines(currentReport: any, dnsEvidence: any = undefined): string[] {
+  return renderNetworkReport(currentReport, dnsEvidence).lines;
+}
+
+function structuredReportLine(currentReport: any, dnsEvidence: any = undefined): string {
+  return renderNetworkReport(currentReport, dnsEvidence).record;
 }
 
 const report = {
@@ -3609,6 +3616,53 @@ test("counts only fixed reasons for unmappable audit findings without changing d
     assert.ok(Object.values(result.omissions.unparsed_finding_reasons).every((count) => count === 0));
     assert.equal(result.network[0].decision, "blocked");
     assert.doesNotMatch(networkReportLines(block, dns).join("\n"), /Unparsed network findings|packet header/);
+  }
+});
+
+test("publishes post evidence from one fresh report and rejects stale or critical evidence", (t: any) => {
+  const verifiedAt = 1_000_000;
+  const currentReport = {
+    ...report,
+    resident_health: { ...report.resident_health, last_successful_verification_unix_milliseconds: verifiedAt },
+  };
+  let clockCalls = 0;
+  let summaryWrites = 0;
+  t.mock.method(Date, "now", () => verifiedAt + (clockCalls++ === 0 ? 19_999 : 20_001));
+  t.mock.method(fs, "appendFileSync", () => { summaryWrites += 1; });
+  const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
+  process.env.GITHUB_STEP_SUMMARY = "fence-test-summary";
+  try {
+    const paths = runtimePaths("action-test");
+    const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
+    const records = output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON="));
+    assert.equal(records.length, 1);
+    const document = JSON.parse(records[0].slice("FENCE_REPORT_JSON=".length));
+    assert.match(output, new RegExp(`Fence network report: ${document.result}`));
+    assert.match(output, /Fence evidence verified/);
+    assert.equal(clockCalls, 1);
+    assert.equal(summaryWrites, 1);
+
+    const staleOutput = captureStdout(() => {
+      assert.throws(() => publishPostEvidence(currentReport, { observations: [] }, paths), /stale/);
+    });
+    assert.equal(staleOutput, "");
+    assert.equal(summaryWrites, 1);
+
+    const criticalReport = {
+      ...currentReport,
+      network_verification_status: "critical_drift",
+      resident_health: { ...currentReport.resident_health, status: "critical", last_successful_verification_unix_milliseconds: verifiedAt + 20_000 },
+      critical_findings: [{ code: "owned_nftables_state_missing", message: "Verified drift" }],
+    };
+    const criticalOutput = captureStdout(() => {
+      assert.throws(() => publishPostEvidence(criticalReport, { observations: [] }, paths), /critical resident findings/);
+    });
+    assert.match(criticalOutput, /FENCE_REPORT_JSON=.*"result":"critical"/);
+    assert.doesNotMatch(criticalOutput, /Fence evidence verified/);
+    assert.equal(summaryWrites, 2);
+  } finally {
+    if (previousSummaryPath === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+    else process.env.GITHUB_STEP_SUMMARY = previousSummaryPath;
   }
 });
 

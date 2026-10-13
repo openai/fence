@@ -1480,6 +1480,12 @@ function validateGithubArtifactCompatibilityEvidence(evidence: any, description:
   }
 }
 
+function rejectCriticalFindings(findings: readonly unknown[]): void {
+  if (findings.length !== 0) {
+    fail("Fence report contains critical resident findings");
+  }
+}
+
 function validateReport(report: any, failOnCritical = true): any {
   if (report === null || Array.isArray(report) || typeof report !== "object") {
     fail("Fence report must be a JSON object");
@@ -1515,8 +1521,8 @@ function validateReport(report: any, failOnCritical = true): any {
   ) {
     fail("Fence report does not contain bounded critical findings");
   }
-  if (failOnCritical && report.critical_findings.length !== 0) {
-    fail("Fence report contains critical resident findings");
+  if (failOnCritical) {
+    rejectCriticalFindings(report.critical_findings);
   }
   const residentHealth = validateResidentHealth(
     report.resident_health,
@@ -2918,8 +2924,7 @@ function structuredNetworkReport(report: any, dnsEvidence: any = undefined): any
   return document;
 }
 
-function networkReportLines(report: any, dnsEvidence: any = undefined): string[] {
-  const document = structuredNetworkReport(report, dnsEvidence);
+function networkReportLines(document: any): string[] {
   const lines = [
     `Fence network report: ${document.result}`,
     `Mode: ${document.mode}`,
@@ -2969,8 +2974,12 @@ function networkReportLines(report: any, dnsEvidence: any = undefined): string[]
   return lines;
 }
 
-function structuredReportLine(report: any, dnsEvidence: any = undefined): string {
-  return `FENCE_REPORT_JSON=${JSON.stringify(structuredNetworkReport(report, dnsEvidence))}`;
+function renderNetworkReport(report: any, dnsEvidence: any = undefined): { lines: string[]; record: string } {
+  const document = structuredNetworkReport(report, dnsEvidence);
+  return {
+    lines: networkReportLines(document),
+    record: `FENCE_REPORT_JSON=${JSON.stringify(document)}`,
+  };
 }
 
 function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
@@ -3020,17 +3029,17 @@ module.exports = {
   materializationWarningLines,
   mountIdFromFdInfo,
   networkActivitySummary,
-  networkReportLines,
+  renderNetworkReport,
   nativeInputsFromEnvironment,
   readJsonBounded,
   readLauncherIntegrity,
   launcherIntegrityDocument,
+  rejectCriticalFindings,
   registeredActionPathGuardPaths,
   resultsStorageWarnings,
   runtimePaths,
   summaryHeading,
   summaryLines,
-  structuredReportLine,
   validateBundle,
   validatedActionRuntimeSnapshot,
   validateInlineConfig,

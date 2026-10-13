@@ -35,7 +35,9 @@ import zipfile
 sys.path.insert(0, os.path.join(sys.argv[1], "script", "lib"))
 
 from protected_finalization import (
+    MAX_JOB_COUNT,
     validate_action_finalization_report,
+    validate_job_listing,
     verified_finalization_jobs,
 )
 
@@ -151,11 +153,11 @@ def action_structured_reports(payload, job_name):
 
 
 def job_metadata():
-    with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page=100"), timeout=15) as response:
+    with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page={MAX_JOB_COUNT}"), timeout=15) as response:
         body = response.read(1024 * 1024 + 1)
     if len(body) > 1024 * 1024:
         raise SystemExit("protected finalization job metadata exceeded its fixed bound")
-    return json.loads(body)
+    return validate_job_listing(json.loads(body))
 
 
 try:

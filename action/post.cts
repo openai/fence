@@ -17,12 +17,12 @@ const {
   MAX_CRITICAL_FINDINGS,
   MAX_STRUCTURED_CRITICAL_CODES,
   MAX_REPORT_BYTES,
-  networkReportLines,
+  renderNetworkReport,
   readJsonBounded,
   readLauncherIntegrity,
+  rejectCriticalFindings,
   resultsStorageWarnings,
   runtimePaths,
-  structuredReportLine,
   summaryLines,
   validateBundle,
   validateActionPathGuardMount,
@@ -317,6 +317,11 @@ function main(): void {
   } else if (report.mode === "block") {
     throw new Error("Fence block-mode DNS evidence is missing");
   }
+  publishPostEvidence(report, dnsEvidence, paths);
+}
+
+function publishPostEvidence(report: any, dnsEvidence: any, paths: { report: string; dnsReport: string }): void {
+  const networkReport = renderNetworkReport(report, dnsEvidence);
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
   const dnsMaterializationRequestRejections = materializationRequestRejections(dnsEvidence);
   const userWildcardRequestRejections = materializationEvidenceCounter(
@@ -341,8 +346,8 @@ function main(): void {
     ).length
     : 0;
   log.debugGroup("Fence debug: post-job evidence", [
-    `report_path=${reportPath}`,
-    `dns_report_path=${effectiveDnsReportPath}`,
+    `report_path=${paths.report}`,
+    `dns_report_path=${paths.dnsReport}`,
     `dns_report_present=${dnsEvidence !== undefined}`,
     `protected_action_runtime=verified`,
     `mode=${report.mode}`,
@@ -379,10 +384,10 @@ function main(): void {
       encoding: "utf8",
     });
   }
-  for (const line of networkReportLines(report, dnsEvidence)) {
+  for (const line of networkReport.lines) {
     log.info(line);
   }
-  log.structuredRecord(structuredReportLine(report, dnsEvidence));
+  log.structuredRecord(networkReport.record);
   if (report.allow_github_artifacts) {
     log.warning(
       `Fence GitHub artifact compatibility permitted ${githubArtifactAuthorizationCount} of 4 storage accounts; artifact uploads are an intentional data-egress channel`,
@@ -403,7 +408,7 @@ function main(): void {
   for (const warning of resultsStorageWarnings(dnsEvidence)) {
     log.warning(warning);
   }
-  validateReport(report, true);
+  rejectCriticalFindings(report.critical_findings);
   const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;
   const evidenceLine = log.postEvidenceLine(report, auditDestinationCount);
   if (evidenceLine) {
@@ -422,4 +427,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, postFailureDiagnostic, validatePostEvidence, settleResidentReport };
+module.exports = { main, postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport };
