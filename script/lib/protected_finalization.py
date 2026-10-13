@@ -3,7 +3,10 @@
 import copy
 import datetime
 import sys
+import time
 import unittest
+import urllib.error
+from unittest import mock
 
 from dns_evidence import (
     MATERIALIZATION_REJECTION_REASONS,
@@ -13,6 +16,7 @@ from dns_evidence import (
 
 
 MAX_PROTECTED_SECONDS = 180
+METADATA_ATTEMPTS = 3
 ACTION_ZERO_INPUT_BURST_JOB = "action zero-input standard"
 ACTION_ZERO_INPUT_BURST_ACTIVATION = "activate bundled Fence agent with strict defaults"
 ACTION_ZERO_INPUT_BURST_DESTINATIONS = ("192.0.2.1", "192.0.2.2")
@@ -164,6 +168,29 @@ def _successful_step(step, job_name, description):
     return started, completed
 
 
+class MetadataPending(ValueError):
+    pass
+
+
+def verified_finalization_jobs(fetch, job_set):
+    for attempt in range(METADATA_ATTEMPTS):
+        try:
+            document = fetch()
+            jobs = validate_finalization_jobs(document, job_set)
+            if job_set == "action":
+                jobs[ACTION_ZERO_INPUT_BURST_JOB] = validate_action_zero_input_burst_job(document)
+            return jobs
+        except urllib.error.HTTPError as error:
+            if error.code not in {502, 503, 504}:
+                raise
+            if attempt == METADATA_ATTEMPTS - 1:
+                raise ValueError(f"protected finalization metadata unavailable: HTTP {error.code}") from None
+        except MetadataPending:
+            if attempt == METADATA_ATTEMPTS - 1:
+                raise
+        time.sleep(5)
+
+
 def validate_finalization_jobs(document, job_set):
     if not isinstance(job_set, str) or job_set not in EXPECTED_FINALIZATION_STEPS:
         raise ValueError("protected finalization job set was invalid")
@@ -222,9 +249,13 @@ def validate_finalization_jobs(document, job_set):
 
         started = _timestamp(job.get("started_at"), f"job start for {name}")
         completed = _timestamp(job.get("completed_at"), f"job completion for {name}")
+        if completed < started:
+            raise ValueError(f"protected finalization job timestamps were out of order: {name}")
         steps = job.get("steps")
         if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
             raise ValueError(f"protected finalization job steps were invalid: {name}")
+        if not steps:
+            raise MetadataPending(f"protected finalization activation step metadata was empty: {name}")
 
         activation_name = expected[name]
         activations = [step for step in steps if step.get("name") == activation_name]
@@ -295,9 +326,13 @@ def validate_action_zero_input_burst_job(document):
         raise ValueError("blocked-burst job did not complete successfully")
     started = _timestamp(job.get("started_at"), "blocked-burst job start")
     completed = _timestamp(job.get("completed_at"), "blocked-burst job completion")
+    if completed < started:
+        raise ValueError("blocked-burst job timestamps were out of order")
     steps = job.get("steps")
     if not isinstance(steps, list) or any(not isinstance(step, dict) for step in steps):
         raise ValueError("blocked-burst job steps were invalid")
+    if not steps:
+        raise MetadataPending("blocked-burst activation step metadata was empty")
 
     ordered_steps = []
     for name, description in (
@@ -450,6 +485,85 @@ class ProtectedFinalizationTests(unittest.TestCase):
         job["steps"] = [activation, evidence, post]
         document["jobs"].append(job)
         return document
+
+    @mock.patch("time.sleep")
+    def test_transient_metadata_errors_retry_but_remain_bounded(self, sleep):
+        for status in (502, 503, 504):
+            with self.subTest(status=status):
+                sleep.reset_mock()
+                error = urllib.error.HTTPError("https://api.github.com/", status, "unavailable", {}, None)
+                fetch = mock.Mock(side_effect=[error, self.document()])
+                self.assertEqual(set(verified_finalization_jobs(fetch, "integration")),
+                                 set(EXPECTED_FINALIZATION_STEPS["integration"]))
+                self.assertEqual(fetch.call_count, 2)
+                sleep.assert_called_once_with(5)
+
+                sleep.reset_mock()
+                fetch = mock.Mock(side_effect=error)
+                with self.assertRaisesRegex(ValueError, f"metadata unavailable: HTTP {status}"):
+                    verified_finalization_jobs(fetch, "integration")
+                self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+                self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_empty_expected_steps_must_become_available_for_all_job_sets(self, sleep):
+        for job_set, document in (
+            ("integration", self.document()),
+            ("action", self.action_burst_document()),
+            ("action", self.action_burst_document("ubuntu-latest action acceptance")),
+        ):
+            for index in range(len(document["jobs"])):
+                with self.subTest(job_set=job_set, name=document["jobs"][index]["name"]):
+                    sleep.reset_mock()
+                    pending = copy.deepcopy(document)
+                    pending["jobs"][index]["steps"] = []
+                    fetch = mock.Mock(side_effect=[pending, document])
+                    result = verified_finalization_jobs(fetch, job_set)
+                    self.assertEqual(len(result), len(document["jobs"]))
+                    self.assertEqual(fetch.call_count, 2)
+                    sleep.assert_called_once_with(5)
+
+                    sleep.reset_mock()
+                    fetch = mock.Mock(return_value=pending)
+                    with self.assertRaisesRegex(MetadataPending, "step metadata was empty"):
+                        verified_finalization_jobs(fetch, job_set)
+                    self.assertEqual(fetch.call_count, METADATA_ATTEMPTS)
+                    self.assertEqual(sleep.call_count, METADATA_ATTEMPTS - 1)
+
+    @mock.patch("time.sleep")
+    def test_finalization_never_retries_failed_or_invalid_evidence(self, sleep):
+        for status in (401, 403, 404, 429, 500):
+            fetch = mock.Mock(side_effect=urllib.error.HTTPError(
+                "https://api.github.com/", status, "rejected", {}, None
+            ))
+            with self.subTest(status=status), self.assertRaises(urllib.error.HTTPError):
+                verified_finalization_jobs(fetch, "action")
+            fetch.assert_called_once()
+            sleep.assert_not_called()
+
+        cases = [
+            ("conclusion", "failure"), ("status", "cancelled"),
+            ("started_at", None), ("completed_at", "invalid"),
+            ("steps", None), ("steps", [{"name": "Post wrong"}]),
+        ]
+        for index in (0, -1):
+            for field, value in cases:
+                with self.subTest(index=index, field=field, value=value):
+                    document = self.action_burst_document()
+                    document["jobs"][index][field] = value
+                    fetch = mock.Mock(side_effect=[document, self.action_burst_document()])
+                    with self.assertRaises(ValueError):
+                        verified_finalization_jobs(fetch, "action")
+                    fetch.assert_called_once()
+                    sleep.assert_not_called()
+
+        document = self.action_burst_document()
+        document["jobs"][0]["steps"].append(copy.deepcopy(document["jobs"][0]["steps"][0]))
+        fetch = mock.Mock(return_value=document)
+        with self.assertRaisesRegex(ValueError, "missing or duplicated"):
+            verified_finalization_jobs(fetch, "action")
+        fetch.assert_called_once()
+        sleep.assert_not_called()
 
     def action_burst_report(self):
         return {
