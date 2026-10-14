@@ -3376,6 +3376,27 @@ test("renders audit network decisions and hostname and direct-IP allowlist sugge
     "api.example.com",
     "ip 2001:db8::10 udp 53",
   ]);
+  const matched = {
+    ...audit.findings[0],
+    rule_class: "matches_recent_hostname_policy",
+  };
+  const matchedReport = { ...audit, findings: [matched] };
+  // A known outside-policy name still gets a narrow suggestion, even on a shared IP.
+  const shared = parsedStructuredNetworkReport(matchedReport, dnsEvidence);
+  assert.deepEqual(shared.suggested_allowlist, ["api.example.com"]);
+  const allowedDns = { observations: dnsEvidence.observations.map((observation: any) => ({
+    ...observation, policy_classification: "user_allowlist",
+  })) };
+  const covered = parsedStructuredNetworkReport(matchedReport, allowedDns);
+  assert.deepEqual(covered.suggested_allowlist, []);
+  const observed = covered.network.find((row: any) => row.destination === matched.remote_address);
+  assert.equal(observed.decision, "would_block");
+  assert.deepEqual(observed.activities, [{
+    kind: "connection_attempt", protocol: matched.protocol, port: matched.remote_port, count: 1,
+  }]);
+  // The post hook must not infer coverage from DNS alone (or from a different finding for the same IP).
+  const unmatched = parsedStructuredNetworkReport({ ...audit, findings: [matched, audit.findings[0]] }, allowedDns);
+  assert.deepEqual(unmatched.suggested_allowlist, ["ip 203.0.113.10 tcp 443"]);
   const humanReport = networkReportLines(audit, dnsEvidence).join("\n");
   assert.match(humanReport, /would.block/i);
   assert.match(humanReport, /api\.example\.com/);

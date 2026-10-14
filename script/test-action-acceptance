@@ -472,7 +472,8 @@ import socket
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.sendto(b"fence-action-audit-probe", ("192.0.2.10", 443))
 PY
-  curl --head --silent --show-error --max-time 10 --retry 0 https://www.google.com >/dev/null
+  probe_https_once https://github.com
+  probe_https_once https://www.google.com
 fi
 
 if [[ "$scenario" == "standard" ]]; then
@@ -573,20 +574,23 @@ else:
 if scenario == "audit":
     require(report["counters"]["total_violations"] >= 1)
     require(report["counters"]["sampled_violations"] >= 1)
-    require(any(item["classification"] == "would_block" for item in report["findings"]))
     require(dns["excluded_unretained_query_count"] == 0)
-    require(any(
-        item["hostname"] == "www.google.com"
-        and item["policy_classification"] == "outside_policy"
-        and item["query_type"] in {"a", "aaaa"}
-        for item in dns["observations"]
-    ))
-    require(any(
-        item["classification"] == "would_block"
-        and item["protocol"] == "tcp"
-        and item["remote_port"] == 443
+    attempts = {
+        (item["remote_address"], item["protocol"], item["rule_class"])
         for item in report["findings"]
-    ))
+        if item["classification"] == "would_block" and item["remote_port"] == 443
+    }
+    require(("192.0.2.10", "udp", "undeclared_new_egress") in attempts, "missing direct-IP audit probe")
+    for hostname, classification, rule in (
+        ("github.com", "platform_profile", "matches_recent_hostname_policy"),
+        ("www.google.com", "outside_policy", "undeclared_new_egress"),
+    ):
+        require(any(
+            (address, "tcp", rule) in attempts
+            for observation in dns["observations"]
+            if observation["hostname"] == hostname and observation["policy_classification"] == classification
+            for address in observation["resolved_addresses"]
+        ), f"missing {hostname} audit probe ({rule})")
 PY
 
 if [[ "$scenario" == "standard" ]]; then

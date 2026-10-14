@@ -2048,6 +2048,11 @@ function dnsAddressHostnameMap(
   return addressMap;
 }
 
+function auditMatchesRecentHostnamePolicy(report: any, finding: any): boolean {
+  return report.mode === "audit" && finding.mode === "audit" &&
+    finding.classification === "would_block" && finding.rule_class === "matches_recent_hostname_policy";
+}
+
 function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): AuditSummary {
   const hostnameRows = new Map<string, AuditFindingRow>();
   const ipRows = new Map<string, AuditFindingRow>();
@@ -2101,7 +2106,8 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
           port: finding.remote_port,
         });
       }
-    } else {
+    } else if (!auditMatchesRecentHostnamePolicy(report, finding)) {
+      // An outside-policy name takes precedence. Otherwise don't broaden an existing hostname policy to an IP.
       addRow(ipRows, {
         destination: finding.remote_address,
         destinationKind: "ip",
@@ -2529,7 +2535,10 @@ function addConnectionFindingActivity(
     if (decision === undefined) {
       continue;
     }
-    const hostnames = Array.from(addressMap.get(finding.remote_address) || []).sort();
+    // A matching transport is not proof that the connection used a particular hostname.
+    const hostnames = auditMatchesRecentHostnamePolicy(report, finding)
+      ? []
+      : Array.from(addressMap.get(finding.remote_address) || []).sort();
     const destinations = hostnames.length > 0 ? hostnames : [finding.remote_address];
     const actor = findingActorLabel(finding);
     for (const destination of destinations) {

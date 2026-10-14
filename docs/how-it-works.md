@@ -148,6 +148,6 @@ The job log stores the report on one line. `jq` formats it like this:
 }
 ```
 
-Anyone who can read the job log can read this report. In audit mode, `would_block` means a request was observed but not denied. In block mode, blocking a request is normal and does not turn a healthy job into a warning.
+Anyone who can read the job log can read this report. In audit mode, `would_block` means a request was observed but not denied. Fence can show a connection to an IP without suggesting you add that IP to your allowlist: a recent allowed DNS answer may already cover the address, protocol, and port. That match doesn't tell us which hostname the connection used. In block mode, blocking a request is normal and does not turn a healthy job into a warning.
 
 For implementation details and the complete security contract, see the [v0 specification](v0.md), [threat model](threat-model.md), and [security guide](security.md).
