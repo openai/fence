@@ -130,7 +130,7 @@ const UNPARSED_FINDING_REASONS = {
   invalid_ipv4_header: "invalid IPv4 header",
   ipv4_fragment: "IPv4 fragment",
   unsupported_ipv4_protocol: "non-TCP/UDP IPv4 packet",
-  unsupported_ipv6_header: "unsupported IPv6 next header",
+  unsupported_ipv6_header: "IPv6 traffic Fence could not map to a destination",
   unknown_ip_version: "unknown IP version",
   invalid_port: "invalid destination port",
   unrecognized: "reason unavailable",

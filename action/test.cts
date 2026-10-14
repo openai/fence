@@ -3619,7 +3619,9 @@ test("counts only fixed reasons for unmappable audit findings without changing d
   }
   assert.match(human, /non-TCP\/UDP IPv4 packet: 1/);
   assert.match(human, /reason unavailable:/);
-  assert.match(summary, /unsupported IPv6 next header: 1/);
+  for (const text of [human, summary]) {
+    assert.match(text, /IPv6 traffic Fence could not map to a destination: 1/);
+  }
   assert.equal(line, structuredReportLine(audit, dns));
 
   const onlyUnavailable = { ...audit, findings: [audit.findings[0]] };
