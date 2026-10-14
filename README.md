@@ -138,6 +138,7 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 
 - **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Fence checks the runner's security controls instead of rejecting routine image updates.
 - **Built-in connections:** GitHub Actions, job reporting, and the hosted runner still need a small set of GitHub and Azure connections.
+- **UDP:** If Fence removes an allowed destination, sending from the same port doesn't keep it open. Replies to allowed requests still work.
 - **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. Azure WireServer access is limited to root-owned host processes.
 - **Artifacts:** `allow_github_artifacts: true` allows limited access to storage used by GitHub Actions.
 - **Docker:** `unsafe_preserve` keeps containers available but reduces isolation.

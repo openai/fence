@@ -526,6 +526,12 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
         "fence:loopback" if is_exact_loopback_rule(expressions) => {
             Ok(OwnedRule::Loopback { chain })
         }
+        "fence:udp_original_dispatch"
+            if matches!(chain.as_str(), NFT_OUTPUT_CHAIN | NFT_FORWARD_CHAIN)
+                && is_exact_udp_original_dispatch(expressions) =>
+        {
+            Ok(OwnedRule::UdpOriginalDispatch { chain })
+        }
         "fence:established" if is_exact_established_related_rule(expressions) => {
             Ok(OwnedRule::EstablishedRelated { chain })
         }
@@ -867,6 +873,18 @@ fn is_exact_loopback_rule(expressions: &[Value]) -> bool {
     )
 }
 
+fn is_exact_udp_original_dispatch(expressions: &[Value]) -> bool {
+    // In `nft -j -n -y` output, IPPROTO_UDP is 17 and the original conntrack direction is 0.
+    expressions_equal(
+        expressions,
+        json!([
+            {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": 17}},
+            {"match": {"left": {"ct": {"key": "direction"}}, "op": "==", "right": 0}},
+            {"jump": {"target": NFT_CLASSIFY_CHAIN}}
+        ]),
+    )
+}
+
 fn is_exact_established_related_rule(expressions: &[Value]) -> bool {
     expressions_equal(
         expressions,
@@ -1140,6 +1158,18 @@ mod tests {
         );
     }
 
+    fn udp_original_dispatch_rule(chain: &str) -> Value {
+        rule(
+            chain,
+            "fence:udp_original_dispatch",
+            json!([
+                {"match": {"left": {"meta": {"key": "l4proto"}}, "op": "==", "right": 17}},
+                {"match": {"left": {"ct": {"key": "direction"}}, "op": "==", "right": 0}},
+                {"jump": {"target": NFT_CLASSIFY_CHAIN}}
+            ]),
+        )
+    }
+
     fn active_state_json(mode: Mode) -> Vec<u8> {
         let (prefix, terminal_comment, terminal) = match mode {
             Mode::Block => (
@@ -1185,6 +1215,7 @@ mod tests {
                 "fence:loopback",
                 json!([{"match": {"left": {"meta": {"key": "oifname"}}, "op": "==", "right": "lo"}}, {"accept": null}]),
             ),
+            udp_original_dispatch_rule(NFT_OUTPUT_CHAIN),
             rule(
                 NFT_OUTPUT_CHAIN,
                 "fence:established",
@@ -1200,6 +1231,7 @@ mod tests {
                 "fence:classify",
                 json!([{"jump": {"target": NFT_CLASSIFY_CHAIN}}]),
             ),
+            udp_original_dispatch_rule(NFT_FORWARD_CHAIN),
             rule(
                 NFT_FORWARD_CHAIN,
                 "fence:established",
@@ -1704,6 +1736,27 @@ mod tests {
                 {"jump": {"target": NFT_VIOLATION_CHAIN}}
             ]),
         );
+    }
+
+    #[test]
+    fn parser_rejects_modified_udp_original_dispatch() {
+        let fixture = udp_original_dispatch_rule(NFT_OUTPUT_CHAIN);
+        let comment = "fence:udp_original_dispatch";
+        let expressions = &fixture["rule"]["expr"];
+        assert_malformed_rule(NFT_CLASSIFY_CHAIN, comment, expressions.clone());
+        for (path, replacement) in [
+            ("/0/match/right", json!(6)), // TCP, not UDP
+            ("/1/match/right", json!(1)), // reply, not original
+            ("/1/match/op", json!("!=")),
+            ("/2/jump/target", json!(NFT_VIOLATION_CHAIN)),
+        ] {
+            let mut changed = expressions.clone();
+            *changed.pointer_mut(path).unwrap() = replacement;
+            assert_malformed_rule(NFT_OUTPUT_CHAIN, comment, changed);
+        }
+        let mut missing_direction = expressions.clone();
+        missing_direction.as_array_mut().unwrap().remove(1);
+        assert_malformed_rule(NFT_FORWARD_CHAIN, comment, missing_direction);
     }
 
     #[test]

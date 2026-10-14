@@ -120,6 +120,9 @@ pub enum OwnedRule {
     Loopback {
         chain: String,
     },
+    UdpOriginalDispatch {
+        chain: String,
+    },
     EstablishedRelated {
         chain: String,
     },
@@ -429,6 +432,9 @@ fn build_rules(
         OwnedRule::Loopback {
             chain: NFT_OUTPUT_CHAIN.to_owned(),
         },
+        OwnedRule::UdpOriginalDispatch {
+            chain: NFT_OUTPUT_CHAIN.to_owned(),
+        },
         OwnedRule::EstablishedRelated {
             chain: NFT_OUTPUT_CHAIN.to_owned(),
         },
@@ -454,6 +460,9 @@ fn build_rules(
         });
     }
     rules.extend([
+        OwnedRule::UdpOriginalDispatch {
+            chain: NFT_FORWARD_CHAIN.to_owned(),
+        },
         OwnedRule::EstablishedRelated {
             chain: NFT_FORWARD_CHAIN.to_owned(),
         },
@@ -526,6 +535,15 @@ fn render_rule(program: &mut String, rule: &OwnedRule) {
             writeln!(
                 program,
                 "add rule {NFT_FAMILY} {NFT_TABLE} {chain} oifname \"lo\" accept comment \"fence:loopback\""
+            )
+            .unwrap();
+        }
+        OwnedRule::UdpOriginalDispatch { chain } => {
+            // Conntrack remembers a UDP tuple, not the socket or its grant. Recheck
+            // the original direction while leaving established replies alone.
+            writeln!(
+                program,
+                "add rule {NFT_FAMILY} {NFT_TABLE} {chain} meta l4proto udp ct direction original jump {NFT_CLASSIFY_CHAIN} comment \"fence:udp_original_dispatch\""
             )
             .unwrap();
         }
@@ -829,26 +847,37 @@ mod tests {
     }
 
     #[test]
-    fn dns_mediator_upstream_dispatch_precedes_connection_state_acceptance() {
-        let block = render_dns_mediated_ruleset(Mode::Block, &[]);
-        let output_dispatch = "add rule inet fence_v0 fence_output ip daddr 168.63.129.16 udp dport 53 jump fence_classify comment \"fence:dns_mediator_upstream_dispatch\"";
-        let output_established = "add rule inet fence_v0 fence_output ct state established,related accept comment \"fence:established\"";
-        let forward_dispatch = "add rule inet fence_v0 fence_forward ip daddr 168.63.129.16 udp dport 53 jump fence_classify comment \"fence:dns_mediator_upstream_dispatch\"";
-        let forward_established = "add rule inet fence_v0 fence_forward ct state established,related accept comment \"fence:established\"";
-
-        assert!(block.find(output_dispatch).unwrap() < block.find(output_established).unwrap());
-        assert!(block.find(forward_dispatch).unwrap() < block.find(forward_established).unwrap());
-        assert_eq!(
-            block
-                .matches("comment \"fence:dns_mediator_upstream_dispatch\"")
-                .count(),
-            2
-        );
-
-        let audit = render_dns_mediated_ruleset(Mode::Audit, &[]);
-        assert!(audit.find(output_dispatch).unwrap() < audit.find(output_established).unwrap());
-        assert!(audit.find(forward_dispatch).unwrap() < audit.find(forward_established).unwrap());
-        assert!(audit.contains("counter name fence_total_violations accept"));
+    fn reserved_dns_and_original_udp_dispatch_precede_established_acceptance() {
+        for mode in [Mode::Block, Mode::Audit] {
+            let ruleset = render_dns_mediated_ruleset(mode, &[]);
+            for chain in [NFT_OUTPUT_CHAIN, NFT_FORWARD_CHAIN] {
+                let prefix = format!("add rule {NFT_FAMILY} {NFT_TABLE} {chain} ");
+                let mut rules = ruleset
+                    .lines()
+                    .filter_map(|line| line.strip_prefix(&prefix));
+                assert!(
+                    rules
+                        .next()
+                        .unwrap()
+                        .starts_with("ip daddr 168.63.129.16 udp dport 53 jump fence_classify")
+                );
+                if chain == NFT_OUTPUT_CHAIN {
+                    assert!(rules.next().unwrap().starts_with("oifname \"lo\" accept"));
+                }
+                assert!(
+                    rules
+                        .next()
+                        .unwrap()
+                        .starts_with("meta l4proto udp ct direction original jump fence_classify")
+                );
+                assert!(
+                    rules
+                        .next()
+                        .unwrap()
+                        .starts_with("ct state established,related accept")
+                );
+            }
+        }
 
         let explicit = render_dns_mediated_ruleset(
             Mode::Block,
