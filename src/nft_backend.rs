@@ -358,7 +358,8 @@ fn run_process_bounded(
                 "nft was interrupted before confirming the command outcome",
             ));
         }
-        return Err(BackendError::new(
+        // A normal diagnostic exit can also mean the kernel acknowledgement was lost.
+        return Err(BackendError::unknown_outcome(
             "nft_command_failed",
             bounded_message(&String::from_utf8_lossy(&stderr.bytes)),
         ));
@@ -1938,7 +1939,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(failed.code, "nft_command_failed");
         assert_eq!(failed.message, "denied");
-        assert!(!failed.outcome_unknown);
+        assert!(failed.outcome_unknown);
 
         let interrupted = run_process_bounded(
             Command::new("/bin/sh"),
@@ -1993,7 +1994,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(missing.code, "nft_spawn_failed");
-        assert!(!missing.outcome_unknown);
+        assert!(!missing.outcome_unknown, "nft was never dispatched");
         assert!(bounded_message(&"x".repeat(600)).ends_with("..."));
     }
 
