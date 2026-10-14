@@ -51,11 +51,11 @@ const SERVICE_STATUS_PROPERTIES = new Map<string, RegExp>([
 
 let diagnosticPaths: { unit: string } | undefined;
 let serviceLaunchAttempted = false;
-let serviceLaunchSucceeded = false;
 let launcherPaths: ReturnType<typeof runtimePaths> | undefined;
 let protectedActionPathGuards: string[] = [];
 let protectedActionMounted = false;
 let readinessObserved = false;
+let launcherDirectoryCreated = false;
 let runtimeDirectoryCreated = false;
 
 function emitError(error: unknown): void {
@@ -136,10 +136,9 @@ function formatServiceProperties(properties: Record<string, string>): string {
 function terminalServiceStatus(output: string): string | undefined {
   const properties = parseServiceProperties(output);
   const terminal =
-    properties.LoadState === "not-found" ||
-    properties.ActiveState === "failed" ||
+    (properties.ActiveState === "failed" && properties.SubState === "failed") ||
     (properties.ActiveState === "inactive" && properties.SubState === "dead");
-  if (!terminal) {
+  if (!terminal || properties.MainPID !== "0") {
     return undefined;
   }
   return formatServiceProperties(properties);
@@ -349,6 +348,11 @@ function createOrValidateRootDirectory(directory: string): void {
   assertRootDirectory(directory);
 }
 
+// Only a successful exclusive mkdir grants this launcher permission to remove the leaf.
+function createInvocationDirectory(directory: string): void {
+  run("/usr/bin/sudo", ["/usr/bin/mkdir", "--mode=0755", "--", directory]);
+}
+
 function installProtectedActionRuntime(
   invocationId: string,
   paths: ReturnType<typeof runtimePaths>,
@@ -359,6 +363,9 @@ function installProtectedActionRuntime(
     throw new Error("Fence launcher invocation directory already exists");
   }
   createOrValidateRootDirectory("/run/fence-launcher");
+  createInvocationDirectory(paths.launcherDirectory);
+  launcherDirectoryCreated = true;
+  assertRootDirectory(paths.launcherDirectory);
   run("/usr/bin/sudo", [
     "/usr/bin/install",
     "-d",
@@ -368,11 +375,8 @@ function installProtectedActionRuntime(
     "root",
     "-m",
     "0755",
-    paths.launcherDirectory,
-    paths.launcherActionDirectory,
     path.join(paths.launcherActionDirectory, "bin"),
   ]);
-  assertRootDirectory(paths.launcherDirectory);
   for (const relativePath of ACTION_RUNTIME_FILES) {
     const mode = relativePath === "bin/fence" ? "0555" : "0444";
     run("/usr/bin/sudo", [
@@ -488,23 +492,6 @@ function installProtectedActionRuntime(
   ]);
 }
 
-function serviceRemainsActive(paths: ReturnType<typeof runtimePaths>): boolean {
-  if (!serviceLaunchSucceeded) {
-    return false;
-  }
-  const status = capture("/usr/bin/systemctl", [
-    "show",
-    paths.unit,
-    "--no-pager",
-    "--property=ActiveState",
-  ]);
-  if (status.error || status.status !== 0) {
-    return true;
-  }
-  const state = status.stdout.trim();
-  return state !== "ActiveState=inactive" && state !== "ActiveState=failed";
-}
-
 function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
   return [
     "/usr/bin/systemd-run",
@@ -519,15 +506,46 @@ function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
   ];
 }
 
-function cleanupLauncherBeforeReadiness(): void {
-  if (!launcherPaths || readinessObserved || !pathEntryExists(launcherPaths.launcherDirectory)) {
-    return;
+function provisionalCleanupPreservationReason(
+  status: ReturnType<typeof capture>,
+  inspect: (name: "ready.json" | "resolv.conf") => { uid: number; mode: number; isFile(): boolean } | undefined,
+): string | undefined {
+  // A timed-out systemd-run may still have launched the resident. Establish that
+  // it stopped *before* looking for its marker, so readiness cannot race cleanup.
+  if (status.error || status.status !== 0 || !terminalServiceStatus(status.stdout)) {
+    return "the resident may still be running";
   }
-  if (serviceRemainsActive(launcherPaths)) {
-    log.warning("Fence left the protected Action runtime mounted because the resident service is still active");
+  try {
+    const marker = inspect("ready.json");
+    if (marker !== undefined) {
+      return marker.isFile() && marker.uid === 0 && (marker.mode & 0o7777) === 0o644
+        ? "the resident created its root-owned readiness marker"
+        : "readiness could not be safely determined";
+    }
+    // Native rollback retains this source when it cannot unmount the host resolver.
+    return inspect("resolv.conf") === undefined ? undefined : "host DNS rollback may be incomplete";
+  } catch {
+    // Only definite absence in the root-owned invocation directory permits removal.
+    return "readiness and host DNS rollback could not be safely determined";
+  }
+}
+
+function cleanupLauncherBeforeReadiness(): void {
+  const paths = launcherPaths;
+  if (!paths || !launcherDirectoryCreated || readinessObserved) {
     return;
   }
   try {
+    if (serviceLaunchAttempted) {
+      const reason = provisionalCleanupPreservationReason(
+        captureServiceStatus(paths.unit),
+        (name) => fs.lstatSync(path.join(paths.directory, name), { throwIfNoEntry: false }),
+      );
+      if (reason) {
+        log.warning(`Fence kept its runtime state because ${reason}; runner teardown will remove it`);
+        return;
+      }
+    }
     if (protectedActionMounted) {
       run("/usr/bin/sudo", ["/usr/bin/umount", ACTION_ROOT]);
       protectedActionMounted = false;
@@ -536,13 +554,13 @@ function cleanupLauncherBeforeReadiness(): void {
       run("/usr/bin/sudo", ["/usr/bin/umount", guard]);
     }
     protectedActionPathGuards = [];
-    if (runtimeDirectoryCreated && pathEntryExists(launcherPaths.directory)) {
+    if (runtimeDirectoryCreated) {
       run("/usr/bin/sudo", [
         "/usr/bin/rm",
         "--recursive",
         "--force",
         "--one-file-system",
-        launcherPaths.directory,
+        paths.directory,
       ]);
       runtimeDirectoryCreated = false;
     }
@@ -551,11 +569,11 @@ function cleanupLauncherBeforeReadiness(): void {
       "--recursive",
       "--force",
       "--one-file-system",
-      launcherPaths.launcherDirectory,
+      paths.launcherDirectory,
     ]);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    log.warning(`Fence could not remove provisional launcher state: ${message}`);
+    launcherDirectoryCreated = false;
+  } catch {
+    log.warning("Fence could not remove its provisional launcher state; runner teardown will remove it");
   }
 }
 
@@ -664,7 +682,7 @@ function main(): void {
     manifest,
   );
   createOrValidateRootDirectory("/run/fence");
-  run("/usr/bin/sudo", ["/usr/bin/install", "-d", "-o", "root", "-g", "root", "-m", "0755", paths.directory]);
+  createInvocationDirectory(paths.directory);
   runtimeDirectoryCreated = true;
   assertRootDirectory(paths.directory);
   run("/usr/bin/sudo", ["/usr/bin/install", "-o", "root", "-g", "root", "-m", "0600", "/dev/null", paths.config]);
@@ -686,7 +704,6 @@ function main(): void {
   ]);
   serviceLaunchAttempted = true;
   run("/usr/bin/sudo", serviceArgs);
-  serviceLaunchSucceeded = true;
   const report = waitForReady(paths);
   readinessObserved = true;
   log.success(log.readyLine(report));
@@ -702,4 +719,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
+module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, provisionalCleanupPreservationReason, residentServiceArgs, run, terminalServiceStatus };

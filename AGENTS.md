@@ -285,11 +285,11 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/test-action-setup-failure`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
   - Invokes the dependency-free Action launcher with malformed invocation, wildcard, over-limit native allowlist, malformed artifact compatibility, audit-mode artifact compatibility, unsupported raw profile, duplicate raw JSON field, scoped IPv6, and restricted results-storage inputs; proves rejection occurs before Action state, runtime directories, transient services, or owned nftables state are created and before passwordless sudo is changed.
-  - Passes one otherwise valid reserved `.invalid` hostname through the raw-config wrapper boundary, proves the bundled source agent reports `dns_block_prehydration_failed` before control mutation, and requires the launcher to retain the failed transient unit, fail before the readiness timeout, and emit only the structured Fence error code from the unit journal.
+  - Passes one otherwise valid reserved `.invalid` hostname through the raw-config wrapper boundary, proves the bundled source agent reports `dns_block_prehydration_failed` before control mutation, and verifies the original resolver file and mount are restored. The failed transient unit remains available for diagnostics.
 
 - `script/test-action-tamper`
   - Linux x64-only, GitHub-Actions-only hosted failure-path evidence entrypoint.
-  - Launches the bundled audit lifecycle through the Action entrypoint, proves direct runner-user modification of the protected post hook fails, verifies the closest registered-path guard retains its mounted device/inode identity, proves the guarded ancestor cannot be renamed and recreated, deletes only the owned nftables table after readiness, proves five-second resident verification records critical drift, and proves the protected post hook emits one bounded critical structured report before failing without stopping the service or restoring network state.
+  - Proves a duplicate audit launch leaves the original service, readiness, integrity evidence, and mount intact. Then verifies the protected post hook and its guarded path resist replacement, deletes only the owned nftables table, and requires a critical post-job report without stopping the service or restoring access.
 
 - `script/lint`
   - Runs format check, clippy, `cargo verify-project`, and docs.

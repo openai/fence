@@ -1497,9 +1497,59 @@ struct DnsRouting {
     docker_original: Option<Vec<u8>>,
     resolver_source: PathBuf,
     resolver_target: PathBuf,
+    provisional: ProvisionalDnsRouting,
+}
+
+#[derive(Default)]
+struct ProvisionalDnsRouting {
     resolver_source_created: bool,
     resolver_mounted: bool,
     docker_changed: bool,
+    committed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsRollbackStep {
+    RestoreDockerConfiguration,
+    RestartDocker,
+    UnmountResolver,
+    RemoveResolverSource,
+}
+
+impl ProvisionalDnsRouting {
+    fn rollback(
+        &mut self,
+        mut apply: impl FnMut(DnsRollbackStep) -> Result<(), DnsMediationError>,
+    ) -> Result<bool, DnsMediationError> {
+        if self.committed {
+            return Err(DnsMediationError::new(
+                "dns_routing_rollback_after_commit",
+                "DNS routing cannot be restored after readiness",
+            ));
+        }
+        let changed = self.resolver_source_created || self.resolver_mounted || self.docker_changed;
+        let docker = (|| {
+            if self.docker_changed {
+                apply(DnsRollbackStep::RestoreDockerConfiguration)?;
+                apply(DnsRollbackStep::RestartDocker)?;
+                self.docker_changed = false;
+            }
+            Ok(())
+        })();
+        // Always try host cleanup, but never unlink the source of a surviving mount.
+        let resolver = (|| {
+            if self.resolver_mounted {
+                apply(DnsRollbackStep::UnmountResolver)?;
+                self.resolver_mounted = false;
+            }
+            if self.resolver_source_created {
+                apply(DnsRollbackStep::RemoveResolverSource)?;
+                self.resolver_source_created = false;
+            }
+            Ok(changed)
+        })();
+        docker.and(resolver)
+    }
 }
 
 impl DnsRouting {
@@ -1520,9 +1570,7 @@ impl DnsRouting {
             docker_original: None,
             resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
             resolver_target,
-            resolver_source_created: false,
-            resolver_mounted: false,
-            docker_changed: false,
+            provisional: ProvisionalDnsRouting::default(),
         };
         let result = routing.activate_inner();
         if result.is_err() {
@@ -1539,13 +1587,18 @@ impl DnsRouting {
                 "DNS routing refuses a preexisting owned resolver file",
             ));
         }
-        write_new_file(&self.resolver_source, RESOLVER_SOURCE_CONTENTS, 0o644).map_err(|_| {
+        write_new_file(
+            &self.resolver_source,
+            RESOLVER_SOURCE_CONTENTS,
+            0o644,
+            &mut self.provisional.resolver_source_created,
+        )
+        .map_err(|_| {
             DnsMediationError::new(
                 "dns_routing_setup_failed",
                 "failed to create the owned resolver routing file",
             )
         })?;
-        self.resolver_source_created = true;
         let source = self.resolver_source.to_str().ok_or_else(|| {
             DnsMediationError::new(
                 "dns_routing_setup_failed",
@@ -1563,13 +1616,13 @@ impl DnsRouting {
             TrustedExecutable::Mount,
             &["--bind", source, target],
         ) {
-            self.resolver_mounted = paths_have_same_identity(
+            self.provisional.resolver_mounted = paths_have_same_identity(
                 self.resolver_source.as_path(),
                 self.resolver_target.as_path(),
             );
             return Err(error);
         }
-        self.resolver_mounted = true;
+        self.provisional.resolver_mounted = true;
         fixed_command(
             &self.executables,
             TrustedExecutable::Mount,
@@ -1607,8 +1660,9 @@ impl DnsRouting {
                 "failed to serialize Docker DNS configuration",
             )
         })?;
-        replace_external_file(docker_path, &docker_bytes)?;
-        self.docker_changed = true;
+        replace_external_file(docker_path, &docker_bytes, || {
+            self.provisional.docker_changed = true;
+        })?;
         fixed_command(
             &self.executables,
             TrustedExecutable::Systemctl,
@@ -1618,41 +1672,40 @@ impl DnsRouting {
     }
 
     fn rollback(&mut self) -> Result<bool, DnsMediationError> {
-        let changed = self.resolver_source_created || self.resolver_mounted || self.docker_changed;
-        if self.docker_changed {
-            match self.docker_original.as_deref() {
-                Some(bytes) => replace_external_file(Path::new(DOCKER_DAEMON_PATH), bytes)?,
-                None => {
-                    let _ = fs::remove_file(DOCKER_DAEMON_PATH);
-                }
-            }
-            fixed_command(
+        self.provisional.rollback(|step| match step {
+            DnsRollbackStep::RestoreDockerConfiguration => match self.docker_original.as_deref() {
+                Some(bytes) => replace_external_file(Path::new(DOCKER_DAEMON_PATH), bytes, || {}),
+                None => match fs::remove_file(DOCKER_DAEMON_PATH) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(_) => Err(DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "failed to remove provisional Docker DNS configuration",
+                    )),
+                },
+            },
+            DnsRollbackStep::RestartDocker => fixed_command(
                 &self.executables,
                 TrustedExecutable::Systemctl,
                 &["restart", "docker.service"],
-            )?;
-            self.docker_changed = false;
-        }
-        if self.resolver_mounted {
-            let target = self.resolver_target.to_str().ok_or_else(|| {
-                DnsMediationError::new(
-                    "dns_routing_rollback_failed",
-                    "accepted resolver target path is not valid UTF-8",
-                )
-            })?;
-            fixed_command(&self.executables, TrustedExecutable::Umount, &[target])?;
-            self.resolver_mounted = false;
-        }
-        if self.resolver_source_created {
-            fs::remove_file(&self.resolver_source).map_err(|_| {
-                DnsMediationError::new(
-                    "dns_routing_rollback_failed",
-                    "failed to remove provisional resolver routing",
-                )
-            })?;
-            self.resolver_source_created = false;
-        }
-        Ok(changed)
+            ),
+            DnsRollbackStep::UnmountResolver => {
+                let target = self.resolver_target.to_str().ok_or_else(|| {
+                    DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "accepted resolver target path is not valid UTF-8",
+                    )
+                })?;
+                fixed_command(&self.executables, TrustedExecutable::Umount, &[target])
+            }
+            DnsRollbackStep::RemoveResolverSource => fs::remove_file(&self.resolver_source)
+                .map_err(|_| {
+                    DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "failed to remove provisional resolver routing",
+                    )
+                }),
+        })
     }
 
     fn verify_active(&self) -> Result<(), DnsMediationError> {
@@ -2304,6 +2357,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
+        mediation.routing.provisional.committed = true;
         lockdown.commit_no_restore();
         evidence.setup_status = "resident_observation_only";
         evidence.readiness_status = PROTECTED_AUDIT_READY_STATUS;
@@ -2715,6 +2769,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
+        mediation.routing.provisional.committed = true;
         lockdown.commit_no_restore();
         evidence.setup_status = scope.resident_status();
         evidence.readiness_status = scope.ready_status();
@@ -6478,7 +6533,12 @@ fn write_report(path: &Path, evidence: &DnsMediationEvidence) -> Result<(), DnsM
     })
 }
 
-fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediationError> {
+fn write_new_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    created: &mut bool,
+) -> Result<(), DnsMediationError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -6491,6 +6551,7 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediati
                 "failed to create bounded DNS mediation evidence file",
             )
         })?;
+    *created = true;
     file.write_all(bytes).map_err(|_| {
         DnsMediationError::new(
             "dns_evidence_write_failed",
@@ -6499,7 +6560,11 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediati
     })
 }
 
-fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationError> {
+fn replace_external_file(
+    path: &Path,
+    bytes: &[u8],
+    opened: impl FnOnce(),
+) -> Result<(), DnsMediationError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
             return Err(DnsMediationError::new(
@@ -6529,6 +6594,8 @@ fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationEr
                 "failed to write fixed DNS routing configuration",
             )
         })?;
+    // A successful open has already created or truncated the configuration.
+    opened();
     let metadata = file.metadata().map_err(|_| {
         DnsMediationError::new(
             "dns_routing_setup_failed",
@@ -12662,7 +12729,9 @@ mod tests {
             "dns_routing_setup_failed"
         );
         assert_eq!(
-            replace_external_file(&linked, b"{}").unwrap_err().code,
+            replace_external_file(&linked, b"{}", || panic!("symlink was opened"))
+                .unwrap_err()
+                .code,
             "dns_routing_setup_failed"
         );
 
@@ -12673,10 +12742,83 @@ mod tests {
             "dns_routing_setup_failed"
         );
         assert_eq!(
-            replace_external_file(&directory, b"{}").unwrap_err().code,
+            replace_external_file(&directory, b"{}", || panic!("directory was opened"))
+                .unwrap_err()
+                .code,
             "dns_routing_setup_failed"
         );
+        let mut truncated = false;
+        replace_external_file(&config, b"{}", || {
+            assert_eq!(fs::metadata(&config).unwrap().len(), 0);
+            truncated = true;
+        })
+        .unwrap();
+        assert!(truncated);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisional_dns_rollback_attempts_both_routes_and_retains_only_unfinished_work() {
+        use DnsRollbackStep::{
+            RemoveResolverSource, RestartDocker, RestoreDockerConfiguration, UnmountResolver,
+        };
+        for docker_failure in [None, Some(RestoreDockerConfiguration), Some(RestartDocker)] {
+            for resolver_failure in [None, Some(UnmountResolver), Some(RemoveResolverSource)] {
+                let mut routing = ProvisionalDnsRouting {
+                    docker_changed: true,
+                    resolver_mounted: true,
+                    resolver_source_created: true,
+                    committed: false,
+                };
+                let mut steps = Vec::new();
+                let result = routing.rollback(|step| {
+                    steps.push(step);
+                    if [docker_failure, resolver_failure].contains(&Some(step)) {
+                        Err(DnsMediationError::new("test_failure", format!("{step:?}")))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Some(first_failure) = docker_failure.or(resolver_failure) {
+                    assert_eq!(result.unwrap_err().message, format!("{first_failure:?}"));
+                } else {
+                    assert_eq!(result, Ok(true));
+                }
+                assert!(steps.contains(&UnmountResolver));
+                assert_eq!(
+                    steps.contains(&RestartDocker),
+                    docker_failure != Some(RestoreDockerConfiguration)
+                );
+                assert_eq!(
+                    steps.contains(&RemoveResolverSource),
+                    resolver_failure != Some(UnmountResolver)
+                );
+                assert_eq!(routing.docker_changed, docker_failure.is_some());
+                assert_eq!(
+                    routing.resolver_mounted,
+                    resolver_failure == Some(UnmountResolver)
+                );
+                assert_eq!(routing.resolver_source_created, resolver_failure.is_some());
+                routing.rollback(|_| Ok(())).unwrap();
+                assert_eq!(
+                    routing.rollback(|_| panic!("nothing left to undo")),
+                    Ok(false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn committed_dns_routing_refuses_every_rollback_step() {
+        let mut routing = ProvisionalDnsRouting {
+            committed: true,
+            ..ProvisionalDnsRouting::default()
+        };
+        let result = routing.rollback(|_| panic!("must not restore DNS after readiness"));
+        assert_eq!(
+            result.unwrap_err().code,
+            "dns_routing_rollback_after_commit"
+        );
     }
 
     #[test]
