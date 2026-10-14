@@ -479,24 +479,29 @@ fn wireserver_is_root_host_only_despite_overlapping_allowance_and_established_co
                 .unwrap();
             nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &overlap))
                 .unwrap();
-            nft.total_violation_packets().unwrap()
         };
+        replace(&mut nft, Mode::Audit);
+        let mut probes = Vec::new();
         for (namespace, user) in [(&topology.router, "runner"), (&topology.source, "root")] {
-            let before_audit = replace(&mut nft, Mode::Audit);
+            let before = nft.total_violation_packets().unwrap();
             let mut probe = start_wireserver_probe(namespace, port, user);
             let mut ready = BufReader::new(probe.0.stdout.take().unwrap()).lines();
             assert_eq!(ready.next().unwrap().unwrap(), "established in audit");
-            assert!(nft.total_violation_packets().unwrap() > before_audit);
+            assert!(nft.total_violation_packets().unwrap() > before);
             expected.push_str("audit");
+            probes.push(probe);
+        }
 
-            // Keep the acknowledged TCP connection (and conntrack entry) live
-            // across the atomic replacement. Verify delivery at the sink, not send().
-            let before_block = replace(&mut nft, Mode::Block);
+        // Both acknowledged connections and their conntrack entries stay live
+        // across the atomic replacement. Assert which bytes reached the sink.
+        replace(&mut nft, Mode::Block);
+        for mut probe in probes {
+            let before = nft.total_violation_packets().unwrap();
             writeln!(probe.0.stdin.take().unwrap(), "block").unwrap();
             assert!(probe.0.wait().unwrap().success());
-            assert!(nft.total_violation_packets().unwrap() > before_block);
-            assert_eq!(fs::read_to_string(&received).unwrap(), expected);
+            assert!(nft.total_violation_packets().unwrap() > before);
         }
+        assert_eq!(fs::read_to_string(&received).unwrap(), expected);
         assert!(nft.rollback_pre_activation().unwrap());
     }
 }
