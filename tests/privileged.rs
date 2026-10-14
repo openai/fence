@@ -138,6 +138,17 @@ impl RoutedTopology {
         let sink = format!("fence-b-{suffix}");
         for namespace in [&source, &router, &sink] {
             ip(&["netns", "add", namespace]);
+            // This IPv4-only topology measures exact violation deltas. Disable IPv6
+            // before adding links so unsolicited multicast reports cannot count as test traffic.
+            in_namespace(
+                namespace,
+                "/usr/sbin/sysctl",
+                &[
+                    "-qw",
+                    "net.ipv6.conf.all.disable_ipv6=1",
+                    "net.ipv6.conf.default.disable_ipv6=1",
+                ],
+            );
             ip(&["-n", namespace, "link", "set", "lo", "up"]);
         }
         connect_namespaces(
@@ -660,7 +671,8 @@ fn udp_tuple_reuse_after_grant_removal_obeys_current_host_and_forward_policy() {
     for hook in ["output", "forward"] {
         witness.push_str(&format!(
             "add chain inet test_udp {hook} {{ type filter hook {hook} priority {priority}; }}; \
-             add rule inet test_udp {hook} meta l4proto udp ct direction original ct state established counter name seen;"
+             add rule inet test_udp {hook} ip daddr {address} udp dport {port} \
+             ct direction original ct state established counter name seen;"
         ));
     }
     nft_in_namespace(firewall, &[&witness]);
@@ -675,10 +687,11 @@ fn udp_tuple_reuse_after_grant_removal_obeys_current_host_and_forward_policy() {
             nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &grant))
                 .unwrap();
             let destination = format!("{address}:{port}");
+            let allowed_baseline = nft.total_violation_packets().unwrap();
             let endpoint = udp_socket_exchange(client, "0.0.0.0:0", &destination, "accepted");
             assert_eq!(
                 nft.total_violation_packets().unwrap(),
-                0,
+                allowed_baseline,
                 "allowed request and reply"
             );
 
@@ -687,6 +700,8 @@ fn udp_tuple_reuse_after_grant_removal_obeys_current_host_and_forward_policy() {
             nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &[]))
                 .unwrap();
             let seen = established_original_udp_packets(firewall);
+            // Replacing the owned table also replaces its violation counter.
+            let revoked_baseline = nft.total_violation_packets().unwrap();
             let expect = if mode == Mode::Block {
                 "rejected"
             } else {
@@ -703,7 +718,7 @@ fn udp_tuple_reuse_after_grant_removal_obeys_current_host_and_forward_policy() {
             );
             assert_eq!(
                 nft.total_violation_packets().unwrap(),
-                1,
+                revoked_baseline + 1,
                 "count the request, not its reply"
             );
             assert!(nft.rollback_pre_activation().unwrap());
