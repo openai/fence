@@ -12,7 +12,7 @@ Fixed host commands bound combined stdout/stderr capture while running and enfor
 
 Resident and DNS evidence publication must share the same exclusive, no-follow atomic replacement path. After a failed write or rename, clean up only the pending file created by that attempt; preserve the original error and never clear a pre-existing pending path. Keep each report's existing write-synchronization behavior.
 
-Publish the final resident report before atomically making the complete readiness marker visible. Never replace an existing marker. Successful marker publication is the no-restore boundary; pending-file cleanup cannot turn it into a pre-ready failure.
+Publish the final resident report before atomically making the complete readiness marker visible. Never replace an existing marker. Successful marker publication is the no-restore boundary; pending-file cleanup cannot turn it into a pre-ready failure. The Action post hook must validate this historical commit and a fresh resident report; neither alone proves both readiness and current health.
 
 The only permitted non-container baseline transition is the already-present, fully observed UUID socket at `/run/uuidd/request`. Require exactly one unchanged root systemd owner in `/init.scope` and at most one non-root system UID owner of `/usr/sbin/uuidd` in exactly `/system.slice/uuidd.service`. Never generalize that exception to other endpoints or cgroups; use the acceptance matrix's Azure CLI cases in both modes for hosted proof.
 

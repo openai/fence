@@ -14,6 +14,7 @@ const {
   launcherIntegrityDocument,
   nativeInputsFromEnvironment,
   readJsonBounded,
+  readReady,
   readLauncherIntegrity,
   runtimePaths,
   validateBundle,
@@ -581,7 +582,7 @@ function waitForReady(paths: { ready: string; report: string; unit: string }): a
         readJsonBounded(paths.report, MAX_REPORT_BYTES, "Fence report"),
         true,
       );
-      const ready = readJsonBounded(paths.ready, 64 * 1024, "Fence readiness");
+      const ready = readReady(paths.ready);
       validateReady(ready, report);
       const service = capture("/usr/bin/systemctl", [
         "show",
