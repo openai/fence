@@ -516,6 +516,7 @@ impl DnsBlockRuntimeScope {
 pub struct DnsMediationError {
     pub code: &'static str,
     pub message: String,
+    resolver_layout_failure: Option<ResolverLayoutFailure>,
 }
 
 impl DnsMediationError {
@@ -523,6 +524,22 @@ impl DnsMediationError {
         Self {
             code,
             message: message.into(),
+            resolver_layout_failure: None,
+        }
+    }
+
+    fn report_resolver_startup_failure(&self) {
+        self.write_resolver_startup_diagnostic(&mut std::io::stderr().lock());
+    }
+
+    fn write_resolver_startup_diagnostic(&self, journal: &mut impl Write) {
+        if let Some(reason) = self.resolver_layout_failure {
+            // Only the failed check, never the observed path, owner, mode, PID or system error.
+            let _ = writeln!(
+                journal,
+                "{}",
+                serde_json::json!({"fence_resolver_layout": {"reason": reason}})
+            );
         }
     }
 }
@@ -1474,6 +1491,28 @@ impl ObservationRecorder {
             &self.evidence_from_state(&state, self.scope.active_routing_status()),
         )
     }
+
+    fn publish_initial_verified_health(
+        &self,
+        host_verification: Result<(), DnsMediationError>,
+        workers: Vec<ResidentWorkerHealth>,
+    ) -> Result<ResidentHealth, DnsMediationError> {
+        host_verification?;
+        let health = self.mark_verification_successful(workers);
+        self.refresh_report()?;
+        Ok(health)
+    }
+
+    fn mark_verification_successful(&self, workers: Vec<ResidentWorkerHealth>) -> ResidentHealth {
+        let mut health = self
+            .resident_health
+            .lock()
+            .expect("resident health lock poisoned");
+        if health.status != "critical" {
+            advance_resident_health(&mut health, workers, unix_time_milliseconds());
+        }
+        health.clone()
+    }
 }
 
 fn query_authorization(
@@ -1886,24 +1925,13 @@ enum ResolverLayoutFailure {
 
 impl From<ResolverLayoutFailure> for DnsMediationError {
     fn from(reason: ResolverLayoutFailure) -> Self {
-        resolver_layout_error(reason, &mut std::io::stderr().lock())
+        // Resident drift checks use the same error without emitting a startup diagnostic.
+        Self {
+            code: "unsupported_resolver_layout",
+            message: "host DNS resolver failed a reviewed layout check".into(),
+            resolver_layout_failure: Some(reason),
+        }
     }
-}
-
-fn resolver_layout_error(
-    reason: ResolverLayoutFailure,
-    journal: &mut impl Write,
-) -> DnsMediationError {
-    // The first failed check, never the observed path, owner, mode, PID or system error.
-    let _ = writeln!(
-        journal,
-        "{}",
-        serde_json::json!({"fence_resolver_layout": {"reason": reason}})
-    );
-    DnsMediationError::new(
-        "unsupported_resolver_layout",
-        "host DNS resolver failed a reviewed layout check",
-    )
 }
 
 fn paths_have_same_identity(left: &Path, right: &Path) -> bool {
@@ -2001,7 +2029,9 @@ impl DnsMediationSession {
                 .expect("resident health lock poisoned");
             health.workers = supervisor.worker_health();
         }
-        let routing = match DnsRouting::activate(runtime_directory, executables, docker_available) {
+        let routing = match DnsRouting::activate(runtime_directory, executables, docker_available)
+            .inspect_err(DnsMediationError::report_resolver_startup_failure)
+        {
             Ok(routing) => routing,
             Err(error) => {
                 shutdown_dns_workers(&stop_workers, &mut threads);
@@ -2047,16 +2077,24 @@ impl DnsMediationSession {
         self.attribution.drain()
     }
 
-    fn mark_verification_successful(&mut self) {
-        let workers = self.supervisor.worker_health();
-        let mut health = self
-            .resident_health
-            .lock()
-            .expect("resident health lock poisoned");
-        if health.status == "critical" {
-            return;
-        }
-        advance_resident_health(&mut health, workers, unix_time_milliseconds());
+    fn verify_before_readiness(
+        &self,
+        baseline: &LocalControlSnapshot,
+    ) -> Result<ResidentHealth, DnsMediationError> {
+        let verified = verify_resident_local_control(self, baseline)
+            .map_err(local_control_error)
+            .and_then(|()| {
+                self.routing
+                    .verify_active_resolver_mount()
+                    .inspect_err(DnsMediationError::report_resolver_startup_failure)
+            });
+        self.recorder
+            .publish_initial_verified_health(verified, self.supervisor.worker_health())
+    }
+
+    fn mark_verification_successful(&self) -> ResidentHealth {
+        self.recorder
+            .mark_verification_successful(self.supervisor.worker_health())
     }
 
     fn mark_resident_critical(&mut self) {
@@ -2318,23 +2356,16 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        mediation.mark_verification_successful();
-        evidence.resident_health = mediation.resident_health();
-        if let Err(error) = mediation.recorder.refresh_report() {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
-        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline)
-            .map_err(local_control_error)
-            .and_then(|_| mediation.routing.verify_active_resolver_mount())
+        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
         {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
+            Ok(health) => health,
+            Err(error) => {
+                evidence.setup_status = "failed_pre_ready";
+                evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+                let _ = runtime.replace_report(&evidence);
+                return Err(error);
+            }
+        };
 
         evidence.setup_status = "verified_before_observation_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
@@ -2497,8 +2528,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 );
             }
             if verification_succeeded && self.evidence.critical_findings.is_empty() {
-                self._mediation.mark_verification_successful();
-                self.evidence.resident_health = self._mediation.resident_health();
+                self.evidence.resident_health = self._mediation.mark_verification_successful();
                 if self._mediation.recorder.refresh_report().is_err() {
                     self.record_critical(
                         "dns_audit_evidence_write_failed",
@@ -2727,25 +2757,17 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        mediation.mark_verification_successful();
-        evidence.resident_health = mediation.resident_health();
-        if let Err(error) = mediation.recorder.refresh_report() {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
-        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline)
-            .map_err(local_control_error)
-            .and_then(|_| mediation.routing.verify_active_resolver_mount())
+        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
         {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
+            Ok(health) => health,
+            Err(error) => {
+                evidence.setup_status = "failed_pre_ready";
+                evidence.rollback_status =
+                    rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+                let _ = runtime.replace_report(&evidence);
+                return Err(error);
+            }
+        };
         evidence.setup_status = "verified_before_test_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
             evidence.setup_status = "failed_pre_ready";
@@ -3102,8 +3124,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 );
             }
             if verification_succeeded && self.evidence.critical_findings.is_empty() {
-                self._mediation.mark_verification_successful();
-                self.evidence.resident_health = self._mediation.resident_health();
+                self.evidence.resident_health = self._mediation.mark_verification_successful();
                 if self._mediation.recorder.refresh_report().is_err() {
                     self.record_critical(
                         "dns_block_evidence_write_failed",
@@ -6843,6 +6864,38 @@ mod tests {
         recorder.refresh_report().unwrap();
         assert!(report.is_file());
 
+        fs::remove_file(report).unwrap();
+    }
+
+    #[test]
+    fn first_heartbeat_is_published_only_after_pre_ready_host_verification_succeeds() {
+        let (recorder, report) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        recorder.refresh_report().unwrap();
+        let starting_report = fs::read(&report).unwrap();
+        let starting = recorder.resident_health.lock().unwrap().clone();
+        assert_eq!(starting.status, "starting");
+        assert_eq!(starting.verification_sequence, 0);
+        assert_eq!(starting.last_successful_verification_unix_milliseconds, 0);
+
+        let workers = starting.workers.clone();
+        let failed = DnsMediationError::from(ResolverLayoutFailure::TargetChanged);
+        assert_eq!(
+            recorder.publish_initial_verified_health(Err(failed.clone()), workers.clone()),
+            Err(failed)
+        );
+        assert_eq!(*recorder.resident_health.lock().unwrap(), starting);
+        assert_eq!(fs::read(&report).unwrap(), starting_report);
+
+        let verified = recorder
+            .publish_initial_verified_health(Ok(()), workers)
+            .unwrap();
+        assert_eq!(verified.status, "healthy");
+        assert_eq!(verified.verification_sequence, 1);
+        let published: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(
+            published["resident_health"],
+            serde_json::to_value(verified).unwrap()
+        );
         fs::remove_file(report).unwrap();
     }
 
@@ -12811,11 +12864,33 @@ mod tests {
         symlink(&second, &pending_link).unwrap();
         fs::rename(pending_link, &link).unwrap();
         assert!(paths_have_same_identity(&first, &second));
-        assert_eq!(
-            verify_live_resolver_target(&link, &reviewed),
-            Err(Failure::TargetChanged)
-        );
+        for _ in 0..2 {
+            let failed = verify_live_resolver_target(&link, &reviewed).unwrap_err();
+            assert_eq!(failed, Failure::TargetChanged);
+            assert_eq!(
+                DnsMediationError::from(failed).code,
+                "unsupported_resolver_layout"
+            );
+        }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_live_resolver_drift_checks_do_not_write_startup_diagnostics_to_stderr() {
+        // Isolate stderr from the other parallel tests.
+        let drift_test =
+            "live_resolver_link_must_reach_the_reviewed_path_even_when_backing_identity_matches";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([drift_test, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -12843,15 +12918,21 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_resolver_layout_reports_only_the_failed_check() {
+    fn unsupported_resolver_layout_reports_only_the_failed_check_at_startup() {
         let mut journal = Vec::new();
-        let error = resolver_layout_error(ResolverLayoutFailure::TargetChanged, &mut journal);
+        let error = DnsMediationError::from(ResolverLayoutFailure::TargetChanged);
         assert_eq!(error.code, "unsupported_resolver_layout");
+        error.write_resolver_startup_diagnostic(&mut journal);
         assert_eq!(
             serde_json::from_slice::<Value>(&journal).unwrap(),
             serde_json::json!({"fence_resolver_layout": {"reason": "target_changed"}}),
         );
         assert_eq!(journal.iter().filter(|&&byte| byte == b'\n').count(), 1);
+
+        journal.clear();
+        DnsMediationError::new("lockdown_command_timeout", "private host details")
+            .write_resolver_startup_diagnostic(&mut journal);
+        assert!(journal.is_empty());
     }
 
     #[test]
