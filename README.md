@@ -95,7 +95,7 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 ```
 
 > [!WARNING]
-> Docker access weakens runner isolation. Use `unsafe_preserve` only when the job needs containers.
+> Keeping Docker gives up containment. Later steps can use Docker to gain root access and bypass Fence's network rules.
 
 ## How It Works 🔧
 
@@ -140,7 +140,7 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 - **Built-in connections:** GitHub Actions, job reporting, and the hosted runner still need a small set of GitHub and Azure connections.
 - **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. Azure WireServer access is limited to root-owned host processes.
 - **Artifacts:** `allow_github_artifacts: true` allows limited access to storage used by GitHub Actions.
-- **Docker:** `unsafe_preserve` keeps containers available but reduces isolation.
+- **Docker:** Fence disables Docker without changing its DNS settings. If you keep Docker available, later steps can bypass Fence.
 - **Release pinning:** Use the full commit SHA from a published Fence release. Do not run the Action from `main`.
 
 See the [security guide](docs/security.md) for more details.

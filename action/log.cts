@@ -186,7 +186,7 @@ function readyLine(report: any): string {
     return "✅ Fence ready: audit mode is observing traffic, not blocking it";
   }
   if (report.status === "protected_host_block_degraded") {
-    return "✅ Fence ready: network restrictions active; passwordless sudo locked down; Docker/container access preserved";
+    return "⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence";
   }
   return "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down";
 }
@@ -196,7 +196,7 @@ function postEvidenceLine(report: any, auditDestinationCount = 0): string | unde
     return `👀 Audit observed ${auditDestinationCount} would-block ${pluralize(auditDestinationCount, "destination")}; see the Fence report`;
   }
   if (report.status === "protected_host_block_degraded") {
-    return "⚠️ Limited assurance: Docker/container access was preserved";
+    return "⚠️ Docker was kept available; later steps could use it to gain root access and bypass Fence";
   }
   return undefined;
 }

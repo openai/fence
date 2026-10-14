@@ -1654,13 +1654,15 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
   ) {
     fail("Fence DNS evidence resident process does not match the report");
   }
-  const expectedWorkers = dnsEvidence.docker_dns_routing === "local_root_resident_mediator"
-    ? REQUIRED_RESIDENT_WORKERS
-    : dnsEvidence.docker_dns_routing === "not_present" && (
-      (report.mode === "block" && report.container_status === "disabled_verified") ||
-      (report.mode === "audit" && report.container_status === "preserved_verified")
-    )
+  const standardBlock = report.status === "protected_host_block";
+  const routing = dnsEvidence.docker_dns_routing;
+  const hostOnly = standardBlock
+    ? routing === "not_configured_standard_block"
+    : report.mode === "audit" && routing === "not_present";
+  const expectedWorkers = hostOnly
     ? REQUIRED_HOST_RESIDENT_WORKERS
+    : !standardBlock && routing === "local_root_resident_mediator"
+    ? REQUIRED_RESIDENT_WORKERS
     : undefined;
   if (
     expectedWorkers === undefined ||
@@ -1774,7 +1776,6 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
   const wildcardRejections = dnsEvidence.user_wildcard_request_rejections;
   if (
     dnsEvidence.host_dns_routing !== "direct_client_to_root_resident_mediator" ||
-    !["local_root_resident_mediator", "not_present"].includes(dnsEvidence.docker_dns_routing) ||
     dnsEvidence.answer_attribution_status !== "bounded_reportable_hostname_answers_only" ||
     !Array.isArray(authorizations) ||
     authorizations.length > MAX_RESULTS_STORAGE_AUTHORIZATIONS ||
@@ -2332,7 +2333,7 @@ function controlsSummary(report: any): string[] {
   const containers = report.container_status === "disabled_verified"
     ? "✅ Disabled"
     : report.container_status === "preserved_unsafe"
-      ? "⚠️ Available; limited assurance"
+      ? "⚠️ Available; later steps can use Docker to bypass Fence"
       : report.container_status === "preserved_verified"
         ? "➖ Available in audit mode"
         : "❌ Unverified";

@@ -57,7 +57,7 @@ const {
   terminalServiceStatus,
 } = require("./main.cts");
 
-function residentHealth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function residentHealth(overrides: Record<string, unknown> = {}, dockerDns = false): Record<string, unknown> {
   return {
     status: "healthy",
     resident_pid: 4242,
@@ -65,8 +65,10 @@ function residentHealth(overrides: Record<string, unknown> = {}): Record<string,
     last_successful_verification_unix_milliseconds: Date.now() - 1_000,
     verification_interval_seconds: 5,
     workers: [
-      { name: "docker_tcp_dns", status: "running" },
-      { name: "docker_udp_dns", status: "running" },
+      ...(dockerDns ? [
+        { name: "docker_tcp_dns", status: "running" },
+        { name: "docker_udp_dns", status: "running" },
+      ] : []),
       { name: "host_tcp_dns", status: "running" },
       { name: "host_udp_dns", status: "running" },
       { name: "process_attribution", status: "running" },
@@ -136,7 +138,11 @@ function dnsEvidenceFor(
     protection_available: currentReport.protection_available,
     routing_status: "active",
     host_dns_routing: "direct_client_to_root_resident_mediator",
-    docker_dns_routing: "local_root_resident_mediator",
+    docker_dns_routing: currentReport.status === "protected_host_block"
+      ? "not_configured_standard_block"
+      : currentReport.resident_health.workers.some((worker: any) => worker.name === "docker_udp_dns")
+      ? "local_root_resident_mediator"
+      : "not_present",
     answer_attribution_status: "bounded_reportable_hostname_answers_only",
     proxy_policy_status: currentReport.mode === "audit"
       ? "audit_forwards_while_simulating_name_authorization"
@@ -943,11 +949,11 @@ test("formats audit and degraded log wording accurately", () => {
   };
   assert.equal(
     actionLog.readyLine(degraded),
-    "✅ Fence ready: network restrictions active; passwordless sudo locked down; Docker/container access preserved",
+    "⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence",
   );
   assert.equal(
     actionLog.postEvidenceLine(degraded, 0),
-    "⚠️ Limited assurance: Docker/container access was preserved",
+    "⚠️ Docker was kept available; later steps could use it to gain root access and bypass Fence",
   );
 });
 
@@ -2155,33 +2161,7 @@ test("validates stable runtime evidence", () => {
     container_status: "preserved_verified",
   };
   validateReport(auditReport);
-  validateDnsEvidence({
-    ...dnsEvidence,
-    status: auditReport.status,
-    mode: auditReport.mode,
-    protection_available: false,
-    proxy_policy_status: "audit_forwards_while_simulating_name_authorization",
-  }, auditReport);
-  const hostOnlyHealth = residentHealth({
-    workers: residentHealth().workers.filter((worker: any) =>
-      !worker.name.startsWith("docker_")
-    ),
-  });
-  for (const currentReport of [
-    { ...report, resident_health: hostOnlyHealth },
-    { ...auditReport, resident_health: hostOnlyHealth },
-  ]) {
-    validateReport(currentReport);
-    validateDnsEvidence(dnsEvidenceFor(currentReport, {
-      docker_dns_routing: "not_present",
-    }), currentReport);
-    assert.throws(
-      () => validateDnsEvidence(dnsEvidenceFor(currentReport, {
-        docker_dns_routing: "local_root_resident_mediator",
-      }), currentReport),
-      /worker set/,
-    );
-  }
+  validateDnsEvidence(dnsEvidenceFor(auditReport), auditReport);
   assert.throws(
     () => validateDnsEvidence({ ...dnsEvidence, docker_dns_routing: "not_present" }, report),
     /worker set/,
@@ -2193,7 +2173,6 @@ test("validates stable runtime evidence", () => {
     setup_status: "resident_degraded",
     protection_available: false,
     container_status: "preserved_unsafe",
-    resident_health: hostOnlyHealth,
   };
   assert.throws(
     () => validateDnsEvidence(dnsEvidenceFor(degradedReport, {
@@ -2201,6 +2180,15 @@ test("validates stable runtime evidence", () => {
     }), degradedReport),
     /worker set/,
   );
+  const dockerHealth = residentHealth({}, true);
+  for (const preserved of [auditReport, degradedReport]) {
+    const withDocker = { ...preserved, resident_health: dockerHealth };
+    validateDnsEvidence(dnsEvidenceFor(withDocker), withDocker);
+  }
+  const unexpectedDocker = { ...report, resident_health: dockerHealth };
+  assert.throws(() => validateDnsEvidence(dnsEvidenceFor(unexpectedDocker, {
+    docker_dns_routing: "local_root_resident_mediator",
+  }), unexpectedDocker), /worker set/);
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
@@ -3181,7 +3169,9 @@ test("reports source-produced sudo and container drift in every runtime mode", (
       const critical = {
         ...currentMode,
         ...Object.fromEntries(controls.map((control) => [control, "critical_drift"])),
-        resident_health: residentHealth({ status: "critical" }),
+        resident_health: residentHealth(
+          { status: "critical" }, currentMode.status === "protected_host_block_degraded",
+        ),
         critical_findings: controls.map((control, index) => ({
           timestamp: `unix-ms:${index + 1}`,
           code: `dns_${currentMode.mode === "audit" ? "audit" : "block"}_${
@@ -3192,10 +3182,9 @@ test("reports source-produced sudo and container drift in every runtime mode", (
       };
 
       assert.equal(validateReport(critical, false), critical);
-      const document = parsedStructuredNetworkReport(critical, {
-        observations: [],
-        observations_truncated: false,
-      });
+      const dns = dnsEvidenceFor(critical);
+      validateDnsEvidence(dns, critical);
+      const document = parsedStructuredNetworkReport(critical, dns);
       assert.equal(document.mode, currentMode.mode);
       assert.equal(document.result, "critical");
       assert.equal(document.controls.resident_health, "critical");
@@ -3997,7 +3986,7 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   assert.match(degradedSummary, /^### 🟡 Fence Summary/);
   assert.doesNotMatch(degradedSummary, /🟢/);
   assert.match(degradedSummary, /\| Passwordless sudo \| ✅ Disabled \|/);
-  assert.match(degradedSummary, /\| Docker\/container access \| ⚠️ Available; limited assurance \|/);
+  assert.match(degradedSummary, /\| Docker\/container access \| ⚠️ Available; later steps can use Docker to bypass Fence \|/);
 
   const critical = {
     ...report,

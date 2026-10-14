@@ -192,6 +192,17 @@ PY
 sudo /usr/bin/install -d -o root -g root -m 0755 /run/fence "$directory"
 sudo /usr/bin/install -o root -g root -m 0600 "$config_source" "$config"
 
+docker_daemon_config_digest() {
+  if [[ -e /etc/docker/daemon.json ]]; then
+    sha256_file /etc/docker/daemon.json
+  else
+    echo absent
+  fi
+}
+if [[ "$scenario" == standard* ]]; then
+  docker_config_before="$(docker_daemon_config_digest)"
+fi
+
 # The service intentionally remains resident after this script exits. The
 # disposable hosted runner teardown is the only post-ready cleanup path.
 sudo /usr/bin/systemd-run \
@@ -448,13 +459,20 @@ require(resident["resident_pid"] > 0)
 require(resident["verification_sequence"] >= 1)
 require(resident["last_successful_verification_unix_milliseconds"] > 0)
 require(resident["verification_interval_seconds"] == 5)
-require(resident["workers"] == [
-    {"name": "docker_tcp_dns", "status": "running"},
-    {"name": "docker_udp_dns", "status": "running"},
+workers = [
     {"name": "host_tcp_dns", "status": "running"},
     {"name": "host_udp_dns", "status": "running"},
     {"name": "process_attribution", "status": "running"},
-])
+]
+if expected["container_status"] == "disabled_verified":
+    require(dns["docker_dns_routing"] == "not_configured_standard_block")
+else:
+    require(dns["docker_dns_routing"] == "local_root_resident_mediator")
+    workers[:0] = [
+        {"name": "docker_tcp_dns", "status": "running"},
+        {"name": "docker_udp_dns", "status": "running"},
+    ]
+require(resident["workers"] == workers)
 require(ready["status"] == expected["ready"])
 require(ready["runtime_evidence_schema_version"] == 5)
 require(ready["mode"] == expected["mode"])
@@ -478,7 +496,6 @@ require(dns["proxy_policy_status"] == (
 ))
 require(dns["routing_status"] == "active")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
-require(dns["docker_dns_routing"] == "local_root_resident_mediator")
 require(dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"])
 require(isinstance(dns["materialization_batch_count"], int))
 require(dns["materialization_batch_count"] >= 0)
@@ -626,6 +643,10 @@ case "$scenario" in
 esac
 case "$scenario" in
   standard|standard-finalization|standard-opt-out)
+    docker_config_after="$(docker_daemon_config_digest)"
+    if [[ "$docker_config_after" != "$docker_config_before" ]]; then
+      die "protected standard-block proof changed Docker's daemon configuration"
+    fi
     if docker ps --quiet >/dev/null 2>&1; then
       die "protected standard-block proof did not disable runner Docker access"
     fi
