@@ -2320,11 +2320,16 @@ function criticalFindingLines(report: any): string[] {
 }
 
 function controlsSummary(report: any): string[] {
+  const audit = report.mode === "audit";
+  const degraded = report.status === "protected_host_block_degraded";
+  const mode = audit ? "👀 Audit" : degraded ? "⚠️ Block with Docker available" : "🔒 Block";
   const network = report.network_verification_status !== "verified"
     ? "❌ Verification failed"
-    : report.mode === "audit"
+    : audit
       ? "⚠️ Observing only"
-      : "✅ Restricted";
+      : degraded
+        ? "⚠️ Host traffic filtered; Docker can bypass Fence"
+        : "✅ Restricted";
   const sudo = report.sudo_status === "disabled_verified"
     ? "✅ Disabled"
     : report.sudo_status === "preserved_verified"
@@ -2342,7 +2347,7 @@ function controlsSummary(report: any): string[] {
     "",
     "| Control | Result |",
     "| --- | --- |",
-    `| Mode | ${report.mode === "audit" ? "👀 Audit" : "🔒 Block"} |`,
+    `| Mode | ${mode} |`,
     `| Outbound network | ${network} |`,
     `| Passwordless sudo | ${sudo} |`,
     `| Docker/container access | ${containers} |`,

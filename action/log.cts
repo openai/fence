@@ -181,14 +181,14 @@ function setupLines(manifest: any, details: ConfigLogDetails): string[] {
   ];
 }
 
-function readyLine(report: any): string {
+function ready(report: any, environment: LogEnvironment = process.env): void {
   if (report.status === "protected_host_audit_observation") {
-    return "✅ Fence ready: audit mode is observing traffic, not blocking it";
+    success("✅ Fence ready: audit mode is observing traffic, not blocking it", environment);
+  } else if (report.status === "protected_host_block_degraded") {
+    warning("⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence");
+  } else {
+    success("✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down", environment);
   }
-  if (report.status === "protected_host_block_degraded") {
-    return "⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence";
-  }
-  return "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down";
 }
 
 function postEvidenceLine(report: any, auditDestinationCount = 0): string | undefined {
@@ -210,7 +210,7 @@ module.exports = {
   error,
   info,
   postEvidenceLine,
-  readyLine,
+  ready,
   sanitizeLogText,
   setupLines,
   structuredRecord,

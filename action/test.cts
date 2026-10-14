@@ -884,8 +884,8 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
   assert.doesNotMatch(lines, /runtime_evidence_schema_version/);
 
   assert.equal(
-    actionLog.readyLine(report),
-    "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down",
+    captureStdout(() => actionLog.ready(report, { NO_COLOR: "1" })),
+    "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down\n",
   );
 });
 
@@ -931,8 +931,8 @@ test("formats audit and degraded log wording accurately", () => {
     container_status: "preserved_verified",
   };
   assert.equal(
-    actionLog.readyLine(auditReport),
-    "✅ Fence ready: audit mode is observing traffic, not blocking it",
+    captureStdout(() => actionLog.ready(auditReport, { NO_COLOR: "1" })),
+    "✅ Fence ready: audit mode is observing traffic, not blocking it\n",
   );
   assert.equal(
     actionLog.postEvidenceLine(auditReport, 2),
@@ -948,8 +948,8 @@ test("formats audit and degraded log wording accurately", () => {
     container_status: "preserved_unsafe",
   };
   assert.equal(
-    actionLog.readyLine(degraded),
-    "⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence",
+    captureStdout(() => actionLog.ready(degraded)),
+    "::warning::⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence\n",
   );
   assert.equal(
     actionLog.postEvidenceLine(degraded, 0),
@@ -2186,6 +2186,7 @@ test("validates stable runtime evidence", () => {
     validateDnsEvidence(dnsEvidenceFor(withDocker), withDocker);
   }
   const unexpectedDocker = { ...report, resident_health: dockerHealth };
+  assert.throws(() => validateDnsEvidence(dnsEvidenceFor(unexpectedDocker), unexpectedDocker), /worker set/);
   assert.throws(() => validateDnsEvidence(dnsEvidenceFor(unexpectedDocker, {
     docker_dns_routing: "local_root_resident_mediator",
   }), unexpectedDocker), /worker set/);
@@ -3984,7 +3985,9 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   validateReport(degraded);
   const degradedSummary = summaryLines(degraded).join("\n");
   assert.match(degradedSummary, /^### 🟡 Fence Summary/);
-  assert.doesNotMatch(degradedSummary, /🟢/);
+  assert.doesNotMatch(degradedSummary, /🟢|🔒 Block|✅ Restricted/);
+  assert.match(degradedSummary, /⚠️ Block with Docker available/);
+  assert.match(degradedSummary, /⚠️ Host traffic filtered; Docker can bypass Fence/);
   assert.match(degradedSummary, /\| Passwordless sudo \| ✅ Disabled \|/);
   assert.match(degradedSummary, /\| Docker\/container access \| ⚠️ Available; later steps can use Docker to bypass Fence \|/);
 

@@ -689,7 +689,7 @@ function main(): void {
   serviceLaunchSucceeded = true;
   const report = waitForReady(paths);
   readinessObserved = true;
-  log.success(log.readyLine(report));
+  log.ready(report);
 }
 
 if (require.main === module) {

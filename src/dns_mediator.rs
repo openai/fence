@@ -376,22 +376,25 @@ enum DnsEvidenceScope {
 }
 
 impl DnsEvidenceScope {
-    fn mode(self) -> Mode {
+    fn lockdown_posture(self) -> LockdownPosture {
         match self {
-            Self::ProtectedHostAudit => Mode::Audit,
-            Self::SelectedProfileRuntimeTest
-            | Self::ProtectedHostBlock
-            | Self::ProtectedHostBlockDegraded => Mode::Block,
+            Self::ProtectedHostAudit => LockdownPosture::Audit,
+            Self::SelectedProfileRuntimeTest | Self::ProtectedHostBlock => {
+                LockdownPosture::StandardBlock
+            }
+            Self::ProtectedHostBlockDegraded => LockdownPosture::UnsafePreserve,
+        }
+    }
+
+    fn mode(self) -> Mode {
+        match self.lockdown_posture() {
+            LockdownPosture::Audit => Mode::Audit,
+            LockdownPosture::StandardBlock | LockdownPosture::UnsafePreserve => Mode::Block,
         }
     }
 
     fn is_block(self) -> bool {
-        matches!(
-            self,
-            Self::SelectedProfileRuntimeTest
-                | Self::ProtectedHostBlock
-                | Self::ProtectedHostBlockDegraded
-        )
+        self.mode() == Mode::Block
     }
 
     #[cfg(test)]
@@ -504,10 +507,7 @@ impl DnsBlockRuntimeScope {
     }
 
     fn lockdown_posture(self) -> LockdownPosture {
-        match self {
-            Self::TestEvidence | Self::ProductionStandardBlock => LockdownPosture::StandardBlock,
-            Self::ProductionUnsafePreserve => LockdownPosture::UnsafePreserve,
-        }
+        self.dns_scope().lockdown_posture()
     }
 }
 
@@ -1894,7 +1894,7 @@ impl DnsMediationSession {
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
-        let docker_dns = if scope == DnsEvidenceScope::ProtectedHostBlock {
+        let docker_dns = if scope.lockdown_posture() == LockdownPosture::StandardBlock {
             DockerDns::DisabledByPolicy
         } else if runner_docker_available(&executables).map_err(lockdown_error)? {
             DockerDns::Mediated
@@ -2604,9 +2604,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_dns == DockerDns::Mediated
-                || scope.lockdown_posture() == LockdownPosture::UnsafePreserve
-            {
+            if scope.lockdown_posture() == LockdownPosture::UnsafePreserve {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -6234,7 +6232,7 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
-        &initial_resident_health(scope != DnsEvidenceScope::ProtectedHostBlock),
+        &initial_resident_health(scope.lockdown_posture() != LockdownPosture::StandardBlock),
     )
 }
 
@@ -6272,7 +6270,7 @@ fn evidence_from_state_and_authorizations(
             .iter()
             .any(|worker| worker.name == "docker_udp_dns")
         {
-            if scope == DnsEvidenceScope::ProtectedHostBlock {
+            if scope.lockdown_posture() == LockdownPosture::StandardBlock {
                 "not_configured_standard_block"
             } else {
                 "not_present"
@@ -6756,7 +6754,9 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(
+                scope.lockdown_posture() != LockdownPosture::StandardBlock,
+            ))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: report_path.clone(),
             scope,

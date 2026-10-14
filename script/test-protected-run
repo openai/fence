@@ -192,15 +192,33 @@ PY
 sudo /usr/bin/install -d -o root -g root -m 0755 /run/fence "$directory"
 sudo /usr/bin/install -o root -g root -m 0600 "$config_source" "$config"
 
-docker_daemon_config_digest() {
-  if [[ -e /etc/docker/daemon.json ]]; then
-    sha256_file /etc/docker/daemon.json
-  else
-    echo absent
-  fi
+docker_daemon_config_identity() {
+  # Detect replacement and same-content rewrites without reading a root-only file.
+  python3 -E - <<'PY'
+import os
+
+try:
+    config = os.lstat("/etc/docker/daemon.json")
+except FileNotFoundError:
+    print("absent")
+else:
+    print(config.st_dev, config.st_ino, config.st_size, config.st_ctime_ns)
+PY
+}
+
+systemd_starting_units() {
+  # SD_MESSAGE_UNIT_STARTING. Use the same match before and after the cursor.
+  /usr/bin/journalctl --system --boot --quiet --no-pager --output=cat --output-fields=UNIT \
+    "$@" _PID=1 MESSAGE_ID=7d4958e842da4a758f6c1cdc7b36dcc5
 }
 if [[ "$scenario" == standard* ]]; then
-  docker_config_before="$(docker_daemon_config_digest)"
+  docker_config_before="$(docker_daemon_config_identity)"
+  docker_start_cursor=''
+  # The initial capability check can legitimately socket-activate an inactive Docker.
+  if /usr/bin/systemctl is-active --quiet docker.service; then
+    docker_start_cursor="$(systemd_starting_units --lines=1 --show-cursor | sed -n 's/^-- cursor: //p')"
+    [[ -n "$docker_start_cursor" ]] || die "protected standard-block proof could not observe systemd service starts"
+  fi
 fi
 
 # The service intentionally remains resident after this script exits. The
@@ -643,9 +661,16 @@ case "$scenario" in
 esac
 case "$scenario" in
   standard|standard-finalization|standard-opt-out)
-    docker_config_after="$(docker_daemon_config_digest)"
+    docker_config_after="$(docker_daemon_config_identity)"
     if [[ "$docker_config_after" != "$docker_config_before" ]]; then
       die "protected standard-block proof changed Docker's daemon configuration"
+    fi
+    if [[ -n "$docker_start_cursor" ]]; then
+      started_units="$(systemd_starting_units --after-cursor="$docker_start_cursor")"
+      grep -Fxq "$unit" <<<"$started_units" || die "protected standard-block proof did not observe its own service start"
+      if grep -Fxq docker.service <<<"$started_units"; then
+        die "protected standard-block proof restarted Docker before disabling it"
+      fi
     fi
     if docker ps --quiet >/dev/null 2>&1; then
       die "protected standard-block proof did not disable runner Docker access"
