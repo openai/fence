@@ -147,6 +147,7 @@ const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
 const HOST_UDP_BIND_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const HOST_RESOLVER_PATH: &str = "/etc/resolv.conf";
 const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
 const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
 const REVIEWED_RESOLVER_TARGETS: [&str; 2] = [
@@ -1508,12 +1509,8 @@ impl DnsRouting {
         executables: Arc<TrustedExecutableSet>,
         docker_available: bool,
     ) -> Result<Self, DnsMediationError> {
-        let resolver_target = fs::canonicalize("/etc/resolv.conf").map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver target could not be resolved safely",
-            )
-        })?;
+        // Mount and roll back only the target we reviewed, never a later link destination.
+        let resolver_target = Self::reviewed_resolver_target(&executables)?;
         let mut routing = Self {
             executables,
             docker_available,
@@ -1532,7 +1529,6 @@ impl DnsRouting {
     }
 
     fn activate_inner(&mut self) -> Result<(), DnsMediationError> {
-        self.verify_supported_resolver_layout()?;
         if self.resolver_source.exists() {
             return Err(DnsMediationError::new(
                 "dns_routing_conflict",
@@ -1669,70 +1665,61 @@ impl DnsRouting {
         }
     }
 
-    fn verify_supported_resolver_layout(&self) -> Result<(), DnsMediationError> {
-        let resolv_conf = Path::new("/etc/resolv.conf");
-        let metadata = fs::symlink_metadata(resolv_conf).map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver layout does not match the reviewed runner fingerprint",
-            )
-        })?;
-        let canonical = fs::canonicalize(resolv_conf).map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver target could not be resolved safely",
-            )
-        })?;
-        let target_metadata = fs::symlink_metadata(&canonical).map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver target could not be inspected safely",
-            )
-        })?;
-        let (resolver_uid, resolver_gid) = self.reviewed_resolver_service_identity()?;
+    fn reviewed_resolver_target(
+        executables: &TrustedExecutableSet,
+    ) -> Result<PathBuf, DnsMediationError> {
+        use ResolverLayoutFailure as Failure;
+        let canonical = reviewed_resolver_link(
+            Path::new(HOST_RESOLVER_PATH),
+            &REVIEWED_RESOLVER_TARGETS.map(Path::new),
+        )?;
+        let target_metadata =
+            fs::symlink_metadata(&canonical).map_err(|_| Failure::TargetUnavailable)?;
+        let (resolver_uid, resolver_gid) = Self::reviewed_resolver_service_identity(executables)?;
         for path in ["/run", "/run/systemd", "/run/systemd/resolve"] {
-            let metadata = fs::symlink_metadata(path).map_err(|_| unsupported_resolver_layout())?;
+            let metadata = fs::symlink_metadata(path).map_err(|_| Failure::DirectoryUnavailable)?;
             if !metadata.file_type().is_dir()
                 || fs::canonicalize(path).ok().as_deref() != Some(Path::new(path))
-                || (metadata.uid() != 0 && metadata.uid() != resolver_uid)
-                || (metadata.gid() != 0 && metadata.gid() != resolver_gid)
-                || metadata.permissions().mode() & 0o022 != 0
-                || runner_path_writable(&self.executables, path.as_ref(), SOCKET_PROBE_TIMEOUT)
-                    .map_err(lockdown_error)?
             {
-                return Err(unsupported_resolver_layout());
+                return Err(Failure::DirectoryNotCanonical.into());
+            }
+            if (metadata.uid() != 0 && metadata.uid() != resolver_uid)
+                || (metadata.gid() != 0 && metadata.gid() != resolver_gid)
+            {
+                return Err(Failure::DirectoryOwnerNotReviewed.into());
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(Failure::DirectoryPermissionsUnsafe.into());
+            }
+            if runner_path_writable(executables, path.as_ref(), SOCKET_PROBE_TIMEOUT)
+                .map_err(lockdown_error)?
+            {
+                return Err(Failure::DirectoryWritableByRunner.into());
             }
         }
-        if !resolver_layout_is_supported(
-            metadata.file_type().is_symlink(),
-            &canonical,
+        validate_resolver_target_metadata(
             target_metadata.file_type().is_file(),
-            target_metadata.file_type().is_symlink(),
             (target_metadata.uid(), target_metadata.gid()),
             target_metadata.permissions().mode() & 0o7777,
             (resolver_uid, resolver_gid),
-        ) {
-            return Err(unsupported_resolver_layout());
-        }
-        if runner_path_writable(
-            &self.executables,
-            canonical.as_os_str(),
-            SOCKET_PROBE_TIMEOUT,
-        )
-        .map_err(lockdown_error)?
+        )?;
+        if runner_path_writable(executables, canonical.as_os_str(), SOCKET_PROBE_TIMEOUT)
+            .map_err(lockdown_error)?
         {
-            return Err(unsupported_resolver_layout());
+            return Err(Failure::TargetWritableByRunner.into());
         }
-        Ok(())
+        Ok(canonical)
     }
 
-    fn reviewed_resolver_service_identity(&self) -> Result<(u32, u32), DnsMediationError> {
-        let (uid, gid) = self
-            .executables
+    fn reviewed_resolver_service_identity(
+        executables: &TrustedExecutableSet,
+    ) -> Result<(u32, u32), DnsMediationError> {
+        use ResolverLayoutFailure as Failure;
+        let (uid, gid) = executables
             .reviewed_resolver_identity()
             .map_err(|error| DnsMediationError::new(error.code, error.message))?;
         let output = lockdown_fixed_command(
-            &self.executables,
+            executables,
             TrustedExecutable::Systemctl,
             &[
                 "show",
@@ -1742,28 +1729,31 @@ impl DnsRouting {
             ],
         )
         .map_err(lockdown_error)?;
+        if !output.status.success() {
+            return Err(Failure::ServiceQueryFailed.into());
+        }
         let pid = std::str::from_utf8(&output.stdout)
             .ok()
             .and_then(reviewed_resolver_service_pid)
-            .ok_or_else(unsupported_resolver_layout)?;
-        if !output.status.success() {
-            return Err(unsupported_resolver_layout());
-        }
+            .ok_or(Failure::ServicePidUnavailable)?;
         let process = PathBuf::from(format!("/proc/{pid}"));
-        let process_metadata = fs::metadata(&process).map_err(|_| unsupported_resolver_layout())?;
+        let process_metadata =
+            fs::metadata(&process).map_err(|_| Failure::ServiceProcessUnavailable)?;
+        if process_metadata.uid() != uid {
+            return Err(Failure::ServiceOwnerNotReviewed.into());
+        }
         let executable = process.join("exe");
         let executable_path =
-            fs::canonicalize(executable).map_err(|_| unsupported_resolver_layout())?;
+            fs::canonicalize(executable).map_err(|_| Failure::ServiceExecutableUnavailable)?;
         let executable_metadata =
-            fs::metadata(&executable_path).map_err(|_| unsupported_resolver_layout())?;
-        if process_metadata.uid() != uid
-            || executable_path != Path::new("/usr/lib/systemd/systemd-resolved")
+            fs::metadata(&executable_path).map_err(|_| Failure::ServiceExecutableUnavailable)?;
+        if executable_path != Path::new("/usr/lib/systemd/systemd-resolved")
             || !executable_metadata.file_type().is_file()
             || executable_metadata.uid() != 0
             || executable_metadata.gid() != 0
             || executable_metadata.permissions().mode() & 0o022 != 0
         {
-            return Err(unsupported_resolver_layout());
+            return Err(Failure::ServiceExecutableNotReviewed.into());
         }
         Ok((uid, gid))
     }
@@ -1808,31 +1798,59 @@ impl DnsRouting {
                 "active resolver mount does not match the reviewed direct-query routing",
             ));
         }
+        // Matching mount evidence is not enough if the host now uses a different path.
+        verify_live_resolver_target(Path::new(HOST_RESOLVER_PATH), &self.resolver_target)?;
         Ok(())
     }
 }
 
-fn resolver_layout_is_supported(
-    resolv_conf_is_symlink: bool,
-    canonical_target: &Path,
+fn resolver_link_target(link: &Path) -> Result<PathBuf, ResolverLayoutFailure> {
+    let metadata =
+        fs::symlink_metadata(link).map_err(|_| ResolverLayoutFailure::LinkUnavailable)?;
+    if !metadata.file_type().is_symlink() {
+        return Err(ResolverLayoutFailure::LinkNotSymlink);
+    }
+    fs::canonicalize(link).map_err(|_| ResolverLayoutFailure::TargetUnavailable)
+}
+
+fn reviewed_resolver_link(
+    link: &Path,
+    reviewed: &[&Path],
+) -> Result<PathBuf, ResolverLayoutFailure> {
+    let target = resolver_link_target(link)?;
+    if !reviewed.contains(&target.as_path()) {
+        return Err(ResolverLayoutFailure::TargetNotReviewed);
+    }
+    Ok(target)
+}
+
+fn verify_live_resolver_target(link: &Path, expected: &Path) -> Result<(), ResolverLayoutFailure> {
+    if resolver_link_target(link)? != expected {
+        return Err(ResolverLayoutFailure::TargetChanged);
+    }
+    Ok(())
+}
+
+fn validate_resolver_target_metadata(
     target_is_file: bool,
-    target_is_symlink: bool,
     target_identity: (u32, u32),
     target_mode: u32,
     resolver_identity: (u32, u32),
-) -> bool {
+) -> Result<(), ResolverLayoutFailure> {
     let (target_uid, target_gid) = target_identity;
     let (resolver_uid, resolver_gid) = resolver_identity;
-    resolv_conf_is_symlink
-        && REVIEWED_RESOLVER_TARGETS
-            .iter()
-            .any(|target| canonical_target == Path::new(target))
-        && target_is_file
-        && !target_is_symlink
-        && (target_uid == 0 || target_uid == resolver_uid)
-        && (target_gid == 0 || target_gid == resolver_gid)
-        && target_mode & 0o7022 == 0
-        && target_mode & 0o400 != 0
+    if !target_is_file {
+        return Err(ResolverLayoutFailure::TargetNotRegularFile);
+    }
+    if (target_uid != 0 && target_uid != resolver_uid)
+        || (target_gid != 0 && target_gid != resolver_gid)
+    {
+        return Err(ResolverLayoutFailure::TargetOwnerNotReviewed);
+    }
+    if target_mode & 0o7022 != 0 || target_mode & 0o400 == 0 {
+        return Err(ResolverLayoutFailure::TargetPermissionsUnsafe);
+    }
+    Ok(())
 }
 
 fn reviewed_resolver_service_pid(contents: &str) -> Option<u32> {
@@ -1841,10 +1859,50 @@ fn reviewed_resolver_service_pid(contents: &str) -> Option<u32> {
     (pid != 0 && lines.next().is_none()).then_some(pid)
 }
 
-fn unsupported_resolver_layout() -> DnsMediationError {
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResolverLayoutFailure {
+    LinkUnavailable,
+    LinkNotSymlink,
+    TargetUnavailable,
+    TargetNotReviewed,
+    TargetChanged,
+    TargetNotRegularFile,
+    TargetOwnerNotReviewed,
+    TargetPermissionsUnsafe,
+    TargetWritableByRunner,
+    DirectoryUnavailable,
+    DirectoryNotCanonical,
+    DirectoryOwnerNotReviewed,
+    DirectoryPermissionsUnsafe,
+    DirectoryWritableByRunner,
+    ServiceQueryFailed,
+    ServicePidUnavailable,
+    ServiceProcessUnavailable,
+    ServiceOwnerNotReviewed,
+    ServiceExecutableUnavailable,
+    ServiceExecutableNotReviewed,
+}
+
+impl From<ResolverLayoutFailure> for DnsMediationError {
+    fn from(reason: ResolverLayoutFailure) -> Self {
+        resolver_layout_error(reason, &mut std::io::stderr().lock())
+    }
+}
+
+fn resolver_layout_error(
+    reason: ResolverLayoutFailure,
+    journal: &mut impl Write,
+) -> DnsMediationError {
+    // The first failed check, never the observed path, owner, mode, PID or system error.
+    let _ = writeln!(
+        journal,
+        "{}",
+        serde_json::json!({"fence_resolver_layout": {"reason": reason}})
+    );
     DnsMediationError::new(
         "unsupported_resolver_layout",
-        "host DNS resolver does not meet the reviewed ownership and routing requirements",
+        "host DNS resolver failed a reviewed layout check",
     )
 }
 
@@ -2268,11 +2326,14 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(error);
         }
-        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline) {
+        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline)
+            .map_err(local_control_error)
+            .and_then(|_| mediation.routing.verify_active_resolver_mount())
+        {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
             let _ = runtime.replace_report(&evidence);
-            return Err(local_control_error(error));
+            return Err(error);
         }
 
         evidence.setup_status = "verified_before_observation_ready";
@@ -2675,12 +2736,15 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(error);
         }
-        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline) {
+        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline)
+            .map_err(local_control_error)
+            .and_then(|_| mediation.routing.verify_active_resolver_mount())
+        {
             evidence.setup_status = "failed_pre_ready";
             evidence.rollback_status =
                 rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
             let _ = runtime.replace_report(&evidence);
-            return Err(local_control_error(error));
+            return Err(error);
         }
         evidence.setup_status = "verified_before_test_ready";
         if let Err(error) = runtime.replace_report(&evidence) {
@@ -12716,99 +12780,78 @@ mod tests {
     }
 
     #[test]
-    fn resolver_layout_rejects_unreviewed_targets_owners_and_modes() {
-        let accepted_target = Path::new(REVIEWED_RESOLVER_TARGETS[0]);
-        for target in REVIEWED_RESOLVER_TARGETS {
-            for (uid, gid, mode) in [(991, 992, 0o644), (0, 0, 0o640), (1201, 1202, 0o444)] {
-                let resolver_uid = if uid == 0 { 991 } else { uid };
-                let resolver_gid = if gid == 0 { 992 } else { gid };
-                assert!(resolver_layout_is_supported(
-                    true,
-                    Path::new(target),
-                    true,
-                    false,
-                    (uid, gid),
-                    mode,
-                    (resolver_uid, resolver_gid),
-                ));
-            }
+    fn live_resolver_link_must_reach_the_reviewed_path_even_when_backing_identity_matches() {
+        use ResolverLayoutFailure as Failure;
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "fence-resolver-link-{}-{}",
+            std::process::id(),
+            TEST_REPORT_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let link = root.join("resolv.conf");
+        let first = root.join("first");
+        let second = root.join("second");
+        assert_eq!(resolver_link_target(&link), Err(Failure::LinkUnavailable));
+        symlink(&first, &link).unwrap();
+        assert_eq!(resolver_link_target(&link), Err(Failure::TargetUnavailable));
+        fs::write(&first, RESOLVER_SOURCE_CONTENTS).unwrap();
+        assert_eq!(resolver_link_target(&first), Err(Failure::LinkNotSymlink));
+        assert_eq!(
+            reviewed_resolver_link(&link, &[&second]),
+            Err(Failure::TargetNotReviewed)
+        );
+        let reviewed = reviewed_resolver_link(&link, &[&first, &second]).unwrap();
+        assert_eq!(reviewed, first);
+        assert_eq!(verify_live_resolver_target(&link, &reviewed), Ok(()));
+
+        fs::hard_link(&first, &second).unwrap();
+        let pending_link = root.join("new-link");
+        symlink(&second, &pending_link).unwrap();
+        fs::rename(pending_link, &link).unwrap();
+        assert!(paths_have_same_identity(&first, &second));
+        assert_eq!(
+            verify_live_resolver_target(&link, &reviewed),
+            Err(Failure::TargetChanged)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolver_layout_checks_regular_target_owner_and_permissions() {
+        use ResolverLayoutFailure as Failure;
+        for (uid, gid, mode) in [(991, 992, 0o644), (0, 0, 0o640), (1201, 1202, 0o444)] {
+            let resolver = if uid == 0 { (991, 992) } else { (uid, gid) };
+            assert_eq!(
+                validate_resolver_target_metadata(true, (uid, gid), mode, resolver),
+                Ok(())
+            );
         }
-        for unsupported in [
-            resolver_layout_is_supported(
-                false,
-                accepted_target,
-                true,
-                false,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                Path::new("/run/unreviewed/resolv.conf"),
-                true,
-                false,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                false,
-                false,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                true,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (1000, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (991, 1000),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (991, 992),
-                0o666,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (991, 992),
-                0o244,
-                (991, 992),
-            ),
+        for (regular, uid, gid, mode, reason) in [
+            (false, 991, 992, 0o644, Failure::TargetNotRegularFile),
+            (true, 1000, 992, 0o644, Failure::TargetOwnerNotReviewed),
+            (true, 991, 1000, 0o644, Failure::TargetOwnerNotReviewed),
+            (true, 991, 992, 0o666, Failure::TargetPermissionsUnsafe),
+            (true, 991, 992, 0o244, Failure::TargetPermissionsUnsafe),
         ] {
-            assert!(!unsupported);
+            assert_eq!(
+                validate_resolver_target_metadata(regular, (uid, gid), mode, (991, 992)),
+                Err(reason)
+            );
         }
+    }
+
+    #[test]
+    fn unsupported_resolver_layout_reports_only_the_failed_check() {
+        let mut journal = Vec::new();
+        let error = resolver_layout_error(ResolverLayoutFailure::TargetChanged, &mut journal);
+        assert_eq!(error.code, "unsupported_resolver_layout");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&journal).unwrap(),
+            serde_json::json!({"fence_resolver_layout": {"reason": "target_changed"}}),
+        );
+        assert_eq!(journal.iter().filter(|&&byte| byte == b'\n').count(), 1);
     }
 
     #[test]

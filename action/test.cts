@@ -53,6 +53,7 @@ const {
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
   residentServiceArgs,
+  resolverLayoutDiagnosticFromJournal,
   run,
   terminalServiceStatus,
 } = require("./main.cts");
@@ -1128,6 +1129,7 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
       `arbitrary journal text ${sensitive}`,
       JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code: "dns_proxy_bind_failed", message: sensitive } }),
       JSON.stringify({ fence_dns_startup: { listener: "host", protocol: "udp", operation: "bind", reason: "address_in_use", detail: sensitive } }),
+      JSON.stringify({ fence_resolver_layout: { reason: "target_changed", path: sensitive } }),
     ].join("\n"),
   };
   const previousDebug = process.env.RUNNER_DEBUG;
@@ -1139,6 +1141,13 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
     assert.match(output, /Fence resident error code: dns_proxy_bind_failed/);
     assert.match(output, /Fence DNS startup: host UDP bind: address already in use/);
     assert.ok(!output.includes(sensitive));
+    assert.doesNotMatch(output, /Fence host resolver:/);
+
+    journal.stdout = journal.stdout.replace("dns_proxy_bind_failed", "unsupported_resolver_layout");
+    const resolverOutput = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    assert.match(resolverOutput, /Fence host resolver: target changed/);
+    assert.doesNotMatch(resolverOutput, /Fence DNS startup:/);
+    assert.ok(!resolverOutput.includes(sensitive));
   } finally {
     if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
     else process.env.RUNNER_DEBUG = previousDebug;
@@ -1251,6 +1260,20 @@ test("DNS startup diagnostics never forward arbitrary error details or injected 
   assert.equal(dnsStartupDiagnosticFromJournal(line({ ...d, extra: "x".repeat(4096) })), undefined);
   assert.equal(dnsStartupDiagnosticFromJournal(`${line(d)}\n${line({ ...d, reason: "::error::secret" })}`),
     "docker UDP bind: address unavailable");
+});
+
+test("host resolver diagnostics show only a fixed failed check, never journal details", () => {
+  const parse = resolverLayoutDiagnosticFromJournal;
+  const line = (reason: unknown, detail: unknown = undefined) =>
+    JSON.stringify({ fence_resolver_layout: { reason, detail } });
+  for (const reason of ["link_unavailable", "target_changed", "directory_writable_by_runner", "service_pid_unavailable"]) {
+    assert.equal(parse(line(reason, "secret path\n::error::injected")), reason.replaceAll("_", " "));
+  }
+  for (const reason of [undefined, null, {}, [], ["target_changed"], 1, "__proto__", "constructor", "target_changed\n::error::injected"]) {
+    assert.equal(parse(line(reason)), undefined);
+  }
+  assert.equal(parse(line("target_changed", "x".repeat(4096))), undefined);
+  assert.equal(parse(`${line("target_changed")}\nnoise\n${line("secret reason")}`), "target changed");
 });
 
 test("derives only bounded fixed runtime paths", () => {
