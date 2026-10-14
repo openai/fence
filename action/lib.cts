@@ -2379,6 +2379,8 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
     "<details>",
     "<summary>View allowlist example</summary>",
     "",
+    "DNS matches are hints, not proof that a connection used that name or that block mode would allow it.",
+    "",
     "```yaml",
     "- uses: openai/fence@<commit-sha>",
     "  with:",
@@ -2513,7 +2515,8 @@ function addConnectionFindingActivity(
   report: any,
   dnsEvidence: any,
 ): void {
-  const addressMap = dnsAddressHostnameMap(dnsEvidence);
+  // In audit, report the address we observed. DNS can guide suggestions, not identify the connection's hostname.
+  const addressMap = report.mode === "audit" ? undefined : dnsAddressHostnameMap(dnsEvidence);
   const findings = Array.isArray(report.findings) ? report.findings.slice(0, 1024) : [];
   for (const finding of findings) {
     if (
@@ -2535,10 +2538,7 @@ function addConnectionFindingActivity(
     if (decision === undefined) {
       continue;
     }
-    // A matching transport is not proof that the connection used a particular hostname.
-    const hostnames = auditMatchesRecentHostnamePolicy(report, finding)
-      ? []
-      : Array.from(addressMap.get(finding.remote_address) || []).sort();
+    const hostnames = Array.from(addressMap?.get(finding.remote_address) || []).sort();
     const destinations = hostnames.length > 0 ? hostnames : [finding.remote_address];
     const actor = findingActorLabel(finding);
     for (const destination of destinations) {

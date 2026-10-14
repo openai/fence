@@ -480,7 +480,6 @@ if [[ "$scenario" == "standard" ]]; then
   assert_action_runtime_immutable
 fi
 
-sleep 6
 python3 -E - "$scenario" "$report" "$dns_report" "$docker_lifecycle_start_sequence" <<'PY'
 import sys
 
@@ -497,7 +496,7 @@ import sys
 import time
 
 sys.path.insert(0, "script/lib")
-from dns_evidence import validate_materialization_rejections
+from dns_evidence import validate_materialization_rejections, wait_for_audit_probe_evidence
 
 expected_workers = [
     {"name": "host_tcp_dns", "status": "running"},
@@ -508,8 +507,12 @@ expected_workers = [
 scenario = sys.argv[1]
 report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:4])
 docker_lifecycle_start_sequence = int(sys.argv[4])
-report = json.loads(report_path.read_text(encoding="utf-8"))
-dns = json.loads(dns_path.read_text(encoding="utf-8"))
+if scenario == "audit":
+    report, dns = wait_for_audit_probe_evidence(report_path, dns_path)
+else:
+    time.sleep(6)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    dns = json.loads(dns_path.read_text(encoding="utf-8"))
 if dns.get("docker_dns_routing") == "local_root_resident_mediator":
     expected_workers[:0] = [
         {"name": "docker_tcp_dns", "status": "running"},
@@ -575,22 +578,6 @@ if scenario == "audit":
     require(report["counters"]["total_violations"] >= 1)
     require(report["counters"]["sampled_violations"] >= 1)
     require(dns["excluded_unretained_query_count"] == 0)
-    attempts = {
-        (item["remote_address"], item["protocol"], item["rule_class"])
-        for item in report["findings"]
-        if item["classification"] == "would_block" and item["remote_port"] == 443
-    }
-    require(("192.0.2.10", "udp", "undeclared_new_egress") in attempts, "missing direct-IP audit probe")
-    for hostname, classification, rule in (
-        ("github.com", "platform_profile", "matches_recent_hostname_policy"),
-        ("www.google.com", "outside_policy", "undeclared_new_egress"),
-    ):
-        require(any(
-            (address, "tcp", rule) in attempts
-            for observation in dns["observations"]
-            if observation["hostname"] == hostname and observation["policy_classification"] == classification
-            for address in observation["resolved_addresses"]
-        ), f"missing {hostname} audit probe ({rule})")
 PY
 
 if [[ "$scenario" == "standard" ]]; then

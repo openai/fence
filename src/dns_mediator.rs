@@ -1431,7 +1431,8 @@ impl ObservationRecorder {
             grant.expires_at > now
                 && (grant.address, grant.protocol, grant.port) == (address, protocol, port)
         }) {
-            // Preserve the observed would-block decision; we don't know which hostname was used.
+            // Match at NFLOG dequeue, not packet time. The policy lifetime includes block's refresh overlap.
+            // This guides IP suggestions; it doesn't identify a hostname or change the would-block observation.
             finding.rule_class = AUDIT_HOSTNAME_POLICY_MATCH.to_owned();
         }
     }

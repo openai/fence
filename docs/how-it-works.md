@@ -23,7 +23,7 @@ Fence does not turn network or privilege access back on. GitHub discards the run
 
 Block mode is the default. It allows the runner's required connections and your allowlisted destinations, blocks other network access, and disables passwordless `sudo` and Docker.
 
-Audit mode shows what block mode would reject without blocking traffic or disabling `sudo` and Docker. Use it to find the destinations a job needs.
+Audit mode helps you find the destinations a job needs. It doesn't block traffic, disable `sudo` or Docker, or predict exactly what block mode would reject.
 
 If a job needs Docker, use `container_policy: unsafe_preserve`. If it needs GitHub artifacts, Pages, or caches, use `allow_github_artifacts: true`. Both options make it easier for a job to send data or bypass isolation, so turn them on only when needed.
 
@@ -76,15 +76,10 @@ The job log stores the report on one line. `jq` formats it like this:
   },
   "network": [
     {
-      "destination_kind": "hostname",
-      "destination": "api.example.com",
+      "destination_kind": "ip",
+      "destination": "203.0.113.10",
       "decision": "would_block",
       "activities": [
-        {
-          "kind": "dns_query",
-          "query_type": "a",
-          "count": 1
-        },
         {
           "kind": "connection_attempt",
           "protocol": "tcp",
@@ -98,7 +93,21 @@ The job log stores the report on one line. `jq` formats it like this:
           "count": 2
         }
       ],
-      "count": 3
+      "count": 2
+    },
+    {
+      "destination_kind": "hostname",
+      "destination": "api.example.com",
+      "decision": "would_block",
+      "activities": [
+        {
+          "kind": "dns_query",
+          "query_type": "a",
+          "count": 1
+        }
+      ],
+      "actors": [],
+      "count": 1
     }
   ],
   "warnings": {
@@ -148,6 +157,10 @@ The job log stores the report on one line. `jq` formats it like this:
 }
 ```
 
-Anyone who can read the job log can read this report. In audit mode, `would_block` means a request was observed but not denied. Fence can show a connection to an IP without suggesting you add that IP to your allowlist: a recent allowed DNS answer may already cover the address, protocol, and port. That match doesn't tell us which hostname the connection used. In block mode, blocking a request is normal and does not turn a healthy job into a warning.
+Anyone who can read the job log can read this report. In audit mode, `would_block` means Fence observed the request but didn't deny it. DNS rows show names; connection rows show the IP Fence actually saw.
+
+Fence may skip suggesting an IP if recent allowed DNS activity matches the address, protocol, and port. It checks when it reads the connection, not when the packet was sent, and keeps DNS matches briefly past their advertised lifetime. Treat the suggestion as a starting point, not proof that the connection used that name or that block mode would allow it.
+
+In block mode, blocking a request is normal and does not turn a healthy job into a warning.
 
 For implementation details and the complete security contract, see the [v0 specification](v0.md), [threat model](threat-model.md), and [security guide](security.md).
