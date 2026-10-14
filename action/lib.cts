@@ -13,6 +13,7 @@ type RuntimePaths = {
   report: string;
   dnsReport: string;
   unit: string;
+  launcherHostClaim: string;
   launcherDirectory: string;
   launcherActionDirectory: string;
   launcherIntegrity: string;
@@ -921,6 +922,7 @@ function runtimePaths(invocationId: unknown): RuntimePaths {
     report: path.join(directory, "report.json"),
     dnsReport: path.join(directory, "dns-report.json"),
     unit: `fence-${invocationId}.service`,
+    launcherHostClaim: path.join(LAUNCHER_RUNTIME_ROOT, ".active"),
     launcherDirectory,
     launcherActionDirectory: path.join(launcherDirectory, "action"),
     launcherIntegrity: path.join(launcherDirectory, "integrity.json"),

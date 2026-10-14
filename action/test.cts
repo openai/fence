@@ -1117,7 +1117,7 @@ test("recognizes terminal service state and only bounded structured Fence error 
   }
 });
 
-test("failed launches permit cleanup only for a stopped resident and a definitely absent readiness marker", () => {
+test("failed launches permit cleanup only for a stopped resident with no readiness or DNS ownership marker", () => {
   const stopped = { error: false, status: 0, stdout: "ActiveState=failed\nSubState=failed\nMainPID=0\n" };
   const absent = () => undefined;
   assert.equal(provisionalCleanupPreservationReason(stopped, absent), undefined);
@@ -1138,7 +1138,7 @@ test("failed launches permit cleanup only for a stopped resident and a definitel
   const rootFile = { uid: 0, mode: 0o644, isFile: () => true };
   assert.match(provisionalCleanupPreservationReason(stopped, () => rootFile), /root-owned readiness marker/);
   assert.match(provisionalCleanupPreservationReason(stopped,
-    (name: string) => name === "resolv.conf" ? rootFile : undefined), /host DNS rollback may be incomplete/);
+    (name: string) => name === "dns-routing-owned" ? rootFile : undefined), /provisional DNS or host-control rollback may be incomplete/);
   for (const untrusted of [
     () => ({ ...rootFile, uid: 1000 }),
     () => ({ ...rootFile, mode: 0o666 }),
@@ -1294,10 +1294,12 @@ test("derives only bounded fixed runtime paths", () => {
     report: "/run/fence/action-test/report.json",
     dnsReport: "/run/fence/action-test/dns-report.json",
     unit: "fence-action-test.service",
+    launcherHostClaim: "/run/fence-launcher/.active",
     launcherDirectory: "/run/fence-launcher/action-test",
     launcherActionDirectory: "/run/fence-launcher/action-test/action",
     launcherIntegrity: "/run/fence-launcher/action-test/integrity.json",
   });
+  assert.throws(() => runtimePaths(".active"), /slug grammar/);
   assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
 });

@@ -55,6 +55,8 @@ let launcherPaths: ReturnType<typeof runtimePaths> | undefined;
 let protectedActionPathGuards: string[] = [];
 let protectedActionMounted = false;
 let readinessObserved = false;
+let launcherHostClaimCreated = false;
+let launcherMountUncertain = false;
 let launcherDirectoryCreated = false;
 let runtimeDirectoryCreated = false;
 
@@ -353,16 +355,29 @@ function createInvocationDirectory(directory: string): void {
   run("/usr/bin/sudo", ["/usr/bin/mkdir", "--mode=0755", "--", directory]);
 }
 
+function bindLauncherMount(source: string, target: string): void {
+  // A failed mount command may have taken effect. Never release the host claim on that ambiguity.
+  launcherMountUncertain = true;
+  run("/usr/bin/sudo", ["/usr/bin/mount", "--bind", source, target]);
+  launcherMountUncertain = false;
+}
+
 function installProtectedActionRuntime(
   invocationId: string,
   paths: ReturnType<typeof runtimePaths>,
   sourceFiles: ReturnType<typeof actionRuntimeFileDigests>,
   sourceManifest: any,
 ): void {
-  if (pathEntryExists(paths.launcherDirectory)) {
-    throw new Error("Fence launcher invocation directory already exists");
+  createOrValidateRootDirectory(path.dirname(paths.launcherHostClaim));
+  if (pathEntryExists(paths.launcherHostClaim)) {
+    throw new Error("Fence already owns this runner; run Fence only once per job");
   }
-  createOrValidateRootDirectory("/run/fence-launcher");
+  // Action, guard, and resolver mounts are host-wide, not isolated by invocation ID.
+  createInvocationDirectory(paths.launcherHostClaim);
+  launcherHostClaimCreated = true;
+  if (pathEntryExists(paths.directory) || pathEntryExists(paths.launcherDirectory)) {
+    throw new Error("Fence invocation directory already exists");
+  }
   createInvocationDirectory(paths.launcherDirectory);
   launcherDirectoryCreated = true;
   assertRootDirectory(paths.launcherDirectory);
@@ -440,23 +455,13 @@ function installProtectedActionRuntime(
   );
 
   for (const guard of pathGuards) {
-    run("/usr/bin/sudo", [
-      "/usr/bin/mount",
-      "--bind",
-      guard.path,
-      guard.path,
-    ]);
+    bindLauncherMount(guard.path, guard.path);
     protectedActionPathGuards.push(guard.path);
     const evidence = activeActionMountEvidence(guard.path);
     validateActionPathGuardMount(evidence.raw, guard.path, evidence.mountId);
   }
 
-  run("/usr/bin/sudo", [
-    "/usr/bin/mount",
-    "--bind",
-    paths.launcherActionDirectory,
-    ACTION_ROOT,
-  ]);
+  bindLauncherMount(paths.launcherActionDirectory, ACTION_ROOT);
   protectedActionMounted = true;
   run("/usr/bin/sudo", [
     "/usr/bin/mount",
@@ -508,7 +513,7 @@ function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
 
 function provisionalCleanupPreservationReason(
   status: ReturnType<typeof capture>,
-  inspect: (name: "ready.json" | "resolv.conf") => { uid: number; mode: number; isFile(): boolean } | undefined,
+  inspect: (name: "ready.json" | "dns-routing-owned") => { uid: number; mode: number; isFile(): boolean } | undefined,
 ): string | undefined {
   // A timed-out systemd-run may still have launched the resident. Establish that
   // it stopped *before* looking for its marker, so readiness cannot race cleanup.
@@ -522,17 +527,21 @@ function provisionalCleanupPreservationReason(
         ? "the resident created its root-owned readiness marker"
         : "readiness could not be safely determined";
     }
-    // Native rollback retains this source when it cannot unmount the host resolver.
-    return inspect("resolv.conf") === undefined ? undefined : "host DNS rollback may be incomplete";
+    // Root removes this marker only after host, Docker DNS, and any prior control rollback succeed.
+    return inspect("dns-routing-owned") === undefined ? undefined : "provisional DNS or host-control rollback may be incomplete";
   } catch {
     // Only definite absence in the root-owned invocation directory permits removal.
-    return "readiness and host DNS rollback could not be safely determined";
+    return "readiness and provisional DNS rollback could not be safely determined";
   }
 }
 
 function cleanupLauncherBeforeReadiness(): void {
   const paths = launcherPaths;
-  if (!paths || !launcherDirectoryCreated || readinessObserved) {
+  if (!paths || !launcherHostClaimCreated || readinessObserved) {
+    return;
+  }
+  if (launcherMountUncertain) {
+    log.warning("Fence kept its host claim because a mount outcome is uncertain; runner teardown will remove it");
     return;
   }
   try {
@@ -564,14 +573,19 @@ function cleanupLauncherBeforeReadiness(): void {
       ]);
       runtimeDirectoryCreated = false;
     }
-    run("/usr/bin/sudo", [
-      "/usr/bin/rm",
-      "--recursive",
-      "--force",
-      "--one-file-system",
-      paths.launcherDirectory,
-    ]);
-    launcherDirectoryCreated = false;
+    if (launcherDirectoryCreated) {
+      run("/usr/bin/sudo", [
+        "/usr/bin/rm",
+        "--recursive",
+        "--force",
+        "--one-file-system",
+        paths.launcherDirectory,
+      ]);
+      launcherDirectoryCreated = false;
+    }
+    // Last operation: no other launch can acquire the host while this cleanup is running.
+    run("/usr/bin/sudo", ["/usr/bin/rmdir", "--", paths.launcherHostClaim]);
+    launcherHostClaimCreated = false;
   } catch {
     log.warning("Fence could not remove its provisional launcher state; runner teardown will remove it");
   }
@@ -672,9 +686,6 @@ function main(): void {
     `unit=${paths.unit}`,
   ]);
 
-  if (pathEntryExists(paths.directory)) {
-    throw new Error("Fence runtime invocation directory already exists");
-  }
   installProtectedActionRuntime(
     config.invocationId,
     paths,

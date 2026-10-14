@@ -335,6 +335,7 @@ fi
 if [[ -e "/run/fence/$runtime_failure_invocation" || -e "/run/fence-launcher/$runtime_failure_invocation" ]]; then
   die "Action runtime-failure evidence left provisional runtime state"
 fi
+[[ ! -e /run/fence-launcher/.active ]] || die "failed Fence startup retained its provisional host claim"
 resolver_after="$(host_resolver_identity)"
 [[ "$resolver_after" == "$resolver_before" ]] || die "failed Fence startup did not restore the original host resolver"
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
