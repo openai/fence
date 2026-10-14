@@ -17,7 +17,7 @@ jobs:
         run: script/test
 ```
 
-Copy the full commit SHA and version from a [published release](https://github.com/openai/fence/releases). Each release includes a ready-to-use pin. The `main` branch does not contain the bundled Action, so it cannot be used directly.
+Copy the full commit SHA and version from the [latest verified release](https://github.com/openai/fence/releases/latest). The `main` branch does not contain the bundled Action, so it cannot be used directly.
 
 Use a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Releases are tested on both, and Fence verifies the runner's security controls even when GitHub updates its images.
 

@@ -193,7 +193,7 @@ if grep -nE "^[[:space:]]*['\"]?workflow_dispatch['\"]?[[:space:]]*:" "$DIR/.git
 fi
 
 require_pattern "$DIR/.github/workflows/release.yml" 'gh release download "\$VERSION_TAG" --repo "\$GITHUB_REPOSITORY" --dir published-assets' "release verify job must download release assets with an explicit repository"
-require_pattern "$DIR/.github/workflows/release.yml" 'release_args[+]=[(]--prerelease[)]' "release workflow must mark prerelease versions as prereleases"
+require_pattern "$DIR/.github/workflows/release.yml" '[[:space:]]--latest=false$' "release workflow must not advertise a release before final verification"
 require_pattern "$DIR/.github/workflows/release.yml" 'gh release create "\$VERSION_TAG" "\$\{assets\[@\]\}" "\$\{release_args\[@\]\}"' "release workflow must create immutable releases with the complete asset list"
 if grep -nE 'gh release upload' "$DIR/.github/workflows/release.yml"; then
   die ".github/workflows/release.yml must upload assets through gh release create before immutable publication"
@@ -203,10 +203,10 @@ require_pattern "$DIR/.github/workflows/release.yml" 'queue:[[:space:]]+max' "re
 require_pattern "$DIR/.github/workflows/release.yml" 'cancel-in-progress:[[:space:]]+false' "release workflow concurrency must not cancel an active release"
 require_pattern "$DIR/.github/workflows/release.yml" 'createCommitOnBranch' "release workflow must create the generated Action commit through GitHub GraphQL"
 require_pattern "$DIR/.github/workflows/release.yml" 'expectedHeadOid' "release workflow must protect generated commit creation with the expected source head"
-require_pattern "$DIR/.github/workflows/release.yml" 'wasSignedByGitHub' "release workflow must require GitHub-signed distribution commits"
+require_pattern "$DIR/script/lib/action_release.py" '"wasSignedByGitHub"[)] is not True' "release verifier must require GitHub-signed distribution commits"
 require_pattern "$DIR/.github/workflows/release.yml" 'action-release[.]json' "release workflow must publish the source-to-Action mapping"
 require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py classify-state' "release workflow must use the tested release-state classifier"
-require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py verify-commit' "release workflow must use the tested distribution-commit verifier"
+require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/release_adoption[.]py verify-commit' "release workflow must use the tested distribution-commit verifier"
 require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py validate-mapping' "release workflow must use the tested release-mapping verifier"
 require_pattern "$DIR/.github/workflows/release.yml" 'release-verified/[$][{]VERSION_TAG[}]' "release workflow must distinguish verified cleanup recovery from withdrawal"
 require_pattern "$DIR/.github/workflows/release.yml" 'script/lib/action_release[.]py probe-release' "release workflow must use one bounded release-state probe"

@@ -1,6 +1,6 @@
 # Configuration Examples 🧪
 
-Copy the full commit SHA and matching version from a [Fence release](https://github.com/openai/fence/releases). Add Fence before checkout and the rest of your job.
+Copy the full commit SHA and matching version from the [latest verified Fence release](https://github.com/openai/fence/releases/latest). Add Fence before checkout and the rest of your job.
 
 ## Default Block Mode
 

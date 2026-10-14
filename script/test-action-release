@@ -9,16 +9,19 @@ require_cmd python3
 python3 -B -E - "$DIR" <<'PY'
 import copy
 import hashlib
-import importlib.util
 import json
 import pathlib
+import subprocess
 import tempfile
+import textwrap
 import sys
+from unittest import mock
+import urllib.error
 
 root = pathlib.Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("action_release", root / "script/lib/action_release.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+sys.path.insert(0, str(root / "script/lib"))
+import action_release as module
+import release_adoption as adoption
 
 
 def expect_error(callable_value, message):
@@ -170,7 +173,7 @@ with tempfile.TemporaryDirectory() as directory:
     asset_root = temporary / "assets"
     asset_root.mkdir()
     notes = temporary / "notes.md"
-    notes.write_text("Release v0.7.0\n", encoding="utf-8")
+    notes.write_text(adoption.PENDING_NOTES + "\n", encoding="utf-8")
     asset_names = (
         artifact,
         f"{artifact}.tar.gz",
@@ -195,20 +198,20 @@ with tempfile.TemporaryDirectory() as directory:
         "tag_name": "v0.7.0",
         "target_commitish": action,
         "name": "v0.7.0",
-        "body": "Release v0.7.0\n",
+        "body": notes.read_text(encoding="utf-8"),
         "draft": True,
-        "prerelease": False,
+        "prerelease": True,
         "immutable": False,
         "published_at": None,
         "author": {"login": "github-actions[bot]", "type": "Bot"},
         "assets": [draft_asset(artifact), draft_asset("action-release.json")],
     }
-    if module.validate_draft_release(draft, notes, asset_root, version, action, "stable") != 7:
+    if module.validate_draft_release(draft, notes, asset_root, version, action) != 7:
         raise SystemExit("matching interrupted draft was rejected")
     for description, mutate in (
         ("target", lambda value: value.update(target_commitish=other)),
         ("notes", lambda value: value.update(body="different")),
-        ("channel", lambda value: value.update(prerelease=True)),
+        ("channel", lambda value: value.update(prerelease=False)),
         ("author", lambda value: value.update(author={"login": "maintainer", "type": "User"})),
         ("published state", lambda value: value.update(immutable=True)),
         ("asset digest", lambda value: value["assets"][0].update(digest="sha256:" + "0" * 64)),
@@ -224,7 +227,6 @@ with tempfile.TemporaryDirectory() as directory:
                 asset_root,
                 version,
                 action,
-                "stable",
             ),
             f"accepted conflicting draft {description}",
         )
@@ -267,6 +269,105 @@ for description, rest_value, graphql_value in (
         lambda left=rest_value, right=graphql_value: module.validate_distribution_commit(left, right, source, action),
         f"accepted conflicting distribution {description}",
     )
+
+def http_error(status):
+    return urllib.error.HTTPError("https://example.invalid", status, "test response", {}, None)
+
+
+tag = f"v{version}"
+publication = adoption.Publication(tag, source, action)
+pending = {
+    "id": 41, "tag_name": tag, "target_commitish": action, "draft": False,
+    "immutable": True, "prerelease": True, "body": adoption.PENDING_NOTES,
+}
+release_id = pending["id"]
+pin = f"- uses: openai/fence@{action} # pin@{tag}"
+assert action not in pending["body"] and "uses:" not in pending["body"]
+assert pin in publication.final_notes.splitlines()
+
+with mock.patch.object(adoption.time, "sleep"):
+    # Transient reads, then the right release before and after GitHub locks it.
+    with mock.patch.object(adoption, "github", side_effect=[
+        http_error(502), http_error(404), dict(pending, immutable=False), pending,
+    ]):
+        assert publication.wait() == (release_id, False)
+    # A transient commit read can recover, not a conflicting identity or signature.
+    with mock.patch.object(adoption, "github", side_effect=[http_error(502), rest, graphql]):
+        adoption.verify_commit(source, action)
+    with mock.patch.object(adoption, "github", side_effect=[invalid_parent, graphql]):
+        expect_error(lambda: adoption.verify_commit(source, action), "accepted incorrect commit parent")
+
+    for invalid in (
+        http_error(401), http_error(403), dict(pending, tag_name="v9.9.9"),
+        dict(pending, target_commitish=other), dict(pending, body=publication.final_notes),
+        dict(pending, prerelease=False), dict(pending, draft=True), dict(pending, immutable=None),
+    ):
+        with mock.patch.object(adoption, "github", side_effect=[invalid]) as api:
+            try:
+                publication.wait()
+            except (ValueError, urllib.error.HTTPError):
+                pass
+            else:
+                raise SystemExit("accepted incorrect release metadata or authorization")
+            api.assert_called_once()
+    with mock.patch.object(adoption, "github", side_effect=http_error(404)) as api:
+        expect_error(publication.wait, "accepted a release that never appeared")
+        assert api.call_count == adoption.READ_ATTEMPTS
+
+    # Withdrawal, unfinished cleanup, and a different release with the same tag.
+    for blocked in (
+        [[{"ref": f"refs/heads/release-candidate/{tag}"}]],
+        [[], [{"ref": f"refs/heads/release-verified/{tag}"}]],
+        [[], [], dict(pending, id=release_id + 1)],
+    ):
+        with mock.patch.object(adoption, "github", side_effect=blocked) as api:
+            expect_error(lambda: publication.promote(release_id), "promoted an ineligible release")
+            assert all(call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list)
+
+    for channel_tag in (tag, tag + "-rc.1"):
+        release = adoption.Publication(channel_tag, source, action)
+        initial = dict(pending, tag_name=channel_tag)
+        final = dict(initial, body=release.final_notes, prerelease=release.prerelease)
+        target = f"repos/openai/fence/releases/{release_id}"
+        # Promotion response lost; confirm by GET, never a second PATCH. Genuine
+        # prereleases must not displace the last verified stable release.
+        responses = [[], [], initial, ConnectionResetError(), initial, final]
+        if not release.prerelease:
+            responses += [dict(id=release_id - 1), final]
+        with mock.patch.object(adoption, "github", side_effect=responses) as api:
+            release.promote(release_id)
+            mutations = [call for call in api.call_args_list if call.kwargs.get("method", "GET") != "GET"]
+            assert mutations == [mock.call(target, method="PATCH", data={
+                "body": release.final_notes, "prerelease": release.prerelease,
+                "make_latest": "false" if release.prerelease else "true",
+            })]
+        # Interrupted after successful promotion: verify again, change nothing.
+        with mock.patch.object(adoption, "github", side_effect=[[], [], final]) as api:
+            release.promote(release_id)
+            assert all(call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list)
+
+    unconfirmed = [[], [], pending, TimeoutError()] + [pending] * adoption.READ_ATTEMPTS
+    with mock.patch.object(adoption, "github", side_effect=unconfirmed) as api:
+        expect_error(lambda: publication.promote(release_id), "advertised an unconfirmed release")
+        assert sum(call.kwargs.get("method") == "PATCH" for call in api.call_args_list) == 1
+
+# Exercise the actual no-permission finalizer. A guarded cleanup can correctly
+# exit zero without promotion; its job result alone must never print the pin.
+workflow = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+report = textwrap.dedent(workflow.split("\n  finalize-release:\n")[1].split("        run: |\n")[1])
+with tempfile.TemporaryDirectory() as directory:
+    summary = pathlib.Path(directory) / "summary"
+    receipt = f"{action}:test-run:2"
+    for proof in ("", f"{action}:test-run:1", f"{other}:test-run:2", receipt):
+        attempt = subprocess.run(["/bin/bash", "-c", report], text=True, capture_output=True, check=False, env={
+            "PATH": "", "SOURCE_COMMIT": source, "ACTION_COMMIT": action, "VERSION_TAG": tag,
+            "GITHUB_RUN_ID": "test-run", "GITHUB_RUN_ATTEMPT": "2", "STATE_RUN_ATTEMPT": "2",
+            "FINALIZED_PIN": proof, "GITHUB_STEP_SUMMARY": str(summary),
+        })
+        if proof == receipt:
+            assert attempt.returncode == 0 and pin in summary.read_text(encoding="utf-8").splitlines()
+        else:
+            assert attempt.returncode != 0 and pin not in attempt.stdout and not summary.exists()
 
 print("Action release state verified")
 PY

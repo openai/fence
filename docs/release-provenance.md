@@ -9,7 +9,8 @@ Each Fence release connects reviewed source code to the exact GitHub Action you 
 3. Release automation builds and attests the Linux agent from `M`.
 4. GitHub creates signed distribution commit `D` with `M` as its only parent.
 5. The Action acceptance tests and runner canary validate `D`.
-6. The workflow publishes the immutable release and verifies it.
+6. The workflow publishes the immutable tag and assets as a prerelease marked "Verification pending."
+7. It downloads and verifies the published files, removes the temporary release refs, and adds the ready-to-use pin. Only then does a stable release become Latest.
 
 The distribution commit adds exactly two generated files:
 
@@ -30,9 +31,11 @@ Use its full `action_commit` value in your workflow:
 - uses: openai/fence@<action-commit> # pin@vX.Y.Z
 ```
 
-Use the matching release version in the `# pin@vX.Y.Z` comment. The release notes include a ready-to-copy example, and Dependabot uses the comment when updating the pinned commit.
+Copy the pin from the [latest verified release](https://github.com/openai/fence/releases/latest). Dependabot uses the matching version in the `# pin@vX.Y.Z` comment when updating the commit.
 
-The release tag points to the distribution commit, but workflows should use its full commit SHA. Do not run Fence from `main`; it does not contain the Action bundle.
+The tag and `action-release.json` are public while verification is pending; their existence is not an invitation to upgrade. If verification fails, stay on the previous release. This does not revoke a SHA someone already pinned, and Fence does not check release status at Action runtime.
+
+Use the full distribution commit SHA, not the tag or `main`. The `main` branch does not contain the Action bundle.
 
 ## Verify Release Artifacts
 

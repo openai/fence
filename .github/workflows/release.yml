@@ -657,31 +657,7 @@ jobs:
           echo "candidate_branch_created=$candidate_branch_created" >> "$GITHUB_OUTPUT"
           echo "candidate_created=$candidate_created" >> "$GITHUB_OUTPUT"
 
-          verified=false
-          owner="${GITHUB_REPOSITORY%%/*}"
-          repository="${GITHUB_REPOSITORY#*/}"
-          for attempt in 1 2 3 4 5 6; do
-            gh api "repos/${GITHUB_REPOSITORY}/commits/${action_commit}" > "$RUNNER_TEMP/distribution-commit-rest.json"
-            gh api graphql \
-              -f query='query($owner: String!, $repository: String!, $oid: GitObjectID!) { repository(owner: $owner, name: $repository) { object(oid: $oid) { ... on Commit { oid signature { isValid wasSignedByGitHub } } } } }' \
-              -F owner="$owner" \
-              -F repository="$repository" \
-              -F oid="$action_commit" > "$RUNNER_TEMP/distribution-commit-graphql.json"
-            if python3 -B -E script/lib/action_release.py verify-commit \
-              --rest "$RUNNER_TEMP/distribution-commit-rest.json" \
-              --graphql "$RUNNER_TEMP/distribution-commit-graphql.json" \
-              --source-commit "$SOURCE_COMMIT" \
-              --action-commit "$action_commit"
-            then
-              verified=true
-              break
-            fi
-            sleep 2
-          done
-          if [[ "$verified" != "true" ]]; then
-            echo "distribution commit signature, parent, or exact diff is invalid" >&2
-            exit 1
-          fi
+          ACTION_COMMIT="$action_commit" python3 -B -E script/lib/release_adoption.py verify-commit
 
           if [[ -n "$candidate_branch" ]]; then
             git fetch --no-tags origin "refs/heads/${candidate_branch}"
@@ -939,8 +915,6 @@ jobs:
         env:
           ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_CHANNEL: ${{ needs.prepare.outputs.release_channel }}
-          SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
           VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
         run: |
@@ -956,16 +930,7 @@ jobs:
           fi
 
           notes="$RUNNER_TEMP/release-notes.md"
-          {
-            echo "Release $VERSION_TAG"
-            echo
-            echo "Reviewed source commit: \`$SOURCE_COMMIT\`"
-            echo "Complete Action commit: \`$ACTION_COMMIT\`"
-            echo
-            echo '```yaml'
-            echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"
-            echo '```'
-          } > "$notes"
+          python3 -B -E script/lib/release_adoption.py pending-notes > "$notes"
 
           release_probe="$RUNNER_TEMP/publication-release-probe.json"
           release_state="$(python3 -B -E script/lib/action_release.py probe-release \
@@ -987,8 +952,7 @@ jobs:
               --notes "$notes" \
               --asset-root release-assets \
               --version "${VERSION_TAG#v}" \
-              --action-commit "$ACTION_COMMIT" \
-              --release-channel "$RELEASE_CHANNEL")"
+              --action-commit "$ACTION_COMMIT")"
             gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_id}"
             post_delete_probe="$RUNNER_TEMP/post-delete-release-probe.json"
             post_delete_state="$(python3 -B -E script/lib/action_release.py probe-release \
@@ -1009,6 +973,8 @@ jobs:
             --title "$VERSION_TAG"
             --notes-file "$notes"
             --target "$ACTION_COMMIT"
+            --prerelease
+            --latest=false
           )
           tag_refs="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${VERSION_TAG}")"
           tag_exists="$(python3 - "$tag_refs" "refs/tags/$VERSION_TAG" <<'PY'
@@ -1028,9 +994,6 @@ jobs:
             fi
             release_args+=(--verify-tag)
           fi
-          if [[ "$RELEASE_CHANNEL" == "prerelease" ]]; then
-            release_args+=(--prerelease)
-          fi
           gh release create "$VERSION_TAG" "${assets[@]}" "${release_args[@]}"
 
   verify-release:
@@ -1041,6 +1004,8 @@ jobs:
       attestations: read
       contents: read
     runs-on: ubuntu-24.04
+    outputs:
+      release_id: ${{ steps.verified.outputs.release_id }}
 
     steps:
       - name: require current-attempt release classification
@@ -1066,92 +1031,26 @@ jobs:
           path: expected-assets
 
       - name: verify immutable published release end to end
+        id: verified
         env:
           ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
           ARTIFACT_SHA256: ${{ needs.build-linux-x64.outputs.artifact_sha256 }}
           BINARY_NAME: ${{ needs.build-linux-x64.outputs.binary_name }}
+          EXISTING_RELEASE: ${{ needs.create-candidate.outputs.existing_release }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_CHANNEL: ${{ needs.prepare.outputs.release_channel }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           VERSION: ${{ needs.prepare.outputs.version }}
           VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
         run: |
           set -euo pipefail
-          metadata=""
-          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-            metadata="$(gh release view "$VERSION_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,targetCommitish,isPrerelease,isDraft,isImmutable,body)"
-            if python3 - "$metadata" <<'PY'
-          import json
-          import sys
-          release = json.loads(sys.argv[1])
-          raise SystemExit(0 if release.get("isImmutable") is True else 1)
-          PY
-            then
-              break
-            fi
-            if [[ "$attempt" == 12 ]]; then
-              echo "published release did not become immutable" >&2
-              exit 1
-            fi
-            sleep 5
-          done
-          python3 - "$metadata" <<'PY'
-          import json
-          import os
-          import sys
-
-          release = json.loads(sys.argv[1])
-          if release.get("tagName") != os.environ["VERSION_TAG"]:
-              raise SystemExit("published release tag mismatch")
-          if release.get("targetCommitish") != os.environ["ACTION_COMMIT"]:
-              raise SystemExit("published release target mismatch")
-          if release.get("isDraft") is not False or release.get("isImmutable") is not True:
-              raise SystemExit("published release must be non-draft and immutable")
-          expected_prerelease = os.environ["RELEASE_CHANNEL"] == "prerelease"
-          if release.get("isPrerelease") is not expected_prerelease:
-              raise SystemExit("published release channel mismatch")
-          expected_pin = f"- uses: openai/fence@{os.environ['ACTION_COMMIT']} # pin@{os.environ['VERSION_TAG']}"
-          if expected_pin not in str(release.get("body", "")).splitlines():
-              raise SystemExit("published release notes are missing the verified full-SHA pin")
-          PY
+          release_id="$(python3 -B -E script/lib/release_adoption.py verify)"
 
           tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
           if [[ "$tag_commit" != "$ACTION_COMMIT" ]]; then
             echo "immutable release tag does not resolve to the Action commit" >&2
             exit 1
           fi
-          commit_metadata="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${ACTION_COMMIT}")"
-          python3 - "$SOURCE_COMMIT" "$commit_metadata" <<'PY'
-          import json
-          import sys
-          source, raw = sys.argv[1:]
-          commit = json.loads(raw)
-          if [parent.get("sha") for parent in commit.get("parents", [])] != [source]:
-              raise SystemExit("published Action commit parent mismatch")
-          if commit.get("commit", {}).get("verification", {}).get("verified") is not True:
-              raise SystemExit("published Action commit signature is invalid")
-          files = {(item.get("filename"), item.get("status")) for item in commit.get("files", [])}
-          if files != {("action/bin/fence", "added"), ("action/bundle-manifest.json", "added")}:
-              raise SystemExit("published Action commit diff mismatch")
-          PY
-          owner="${GITHUB_REPOSITORY%%/*}"
-          repository="${GITHUB_REPOSITORY#*/}"
-          signature_metadata="$(gh api graphql \
-            -f query='query($owner: String!, $repository: String!, $oid: GitObjectID!) { repository(owner: $owner, name: $repository) { object(oid: $oid) { ... on Commit { oid signature { isValid wasSignedByGitHub } } } } }' \
-            -F owner="$owner" \
-            -F repository="$repository" \
-            -F oid="$ACTION_COMMIT")"
-          python3 - "$ACTION_COMMIT" "$signature_metadata" <<'PY'
-          import json
-          import sys
-          action_commit, raw = sys.argv[1:]
-          commit = json.loads(raw).get("data", {}).get("repository", {}).get("object", {})
-          signature = commit.get("signature") or {}
-          if commit.get("oid") != action_commit:
-              raise SystemExit("published Action commit GraphQL identity mismatch")
-          if signature.get("isValid") is not True or signature.get("wasSignedByGitHub") is not True:
-              raise SystemExit("published Action commit was not validly signed by GitHub")
-          PY
+          python3 -B -E script/lib/release_adoption.py verify-commit
 
           script/validate-action-bundle
           if [[ "$(git rev-list --parents -n 1 HEAD)" != "$ACTION_COMMIT $SOURCE_COMMIT" ]]; then
@@ -1203,6 +1102,7 @@ jobs:
               --source-ref refs/heads/main \
               --deny-self-hosted-runners >/dev/null
           done
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
   cleanup-candidate:
     if: ${{ always() && needs.prepare.outputs.should_release == 'true' }}
@@ -1211,6 +1111,8 @@ jobs:
       contents: write
     environment: release
     runs-on: ubuntu-24.04
+    outputs:
+      finalized_pin: ${{ steps.cleanup.outputs.finalized_pin }}
 
     steps:
       - name: checkout source commit
@@ -1225,7 +1127,8 @@ jobs:
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
         run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
 
-      - name: delete only the exact temporary candidate ref
+      - name: clean up exact temporary refs and finalize the verified release
+        id: cleanup
         env:
           ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
           CANDIDATE_BRANCH: ${{ needs.create-candidate.outputs.candidate_branch }}
@@ -1237,6 +1140,7 @@ jobs:
           PUBLISH_RESULT: ${{ needs.publish.result }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
+          VERIFIED_RELEASE_ID: ${{ needs.verify-release.outputs.release_id }}
           VERIFY_RESULT: ${{ needs.verify-release.result }}
           VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
         run: |
@@ -1385,6 +1289,11 @@ jobs:
             delete_ref_with_lease "$verified_branch" "$ACTION_COMMIT"
           fi
 
+          if [[ "$VERIFY_RESULT" == success && "$PUBLISH_RESULT" == success ]]; then
+            python3 -B -E script/lib/release_adoption.py promote
+            echo "finalized_pin=$ACTION_COMMIT:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          fi
+
   finalize-release:
     if: ${{ success() && needs.prepare.outputs.should_release == 'true' }}
     needs: [prepare, create-candidate, verify-release, cleanup-candidate]
@@ -1395,6 +1304,7 @@ jobs:
       - name: report verified consumer pin
         env:
           ACTION_COMMIT: ${{ needs.create-candidate.outputs.action_commit }}
+          FINALIZED_PIN: ${{ needs.cleanup-candidate.outputs.finalized_pin }}
           SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
           STATE_RUN_ATTEMPT: ${{ needs.create-candidate.outputs.state_run_attempt }}
           VERSION_TAG: ${{ needs.prepare.outputs.version_tag }}
@@ -1406,6 +1316,10 @@ jobs:
           fi
           if ! [[ "$ACTION_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
             echo "final release Action commit is invalid" >&2
+            exit 1
+          fi
+          if [[ "$FINALIZED_PIN" != "$ACTION_COMMIT:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" ]]; then
+            echo "release finalization was not confirmed for this workflow attempt" >&2
             exit 1
           fi
           {
