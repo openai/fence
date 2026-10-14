@@ -106,7 +106,7 @@ Fence runs before the rest of your job and controls which network destinations t
 1. It checks that the runner and bundled agent are supported.
 2. It allows required GitHub and runner connections, plus your `allowlist`.
 3. It blocks other outbound connections and turns off passwordless `sudo` and Docker.
-4. It keeps those protections in place until the job ends.
+4. It signals readiness only after verifying those protections, then keeps them in place until the job ends.
 5. It reports network activity and fails the job if its protections change unexpectedly.
 
 See [how Fence works](docs/how-it-works.md) for more detail.

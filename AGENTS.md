@@ -12,6 +12,8 @@ Fixed host commands bound combined stdout/stderr capture while running and enfor
 
 Resident and DNS evidence publication must share the same exclusive, no-follow atomic replacement path. After a failed write or rename, clean up only the pending file created by that attempt; preserve the original error and never clear a pre-existing pending path. Keep each report's existing write-synchronization behavior.
 
+Publish the final resident report before atomically making the complete readiness marker visible. Never replace an existing marker. Successful marker publication is the no-restore boundary; pending-file cleanup cannot turn it into a pre-ready failure.
+
 The only permitted non-container baseline transition is the already-present, fully observed UUID socket at `/run/uuidd/request`. Require exactly one unchanged root systemd owner in `/init.scope` and at most one non-root system UID owner of `/usr/sbin/uuidd` in exactly `/system.slice/uuidd.service`. Never generalize that exception to other endpoints or cgroups; use the acceptance matrix's Azure CLI cases in both modes for hosted proof.
 
 Fence accepts reviewed even-year Ubuntu LTS versions from 24.04 through 40.04 and validates security-relevant runner capabilities instead of rejecting routine image changes. The root resident may restore root ownership only to the exact reviewed `/etc` and `/usr` directories before trusted executable capture. Sudo-policy capture follows sudo's own drop-in filename rules and accepts safe `Defaults` alongside reviewed runner grants. Both block modes must prove all runner sudo grants are removed; standard block must also prove container access is unavailable or absent before readiness.
