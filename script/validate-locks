@@ -2737,7 +2737,7 @@ for fragment in [
     "group: release",
     "createCommitOnBranch",
     "expectedHeadOid",
-    "wasSignedByGitHub",
+    "script/lib/release_adoption.py verify-commit",
     "action/bin/fence",
     "action/bundle-manifest.json",
     "uses: ./.github/workflows/action-acceptance.yml",
@@ -2745,9 +2745,33 @@ for fragment in [
     "action-release.json",
     'gh release create "$VERSION_TAG" "${assets[@]}" "${release_args[@]}"',
     'echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"',
-    'expected_pin = f"- uses: openai/fence@{os.environ[\'ACTION_COMMIT\']} # pin@{os.environ[\'VERSION_TAG\']}"',
 ]:
     require(fragment in release, "One-PR Action release workflow contract is incomplete")
+for job, order in {
+    "publish": ("release_adoption.py pending-notes", "--prerelease\n            --latest=false", "gh release create"),
+    "verify-release": ("release_adoption.py verify)", "gh attestation verify", 'echo "release_id=$release_id"'),
+    "cleanup-candidate": (
+        "needs.verify-release.outputs.release_id",
+        'delete_ref_with_lease "$verified_branch" "$ACTION_COMMIT"',
+        '"$VERIFY_RESULT" == success && "$PUBLISH_RESULT" == success',
+        "release_adoption.py promote",
+        'finalized_pin=$ACTION_COMMIT:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT',
+    ),
+    "finalize-release": (
+        "permissions: {}",
+        "needs.cleanup-candidate.outputs.finalized_pin",
+        '"$FINALIZED_PIN" != "$ACTION_COMMIT:$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT"',
+        'echo "- uses: openai/fence@$ACTION_COMMIT # pin@$VERSION_TAG"',
+    ),
+}.items():
+    block = indented_block(release, f"  {job}:", f"Release {job} job must be unique")
+    positions = [block.find(fragment) for fragment in order]
+    require(
+        -1 not in positions and positions == sorted(positions),
+        f"Release {job} must withhold the consumer pin until verification, cleanup, and promotion are confirmed",
+    )
+    if job == "publish":
+        require("uses: openai/fence@" not in block, "Pending release notes must not advertise a consumer pin")
 require(
     release.count("uses: ./.github/workflows/action-acceptance.yml") == 1,
     "Release workflow must invoke Action acceptance exactly once",

@@ -64,7 +64,7 @@ See [network reports](how-it-works.md#network-reports) for the report format and
 
 ## Release Pinning
 
-Pin the full `action_commit` SHA from a [published release](https://github.com/openai/fence/releases):
+Pin the full `action_commit` SHA from the [latest verified release](https://github.com/openai/fence/releases/latest):
 
 ```yaml
 - uses: openai/fence@<commit-sha> # pin@vX.Y.Z

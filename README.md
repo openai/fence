@@ -27,7 +27,7 @@ jobs:
       - run: script/test
 ```
 
-Copy the full commit SHA and version comment from the [latest release](https://github.com/openai/fence/releases). Fence supports GitHub-hosted `ubuntu-24.04` and `ubuntu-latest` x64 runners.
+Copy the full commit SHA and version comment from the [latest verified release](https://github.com/openai/fence/releases/latest). Fence supports GitHub-hosted `ubuntu-24.04` and `ubuntu-latest` x64 runners.
 
 By default, Fence:
 
@@ -144,7 +144,7 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 - **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. In block mode, only root-owned host sockets can reach Azure WireServer. Neither service needs an allowlist entry.
 - **Artifacts:** `allow_github_artifacts: true` allows limited access to storage used by GitHub Actions.
 - **Docker:** Fence disables Docker without changing its DNS settings. If you keep Docker available, later steps can bypass Fence.
-- **Release pinning:** Use the full commit SHA from a published Fence release. Do not run the Action from `main`.
+- **Release pinning:** Copy the full commit SHA from the [verified release notes](https://github.com/openai/fence/releases/latest), not from `main` or a version tag.
 
 See the [security guide](docs/security.md) for more details.
 
