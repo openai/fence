@@ -28,6 +28,8 @@ The block-only native Action input and strict JSON field `allow_github_artifacts
 
 Packets to the fixed upstream DNS tuple are dispatched through current-socket policy before generic established/related acceptance. Decide WireServer access before connection-state and allowlist rules: accept root-owned host sockets, and send all other host or forwarded packets through the normal block or audit verdict.
 
+In host output and forwarding, original-direction UDP packets follow the current destination policy even for established flows; reply-direction packets keep normal connection-state handling. Connection tracking identifies a flow, not the socket that sent it.
+
 Production runtime intake accepts only `/run/fence/<invocation-id>/config.json`, requires pinned root-owned directories containing only a root-owned `0600` regular config file before activation, uses no-follow and close-on-exec config opens, and validates that production execution is the root `MainPID` of `fence-<invocation-id>.service`. The public worker composes DNS-mediated network policy, mode-specific lockdown or observation semantics, production readiness, resident verification, and no-restore operation onto those primitives.
 
 ## North-Star Principles

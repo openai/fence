@@ -7,8 +7,8 @@ use fence::findings::FindingCollection;
 use fence::lifecycle::run_resident_test_service;
 use fence::nflog::NflogReader;
 use fence::nft::{
-    DNS_MEDIATOR_UPSTREAM_ADDRESS, DNS_MEDIATOR_UPSTREAM_PORT, NetworkEvidenceCounters,
-    expected_dns_mediated_owned_state, expected_owned_state,
+    DNS_MEDIATOR_UPSTREAM_ADDRESS, DNS_MEDIATOR_UPSTREAM_PORT, NFT_HOOK_PRIORITY,
+    NetworkEvidenceCounters, expected_dns_mediated_owned_state, expected_owned_state,
     render_dns_mediated_replacement_ruleset, render_dns_mediated_ruleset, render_ruleset,
     unapplied_test_evidence_model,
 };
@@ -140,6 +140,17 @@ impl RoutedTopology {
         let sink = format!("fence-b-{suffix}");
         for namespace in [&source, &router, &sink] {
             ip(&["netns", "add", namespace]);
+            // This IPv4-only topology measures exact violation deltas. Disable IPv6
+            // before adding links so unsolicited multicast reports cannot count as test traffic.
+            in_namespace(
+                namespace,
+                "/usr/sbin/sysctl",
+                &[
+                    "-qw",
+                    "net.ipv6.conf.all.disable_ipv6=1",
+                    "net.ipv6.conf.default.disable_ipv6=1",
+                ],
+            );
             ip(&["-n", namespace, "link", "set", "lo", "up"]);
         }
         connect_namespaces(
@@ -832,6 +843,153 @@ fn forward_hook_proves_routed_block_and_audit_behavior_without_containment_claim
     assert!(audit.rollback_pre_activation().unwrap());
 }
 
+#[test]
+#[ignore = "requires Linux root network namespaces and native nftables"]
+fn udp_tuple_reuse_after_grant_removal_obeys_current_host_and_forward_policy() {
+    require_root();
+    let topology = RoutedTopology::new();
+    let firewall = &topology.router;
+    let address = "203.0.113.2";
+    let port = 21446;
+    let grant = [allowance(address, Protocol::Udp, port)];
+    let ready = evidence_root().join(format!("udp-grant-{}.ready", unique_suffix()));
+    let _echo_server = start_listener(&topology.sink, address, "udp", port, &ready);
+    wait_for_path(&ready);
+    fs::remove_file(ready).unwrap();
+
+    // This independent, counter-only table survives Fence's ruleset replacement.
+    // Prove the rebound packet was actually established, not a new flow that would
+    // have been classified even without the fix. Never flush conntrack or wait for expiry.
+    let mut witness = String::from("add table inet test_udp; add counter inet test_udp seen;");
+    let priority = NFT_HOOK_PRIORITY - 1;
+    for hook in ["output", "forward"] {
+        witness.push_str(&format!(
+            "add chain inet test_udp {hook} {{ type filter hook {hook} priority {priority}; }}; \
+             add rule inet test_udp {hook} ip daddr {address} udp dport {port} \
+             ct direction original ct state established counter name seen;"
+        ));
+    }
+    nft_in_namespace(firewall, &[&witness]);
+
+    // Sending from the router exercises output; sending through it exercises
+    // forward, including the reply (which has no reverse-direction allowance).
+    for client in [firewall, &topology.source] {
+        for mode in [Mode::Block, Mode::Audit] {
+            let mut nft = backend(firewall);
+            nft.apply_provisional(&render_dns_mediated_ruleset(mode, &grant))
+                .unwrap();
+            nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &grant))
+                .unwrap();
+            let destination = format!("{address}:{port}");
+            let allowed_baseline = nft.total_violation_packets().unwrap();
+            let endpoint = udp_socket_exchange(client, "0.0.0.0:0", &destination, "accepted");
+            assert_eq!(
+                nft.total_violation_packets().unwrap(),
+                allowed_baseline,
+                "allowed request and reply"
+            );
+
+            nft.replace_owned_state(&render_dns_mediated_replacement_ruleset(mode, &[]))
+                .unwrap();
+            nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &[]))
+                .unwrap();
+            let seen = established_original_udp_packets(firewall);
+            // Replacing the owned table also replaces its violation counter.
+            let revoked_baseline = nft.total_violation_packets().unwrap();
+            let expect = if mode == Mode::Block {
+                "rejected"
+            } else {
+                "accepted"
+            };
+            assert_eq!(
+                udp_socket_exchange(client, &endpoint, &destination, expect),
+                endpoint
+            );
+            assert_eq!(
+                established_original_udp_packets(firewall),
+                seen + 1,
+                "reused established flow"
+            );
+            assert_eq!(
+                nft.total_violation_packets().unwrap(),
+                revoked_baseline + 1,
+                "count the request, not its reply"
+            );
+            assert!(nft.rollback_pre_activation().unwrap());
+        }
+    }
+}
+
+fn established_original_udp_packets(namespace: &str) -> u64 {
+    let output = run_output(
+        IP_BINARY_PATH,
+        &[
+            "netns",
+            "exec",
+            namespace,
+            "/usr/sbin/nft",
+            "-j",
+            "list",
+            "counter",
+            "inet",
+            "test_udp",
+            "seen",
+        ],
+    );
+    assert!(output.status.success());
+    let listing: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    listing["nftables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|item| item["counter"]["packets"].as_u64())
+        .unwrap()
+}
+
+// One datagram per fresh socket. The first exchange returns the exact local endpoint
+// for the second to bind; a timeout, unlike a reject, always fails the evidence.
+fn udp_socket_exchange(namespace: &str, local: &str, destination: &str, expect: &str) -> String {
+    let script = r#"
+import socket, sys
+def endpoint(arg):
+    address, port = arg.split(":")
+    return address, int(port)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(2)
+s.bind(endpoint(sys.argv[1]))
+s.connect(endpoint(sys.argv[2]))
+print("%s:%s" % s.getsockname())
+try:
+    s.send(b"x")
+    reply = s.recv(2)
+except (ConnectionRefusedError, PermissionError):
+    if sys.argv[3] != "rejected":
+        raise
+else:
+    assert sys.argv[3] == "accepted" and reply == b"ok"
+"#;
+    let output = run_output(
+        IP_BINARY_PATH,
+        &[
+            "netns",
+            "exec",
+            namespace,
+            PYTHON,
+            "-c",
+            script,
+            local,
+            destination,
+            expect,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "UDP exchange: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 fn backend(namespace: &str) -> NativeNftBackend<SystemNftExecutor> {
     NativeNftBackend::new(SystemNftExecutor::in_test_network_namespace(namespace).unwrap())
 }
@@ -1133,8 +1291,11 @@ if protocol == "tcp":
     c.recv(1)
     c.send(b"ok")
 else:
-    data, peer = s.recvfrom(8)
-    s.sendto(b"ok", peer)
+    # The parent owns this listener and may make more than one exchange.
+    s.settimeout(None)
+    while True:
+        data, peer = s.recvfrom(8)
+        s.sendto(b"ok", peer)
 "#;
     let child = Command::new(IP_BINARY_PATH)
         .args([
