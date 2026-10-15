@@ -2275,14 +2275,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             return Err(local_control_error(error));
         }
 
-        evidence.setup_status = "verified_before_observation_ready";
-        if let Err(error) = runtime.replace_report(&evidence) {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(runtime_error(error));
-        }
-        if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedAuditReady {
+        evidence.setup_status = "resident_observation_only";
+        evidence.readiness_status = PROTECTED_AUDIT_READY_STATUS;
+        let ready = DnsMediatedAuditReady {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_READY_STATUS,
             mode: Mode::Audit,
@@ -2298,16 +2293,15 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             limitations: protected_audit_limitations(
                 plan.runtime_hostname_policy.has_user_wildcards(),
             ),
-        }) {
+        };
+        if let Err(error) = runtime.publish_readiness(&evidence, &ready) {
             evidence.setup_status = "failed_pre_ready";
+            evidence.readiness_status = "not_emitted";
             evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
         lockdown.commit_no_restore();
-        evidence.setup_status = "resident_observation_only";
-        evidence.readiness_status = PROTECTED_AUDIT_READY_STATUS;
-        runtime.replace_report(&evidence).map_err(runtime_error)?;
         Ok(Self {
             _mediation: mediation,
             backend,
@@ -2682,15 +2676,9 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(local_control_error(error));
         }
-        evidence.setup_status = "verified_before_test_ready";
-        if let Err(error) = runtime.replace_report(&evidence) {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(runtime_error(error));
-        }
-        if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedBlockReady {
+        evidence.setup_status = scope.resident_status();
+        evidence.readiness_status = scope.ready_status();
+        let ready = DnsMediatedBlockReady {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.ready_status(),
             mode: Mode::Block,
@@ -2708,17 +2696,16 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 plan.runtime_hostname_policy.has_user_wildcards(),
                 plan.allow_github_artifacts,
             ),
-        }) {
+        };
+        if let Err(error) = runtime.publish_readiness(&evidence, &ready) {
             evidence.setup_status = "failed_pre_ready";
+            evidence.readiness_status = "not_emitted";
             evidence.rollback_status =
                 rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
         lockdown.commit_no_restore();
-        evidence.setup_status = scope.resident_status();
-        evidence.readiness_status = scope.ready_status();
-        runtime.replace_report(&evidence).map_err(runtime_error)?;
         let next_hostname_refresh =
             hostname_refresh_schedule(&hostname_policy, &active, Duration::ZERO);
         Ok(Self {

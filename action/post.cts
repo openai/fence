@@ -19,6 +19,7 @@ const {
   MAX_REPORT_BYTES,
   renderNetworkReport,
   readJsonBounded,
+  readReady,
   readLauncherIntegrity,
   rejectCriticalFindings,
   resultsStorageWarnings,
@@ -30,6 +31,7 @@ const {
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,
   validateDnsEvidence,
+  validateReady,
   validateReport,
   validateResidentUnitStatus,
 } = require("./lib.cts");
@@ -337,7 +339,9 @@ function writeJobSummary(filePath: string, report: any, dnsEvidence: any): void 
   }
 }
 
-function publishPostEvidence(report: any, dnsEvidence: any, paths: { report: string; dnsReport: string }): void {
+function publishPostEvidence(report: any, dnsEvidence: any, paths: { ready: string; report: string; dnsReport: string }): void {
+  // The report is published before the ready marker. It cannot by itself certify that setup committed.
+  validateReady(readReady(paths.ready), report, "post");
   const networkReport = renderNetworkReport(report, dnsEvidence);
   const auditSummary = correlateFindingsToDns(report, dnsEvidence);
   const dnsMaterializationRequestRejections = materializationRequestRejections(dnsEvidence);

@@ -4,7 +4,10 @@ use crate::nflog::{NflogError, NflogReader};
 use crate::nft::{NetworkEvidenceCounters, OwnedNftState, expected_dns_mediated_owned_state};
 use crate::nft_backend::{BackendError, NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, PlanData};
-use crate::runtime::{RESIDENT_EVIDENCE_STATUS, RuntimeError, TEST_READY_STATUS, TestRuntimeStore};
+use crate::runtime::{
+    RESIDENT_EVIDENCE_STATUS, RuntimeDocumentStore, RuntimeError, TEST_READY_STATUS,
+    TestRuntimeStore,
+};
 use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
 use serde::Serialize;
 use std::fs;
@@ -247,12 +250,9 @@ impl<N: ResidentNetwork> ResidentSession<N> {
             return Err(error);
         }
 
-        session.evidence.setup_status = "verified_before_test_ready";
-        if let Err(error) = session.runtime.replace_report(&session.evidence) {
-            session.rollback_failed_setup();
-            return Err(error.into());
-        }
-        if let Err(error) = session.runtime.write_ready_exclusive(&TestOnlyReady {
+        session.evidence.setup_status = "resident_test_only";
+        session.evidence.readiness_status = TEST_READY_STATUS;
+        let ready = TestOnlyReady {
             status: TEST_READY_STATUS,
             mode: plan.selected_mode,
             assurance_status: plan.assurance_status,
@@ -264,13 +264,11 @@ impl<N: ResidentNetwork> ResidentSession<N> {
                 "sudo_lockdown_not_implemented",
                 "container_lockdown_not_implemented",
             ],
-        }) {
+        };
+        if let Err(error) = session.runtime.publish_readiness(&session.evidence, &ready) {
             session.rollback_failed_setup();
             return Err(error.into());
         }
-        session.evidence.setup_status = "resident_test_only";
-        session.evidence.readiness_status = TEST_READY_STATUS;
-        session.runtime.replace_report(&session.evidence)?;
         Ok(session)
     }
 
@@ -746,14 +744,13 @@ mod tests {
         let root = root();
         let plan = plan("ready-failure");
         let runtime = TestRuntimeStore::create(&root, "ready-failure").unwrap();
-        runtime
-            .write_ready_exclusive(&serde_json::json!({"occupied": true}))
-            .unwrap();
+        fs::write(&runtime.ready, b"occupied").unwrap();
         let error =
             ResidentSession::establish_test_only(runtime.clone(), &plan, FakeNetwork::healthy())
                 .err()
                 .unwrap();
-        assert_eq!(error.code, "runtime_write_failed");
+        assert_eq!(error.code, "runtime_atomic_write_failed");
+        assert_eq!(fs::read(&runtime.ready).unwrap(), b"occupied");
         let report = fs::read_to_string(&runtime.report).unwrap();
         assert!(report.contains("\"rollback_status\":\"rolled_back_pre_ready\""));
         assert!(report.contains("\"readiness_status\":\"not_emitted\""));
