@@ -548,7 +548,9 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
             parse_dns_mediator_upstream_dispatch_rule(chain, expressions)
         }
         "fence:dns_mediator_upstream" => parse_dns_mediator_upstream_rule(chain, expressions),
-        "fence:wireserver_platform" => parse_wireserver_platform_rule(chain, expressions),
+        "fence:wireserver_platform" | "fence:wireserver_violation" => {
+            parse_wireserver_rule(chain, expressions, comment == "fence:wireserver_platform")
+        }
         "fence:instance_metadata_platform" => {
             parse_instance_metadata_platform_rule(chain, expressions)
         }
@@ -649,26 +651,38 @@ fn parse_dns_mediator_upstream_rule(
     })
 }
 
-fn parse_wireserver_platform_rule(
+fn parse_wireserver_rule(
     chain: String,
     expressions: &[Value],
+    allow_root: bool,
 ) -> Result<OwnedRule, BackendError> {
-    if expressions.len() != 4
-        || !has_meta_uid(
-            expressions.first(),
-            crate::platform_profile::AZURE_WIRESERVER_ROOT_UID.into(),
-        )
-        || !is_exact_verdict(&expressions[3], "accept")
-    {
-        return Err(BackendError::new(
-            "unexpected_nft_state",
-            "WireServer platform rule does not have the exact expected expression shape",
-        ));
-    }
-    let (address_family, destination) = extract_destination(&expressions[1..2])?;
-    let (protocol, port) = extract_transport(&expressions[2..3])?;
-    if chain != NFT_CLASSIFY_CHAIN
-        || address_family != "ip"
+    use crate::platform_profile::AZURE_WIRESERVER_ROOT_UID as ROOT;
+    let (address, transport) = match expressions {
+        [uid, address, transport, verdict]
+            if allow_root
+                && chain == NFT_OUTPUT_CHAIN
+                && has_meta_uid(Some(uid), ROOT.into())
+                && is_exact_verdict(verdict, "accept") =>
+        {
+            (address, transport)
+        }
+        [address, transport, verdict]
+            if !allow_root
+                && matches!(chain.as_str(), NFT_OUTPUT_CHAIN | NFT_FORWARD_CHAIN)
+                && is_exact_jump_rule(std::slice::from_ref(verdict), NFT_VIOLATION_CHAIN) =>
+        {
+            (address, transport)
+        }
+        _ => {
+            return Err(BackendError::new(
+                "unexpected_nft_state",
+                "WireServer rule does not have the exact expected expression shape",
+            ));
+        }
+    };
+    let (address_family, destination) = extract_destination(std::slice::from_ref(address))?;
+    let (protocol, port) = extract_transport(std::slice::from_ref(transport))?;
+    if address_family != "ip"
         || destination != crate::platform_profile::AZURE_WIRESERVER_ADDRESS
         || protocol != "tcp"
         || !crate::platform_profile::AZURE_WIRESERVER_TCP_PORTS.contains(&port)
@@ -678,12 +692,16 @@ fn parse_wireserver_platform_rule(
             "WireServer platform rule does not match its fixed destination",
         ));
     }
-    Ok(OwnedRule::WireServerPlatform {
-        chain,
-        uid: crate::platform_profile::AZURE_WIRESERVER_ROOT_UID,
-        destination,
-        protocol,
-        port,
+    Ok(if allow_root {
+        OwnedRule::WireServerPlatform {
+            chain,
+            uid: ROOT,
+            destination,
+            protocol,
+            port,
+        }
+    } else {
+        OwnedRule::WireServerViolationDispatch { chain, port }
     })
 }
 
@@ -1376,9 +1394,10 @@ mod tests {
             {"accept": null}
         ]);
         assert!(matches!(
-            parse_wireserver_platform_rule(
-                NFT_CLASSIFY_CHAIN.to_owned(),
-                expressions.as_array().unwrap()
+            parse_wireserver_rule(
+                NFT_OUTPUT_CHAIN.to_owned(),
+                expressions.as_array().unwrap(),
+                true,
             )
             .unwrap(),
             OwnedRule::WireServerPlatform {
@@ -1388,7 +1407,7 @@ mod tests {
             }
         ));
         let serialized = json!({
-            "chain": NFT_CLASSIFY_CHAIN,
+            "chain": NFT_OUTPUT_CHAIN,
             "comment": "fence:wireserver_platform",
             "expr": expressions.clone(),
         });
@@ -1429,22 +1448,34 @@ mod tests {
                 2
             };
             bad[index] = replacement;
-            assert!(parse_wireserver_platform_rule(NFT_CLASSIFY_CHAIN.to_owned(), &bad).is_err());
+            assert!(parse_wireserver_rule(NFT_OUTPUT_CHAIN.to_owned(), &bad, true).is_err());
         }
         assert!(
-            parse_wireserver_platform_rule(
-                NFT_OUTPUT_CHAIN.to_owned(),
-                expressions.as_array().unwrap()
+            parse_wireserver_rule(
+                NFT_FORWARD_CHAIN.to_owned(),
+                expressions.as_array().unwrap(),
+                true,
             )
             .is_err()
         );
         assert!(
-            parse_wireserver_platform_rule(
-                NFT_CLASSIFY_CHAIN.to_owned(),
-                &expressions.as_array().unwrap()[..3]
+            parse_wireserver_rule(
+                NFT_OUTPUT_CHAIN.to_owned(),
+                &expressions.as_array().unwrap()[..3],
+                true,
             )
             .is_err()
         );
+        let mut guard = expressions.as_array().unwrap()[1..].to_vec();
+        guard[2] = json!({"jump": {"target": NFT_VIOLATION_CHAIN}});
+        for chain in [NFT_OUTPUT_CHAIN, NFT_FORWARD_CHAIN] {
+            assert!(matches!(
+                parse_wireserver_rule(chain.to_owned(), &guard, false).unwrap(),
+                OwnedRule::WireServerViolationDispatch { port: 80, .. }
+            ));
+        }
+        guard[2] = json!({"jump": {"target": NFT_CLASSIFY_CHAIN}});
+        assert!(parse_wireserver_rule(NFT_FORWARD_CHAIN.to_owned(), &guard, false).is_err());
     }
 
     #[test]
