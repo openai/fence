@@ -3439,6 +3439,33 @@ test("renders audit network decisions and hostname and direct-IP allowlist sugge
     "api.example.com",
     "ip 2001:db8::10 udp 53",
   ]);
+  const matched = {
+    ...audit.findings[0],
+    rule_class: "matches_recent_hostname_policy",
+  };
+  const matchedReport = { ...audit, findings: [matched] };
+  // A known outside-policy name still gets a narrow suggestion, even on a shared IP.
+  const shared = parsedStructuredNetworkReport(matchedReport, dnsEvidence);
+  assert.deepEqual(shared.suggested_allowlist, ["api.example.com"]);
+  const allowedDns = { observations: dnsEvidence.observations.map((observation: any) => ({
+    ...observation, policy_classification: "user_allowlist",
+  })) };
+  const covered = parsedStructuredNetworkReport(matchedReport, allowedDns);
+  assert.deepEqual(covered.suggested_allowlist, []);
+  const observed = covered.network.find((row: any) => row.destination === matched.remote_address);
+  assert.equal(observed.decision, "would_block");
+  assert.deepEqual(observed.activities, [{
+    kind: "connection_attempt", protocol: matched.protocol, port: matched.remote_port, count: 1,
+  }]);
+  // The post hook must not infer coverage from DNS alone (or from a different finding for the same IP).
+  const unmatched = parsedStructuredNetworkReport({ ...audit, findings: [matched, audit.findings[0]] }, allowedDns);
+  assert.deepEqual(unmatched.suggested_allowlist, ["ip 203.0.113.10 tcp 443"]);
+  const attempts = unmatched.network.find((row: any) => row.destination === matched.remote_address);
+  assert.deepEqual(attempts.activities, [{
+    kind: "connection_attempt", protocol: matched.protocol, port: matched.remote_port, count: 2,
+  }]);
+  const query = unmatched.network.find((row: any) => row.destination === "api.example.com");
+  assert.deepEqual(query.activities, [{ kind: "dns_query", query_type: "a", count: 1 }]);
   const humanReport = networkReportLines(audit, dnsEvidence).join("\n");
   assert.match(humanReport, /would.block/i);
   assert.match(humanReport, /api\.example\.com/);
@@ -4242,7 +4269,8 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.match(summary, /\| Passwordless sudo \| ➖ Available in audit mode \|/);
   assert.match(summary, /\| Docker\/container access \| ➖ Available in audit mode \|/);
   assert.match(summary, /#### Network activity/);
-  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query, 2 TCP\/443 attempts \|/);
+  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query \|/);
+  assert.match(summary, /\| `203.0.113.10` \| ⚠️ Would block \| 2 TCP\/443 attempts \|/);
   assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /\| `2001:db8::10` \| ⚠️ Would block \| 1 TCP\/8443 attempt \|/);
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
@@ -4302,9 +4330,10 @@ test("renders only bounded approved local attribution beside network findings", 
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");
   assert.match(summary, /\| Destination \| Result \| Activity \| Actor \|/);
+  assert.match(summary, /\| `example.com` \| ⚠️ Would block \| 1 A query \| ➖ \|/);
   assert.match(
     summary,
-    /\| `example.com` \| ⚠️ Would block \| 1 A query, 1 TCP\/443 attempt \| runner: curl \(PID 4242\) \|/,
+    /\| `203.0.113.10` \| ⚠️ Would block \| 1 TCP\/443 attempt \| runner: curl \(PID 4242\) \|/,
   );
   assert.doesNotMatch(summary, /secret-payload-marker/);
   assert.doesNotMatch(summary, /private\/operator/);

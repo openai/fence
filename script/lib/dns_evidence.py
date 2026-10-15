@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 import copy
+import json
 import sys
+import time
 import unittest
+from unittest.mock import Mock, patch
 
 
 MATERIALIZATION_REJECTION_REASONS = (
@@ -14,6 +17,7 @@ MATERIALIZATION_REJECTION_REASONS = (
 )
 MAX_U64 = (1 << 64) - 1
 MAX_SAFE_INTEGER = (1 << 53) - 1
+AUDIT_PROBE_WAIT_SECONDS = 10
 
 
 def validate_materialization_rejections(document, *, public=False):
@@ -35,6 +39,44 @@ def validate_materialization_rejections(document, *, public=False):
     if reasons["firewall_update_failed"]:
         raise ValueError("DNS firewall update failed")
     return reasons
+
+
+def wait_for_audit_probe_evidence(report_path, dns_path):
+    """Wait for the hosted audit probes and resident re-verification; never resend a probe."""
+    deadline = time.monotonic() + AUDIT_PROBE_WAIT_SECONDS
+    while True:
+        report, dns = (json.loads(path.read_text(encoding="utf-8")) for path in (report_path, dns_path))
+        attempts = {
+            (item["remote_address"], item["protocol"], item["rule_class"])
+            for item in report["findings"]
+            if item["classification"] == "would_block" and item["remote_port"] == 443
+        }
+        missing = []
+        for hostname, classification, rule in (
+            ("github.com", "platform_profile", "matches_recent_hostname_policy"),
+            ("www.google.com", "outside_policy", "undeclared_new_egress"),
+        ):
+            if not any(
+                (address, "tcp", rule) in attempts
+                for item in dns["observations"]
+                if item["hostname"] == hostname and item["policy_classification"] == classification
+                for address in item["resolved_addresses"]
+            ):
+                missing.append(hostname)
+        if ("192.0.2.10", "udp", "undeclared_new_egress") not in attempts:
+            missing.append("direct-IP probe")
+        health = [doc["resident_health"] for doc in (report, dns)]
+        if any(item["status"] != "healthy" for item in health):
+            raise SystemExit("resident unhealthy while waiting for audit probe evidence")
+        if any(item["verification_sequence"] < 2 for item in health):
+            missing.append("resident re-verification")
+
+        remaining = deadline - time.monotonic()
+        if not missing and remaining >= 0:
+            return report, dns  # The caller validates these exact snapshots.
+        if remaining <= 0:
+            raise SystemExit(f"audit probe evidence deadline reached: {', '.join(missing) or 'late evidence'}")
+        time.sleep(min(0.25, remaining))
 
 
 class DnsEvidenceTests(unittest.TestCase):
@@ -98,6 +140,53 @@ class DnsEvidenceTests(unittest.TestCase):
         ):
             with self.subTest(counts=counts), self.assertRaises(ValueError):
                 validate_materialization_rejections(self.evidence(public=True, **counts), public=True)
+
+
+class AuditProbeEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        health = {"status": "healthy", "verification_sequence": 2}
+        self.report = {"resident_health": health, "findings": []}
+        self.dns = {"resident_health": health, "observations": []}
+        for address, hostname, dns_class, protocol, rule in (
+            ("192.0.2.1", "github.com", "platform_profile", "tcp", "matches_recent_hostname_policy"),
+            ("192.0.2.2", "www.google.com", "outside_policy", "tcp", "undeclared_new_egress"),
+            ("192.0.2.10", None, None, "udp", "undeclared_new_egress"),
+        ):
+            self.report["findings"].append(dict(
+                remote_address=address, remote_port=443, protocol=protocol, rule_class=rule, classification="would_block"
+            ))
+            if hostname:
+                self.dns["observations"].append(dict(
+                    hostname=hostname, policy_classification=dns_class, resolved_addresses=[address]
+                ))
+
+    def wait(self, elapsed, *reports):
+        report_path, dns_path = Mock(), Mock()
+        report_path.read_text.side_effect = [json.dumps(doc) for doc in (reports or (self.report,))]
+        dns_path.read_text.return_value = json.dumps(self.dns)
+        with patch.object(time, "monotonic", side_effect=(0, *elapsed)), patch.object(time, "sleep"):
+            return wait_for_audit_probe_evidence(report_path, dns_path)
+
+    def test_accepts_complete_or_delayed_samples_without_waiting_past_deadline(self):
+        expected = (self.report, self.dns)
+        self.assertEqual(self.wait([0]), expected)
+        self.assertEqual(self.wait([0, AUDIT_PROBE_WAIT_SECONDS], self.report | {"findings": []}, self.report), expected)
+        with self.assertRaisesRegex(SystemExit, "late evidence"):
+            self.wait([AUDIT_PROBE_WAIT_SECONDS + 1])
+
+    def test_requires_each_exact_sample_and_resident_reverification(self):
+        for i, label in enumerate(("github.com", "www.google.com", "direct-IP probe")):
+            with self.subTest(label=label), self.assertRaisesRegex(SystemExit, label):
+                wrong_rule = copy.deepcopy(self.report)
+                wrong_rule["findings"][i]["rule_class"] = "other"
+                self.wait([AUDIT_PROBE_WAIT_SECONDS], wrong_rule)
+        self.dns["observations"][0]["resolved_addresses"] = ["192.0.2.2"]
+        self.dns["resident_health"]["verification_sequence"] = 1
+        with self.assertRaisesRegex(SystemExit, "github.com, resident re-verification"):
+            self.wait([AUDIT_PROBE_WAIT_SECONDS])
+        self.dns["resident_health"]["status"] = "critical"
+        with self.assertRaisesRegex(SystemExit, "resident unhealthy"):
+            self.wait([])
 
 
 if __name__ == "__main__":

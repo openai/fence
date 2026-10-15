@@ -31,13 +31,15 @@ use crate::lockdown::{
 };
 use crate::nflog::NflogReader;
 use crate::nft::{
-    NetworkEvidenceCounters, OwnedNftState, expected_dns_mediated_owned_state,
-    render_dns_mediated_replacement_ruleset, render_dns_mediated_ruleset,
+    DNS_MEDIATOR_UPSTREAM_ADDRESS, DNS_MEDIATOR_UPSTREAM_PORT, NetworkEvidenceCounters,
+    OwnedNftState, expected_dns_mediated_owned_state, render_dns_mediated_replacement_ruleset,
+    render_dns_mediated_ruleset,
 };
 use crate::nft_backend::{NativeNftBackend, SystemNftExecutor};
 use crate::plan::{AssuranceStatus, EffectiveAllowance, PlanData, build_activation_plan};
 use crate::platform_profile::{
-    GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
+    AZURE_INSTANCE_METADATA_ADDRESS, AZURE_INSTANCE_METADATA_TCP_PORT, AZURE_WIRESERVER_ADDRESS,
+    AZURE_WIRESERVER_TCP_PORTS, GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_ACTIONS_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_EXACT_COMPATIBILITY_HOSTNAMES,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_GITHUBAPP_SUFFIX_PATTERN,
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_HTTPS_REFRESH_OVERLAP_SECONDS,
@@ -114,6 +116,7 @@ const MAX_RETAINED_DNS_OBSERVATIONS: usize = 256;
 const MAX_RETAINED_ADDRESSES_PER_OBSERVATION: usize = 32;
 const MAX_MATERIALIZATIONS_PER_UPDATE: usize = 128;
 const MAX_ACTIVE_MATERIALIZATIONS: usize = MAX_EXPANDED_RULES;
+const AUDIT_HOSTNAME_POLICY_MATCH: &str = "matches_recent_hostname_policy";
 const MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS: usize =
     GITHUB_HOSTED_WORKFLOW_BOOTSTRAP_MAX_DYNAMIC_ACTIONS_SUFFIX_AUTHORIZATIONS;
 const MAX_DYNAMIC_ACTIONS_SUFFIX_PREFIX_LABELS: usize =
@@ -982,6 +985,8 @@ struct CnameAuthorizationState {
     runner_authorized_results_storage_truncated: bool,
     active: BTreeMap<String, ActiveCnameAuthorization>,
     truncated: bool,
+    // Advisory only: these are transports block mode could materialize, not firewall grants.
+    audit_hostname_policy: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1331,12 +1336,23 @@ impl ObservationRecorder {
                 now,
                 &self.hostname_policy,
             ) {
-                Ok(response) => {
+                Ok(mut response) => {
                     if forwardable_block_response {
                         observed_answers = records.addresses.clone();
                         block_validation = Some(response);
                     } else {
-                        let _ = commit_dns_response_authorizations(&mut authorizations, response);
+                        let transports = std::mem::take(&mut response.materializations);
+                        if commit_dns_response_authorizations(&mut authorizations, response)
+                            && classification_override.is_none()
+                            && !transports.is_empty()
+                        {
+                            let policy = &mut authorizations.audit_hostname_policy;
+                            merge_materializations(policy, transports, now);
+                            if policy.len() > MAX_ACTIVE_MATERIALIZATIONS {
+                                // Keep the IP suggestion rather than rely on incomplete coverage.
+                                policy.clear();
+                            }
+                        }
                     }
                 }
                 Err(DnsResponseValidationError::Capacity) => {
@@ -1398,6 +1414,46 @@ impl ObservationRecorder {
             self.report_write_failed.store(true, Ordering::Relaxed);
         }
         disposition
+    }
+
+    fn annotate_audit_hostname_match(&self, finding: &mut ConnectionFinding, now: Instant) {
+        let (Some(address), Some(port)) = (finding.remote_address.as_deref(), finding.remote_port)
+        else {
+            return;
+        };
+        let protocol = match finding.protocol.as_str() {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => return,
+        };
+        // Platform permissions have their own scope (including root-only WireServer access).
+        // A DNS answer pointing there is not a reason to hide a policy violation.
+        let platform_service = match (address, protocol) {
+            (AZURE_WIRESERVER_ADDRESS, Protocol::Tcp) => AZURE_WIRESERVER_TCP_PORTS.contains(&port),
+            (DNS_MEDIATOR_UPSTREAM_ADDRESS, Protocol::Udp) => port == DNS_MEDIATOR_UPSTREAM_PORT,
+            (AZURE_INSTANCE_METADATA_ADDRESS, Protocol::Tcp) => {
+                port == AZURE_INSTANCE_METADATA_TCP_PORT
+            }
+            _ => false,
+        };
+        if platform_service {
+            return;
+        }
+        let Ok(address) = address.parse::<IpAddr>() else {
+            return;
+        };
+        let state = self
+            .cname_authorizations
+            .lock()
+            .expect("DNS CNAME authorization lock poisoned");
+        if state.audit_hostname_policy.values().any(|grant| {
+            grant.expires_at > now
+                && (grant.address, grant.protocol, grant.port) == (address, protocol, port)
+        }) {
+            // Match at NFLOG dequeue, not packet time. The policy lifetime includes block's refresh overlap.
+            // This guides IP suggestions; it doesn't identify a hostname or change the would-block observation.
+            finding.rule_class = AUDIT_HOSTNAME_POLICY_MATCH.to_owned();
+        }
     }
 
     fn record_materialization_rejection(&self, reason: MaterializationRejectionReason) {
@@ -2569,7 +2625,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         match drain_connection_events(
             finding_timeout,
             &mut |timeout| reader.next_event(timeout).map_err(|_| ()),
-            &mut |event| {
+            &mut |mut event| {
+                mediation
+                    .recorder
+                    .annotate_audit_hostname_match(&mut event.finding, Instant::now());
                 record_connection_event(mediation, findings, event);
                 finding_received = true;
             },
@@ -8587,6 +8646,120 @@ mod tests {
         let _ = fs::remove_file(report_path);
     }
 
+    fn audit_matches_transport(
+        recorder: &ObservationRecorder,
+        address: Ipv4Addr,
+        protocol: u8,
+        port: u16,
+        now: Instant,
+    ) -> bool {
+        let mut prefix = [0; 24];
+        prefix[0] = 0x45;
+        prefix[9] = protocol;
+        prefix[16..20].copy_from_slice(&address.octets());
+        prefix[22..24].copy_from_slice(&port.to_be_bytes());
+        let mut finding = crate::findings::finding_from_prefix(Mode::Audit, String::new(), &prefix);
+        let observed = finding.classification;
+        recorder.annotate_audit_hostname_match(&mut finding, now);
+        assert_eq!(
+            finding.classification, observed,
+            "do not reinterpret the observed packet"
+        );
+        finding.rule_class == AUDIT_HOSTNAME_POLICY_MATCH
+    }
+
+    #[test]
+    fn audit_matches_only_validated_authorized_transports_until_their_actual_expiry() {
+        let (audit, path) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        let root = "github.com";
+        let address = Ipv4Addr::new(192, 0, 2, 10);
+        let unrelated =
+            response_with_unrelated_address(root, 1, "unrelated.example", &address.octets());
+        let valid =
+            response_with_cname_and_address(root, "edge.example", 60, 60, &address.octets());
+        let matches =
+            |protocol, port, now| audit_matches_transport(&audit, address, protocol, port, now);
+        for (response, classification) in [(&unrelated, None), (&valid, Some("outside_policy"))] {
+            assert_eq!(
+                audit.record_response(root, 1, response, classification),
+                DnsResponseDisposition::ForwardOriginal,
+            );
+            assert!(!matches(6, 443, Instant::now()));
+        }
+        assert_eq!(
+            audit.record_response(root, 1, &valid, None),
+            DnsResponseDisposition::ForwardOriginal
+        );
+        let policy = audit.cname_authorizations.lock().unwrap();
+        let expiry = policy
+            .audit_hostname_policy
+            .values()
+            .next()
+            .unwrap()
+            .expires_at;
+        drop(policy);
+        let now = Instant::now();
+        assert!(matches(6, 443, now));
+        assert!(!matches(6, 8443, now));
+        assert!(!matches(17, 443, now));
+        assert!(!matches(6, 443, expiry));
+        audit.reset_after_activation().unwrap();
+        assert!(!matches(6, 443, now));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn audit_does_not_explain_platform_service_violations_with_an_allowed_hostname() {
+        let mut policy = test_hostname_policy(false);
+        let root = "github.com";
+        let hostname = policy
+            .exact
+            .iter_mut()
+            .find(|entry| entry.hostname == root)
+            .unwrap();
+        hostname.transports.extend([
+            HostnameTransport {
+                protocol: Protocol::Tcp,
+                port: AZURE_INSTANCE_METADATA_TCP_PORT,
+            },
+            HostnameTransport {
+                protocol: Protocol::Udp,
+                port: DNS_MEDIATOR_UPSTREAM_PORT,
+            },
+        ]);
+        let (audit, path) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostAudit, None, policy);
+        for (service, protocol, port) in [
+            (AZURE_WIRESERVER_ADDRESS, 6, AZURE_WIRESERVER_TCP_PORTS[0]),
+            (
+                DNS_MEDIATOR_UPSTREAM_ADDRESS,
+                17,
+                DNS_MEDIATOR_UPSTREAM_PORT,
+            ),
+            (
+                AZURE_INSTANCE_METADATA_ADDRESS,
+                6,
+                AZURE_INSTANCE_METADATA_TCP_PORT,
+            ),
+        ] {
+            let address: Ipv4Addr = service.parse().unwrap();
+            let response = response_with_address(root, 1, 60, &address.octets());
+            assert_eq!(
+                audit.record_response(root, 1, &response, None),
+                DnsResponseDisposition::ForwardOriginal
+            );
+            let now = Instant::now();
+            assert!(
+                audit_matches_transport(&audit, address, 6, 443, now),
+                "ordinary transport on the same IP"
+            );
+            assert!(!audit_matches_transport(
+                &audit, address, protocol, port, now
+            ));
+        }
+        fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn failed_disconnected_and_saturated_materialization_requests_fail_closed() {
         let (submitter, requests) = materialization_request_channel();
@@ -11675,6 +11848,27 @@ mod tests {
         assert!(materialization_candidate_exceeds_bounds(
             &active, &effective
         ));
+
+        let (audit, path) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        audit
+            .cname_authorizations
+            .lock()
+            .unwrap()
+            .audit_hostname_policy = active;
+        let response = response_with_address("github.com", 1, 60, &[192, 0, 2, 10]);
+        assert_eq!(
+            audit.record_response("github.com", 1, &response, None),
+            DnsResponseDisposition::ForwardOriginal,
+        );
+        assert!(
+            audit
+                .cname_authorizations
+                .lock()
+                .unwrap()
+                .audit_hostname_policy
+                .is_empty()
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -2078,6 +2078,11 @@ function dnsAddressHostnameMap(
   return addressMap;
 }
 
+function auditMatchesRecentHostnamePolicy(report: any, finding: any): boolean {
+  return report.mode === "audit" && finding.mode === "audit" &&
+    finding.classification === "would_block" && finding.rule_class === "matches_recent_hostname_policy";
+}
+
 function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): AuditSummary {
   const hostnameRows = new Map<string, AuditFindingRow>();
   const ipRows = new Map<string, AuditFindingRow>();
@@ -2131,7 +2136,8 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
           port: finding.remote_port,
         });
       }
-    } else {
+    } else if (!auditMatchesRecentHostnamePolicy(report, finding)) {
+      // An outside-policy name takes precedence. Otherwise don't broaden an existing hostname policy to an IP.
       addRow(ipRows, {
         destination: finding.remote_address,
         destinationKind: "ip",
@@ -2408,6 +2414,8 @@ function allowlistYamlSnippet(rows: AuditFindingRow[]): string[] {
     "<details>",
     "<summary>View allowlist example</summary>",
     "",
+    "DNS matches are hints, not proof that a connection used that name or that block mode would allow it.",
+    "",
     "```yaml",
     "- uses: openai/fence@<commit-sha>",
     "  with:",
@@ -2542,7 +2550,8 @@ function addConnectionFindingActivity(
   report: any,
   dnsEvidence: any,
 ): void {
-  const addressMap = dnsAddressHostnameMap(dnsEvidence);
+  // In audit, report the address we observed. DNS can guide suggestions, not identify the connection's hostname.
+  const addressMap = report.mode === "audit" ? undefined : dnsAddressHostnameMap(dnsEvidence);
   const findings = Array.isArray(report.findings) ? report.findings.slice(0, 1024) : [];
   for (const finding of findings) {
     if (
@@ -2564,7 +2573,7 @@ function addConnectionFindingActivity(
     if (decision === undefined) {
       continue;
     }
-    const hostnames = Array.from(addressMap.get(finding.remote_address) || []).sort();
+    const hostnames = Array.from(addressMap?.get(finding.remote_address) || []).sort();
     const destinations = hostnames.length > 0 ? hostnames : [finding.remote_address];
     const actor = findingActorLabel(finding);
     for (const destination of destinations) {
