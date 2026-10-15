@@ -141,7 +141,7 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 - **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. Azure WireServer access is limited to root-owned host processes.
 - **Artifacts:** `allow_github_artifacts: true` allows limited access to storage used by GitHub Actions.
 - **Docker:** `unsafe_preserve` keeps containers available but reduces isolation.
-- **Release pinning:** Use the full commit SHA from a published Fence release. Do not run the Action from `main`.
+- **Release pinning:** Copy the full commit SHA from the [verified release notes](https://github.com/openai/fence/releases/latest), not from `main` or a version tag.
 
 See the [security guide](docs/security.md) for more details.
 

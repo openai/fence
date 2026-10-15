@@ -39,7 +39,7 @@ This page tracks the major changes that shaped Fence. For current behavior and s
 
 - Releases through `v0.6.3` used two stages: first a source release, then a reviewed update to the Action binary and manifest. Their original tags and commit pins remain unchanged.
 - The current release process keeps `main` source-only. One reviewed version bump authorizes automation to build source commit `M`, create signed distribution commit `D`, test it, and publish an immutable release.
-- `action-release.json` maps each release to its exact distribution commit. Users pin that full commit SHA; the Action never downloads an agent or policy at runtime.
+- `action-release.json` maps each release to its exact distribution commit. Users copy the full commit SHA from the finalized release notes. The Action never downloads an agent or policy at runtime.
 
 ## v0 hardening
 
