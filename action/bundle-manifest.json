@@ -1,0 +1,14 @@
+{
+  "artifact_name": "fence_v0.12.0_linux-amd64",
+  "artifact_sha256": "f3882aa0ef4806a14ac1f445969bbd9290f79ce059dbec89ad5edc684b57c4b5",
+  "bundle_path": "action/bin/fence",
+  "release_channel": "stable",
+  "release_tag": "v0.12.0",
+  "release_url": "https://github.com/openai/fence/releases/tag/v0.12.0",
+  "repository": "openai/fence",
+  "schema_version": 4,
+  "signer_digest": "a18ddd26fbb86be45459628d479eeb45e068f80c",
+  "signer_workflow": "openai/fence/.github/workflows/release.yml",
+  "source_commit": "a18ddd26fbb86be45459628d479eeb45e068f80c",
+  "source_ref": "refs/heads/main"
+}
