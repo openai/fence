@@ -1045,13 +1045,6 @@ jobs:
           set -euo pipefail
           release_id="$(python3 -B -E script/lib/release_adoption.py verify)"
 
-          tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${VERSION_TAG}" --jq .sha)"
-          if [[ "$tag_commit" != "$ACTION_COMMIT" ]]; then
-            echo "immutable release tag does not resolve to the Action commit" >&2
-            exit 1
-          fi
-          python3 -B -E script/lib/release_adoption.py verify-commit
-
           script/validate-action-bundle
           if [[ "$(git rev-list --parents -n 1 HEAD)" != "$ACTION_COMMIT $SOURCE_COMMIT" ]]; then
             echo "checked-out Action commit does not have the exact source parent" >&2

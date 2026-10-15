@@ -303,7 +303,7 @@ def classify_release_state(state, repository, version, source_commit, artifact_n
     return {"state": "candidate", "action_commit": candidate_head}
 
 
-def validate_distribution_commit(rest, graphql, source_commit, action_commit):
+def validate_distribution_rest(rest, source_commit, action_commit):
     if not SHA1.fullmatch(source_commit) or not SHA1.fullmatch(action_commit):
         fail("distribution commit identity is invalid")
     if not isinstance(rest, dict) or rest.get("sha") != action_commit:
@@ -316,12 +316,25 @@ def validate_distribution_commit(rest, graphql, source_commit, action_commit):
     verification = rest.get("commit", {}).get("verification", {})
     if verification.get("verified") is not True:
         fail("distribution commit REST signature is invalid")
-    commit = graphql.get("data", {}).get("repository", {}).get("object", {}) if isinstance(graphql, dict) else {}
-    signature = commit.get("signature") or {}
-    if commit.get("oid") != action_commit:
+
+
+def visible_distribution_signature(graphql, action_commit):
+    if not isinstance(graphql, dict) or graphql.get("errors", []) != []:
+        fail("distribution GraphQL query failed")
+    try:
+        commit = graphql["data"]["repository"]["object"]
+    except (KeyError, TypeError):
+        fail("distribution GraphQL commit response is malformed")
+    # An error-free, explicit null object means the new commit is not visible yet.
+    if commit is None:
+        return None
+    if not isinstance(commit, dict) or commit.get("oid") != action_commit:
         fail("distribution GraphQL commit identity mismatch")
-    if signature.get("isValid") is not True or signature.get("wasSignedByGitHub") is not True:
+    signature = commit.get("signature")
+    if (not isinstance(signature, dict) or signature.get("isValid") is not True
+            or signature.get("wasSignedByGitHub") is not True):
         fail("distribution commit was not validly signed by GitHub")
+    return True
 
 
 def validate_draft_release(metadata, notes_path, asset_root, version, action_commit):

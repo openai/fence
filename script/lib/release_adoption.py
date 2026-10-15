@@ -8,10 +8,12 @@ import time
 import urllib.error
 import urllib.request
 
-from action_release import REPOSITORY, SHA1, fail, release_channel, validate_distribution_commit
+from action_release import (
+    REPOSITORY, SHA1, fail, release_channel, validate_distribution_rest, visible_distribution_signature,
+)
 
 
-PENDING_NOTES = "Verification pending. Keep using the previous release."
+PENDING_NOTES = "Not verified for use. Keep using the previous release."
 READ_ATTEMPTS = 12
 
 
@@ -62,17 +64,21 @@ def read(path, *, validate=lambda value: value, **query):
     fail(f"timed out reading release metadata: {path}")
 
 
-def verify_commit(source, action):
+def verify_commit(source, action, *, ref=None):
     owner, repo = REPOSITORY.split("/")
     query = """query($owner: String!, $repo: String!, $oid: GitObjectID!) {
       repository(owner: $owner, name: $repo) { object(oid: $oid) {
         ... on Commit { oid signature { isValid wasSignedByGitHub } }
       } } }"""
-    rest = read(f"repos/{REPOSITORY}/commits/{action}")
-    graphql = read("graphql", method="POST",
-                   data={"query": query, "variables": {"owner": owner, "repo": repo, "oid": action}})
-    # Invalid identity, tree, or signature is an integrity failure, not a retry.
-    validate_distribution_commit(rest, graphql, source, action)
+
+    def validate_rest(document):
+        # One lookup verifies both the published tag's target and the full commit.
+        validate_distribution_rest(document, source, action)
+        return True
+
+    read(f"repos/{REPOSITORY}/commits/{ref or action}", validate=validate_rest)
+    read("graphql", method="POST", validate=lambda document: visible_distribution_signature(document, action),
+         data={"query": query, "variables": {"owner": owner, "repo": repo, "oid": action}})
 
 
 class Publication:
@@ -117,18 +123,19 @@ class Publication:
             if not isinstance(refs, list) or any(item["ref"] == f"refs/{ref}" for item in refs):
                 fail(f"release not finalized: {ref} remains or could not be verified")
         _, finalized = self.wait(release_id=release_id, existing=True)
-        if finalized:
-            return  # Never re-promote an older release to latest on re-verification.
-        update = {"body": self.final_notes, "prerelease": self.prerelease,
-                  "make_latest": "false" if self.prerelease else "true"}
-        try:
-            github(f"{self.base}/{release_id}", method="PATCH", data=update)
-        except (OSError, http.client.HTTPException) as error:
-            if not transient(error):
-                raise
-        # Whether the response arrived or not, confirm the exact update by GET.
-        # Never retry the mutation. A full workflow rerun can recover pending state.
-        self.wait(release_id=release_id, existing=True, require_final=True)
+        if not finalized:
+            update = {"body": self.final_notes, "prerelease": self.prerelease,
+                      "make_latest": "false" if self.prerelease else "true"}
+            try:
+                github(f"{self.base}/{release_id}", method="PATCH", data=update)
+            except (OSError, http.client.HTTPException) as error:
+                if not transient(error):
+                    raise
+            # Whether the response arrived or not, confirm the exact update by GET.
+            # Never retry the mutation. A full workflow rerun can recover pending state.
+            self.wait(release_id=release_id, existing=True, require_final=True)
+        # Also confirm Latest on recovery after successful PATCH but failed readback.
+        # Never move a historical release back to Latest: this is a read-only check.
         if not self.prerelease:
             read(f"{self.base}/latest", validate=lambda value: True if value["id"] == release_id else None)
 
@@ -144,6 +151,7 @@ def main(command):
     publication = Publication(os.environ["VERSION_TAG"], source, action)
     if command == "verify":
         release_id, _ = publication.wait(existing=os.environ["EXISTING_RELEASE"] == "true")
+        verify_commit(source, action, ref=publication.tag)
         print(release_id)
     elif command == "promote":
         publication.promote(int(os.environ["VERIFIED_RELEASE_ID"]))

@@ -10,6 +10,7 @@ python3 -B -E - "$DIR" <<'PY'
 import copy
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -250,7 +251,8 @@ graphql = {
         }
     }
 }
-module.validate_distribution_commit(rest, graphql, source, action)
+module.validate_distribution_rest(rest, source, action)
+assert module.visible_distribution_signature(graphql, action) is True
 invalid_parent = copy.deepcopy(rest)
 invalid_parent["parents"] = [{"sha": other}]
 invalid_diff = copy.deepcopy(rest)
@@ -259,14 +261,11 @@ invalid_rest_signature = copy.deepcopy(rest)
 invalid_rest_signature["commit"]["verification"]["verified"] = False
 invalid_github_signature = copy.deepcopy(graphql)
 invalid_github_signature["data"]["repository"]["object"]["signature"]["wasSignedByGitHub"] = False
-for description, rest_value, graphql_value in (
-    ("parent", invalid_parent, graphql),
-    ("diff", invalid_diff, graphql),
-    ("REST signature", invalid_rest_signature, graphql),
-    ("GitHub signature", rest, invalid_github_signature),
+for description, invalid in (
+    ("parent", invalid_parent), ("diff", invalid_diff), ("REST signature", invalid_rest_signature),
 ):
     expect_error(
-        lambda left=rest_value, right=graphql_value: module.validate_distribution_commit(left, right, source, action),
+        lambda: module.validate_distribution_rest(invalid, source, action),
         f"accepted conflicting distribution {description}",
     )
 
@@ -291,11 +290,31 @@ with mock.patch.object(adoption.time, "sleep"):
         http_error(502), http_error(404), dict(pending, immutable=False), pending,
     ]):
         assert publication.wait() == (release_id, False)
-    # A transient commit read can recover, not a conflicting identity or signature.
-    with mock.patch.object(adoption, "github", side_effect=[http_error(502), rest, graphql]):
-        adoption.verify_commit(source, action)
-    with mock.patch.object(adoption, "github", side_effect=[invalid_parent, graphql]):
-        expect_error(lambda: adoption.verify_commit(source, action), "accepted incorrect commit parent")
+    # Resolve the published tag once, using that same commit response. Only an
+    # explicitly not-yet-visible GraphQL object, not an error or bad identity, can wait.
+    tag_path = f"repos/openai/fence/commits/{tag}"
+    not_visible = {"data": {"repository": {"object": None}}}
+    verification_env = {"SOURCE_COMMIT": source, "ACTION_COMMIT": action, "VERSION_TAG": tag, "EXISTING_RELEASE": "false"}
+    with (mock.patch.dict(os.environ, verification_env), mock.patch("builtins.print") as printed,
+          mock.patch.object(adoption, "github", side_effect=[pending, http_error(502), rest, not_visible, graphql]) as api):
+        adoption.main("verify")
+        printed.assert_called_once_with(release_id)
+        assert [call.args[0] for call in api.call_args_list[1:]] == [tag_path, tag_path, "graphql", "graphql"]
+        assert api.call_args.kwargs["data"]["variables"]["oid"] == action
+    for invalid in (None, invalid_parent, dict(rest, sha=other)):
+        with mock.patch.object(adoption, "github", return_value=invalid) as api:
+            expect_error(lambda: adoption.verify_commit(source, action, ref=tag), "accepted incorrect tag commit")
+            api.assert_called_once_with(tag_path)
+    with mock.patch.object(adoption, "github", side_effect=[rest] + [not_visible] * adoption.READ_ATTEMPTS) as api:
+        expect_error(lambda: adoption.verify_commit(source, action), "accepted a commit that never became visible")
+        assert api.call_count == 1 + adoption.READ_ATTEMPTS
+    for invalid in (
+        dict(not_visible, errors=[{"type": "FORBIDDEN"}]),
+        {"data": {"repository": None}}, {"data": {"repository": {}}},
+        {"data": {"repository": {"object": {"oid": other}}}}, invalid_github_signature,
+    ):
+        with mock.patch.object(adoption, "github", side_effect=[rest, invalid]):
+            expect_error(lambda: adoption.verify_commit(source, action), "accepted a malformed or conflicting commit")
 
     for invalid in (
         http_error(401), http_error(403), dict(pending, tag_name="v9.9.9"),
@@ -341,10 +360,24 @@ with mock.patch.object(adoption.time, "sleep"):
                 "body": release.final_notes, "prerelease": release.prerelease,
                 "make_latest": "false" if release.prerelease else "true",
             })]
-        # Interrupted after successful promotion: verify again, change nothing.
-        with mock.patch.object(adoption, "github", side_effect=[[], [], final]) as api:
+        # Re-run after successful promotion: verify latest again, change nothing.
+        latest = [] if release.prerelease else [final]
+        with mock.patch.object(adoption, "github", side_effect=[[], [], final] + latest) as api:
             release.promote(release_id)
             assert all(call.kwargs.get("method", "GET") == "GET" for call in api.call_args_list)
+            if not release.prerelease:
+                assert api.call_args == mock.call("repos/openai/fence/releases/latest")
+
+    # PATCH succeeds but stable Latest cannot be confirmed, including on a
+    # subsequent full read-only verification. Neither attempt can report success.
+    final = dict(pending, body=publication.final_notes, prerelease=False)
+    previous = {"id": release_id - 1}
+    for start, writes in (([pending, None, final], 1), ([final], 0)):
+        responses = [[], []] + start + [previous] * adoption.READ_ATTEMPTS
+        with mock.patch.object(adoption, "github", side_effect=responses) as api:
+            expect_error(lambda: publication.promote(release_id), "advertised a stable release not confirmed Latest")
+            assert sum(call.kwargs.get("method") == "PATCH" for call in api.call_args_list) == writes
+            assert api.call_args == mock.call("repos/openai/fence/releases/latest")
 
     unconfirmed = [[], [], pending, TimeoutError()] + [pending] * adoption.READ_ATTEMPTS
     with mock.patch.object(adoption, "github", side_effect=unconfirmed) as api:
