@@ -13,13 +13,15 @@ use fence::nft::{
     unapplied_test_evidence_model,
 };
 use fence::nft_backend::{
-    IP_BINARY_PATH, NativeNftBackend, SystemNftExecutor, write_test_evidence,
+    BackendError, IP_BINARY_PATH, NativeNftBackend, NftExecutor, NftOperation, SystemNftExecutor,
+    write_test_evidence,
 };
 use fence::plan::{EffectiveAllowance, build_plan};
+use fence::platform_profile::{AZURE_WIRESERVER_ADDRESS, AZURE_WIRESERVER_TCP_PORTS};
 use fence::resolver::{Resolution, ResolveError, Resolver};
 use fence::runtime::{RESIDENT_EVIDENCE_STATUS, TEST_READY_STATUS};
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -439,6 +441,158 @@ fn dns_mediator_guard_handles_conntrack_principal_transfer_by_mode() {
 }
 
 #[test]
+#[ignore = "requires Linux root network namespaces and native nftables"]
+fn wireserver_is_root_host_only_despite_overlapping_allowance_and_established_connection() {
+    require_root();
+    let topology = RoutedTopology::new();
+    // All three namespaces have only veth routes, no default route. The exact
+    // WireServer address terminates at our recording listener, never at Azure.
+    let address = AZURE_WIRESERVER_ADDRESS;
+    let prefix = format!("{address}/32");
+    in_namespace(
+        &topology.sink,
+        IP_BINARY_PATH,
+        &["addr", "add", &prefix, "dev", "lo"],
+    );
+    for (namespace, via) in [
+        (&topology.router, "203.0.113.2"),
+        (&topology.source, "198.51.100.1"),
+    ] {
+        in_namespace(
+            namespace,
+            IP_BINARY_PATH,
+            &["route", "add", &prefix, "via", via],
+        );
+    }
+
+    let mut nft = backend(&topology.router);
+    for port in AZURE_WIRESERVER_TCP_PORTS {
+        let received = evidence_root().join(format!("wireserver-{port}-received"));
+        let _listener = start_wireserver_listener(&topology.sink, port, &received);
+        wait_for_path(&received);
+
+        let empty = render_dns_mediated_ruleset(Mode::Block, &[]);
+        nft.preflight(&empty).unwrap();
+        nft.apply_provisional(&empty).unwrap();
+        nft.verify_owned_state(&expected_dns_mediated_owned_state(Mode::Block, &[]))
+            .unwrap();
+        assert!(send_traffic(&topology.router, address, "tcp", port, "root"));
+        let mut expected = String::from("root");
+
+        // A covering CIDR must not grant local runner or forwarded access.
+        let overlap = [EffectiveAllowance {
+            destination_type: DestinationType::Cidr,
+            destination: format!("{address}/31"),
+            protocol: Protocol::Tcp,
+            port,
+        }];
+        let replace = |nft: &mut NativeNftBackend<_>, mode| {
+            nft.replace_owned_state(&render_dns_mediated_replacement_ruleset(mode, &overlap))
+                .unwrap();
+            nft.verify_owned_state(&expected_dns_mediated_owned_state(mode, &overlap))
+                .unwrap();
+        };
+        replace(&mut nft, Mode::Audit);
+        let mut probes = Vec::new();
+        for (namespace, user) in [(&topology.router, "runner"), (&topology.source, "root")] {
+            let before = nft.total_violation_packets().unwrap();
+            let mut probe = start_wireserver_probe(namespace, port, user);
+            let mut ready = BufReader::new(probe.0.stdout.take().unwrap()).lines();
+            assert_eq!(ready.next().unwrap().unwrap(), "established in audit");
+            assert!(nft.total_violation_packets().unwrap() > before);
+            expected.push_str("audit");
+            probes.push(probe);
+        }
+
+        // Both acknowledged connections and their conntrack entries stay live
+        // across the atomic replacement. Assert which bytes reached the sink.
+        replace(&mut nft, Mode::Block);
+        for mut probe in probes {
+            let before = nft.total_violation_packets().unwrap();
+            writeln!(probe.0.stdin.take().unwrap(), "block").unwrap();
+            assert!(probe.0.wait().unwrap().success());
+            assert!(nft.total_violation_packets().unwrap() > before);
+        }
+        assert_eq!(fs::read_to_string(&received).unwrap(), expected);
+        assert!(nft.rollback_pre_activation().unwrap());
+    }
+}
+
+fn start_wireserver_listener(namespace: &str, port: u16, received: &Path) -> ChildGuard {
+    let script = r#"
+import pathlib, socketserver, sys
+address, port, received = sys.argv[1:]
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        while data := self.request.recv(64):
+            with open(received, "ab") as evidence:
+                evidence.write(data)
+            self.request.sendall(b"ok")
+with socketserver.ThreadingTCPServer((address, int(port)), Handler) as server:
+    pathlib.Path(received).touch(exist_ok=False)
+    server.serve_forever()
+"#;
+    let mut command = Command::new(IP_BINARY_PATH);
+    command.args([
+        "netns",
+        "exec",
+        namespace,
+        PYTHON,
+        "-c",
+        script,
+        AZURE_WIRESERVER_ADDRESS,
+    ]);
+    ChildGuard(command.arg(port.to_string()).arg(received).spawn().unwrap())
+}
+
+fn start_wireserver_probe(namespace: &str, port: u16, user: &str) -> ChildGuard {
+    let script = r#"
+import os, pwd, socket, sys
+address, port, user = sys.argv[1:]
+peer = (address, int(port))
+account = pwd.getpwnam(user)
+os.setgroups([])
+os.setgid(account.pw_gid)
+os.setuid(account.pw_uid)
+with socket.create_connection(peer, timeout=3) as established:
+    established.sendall(b"audit")
+    assert established.recv(2) == b"ok"
+    print("established in audit", flush=True)
+    assert input() == "block"
+    try:
+        established.sendall(b"escaped-established")
+        assert not established.recv(2), "established TCP escaped block"
+    except (ConnectionError, TimeoutError):
+        pass
+try:
+    with socket.create_connection(peer, timeout=3) as fresh:
+        fresh.sendall(b"escaped-fresh")
+        raise AssertionError("fresh TCP escaped block")
+except (ConnectionError, TimeoutError):
+    pass
+"#;
+    let mut command = Command::new(IP_BINARY_PATH);
+    command.args([
+        "netns",
+        "exec",
+        namespace,
+        PYTHON,
+        "-c",
+        script,
+        AZURE_WIRESERVER_ADDRESS,
+    ]);
+    ChildGuard(
+        command
+            .arg(port.to_string())
+            .arg(user)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+#[test]
 #[ignore = "requires Linux root, transient systemd services, namespaces, and native nftables"]
 fn resident_systemd_service_reports_drift_without_restoring_post_ready_state() {
     require_root();
@@ -527,7 +681,10 @@ fn conflict_preflight_and_rollback_are_confined_to_owned_namespace_state() {
     first.apply_provisional(&program).unwrap();
     let mut conflict = backend(&topology.client);
     assert!(conflict.apply_provisional(&program).is_err());
-    assert!(!conflict.rollback_pre_activation().unwrap());
+    assert_eq!(
+        conflict.rollback_pre_activation().unwrap_err().code,
+        "provisional_nft_state_unknown"
+    );
     assert!(first.rollback_pre_activation().unwrap());
 
     let invalid =
@@ -545,6 +702,43 @@ fn conflict_preflight_and_rollback_are_confined_to_owned_namespace_state() {
     );
     assert!(applied.rollback_pre_activation().unwrap());
     nft_in_namespace(&topology.client, &["list", "table", "inet", "foreign_test"]);
+}
+
+#[test]
+#[ignore = "requires Linux root network namespaces and native nftables"]
+fn an_error_reply_after_a_real_kernel_commit_cannot_claim_or_delete_the_table() {
+    struct LoseApplyReply(SystemNftExecutor);
+    impl NftExecutor for LoseApplyReply {
+        fn execute(&self, operation: NftOperation, input: &[u8]) -> Result<Vec<u8>, BackendError> {
+            let reply = self.0.execute(operation, input)?;
+            if operation == NftOperation::ApplyProvisional {
+                // Commit the actual batch, but return an ordinary diagnostic exit as if its
+                // acknowledgement were lost. The second (-c) operation cannot change the table.
+                return self
+                    .0
+                    .execute(NftOperation::Preflight, b"invalid nft command");
+            }
+            Ok(reply)
+        }
+    }
+
+    require_root();
+    let topology = PeerTopology::new();
+    let nft = SystemNftExecutor::in_test_network_namespace(&topology.client).unwrap();
+    let mut uncertain = NativeNftBackend::new(LoseApplyReply(nft));
+    let program = render_ruleset(Mode::Block, &[]);
+    assert_eq!(
+        uncertain.apply_provisional(&program).unwrap_err().code,
+        "nft_command_failed"
+    );
+    assert_eq!(
+        uncertain.rollback_pre_activation().unwrap_err().code,
+        "provisional_nft_state_unknown"
+    );
+    // Read-only proof that the real committed table survived. Dropping the namespace cleans up.
+    uncertain
+        .verify_owned_state(&expected_owned_state(Mode::Block, &[]))
+        .unwrap();
 }
 
 #[test]

@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 pub const RESIDENT_EVIDENCE_STATUS: &str = "resident_lifecycle_test_only";
 pub const TEST_READY_STATUS: &str = "test_only_ready_no_protection";
 pub const PRODUCTION_RUNTIME_ROOT: &str = "/run/fence";
+const READY_FILE_NAME: &str = "ready.json";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuntimeError {
@@ -35,9 +36,18 @@ pub struct TestRuntimeStore {
 pub trait RuntimeDocumentStore {
     fn directory(&self) -> &Path;
     fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
-    fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
     fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError>;
     fn verify_evidence_persistence(&self, require_ready: bool) -> Result<(), RuntimeError>;
+
+    /// Publish the matching report first. A visible ready marker commits to no restore.
+    fn publish_readiness(
+        &self,
+        report: &impl Serialize,
+        ready: &impl Serialize,
+    ) -> Result<(), RuntimeError> {
+        let bytes = bounded_json(ready)?;
+        publish_readiness(self, report, |file| write_and_sync(file, &bytes))
+    }
 }
 
 impl TestRuntimeStore {
@@ -57,17 +67,13 @@ impl TestRuntimeStore {
         Ok(Self {
             state: directory.join("state.json"),
             report: directory.join("report.json"),
-            ready: directory.join("ready.json"),
+            ready: directory.join(READY_FILE_NAME),
             directory,
         })
     }
 
     pub fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         write_json_exclusive(&self.state, value, 0o600)
-    }
-
-    pub fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        write_json_exclusive(&self.ready, value, 0o644)
     }
 
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
@@ -91,10 +97,6 @@ impl RuntimeDocumentStore for TestRuntimeStore {
 
     fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         self.write_state_exclusive(value)
-    }
-
-    fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        self.write_ready_exclusive(value)
     }
 
     fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
@@ -132,7 +134,7 @@ impl ProductionRuntimeStore {
         Ok(Self {
             state: directory.join("state.json"),
             report: directory.join("report.json"),
-            ready: directory.join("ready.json"),
+            ready: directory.join(READY_FILE_NAME),
             invocation_id,
             directory,
             config: config.to_path_buf(),
@@ -170,10 +172,6 @@ impl ProductionRuntimeStore {
         write_json_exclusive(&self.state, value, 0o600)
     }
 
-    pub fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        write_json_exclusive(&self.ready, value, 0o644)
-    }
-
     pub fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         replace_report(&self.report, value)
     }
@@ -195,10 +193,6 @@ impl RuntimeDocumentStore for ProductionRuntimeStore {
 
     fn write_state_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
         self.write_state_exclusive(value)
-    }
-
-    fn write_ready_exclusive(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
-        self.write_ready_exclusive(value)
     }
 
     fn replace_report(&self, value: &impl Serialize) -> Result<(), RuntimeError> {
@@ -386,20 +380,48 @@ fn replace_report(report: &Path, value: &impl Serialize) -> Result<(), RuntimeEr
     atomic_replace_report(report, |file| write_and_sync(file, &bytes))
 }
 
+fn publish_readiness(
+    store: &(impl RuntimeDocumentStore + ?Sized),
+    report: &impl Serialize,
+    write_ready: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<(), RuntimeError> {
+    store.replace_report(report)?;
+    let ready = store.directory().join(READY_FILE_NAME);
+    publish_evidence(&ready, Publication::Create, write_ready)
+}
+
 /// Replaces a report in a trusted runtime directory; the writer controls syncing.
 pub(crate) fn atomic_replace_report(
     report: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
 ) -> Result<(), RuntimeError> {
-    let pending = report.with_added_extension("next");
+    publish_evidence(report, Publication::Replace, write)
+}
+
+enum Publication {
+    Create,
+    Replace,
+}
+
+fn publish_evidence(
+    path: &Path,
+    publication: Publication,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<(), RuntimeError> {
+    let pending = path.with_added_extension("next");
     let mut file = create_exclusive(&pending, 0o644)?;
     let result = write(&mut file)
         .map_err(|error| io_error("runtime_write_failed", error))
         .and_then(|()| {
-            fs::rename(&pending, report)
-                .map_err(|error| io_error("runtime_atomic_write_failed", error))
+            match publication {
+                // A same-directory hard link publishes the complete file without replacing
+                // an existing marker. Once visible, cleanup must never turn success into failure.
+                Publication::Create => fs::hard_link(&pending, path),
+                Publication::Replace => fs::rename(&pending, path),
+            }
+            .map_err(|error| io_error("runtime_atomic_write_failed", error))
         });
-    if result.is_err() {
+    if result.is_err() || matches!(publication, Publication::Create) {
         remove_created_file(&pending, &file);
     }
     result
@@ -487,20 +509,18 @@ mod tests {
                 value: "first".to_owned(),
             })
             .unwrap();
-        store
-            .replace_report(&Document {
-                value: "second".to_owned(),
-            })
-            .unwrap();
         store.verify_evidence_persistence(false).unwrap();
         assert_eq!(
             store.verify_evidence_persistence(true).unwrap_err().code,
             "runtime_evidence_missing"
         );
         store
-            .write_ready_exclusive(&Document {
-                value: TEST_READY_STATUS.to_owned(),
-            })
+            .publish_readiness(
+                &Document {
+                    value: "second".to_owned(),
+                },
+                &TEST_READY_STATUS,
+            )
             .unwrap();
         store.verify_evidence_persistence(true).unwrap();
 
@@ -580,6 +600,63 @@ mod tests {
     }
 
     #[test]
+    fn first_visible_ready_marker_is_complete_and_its_report_is_already_final() {
+        let (root, config, uid) = production_fixture(b"{}");
+        let store = ProductionRuntimeStore::open_under(&root, &config, uid).unwrap();
+        let report = serde_json::json!({"readiness_status": "ready"});
+        let marker = br#"{"status":"ready"}"#;
+
+        publish_readiness(&store, &report, |file| {
+            // Observe the exact publication boundary, without a scheduler race or a sleep.
+            file.write_all(&marker[..1])?;
+            let visible_report = fs::read(&store.report).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&visible_report).unwrap(),
+                report
+            );
+            assert_eq!(
+                fs::symlink_metadata(&store.ready).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+            write_and_sync(file, &marker[1..])
+        })
+        .unwrap();
+        assert_eq!(fs::read(&store.ready).unwrap(), marker);
+        assert!(!store.ready.with_added_extension("next").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_final_report_or_partial_marker_never_publishes_readiness() {
+        let (root, config, uid) = production_fixture(b"{}");
+        let store = ProductionRuntimeStore::open_under(&root, &config, uid).unwrap();
+        fs::create_dir(&store.report).unwrap();
+        assert_eq!(
+            publish_readiness(&store, &"ready", |_| panic!(
+                "report must be published first"
+            ))
+            .unwrap_err()
+            .code,
+            "runtime_atomic_write_failed"
+        );
+        assert!(!store.ready.exists());
+        fs::remove_dir(&store.report).unwrap();
+
+        assert_eq!(
+            publish_readiness(&store, &"ready", |file| {
+                file.write_all(b"partial")?;
+                Err(std::io::ErrorKind::WriteZero.into())
+            })
+            .unwrap_err()
+            .code,
+            "runtime_write_failed"
+        );
+        assert!(!store.ready.exists());
+        assert!(!store.ready.with_added_extension("next").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_production_roots_symlinks_duplicate_state_and_large_documents() {
         assert_eq!(
             TestRuntimeStore::create(Path::new("/run/fence"), "bad")
@@ -653,16 +730,7 @@ mod tests {
                 value: "state".to_owned(),
             })
             .unwrap();
-        store
-            .replace_report(&Document {
-                value: "report".to_owned(),
-            })
-            .unwrap();
-        store
-            .write_ready_exclusive(&Document {
-                value: "ready".to_owned(),
-            })
-            .unwrap();
+        store.publish_readiness(&"report", &"ready").unwrap();
         store.verify_evidence_persistence(true).unwrap();
 
         assert_eq!(
@@ -689,16 +757,7 @@ mod tests {
                 value: "state".to_owned(),
             })
             .unwrap();
-        store
-            .replace_report(&Document {
-                value: "report".to_owned(),
-            })
-            .unwrap();
-        store
-            .write_ready_exclusive(&Document {
-                value: "ready".to_owned(),
-            })
-            .unwrap();
+        store.publish_readiness(&"report", &"ready").unwrap();
         store.verify_evidence_persistence(true).unwrap();
 
         fs::set_permissions(&store.report, fs::Permissions::from_mode(0o600)).unwrap();

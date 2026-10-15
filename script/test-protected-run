@@ -192,6 +192,34 @@ PY
 sudo /usr/bin/install -d -o root -g root -m 0755 /run/fence "$directory"
 sudo /usr/bin/install -o root -g root -m 0600 "$config_source" "$config"
 
+docker_daemon_config_identity() {
+  # Detect replacement and same-content rewrites without reading a root-only file.
+  python3 -E - <<'PY'
+import os
+
+try:
+    config = os.lstat("/etc/docker/daemon.json")
+except FileNotFoundError:
+    print("absent")
+else:
+    print(config.st_dev, config.st_ino, config.st_size, config.st_ctime_ns)
+PY
+}
+
+systemd_starting_units() {
+  # SD_MESSAGE_UNIT_STARTING. Use the same match before and after the cursor.
+  /usr/bin/journalctl --system --boot --quiet --no-pager --output=cat --output-fields=UNIT \
+    "$@" _PID=1 MESSAGE_ID=7d4958e842da4a758f6c1cdc7b36dcc5
+}
+if [[ "$scenario" == standard* ]]; then
+  docker_config_before="$(docker_daemon_config_identity)"
+  # The initial capability check can legitimately socket-activate an inactive Docker.
+  allowed_docker_starts=0
+  /usr/bin/systemctl is-active --quiet docker.service || allowed_docker_starts=1
+  docker_start_cursor="$(systemd_starting_units --lines=1 --show-cursor | sed -n 's/^-- cursor: //p')"
+  [[ -n "$docker_start_cursor" ]] || die "protected standard-block proof could not observe systemd service starts"
+fi
+
 # The service intentionally remains resident after this script exits. The
 # disposable hosted runner teardown is the only post-ready cleanup path.
 sudo /usr/bin/systemd-run \
@@ -448,13 +476,20 @@ require(resident["resident_pid"] > 0)
 require(resident["verification_sequence"] >= 1)
 require(resident["last_successful_verification_unix_milliseconds"] > 0)
 require(resident["verification_interval_seconds"] == 5)
-require(resident["workers"] == [
-    {"name": "docker_tcp_dns", "status": "running"},
-    {"name": "docker_udp_dns", "status": "running"},
+workers = [
     {"name": "host_tcp_dns", "status": "running"},
     {"name": "host_udp_dns", "status": "running"},
     {"name": "process_attribution", "status": "running"},
-])
+]
+if expected["container_status"] == "disabled_verified":
+    require(dns["docker_dns_routing"] == "not_configured_standard_block")
+else:
+    require(dns["docker_dns_routing"] == "local_root_resident_mediator")
+    workers[:0] = [
+        {"name": "docker_tcp_dns", "status": "running"},
+        {"name": "docker_udp_dns", "status": "running"},
+    ]
+require(resident["workers"] == workers)
 require(ready["status"] == expected["ready"])
 require(ready["runtime_evidence_schema_version"] == 5)
 require(ready["mode"] == expected["mode"])
@@ -478,7 +513,6 @@ require(dns["proxy_policy_status"] == (
 ))
 require(dns["routing_status"] == "active")
 require(dns["host_dns_routing"] == "direct_client_to_root_resident_mediator")
-require(dns["docker_dns_routing"] == "local_root_resident_mediator")
 require(dns["bootstrap_hostnames"] == expected["bootstrap_hostnames"])
 require(isinstance(dns["materialization_batch_count"], int))
 require(dns["materialization_batch_count"] >= 0)
@@ -626,6 +660,14 @@ case "$scenario" in
 esac
 case "$scenario" in
   standard|standard-finalization|standard-opt-out)
+    docker_config_after="$(docker_daemon_config_identity)"
+    if [[ "$docker_config_after" != "$docker_config_before" ]]; then
+      die "protected standard-block proof changed Docker's daemon configuration"
+    fi
+    started_units="$(systemd_starting_units --after-cursor="$docker_start_cursor")"
+    grep -Fxq "$unit" <<<"$started_units" || die "protected standard-block proof did not observe its own service start"
+    docker_starts="$(awk '$0 == "docker.service" { starts++ } END { print starts+0 }' <<<"$started_units")"
+    ((docker_starts <= allowed_docker_starts)) || die "protected standard-block proof restarted Docker before disabling it"
     if docker ps --quiet >/dev/null 2>&1; then
       die "protected standard-block proof did not disable runner Docker access"
     fi

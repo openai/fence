@@ -42,14 +42,36 @@ if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1
   die "Action tamper evidence requires no preexisting inet fence_v0 table"
 fi
 
-INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"action-tamper","allowlist":[]}' \
-  GITHUB_STATE="$state" \
-  GITHUB_STEP_SUMMARY="$summary" \
-  node action/main.cts
+launch_audit() {
+  INPUT_MODE=audit \
+    INPUT_INVOCATION_ID="$1" \
+    GITHUB_STATE="$2" \
+    GITHUB_STEP_SUMMARY="$summary" \
+    node action/main.cts
+}
+launch_audit "$invocation" "$state"
 
 grep -Fxq "invocation_id=$invocation" "$state"
 grep -Fxq "report_path=$report" "$state"
 grep -Fxq "launcher_integrity_path=$launcher_integrity" "$state"
+
+# A rejected duplicate must not unmount the original Action or remove its evidence.
+active_launch_identity() {
+  sha256sum "$directory/ready.json" "$launcher_integrity" &&
+    stat --format='%d:%i:%u:%a' /run/fence-launcher/.active "$directory/dns-routing-owned" &&
+    findmnt --noheadings --mountpoint "$DIR/action" --output ID &&
+    systemctl show "fence-$invocation.service" --property=MainPID --value
+}
+original_identity="$(active_launch_identity)"
+duplicate_log="$temporary_directory/duplicate-log"
+for second_id in "$invocation" "$invocation-overlap"; do
+  if launch_audit "$second_id" "$temporary_directory/duplicate-state" >"$duplicate_log" 2>&1; then
+    die "Action tamper evidence unexpectedly accepted an overlapping launch"
+  fi
+  grep -Fq "Fence already owns this runner" "$duplicate_log"
+  surviving_identity="$(active_launch_identity)"
+  [[ "$surviving_identity" == "$original_identity" ]] || die "overlapping launch changed the active Fence"
+done
 sudo --non-interactive /usr/bin/systemctl is-active --quiet "fence-$invocation.service"
 sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null
 
