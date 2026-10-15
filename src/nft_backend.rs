@@ -33,6 +33,7 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct BackendError {
     pub code: &'static str,
     pub message: String,
+    outcome_unknown: bool,
 }
 
 impl BackendError {
@@ -40,6 +41,16 @@ impl BackendError {
         Self {
             code,
             message: message.into(),
+            outcome_unknown: false,
+        }
+    }
+
+    // Once nft has been dispatched, losing its reply does not undo a kernel commit.
+    #[cfg(any(target_os = "linux", test))]
+    fn unknown_outcome(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            outcome_unknown: true,
+            ..Self::new(code, message)
         }
     }
 }
@@ -165,14 +176,21 @@ impl NftExecutor for SystemNftExecutor {
 
 pub struct NativeNftBackend<E: NftExecutor> {
     executor: E,
-    created_table: bool,
+    provisional_table: ProvisionalTable,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProvisionalTable {
+    Absent,
+    Unconfirmed,
+    Owned,
 }
 
 impl<E: NftExecutor> NativeNftBackend<E> {
     pub fn new(executor: E) -> Self {
         Self {
             executor,
-            created_table: false,
+            provisional_table: ProvisionalTable::Absent,
         }
     }
 
@@ -184,13 +202,18 @@ impl<E: NftExecutor> NativeNftBackend<E> {
 
     pub fn apply_provisional(&mut self, program: &str) -> Result<(), BackendError> {
         self.executor
-            .execute(NftOperation::ApplyProvisional, program.as_bytes())?;
-        self.created_table = true;
+            .execute(NftOperation::ApplyProvisional, program.as_bytes())
+            .inspect_err(|error| {
+                if error.outcome_unknown {
+                    self.provisional_table = ProvisionalTable::Unconfirmed;
+                }
+            })?;
+        self.provisional_table = ProvisionalTable::Owned;
         Ok(())
     }
 
     pub fn replace_owned_state(&mut self, program: &str) -> Result<(), BackendError> {
-        if !self.created_table {
+        if self.provisional_table != ProvisionalTable::Owned {
             return Err(BackendError::new(
                 "owned_nft_state_not_created",
                 "cannot replace owned nftables state before provisional activation",
@@ -219,11 +242,18 @@ impl<E: NftExecutor> NativeNftBackend<E> {
     }
 
     pub fn rollback_pre_activation(&mut self) -> Result<bool, BackendError> {
-        if !self.created_table {
-            return Ok(false);
+        match self.provisional_table {
+            ProvisionalTable::Absent => return Ok(false),
+            ProvisionalTable::Unconfirmed => {
+                return Err(BackendError::new(
+                    "provisional_nft_state_unknown",
+                    "cannot confirm whether provisional nftables activation committed; leaving the table untouched",
+                ));
+            }
+            ProvisionalTable::Owned => {}
         }
         self.executor.execute(NftOperation::DeleteOwnedState, &[])?;
-        self.created_table = false;
+        self.provisional_table = ProvisionalTable::Absent;
         Ok(true)
     }
 }
@@ -253,10 +283,9 @@ fn run_process_bounded(
     let mut child = command.spawn().map_err(|error| {
         BackendError::new("nft_spawn_failed", bounded_message(&error.to_string()))
     })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| BackendError::new("nft_stdin_failed", "failed to open nft stdin"))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        BackendError::unknown_outcome("nft_stdin_failed", "failed to open nft stdin")
+    })?;
     let input = input.to_vec();
     let stdin_writer = thread::spawn(move || {
         stdin.write_all(&input)?;
@@ -264,21 +293,19 @@ fn run_process_bounded(
         Ok::<(), std::io::Error>(())
     });
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| BackendError::new("nft_stdout_failed", "failed to capture nft stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| BackendError::new("nft_stderr_failed", "failed to capture nft stderr"))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        BackendError::unknown_outcome("nft_stdout_failed", "failed to capture nft stdout")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        BackendError::unknown_outcome("nft_stderr_failed", "failed to capture nft stderr")
+    })?;
     let stdout_reader = thread::spawn(move || read_bounded(stdout, output_limit));
     let stderr_reader = thread::spawn(move || read_bounded(stderr, output_limit));
     let deadline = Instant::now() + timeout;
 
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| {
-            BackendError::new("nft_wait_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_wait_failed", bounded_message(&error.to_string()))
         })? {
             break status;
         }
@@ -288,7 +315,7 @@ fn run_process_bounded(
             let _ = stdin_writer.join();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(BackendError::new(
+            return Err(BackendError::unknown_outcome(
                 "nft_command_timeout",
                 "nft command exceeded its execution deadline",
             ));
@@ -298,30 +325,41 @@ fn run_process_bounded(
 
     stdin_writer
         .join()
-        .map_err(|_| BackendError::new("nft_stdin_failed", "nft stdin writer failed"))?
+        .map_err(|_| BackendError::unknown_outcome("nft_stdin_failed", "nft stdin writer failed"))?
         .map_err(|error| {
-            BackendError::new("nft_stdin_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_stdin_failed", bounded_message(&error.to_string()))
         })?;
     let stdout = stdout_reader
         .join()
-        .map_err(|_| BackendError::new("nft_stdout_failed", "nft stdout reader failed"))?
+        .map_err(|_| {
+            BackendError::unknown_outcome("nft_stdout_failed", "nft stdout reader failed")
+        })?
         .map_err(|error| {
-            BackendError::new("nft_stdout_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_stdout_failed", bounded_message(&error.to_string()))
         })?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| BackendError::new("nft_stderr_failed", "nft stderr reader failed"))?
+        .map_err(|_| {
+            BackendError::unknown_outcome("nft_stderr_failed", "nft stderr reader failed")
+        })?
         .map_err(|error| {
-            BackendError::new("nft_stderr_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_stderr_failed", bounded_message(&error.to_string()))
         })?;
     if stdout.overflowed || stderr.overflowed {
-        return Err(BackendError::new(
+        return Err(BackendError::unknown_outcome(
             "nft_output_too_large",
             "nft command output exceeded its fixed capture limit",
         ));
     }
     if !status.success() {
-        return Err(BackendError::new(
+        if status.code().is_none() {
+            return Err(BackendError::unknown_outcome(
+                "nft_command_interrupted",
+                "nft was interrupted before confirming the command outcome",
+            ));
+        }
+        // A normal diagnostic exit can also mean the kernel acknowledgement was lost.
+        return Err(BackendError::unknown_outcome(
             "nft_command_failed",
             bounded_message(&String::from_utf8_lossy(&stderr.bytes)),
         ));
@@ -1562,6 +1600,26 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_activation_is_neither_successful_rollback_nor_permission_to_delete_a_table() {
+        let timeout = BackendError::unknown_outcome("nft_command_timeout", "reply lost");
+        let executor = FakeExecutor::with_responses(vec![Err(timeout)]);
+        let mut backend = NativeNftBackend::new(executor);
+        assert_eq!(
+            backend.apply_provisional("program").unwrap_err().code,
+            "nft_command_timeout"
+        );
+        assert_eq!(
+            backend.rollback_pre_activation().unwrap_err().code,
+            "provisional_nft_state_unknown"
+        );
+        // In particular, we did not issue DeleteOwnedState for an unconfirmed owner.
+        assert_eq!(
+            backend.executor.operations.borrow().as_slice(),
+            &[NftOperation::ApplyProvisional]
+        );
+    }
+
+    #[test]
     fn backend_reads_structured_total_violation_counter() {
         let counter = serde_json::to_vec(&json!({
             "nftables": [
@@ -1912,6 +1970,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(failed.code, "nft_command_failed");
         assert_eq!(failed.message, "denied");
+        assert!(failed.outcome_unknown);
+
+        let interrupted = run_process_bounded(
+            Command::new("/bin/sh"),
+            &["-c", "kill -TERM $$"],
+            b"",
+            Duration::from_secs(1),
+            32,
+        )
+        .unwrap_err();
+        assert_eq!(interrupted.code, "nft_command_interrupted");
+        assert!(interrupted.outcome_unknown);
 
         let overflow = run_process_bounded(
             Command::new("/bin/sh"),
@@ -1922,6 +1992,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(overflow.code, "nft_output_too_large");
+        assert!(overflow.outcome_unknown);
 
         let timeout = run_process_bounded(
             Command::new("/bin/sleep"),
@@ -1932,6 +2003,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(timeout.code, "nft_command_timeout");
+        assert!(timeout.outcome_unknown);
 
         let blocked_stdin_timeout = run_process_bounded(
             Command::new("/bin/sleep"),
@@ -1942,6 +2014,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(blocked_stdin_timeout.code, "nft_command_timeout");
+        assert!(blocked_stdin_timeout.outcome_unknown);
 
         let missing = run_process_bounded(
             Command::new("/missing/fence-command"),
@@ -1952,6 +2025,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(missing.code, "nft_spawn_failed");
+        assert!(!missing.outcome_unknown, "nft was never dispatched");
         assert!(bounded_message(&"x".repeat(600)).ends_with("..."));
     }
 

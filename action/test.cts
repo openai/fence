@@ -52,6 +52,7 @@ const {
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
+  provisionalCleanupPreservationReason,
   residentServiceArgs,
   resolverLayoutDiagnosticFromJournal,
   run,
@@ -1107,8 +1108,8 @@ test("recognizes terminal service state and only bounded structured Fence error 
     undefined,
   );
   assert.equal(
-    terminalServiceStatus("LoadState=not-found\nActiveState=inactive\nSubState=dead\n"),
-    "LoadState=not-found; ActiveState=inactive; SubState=dead",
+    terminalServiceStatus("LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n"),
+    "LoadState=not-found; ActiveState=inactive; SubState=dead; MainPID=0",
   );
 
   const structuredFailure = JSON.stringify({
@@ -1133,6 +1134,38 @@ test("recognizes terminal service state and only bounded structured Fence error 
     "not JSON",
   ]) {
     assert.equal(fenceErrorCodeFromJournal(invalid), undefined);
+  }
+});
+
+test("failed launches permit cleanup only for a stopped resident with no readiness or DNS ownership marker", () => {
+  const stopped = { error: false, status: 0, stdout: "ActiveState=failed\nSubState=failed\nMainPID=0\n" };
+  const absent = () => undefined;
+  assert.equal(provisionalCleanupPreservationReason(stopped, absent), undefined);
+
+  // An incomplete or unreadable observation must not race marker publication.
+  for (const status of [
+    { ...stopped, error: true },
+    { ...stopped, status: 1 },
+    { ...stopped, stdout: stopped.stdout.replace("MainPID=0", "MainPID=4321") },
+    { ...stopped, stdout: "ActiveState=active\nSubState=running\nMainPID=4321\n" },
+    { ...stopped, stdout: "ActiveState=inactive\n" },
+  ]) {
+    assert.match(provisionalCleanupPreservationReason(status, () => {
+      throw new Error("must establish the resident stopped before looking for readiness");
+    }), /resident may still be running/);
+  }
+
+  const rootFile = { uid: 0, mode: 0o644, isFile: () => true };
+  assert.match(provisionalCleanupPreservationReason(stopped, () => rootFile), /root-owned readiness marker/);
+  assert.match(provisionalCleanupPreservationReason(stopped,
+    (name: string) => name === "dns-routing-owned" ? rootFile : undefined), /provisional DNS or host-control rollback may be incomplete/);
+  for (const untrusted of [
+    () => ({ ...rootFile, uid: 1000 }),
+    () => ({ ...rootFile, mode: 0o666 }),
+    () => ({ ...rootFile, isFile: () => false }),
+    () => { throw new Error("unable to inspect readiness"); },
+  ]) {
+    assert.match(provisionalCleanupPreservationReason(stopped, untrusted), /could not be safely determined/);
   }
 });
 
@@ -1303,10 +1336,12 @@ test("derives only bounded fixed runtime paths", () => {
     report: "/run/fence/action-test/report.json",
     dnsReport: "/run/fence/action-test/dns-report.json",
     unit: "fence-action-test.service",
+    launcherHostClaim: "/run/fence-launcher/.active",
     launcherDirectory: "/run/fence-launcher/action-test",
     launcherActionDirectory: "/run/fence-launcher/action-test/action",
     launcherIntegrity: "/run/fence-launcher/action-test/integrity.json",
   });
+  assert.throws(() => runtimePaths(".active"), /slug grammar/);
   assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
 });

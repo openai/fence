@@ -13,7 +13,8 @@ use fence::nft::{
     unapplied_test_evidence_model,
 };
 use fence::nft_backend::{
-    IP_BINARY_PATH, NativeNftBackend, SystemNftExecutor, write_test_evidence,
+    BackendError, IP_BINARY_PATH, NativeNftBackend, NftExecutor, NftOperation, SystemNftExecutor,
+    write_test_evidence,
 };
 use fence::plan::{EffectiveAllowance, build_plan};
 use fence::platform_profile::{AZURE_WIRESERVER_ADDRESS, AZURE_WIRESERVER_TCP_PORTS};
@@ -669,7 +670,10 @@ fn conflict_preflight_and_rollback_are_confined_to_owned_namespace_state() {
     first.apply_provisional(&program).unwrap();
     let mut conflict = backend(&topology.client);
     assert!(conflict.apply_provisional(&program).is_err());
-    assert!(!conflict.rollback_pre_activation().unwrap());
+    assert_eq!(
+        conflict.rollback_pre_activation().unwrap_err().code,
+        "provisional_nft_state_unknown"
+    );
     assert!(first.rollback_pre_activation().unwrap());
 
     let invalid =
@@ -687,6 +691,43 @@ fn conflict_preflight_and_rollback_are_confined_to_owned_namespace_state() {
     );
     assert!(applied.rollback_pre_activation().unwrap());
     nft_in_namespace(&topology.client, &["list", "table", "inet", "foreign_test"]);
+}
+
+#[test]
+#[ignore = "requires Linux root network namespaces and native nftables"]
+fn an_error_reply_after_a_real_kernel_commit_cannot_claim_or_delete_the_table() {
+    struct LoseApplyReply(SystemNftExecutor);
+    impl NftExecutor for LoseApplyReply {
+        fn execute(&self, operation: NftOperation, input: &[u8]) -> Result<Vec<u8>, BackendError> {
+            let reply = self.0.execute(operation, input)?;
+            if operation == NftOperation::ApplyProvisional {
+                // Commit the actual batch, but return an ordinary diagnostic exit as if its
+                // acknowledgement were lost. The second (-c) operation cannot change the table.
+                return self
+                    .0
+                    .execute(NftOperation::Preflight, b"invalid nft command");
+            }
+            Ok(reply)
+        }
+    }
+
+    require_root();
+    let topology = PeerTopology::new();
+    let nft = SystemNftExecutor::in_test_network_namespace(&topology.client).unwrap();
+    let mut uncertain = NativeNftBackend::new(LoseApplyReply(nft));
+    let program = render_ruleset(Mode::Block, &[]);
+    assert_eq!(
+        uncertain.apply_provisional(&program).unwrap_err().code,
+        "nft_command_failed"
+    );
+    assert_eq!(
+        uncertain.rollback_pre_activation().unwrap_err().code,
+        "provisional_nft_state_unknown"
+    );
+    // Read-only proof that the real committed table survived. Dropping the namespace cleans up.
+    uncertain
+        .verify_owned_state(&expected_owned_state(Mode::Block, &[]))
+        .unwrap();
 }
 
 #[test]
