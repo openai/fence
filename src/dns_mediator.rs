@@ -377,22 +377,25 @@ enum DnsEvidenceScope {
 }
 
 impl DnsEvidenceScope {
-    fn mode(self) -> Mode {
+    fn lockdown_posture(self) -> LockdownPosture {
         match self {
-            Self::ProtectedHostAudit => Mode::Audit,
-            Self::SelectedProfileRuntimeTest
-            | Self::ProtectedHostBlock
-            | Self::ProtectedHostBlockDegraded => Mode::Block,
+            Self::ProtectedHostAudit => LockdownPosture::Audit,
+            Self::SelectedProfileRuntimeTest | Self::ProtectedHostBlock => {
+                LockdownPosture::StandardBlock
+            }
+            Self::ProtectedHostBlockDegraded => LockdownPosture::UnsafePreserve,
+        }
+    }
+
+    fn mode(self) -> Mode {
+        match self.lockdown_posture() {
+            LockdownPosture::Audit => Mode::Audit,
+            LockdownPosture::StandardBlock | LockdownPosture::UnsafePreserve => Mode::Block,
         }
     }
 
     fn is_block(self) -> bool {
-        matches!(
-            self,
-            Self::SelectedProfileRuntimeTest
-                | Self::ProtectedHostBlock
-                | Self::ProtectedHostBlockDegraded
-        )
+        self.mode() == Mode::Block
     }
 
     #[cfg(test)]
@@ -505,10 +508,7 @@ impl DnsBlockRuntimeScope {
     }
 
     fn lockdown_posture(self) -> LockdownPosture {
-        match self {
-            Self::TestEvidence | Self::ProductionStandardBlock => LockdownPosture::StandardBlock,
-            Self::ProductionUnsafePreserve => LockdownPosture::UnsafePreserve,
-        }
+        self.dns_scope().lockdown_posture()
     }
 }
 
@@ -1531,9 +1531,16 @@ fn query_authorization(
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DockerDns {
+    DisabledByPolicy,
+    Unavailable,
+    Mediated,
+}
+
 struct DnsRouting {
     executables: Arc<TrustedExecutableSet>,
-    docker_available: bool,
+    docker_dns: DockerDns,
     docker_original: Option<Vec<u8>>,
     resolver_source: PathBuf,
     resolver_target: PathBuf,
@@ -1546,13 +1553,13 @@ impl DnsRouting {
     fn activate(
         runtime_directory: &Path,
         executables: Arc<TrustedExecutableSet>,
-        docker_available: bool,
+        docker_dns: DockerDns,
     ) -> Result<Self, DnsMediationError> {
         // Mount and roll back only the target we reviewed, never a later link destination.
         let resolver_target = Self::reviewed_resolver_target(&executables)?;
         let mut routing = Self {
             executables,
-            docker_available,
+            docker_dns,
             docker_original: None,
             resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
             resolver_target,
@@ -1612,7 +1619,7 @@ impl DnsRouting {
         )?;
         self.verify_active_resolver_mount()?;
 
-        if !self.docker_available {
+        if self.docker_dns != DockerDns::Mediated {
             return Ok(());
         }
         let docker_path = Path::new(DOCKER_DAEMON_PATH);
@@ -1692,15 +1699,19 @@ impl DnsRouting {
 
     fn verify_active(&self) -> Result<(), DnsMediationError> {
         self.verify_active_resolver_mount()?;
-        if self.docker_available {
-            verify_docker_dns_route()
-        } else if runner_docker_available(&self.executables).map_err(lockdown_error)? {
-            Err(DnsMediationError::new(
+        match self.docker_dns {
+            // Standard block verifies container lockdown, not a Docker DNS route.
+            DockerDns::DisabledByPolicy => Ok(()),
+            DockerDns::Mediated => verify_docker_dns_route(),
+            DockerDns::Unavailable
+                if !runner_docker_available(&self.executables).map_err(lockdown_error)? =>
+            {
+                Ok(())
+            }
+            DockerDns::Unavailable => Err(DnsMediationError::new(
                 "dns_routing_verification_failed",
                 "a container runtime appeared after host-only DNS routing was selected",
-            ))
-        } else {
-            Ok(())
+            )),
         }
     }
 
@@ -1969,7 +1980,14 @@ impl DnsMediationSession {
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
-        let docker_available = runner_docker_available(&executables).map_err(lockdown_error)?;
+        let docker_dns = if scope.lockdown_posture() == LockdownPosture::StandardBlock {
+            DockerDns::DisabledByPolicy
+        } else if runner_docker_available(&executables).map_err(lockdown_error)? {
+            DockerDns::Mediated
+        } else {
+            DockerDns::Unavailable
+        };
+        let mediate_docker = docker_dns == DockerDns::Mediated;
         let fence_owner =
             PinnedCurrentFenceOwner::capture(Path::new("/proc")).map_err(local_control_error)?;
         let trusted_runner_worker = Arc::new(
@@ -1977,7 +1995,7 @@ impl DnsMediationSession {
                 .map_err(|error| DnsMediationError::new(error.code, error.message))?,
         );
         let report_path = runtime_directory.join("dns-report.json");
-        let resident_health = Arc::new(Mutex::new(initial_resident_health(docker_available)));
+        let resident_health = Arc::new(Mutex::new(initial_resident_health(mediate_docker)));
         let stop_workers = Arc::new(AtomicBool::new(false));
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
@@ -2014,11 +2032,7 @@ impl DnsMediationSession {
             mut threads,
             mut supervisor,
             attribution,
-        } = start_dns_proxy(
-            recorder.clone(),
-            Arc::clone(&stop_workers),
-            docker_available,
-        )?;
+        } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers), mediate_docker)?;
         if let Err(error) = supervisor.wait_for_startup() {
             shutdown_dns_workers(&stop_workers, &mut threads);
             return Err(error);
@@ -2029,7 +2043,7 @@ impl DnsMediationSession {
                 .expect("resident health lock poisoned");
             health.workers = supervisor.worker_health();
         }
-        let routing = match DnsRouting::activate(runtime_directory, executables, docker_available)
+        let routing = match DnsRouting::activate(runtime_directory, executables, docker_dns)
             .inspect_err(DnsMediationError::report_resolver_startup_failure)
         {
             Ok(routing) => routing,
@@ -2297,7 +2311,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_available {
+            if mediation.routing.docker_dns == DockerDns::Mediated {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -2310,7 +2324,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 .map_err(backend_error)?;
             evidence.network_verification_status = "verified";
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_available {
+            if mediation.routing.docker_dns == DockerDns::Mediated {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -2484,7 +2498,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                     "measured passwordless sudo availability drifted after observation readiness",
                 );
             }
-            if self._mediation.routing.docker_available
+            if self._mediation.routing.docker_dns == DockerDns::Mediated
                 && self.lockdown.verify_containers_available().is_err()
             {
                 verification_succeeded = false;
@@ -2675,9 +2689,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_available
-                || scope.lockdown_posture() == LockdownPosture::UnsafePreserve
-            {
+            if scope.lockdown_posture() == LockdownPosture::UnsafePreserve {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -6292,7 +6304,7 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
-        &initial_resident_health(true),
+        &initial_resident_health(scope.lockdown_posture() != LockdownPosture::StandardBlock),
     )
 }
 
@@ -6330,7 +6342,11 @@ fn evidence_from_state_and_authorizations(
             .iter()
             .any(|worker| worker.name == "docker_udp_dns")
         {
-            "not_present"
+            if scope.lockdown_posture() == LockdownPosture::StandardBlock {
+                "not_configured_standard_block"
+            } else {
+                "not_present"
+            }
         } else {
             match scope {
                 DnsEvidenceScope::ProtectedHostAudit
@@ -6810,7 +6826,9 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(
+                scope.lockdown_posture() != LockdownPosture::StandardBlock,
+            ))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: report_path.clone(),
             scope,

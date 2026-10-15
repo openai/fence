@@ -180,8 +180,6 @@ require(resident["verification_sequence"] >= 1)
 require(resident["last_successful_verification_unix_milliseconds"] > 0)
 require(resident["verification_interval_seconds"] == 5)
 expected_workers = [
-    {"name": "docker_tcp_dns", "status": "running"},
-    {"name": "docker_udp_dns", "status": "running"},
     {"name": "host_tcp_dns", "status": "running"},
     {
         "name": "host_udp_dns",
@@ -201,6 +199,7 @@ require(ready["base_ruleset_hash"] == report["base_ruleset_hash"])
 require(ready["resident_health"]["resident_pid"] == resident["resident_pid"])
 require(ready["resident_health"]["status"] == "healthy")
 require(dns["status"] == "selected_profile_runtime_test_only")
+require(dns["docker_dns_routing"] == "not_configured_standard_block")
 require(dns["runtime_evidence_schema_version"] == 5)
 require(dns["profile_realization_id"] == "github_hosted_workflow_bootstrap_dns_provenance_v5")
 require(dns["platform_profile_id"] == "github_hosted_workflow_bootstrap_v5")

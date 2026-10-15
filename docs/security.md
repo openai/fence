@@ -18,7 +18,7 @@ Run Fence before checkout and the other steps you want it to protect.
 
 - **Block:** Allows required runner connections and your allowlist, blocks other outbound traffic, and disables passwordless `sudo` and Docker. This is the default.
 - **Audit:** Shows what block mode would deny without blocking traffic or disabling `sudo` and Docker.
-- **Preserved containers:** `container_policy: unsafe_preserve` keeps Docker and containerd available. Network filtering stays active, but the runner is less isolated.
+- **Preserved containers:** `container_policy: unsafe_preserve` keeps Docker and containerd available. Fence installs its network rules, but later steps can use Docker to gain root access and bypass them. Do not rely on containment in this mode.
 
 Fence never switches to audit mode or preserved containers automatically.
 

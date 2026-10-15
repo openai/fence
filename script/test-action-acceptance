@@ -228,15 +228,15 @@ dns = json.loads(dns_path.read_text(encoding="utf-8"))
 ready = json.loads(ready_path.read_text(encoding="utf-8"))
 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 docker_routing = dns.get("docker_dns_routing")
-if docker_routing == "local_root_resident_mediator":
+if container_status == "disabled_verified":
+    require(docker_routing == "not_configured_standard_block")
+elif docker_routing == "local_root_resident_mediator":
     expected_workers[:0] = [
         {"name": "docker_tcp_dns", "status": "running"},
         {"name": "docker_udp_dns", "status": "running"},
     ]
-elif docker_routing == "not_present":
-    require(scenario in {"standard", "audit"})
 else:
-    raise SystemExit("unsupported Docker DNS routing evidence")
+    require(scenario == "audit" and docker_routing == "not_present")
 require(manifest["schema_version"] == 4)
 require(manifest["source_ref"] == "refs/heads/main")
 require(manifest["signer_digest"] == manifest["source_commit"])
@@ -405,8 +405,7 @@ case "$scenario" in
 esac
 case "$scenario" in
   standard|standard-opt-out|github-artifacts)
-    if [[ "$docker_routing" == "local_root_resident_mediator" ]] \
-      && docker ps --quiet >/dev/null 2>&1; then
+    if command -v docker >/dev/null && docker ps --quiet >/dev/null 2>&1; then
       die "Fence Action standard block did not disable Docker access"
     fi
     ;;
@@ -480,7 +479,7 @@ if [[ "$scenario" == "standard" ]]; then
 fi
 
 sleep 6
-python3 -E - "$scenario" "$report" "$dns_report" "$docker_lifecycle_start_sequence" <<'PY'
+python3 -E - "$scenario" "$report" "$dns_report" "$docker_lifecycle_start_sequence" "$docker_routing" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -509,14 +508,13 @@ report_path, dns_path = (pathlib.Path(item) for item in sys.argv[2:4])
 docker_lifecycle_start_sequence = int(sys.argv[4])
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
-if dns.get("docker_dns_routing") == "local_root_resident_mediator":
+docker_routing = sys.argv[5]
+require(dns.get("docker_dns_routing") == docker_routing)
+if docker_routing == "local_root_resident_mediator":
     expected_workers[:0] = [
         {"name": "docker_tcp_dns", "status": "running"},
         {"name": "docker_udp_dns", "status": "running"},
     ]
-else:
-    require(dns.get("docker_dns_routing") == "not_present")
-    require(scenario in {"standard", "audit"})
 require(report["runtime_evidence_schema_version"] == 5)
 require(report["policy_hash_schema_version"] == 9)
 require(report["network_verification_status"] == "verified")
