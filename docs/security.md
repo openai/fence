@@ -18,7 +18,7 @@ Run Fence before checkout and the other steps you want it to protect.
 
 - **Block:** Allows required runner connections and your allowlist, blocks other outbound traffic, and disables passwordless `sudo` and Docker. This is the default.
 - **Audit:** Shows what block mode would deny without blocking traffic or disabling `sudo` and Docker.
-- **Preserved containers:** `container_policy: unsafe_preserve` keeps Docker and containerd available. Network filtering stays active, but the runner is less isolated.
+- **Preserved containers:** `container_policy: unsafe_preserve` keeps Docker and containerd available. Fence installs its network rules, but later steps can use Docker to gain root access and bypass them. Do not rely on containment in this mode.
 
 Fence never switches to audit mode or preserved containers automatically.
 
@@ -38,7 +38,7 @@ Fence also allows the storage endpoints needed for job reporting without allowin
 GitHub-hosted runners depend on Azure platform services:
 
 - **Azure Instance Metadata Service (IMDS):** `169.254.169.254:80` remains reachable from host and forwarded traffic, including later workflow steps.
-- **Azure WireServer:** `168.63.129.16` on TCP ports `80` and `32526` is available only to root-owned host processes.
+- **Azure WireServer:** In block mode, only root-owned host sockets can reach `168.63.129.16` on TCP ports `80` and `32526`. Audit mode records other traffic without blocking it.
 
 These platform connections are built in; you do not need to add them to `allowlist`. Fence does not block IMDS.
 
