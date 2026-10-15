@@ -12,7 +12,7 @@ Fence protects GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest` 
 
 The main risks are how Fence starts its root-owned agent, translates DNS responses into firewall rules, removes sudo and container access, and verifies its post-job evidence. Fence limits outbound network access, but it cannot stop data from being sent to allowed GitHub services, user-approved destinations, or services sharing an allowed IP address.
 
-Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526` is limited to root-owned host processes. Azure Instance Metadata Service at `169.254.169.254:80` remains available to host and forwarded traffic, including later workflow steps. Standard block mode depends on removing sudo and container access so untrusted steps cannot reach root-only services; audit mode and `unsafe_preserve` do not make the same containment claim.
+In block mode, only root-owned host sockets can reach Azure WireServer at `168.63.129.16` on TCP ports `80` and `32526`. Audit mode records other WireServer traffic without blocking it. Azure Instance Metadata Service at `169.254.169.254:80` remains available to host and forwarded traffic, including later workflow steps. Standard block mode depends on removing sudo and container access so untrusted steps cannot reach root-only services; audit mode and `unsafe_preserve` do not make the same containment claim.
 
 ## Scope and assumptions
 
