@@ -874,6 +874,18 @@ struct PendingMaterialization {
     expires_at: Instant,
 }
 
+impl PendingMaterialization {
+    fn active_key(&self) -> ActiveMaterializationKey {
+        (
+            self.source_hostname.clone(),
+            self.hostname.clone(),
+            self.address,
+            self.protocol,
+            self.port,
+        )
+    }
+}
+
 type PendingMaterializationIdentity = (
     String,
     String,
@@ -885,8 +897,14 @@ type PendingMaterializationIdentity = (
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum MaterializationCompletion {
-    AppliedVerifiedAndCommitted,
+    AppliedVerifiedAndCommitted(VerifiedAnswerLifetime),
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct VerifiedAnswerLifetime {
+    cache_until: Instant,
+    covered_until: Instant,
 }
 
 #[derive(Debug)]
@@ -903,9 +921,13 @@ struct MaterializationSubmitter {
     requests: SyncSender<MaterializationRequest>,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 enum DnsResponseDisposition {
     ForwardOriginal,
+    LimitAnswerTtls {
+        lifetime: VerifiedAnswerLifetime,
+        ttl_offsets: Vec<usize>,
+    },
     RetryableFailure,
 }
 
@@ -1311,18 +1333,18 @@ impl ObservationRecorder {
             };
         };
         let forwardable_block_response = self.scope.is_block();
-        let records = parse_complete_dns_response(packet, &hostname, query_type);
+        let records = parse_dns_answer_records(packet, &hostname, query_type);
         let mut observed_answers = if forwardable_block_response {
             Vec::new()
         } else {
             records
                 .as_ref()
-                .map(|records| records.addresses.clone())
+                .map(|(records, _)| records.addresses.clone())
                 .unwrap_or_default()
         };
         let mut block_validation = None;
         let mut rejection_reason = MaterializationRejectionReason::InvalidResponse;
-        if let Some(records) = records.as_ref() {
+        if let Some((records, ttl_offsets)) = records {
             let now = Instant::now();
             let mut authorizations = self
                 .cname_authorizations
@@ -1331,15 +1353,15 @@ impl ObservationRecorder {
             remove_expired_cname_authorizations(&mut authorizations, now);
             match validate_dns_response_lineage(
                 &hostname,
-                records,
+                &records,
                 &authorizations,
                 now,
                 &self.hostname_policy,
             ) {
                 Ok(mut response) => {
                     if forwardable_block_response {
-                        observed_answers = records.addresses.clone();
-                        block_validation = Some(response);
+                        observed_answers = records.addresses;
+                        block_validation = Some((response, ttl_offsets));
                     } else {
                         let transports = std::mem::take(&mut response.materializations);
                         if commit_dns_response_authorizations(&mut authorizations, response)
@@ -1381,19 +1403,22 @@ impl ObservationRecorder {
             DnsResponseDisposition::RetryableFailure
         } else if block_validation
             .as_ref()
-            .is_some_and(|response| response.materializations.is_empty())
+            .is_some_and(|(response, _)| response.materializations.is_empty())
         {
             DnsResponseDisposition::ForwardOriginal
         } else if let Some(submitter) = &self.materializations {
-            let response = block_validation.expect("block validation checked above");
+            let (response, ttl_offsets) = block_validation.expect("block validation checked above");
             match submit_materialization_request(
                 submitter,
                 hostname.clone(),
                 response,
                 &self.shutdown,
             ) {
-                Ok(MaterializationCompletion::AppliedVerifiedAndCommitted) => {
-                    DnsResponseDisposition::ForwardOriginal
+                Ok(MaterializationCompletion::AppliedVerifiedAndCommitted(lifetime)) => {
+                    DnsResponseDisposition::LimitAnswerTtls {
+                        lifetime,
+                        ttl_offsets,
+                    }
                 }
                 Ok(MaterializationCompletion::Failed) => DnsResponseDisposition::RetryableFailure,
                 Err(reason) => {
@@ -3104,7 +3129,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let (
             proposed_authorizations,
             materializations,
-            accepted_requests,
+            mut accepted_requests,
             rejected_requests,
             materialization_capacity_rejected,
         ) = stage_materialization_transactions(
@@ -3153,6 +3178,13 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
             self.evidence.network_verification_status = "verified";
         }
+        // Snapshot both grants at commit. Completion only wakes the DNS worker;
+        // the owner never waits for that worker to write to the client.
+        if update_succeeded {
+            complete_materialization_requests(accepted_requests.drain(..), |request| {
+                request.verified_answer_lifetime(&authorizations, &self.active)
+            });
+        }
         drop(authorizations);
 
         if rejected_request_count > 0 {
@@ -3190,24 +3222,18 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 .recorder
                 .record_materialization_batch(batch_started.elapsed());
         }
-        if update_succeeded {
-            if merge.metadata_changed || merge.rules_changed {
-                self.evidence.materialized_allowances = report_materializations(&self.active);
-                self.evidence.expired_materializations = self
-                    .evidence
-                    .expired_materializations
-                    .saturating_add(merge.expired);
-            }
-            complete_materialization_requests(
-                accepted_requests,
-                MaterializationCompletion::AppliedVerifiedAndCommitted,
-            );
-        } else {
-            complete_materialization_requests(accepted_requests, MaterializationCompletion::Failed);
+        if update_succeeded && (merge.metadata_changed || merge.rules_changed) {
+            self.evidence.materialized_allowances = report_materializations(&self.active);
+            self.evidence.expired_materializations = self
+                .evidence
+                .expired_materializations
+                .saturating_add(merge.expired);
         }
         complete_materialization_requests(
-            rejected_requests.into_iter().map(|(request, _)| request),
-            MaterializationCompletion::Failed,
+            accepted_requests
+                .into_iter()
+                .chain(rejected_requests.into_iter().map(|(request, _)| request)),
+            |_| None,
         );
         if batch_has_work || merge.rules_changed || merge.metadata_changed {
             changed = true;
@@ -4531,13 +4557,7 @@ fn merge_materializations(
         if expires_at <= now {
             continue;
         }
-        let key = (
-            materialization.source_hostname.clone(),
-            materialization.hostname.clone(),
-            materialization.address,
-            materialization.protocol,
-            materialization.port,
-        );
+        let key = materialization.active_key();
         let replacement = ActiveMaterialization {
             source_hostname: materialization.source_hostname,
             hostname: materialization.hostname,
@@ -4573,10 +4593,52 @@ fn merge_materializations(
 
 fn complete_materialization_requests(
     requests: impl IntoIterator<Item = MaterializationRequest>,
-    completion: MaterializationCompletion,
+    verified_lifetime: impl Fn(&MaterializationRequest) -> Option<VerifiedAnswerLifetime>,
 ) {
     for request in requests {
+        let completion = verified_lifetime(&request).map_or(
+            MaterializationCompletion::Failed,
+            MaterializationCompletion::AppliedVerifiedAndCommitted,
+        );
         let _ = request.completion.try_send(completion);
+    }
+}
+
+impl MaterializationRequest {
+    fn verified_answer_lifetime(
+        &self,
+        authorizations: &CnameAuthorizationState,
+        active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    ) -> Option<VerifiedAnswerLifetime> {
+        // Batched requests can shorten address grants; never advertise their private overlap.
+        let response = &self.response;
+        let mut cache_until = response.materializations.iter().try_fold(
+            response.valid_until?,
+            |until, materialization| {
+                let grant = active.get(&materialization.active_key())?;
+                Some(until.min(grant.expires_at - DNS_MATERIALIZATION_REFRESH_OVERLAP))
+            },
+        )?;
+        let mut covered_until = cache_until + DNS_MATERIALIZATION_REFRESH_OVERLAP;
+
+        // The committed CNAME lineage can be shorter than the proposed one. It has no overlap.
+        let derived_root = response
+            .root_authorization
+            .as_ref()
+            .map(|_| self.queried_hostname.as_str());
+        let targets = response
+            .authorizations
+            .iter()
+            .map(|(name, _)| name.as_str());
+        for name in derived_root.into_iter().chain(targets) {
+            let expires_at = authorizations.active.get(name)?.expires_at;
+            cache_until = cache_until.min(expires_at);
+            covered_until = covered_until.min(expires_at);
+        }
+        Some(VerifiedAnswerLifetime {
+            cache_until,
+            covered_until,
+        })
     }
 }
 
@@ -5032,7 +5094,13 @@ fn serve_udp(
                 recorder.record_response(hostname, *query_type, &response, response_classification)
             })
             .unwrap_or(DnsResponseDisposition::ForwardOriginal);
-        let Some(output) = dns_response_for_disposition(bytes, &response, disposition) else {
+        let Some((output, _)) = dns_response_for_disposition(
+            bytes,
+            response,
+            disposition,
+            Instant::now(),
+            Duration::ZERO,
+        ) else {
             continue;
         };
         let _ = socket.send_to(&output, peer);
@@ -5263,7 +5331,12 @@ fn serve_tcp_client(
             DnsQueryDispatch::Refused(classification_override) => {
                 record_rejected_query(&recorder, parsed_question.as_ref(), classification_override);
                 if let Some(response) = refused_response(&query)
-                    && !write_tcp_dns_response(&mut client, &response, shutdown)
+                    && !write_tcp_dns_response(
+                        &mut client,
+                        &response,
+                        Instant::now() + DNS_FORWARD_TIMEOUT,
+                        shutdown,
+                    )
                 {
                     return Ok(());
                 }
@@ -5298,10 +5371,16 @@ fn serve_tcp_client(
                 recorder.record_response(hostname, *query_type, &response, response_classification)
             })
             .unwrap_or(DnsResponseDisposition::ForwardOriginal);
-        let Some(output) = dns_response_for_disposition(&query, &response, disposition) else {
+        let Some((output, write_until)) = dns_response_for_disposition(
+            &query,
+            response,
+            disposition,
+            Instant::now(),
+            DNS_FORWARD_TIMEOUT,
+        ) else {
             continue;
         };
-        if !write_tcp_dns_response(&mut client, &output, shutdown) {
+        if !write_tcp_dns_response(&mut client, &output, write_until, shutdown) {
             return Ok(());
         }
     }
@@ -5388,11 +5467,15 @@ fn write_tcp_all_until(
     Ok(())
 }
 
-fn write_tcp_dns_response(client: &mut TcpStream, response: &[u8], shutdown: &AtomicBool) -> bool {
+fn write_tcp_dns_response(
+    client: &mut TcpStream,
+    response: &[u8],
+    deadline: Instant,
+    shutdown: &AtomicBool,
+) -> bool {
     let Ok(length) = u16::try_from(response.len()) else {
         return false;
     };
-    let deadline = Instant::now() + DNS_FORWARD_TIMEOUT;
     write_tcp_all_until(client, &length.to_be_bytes(), deadline, shutdown).is_ok()
         && write_tcp_all_until(client, response, deadline, shutdown).is_ok()
 }
@@ -5405,7 +5488,12 @@ fn write_tcp_retryable_failure(
     let Some(response) = server_failure_response(query) else {
         return false;
     };
-    write_tcp_dns_response(client, &response, shutdown)
+    write_tcp_dns_response(
+        client,
+        &response,
+        Instant::now() + DNS_FORWARD_TIMEOUT,
+        shutdown,
+    )
 }
 
 fn forward_upstream_udp(upstream_address: &str, query: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -5433,7 +5521,15 @@ fn parse_complete_dns_response(
     queried_hostname: &str,
     query_type: u16,
 ) -> Option<DnsAnswerRecords> {
-    if packet.len() < 12 {
+    parse_dns_answer_records(packet, queried_hostname, query_type).map(|(records, _)| records)
+}
+
+fn parse_dns_answer_records(
+    packet: &[u8],
+    queried_hostname: &str,
+    query_type: u16,
+) -> Option<(DnsAnswerRecords, Vec<usize>)> {
+    if !(12..=MAX_DNS_PACKET_BYTES).contains(&packet.len()) {
         return None;
     }
     let flags = u16::from_be_bytes([packet[2], packet[3]]);
@@ -5463,6 +5559,8 @@ fn parse_complete_dns_response(
         });
     let record_count = record_count?;
     let mut records = DnsAnswerRecords::default();
+    let mut name_bytes = vec![false; packet.len()];
+    let mut ttl_offsets = Vec::new();
     let mut offset = question_name_end + 4;
     for record_index in 0..record_count {
         let owner_offset = offset;
@@ -5487,12 +5585,13 @@ fn parse_complete_dns_response(
         if data_end > packet.len() {
             return None;
         }
+        offset = data_end;
 
         let owner_is_root = packet.get(owner_offset) == Some(&0);
         let owner = if owner_is_root {
             None
         } else {
-            Some(parse_dns_name(packet, owner_offset)?)
+            Some(parse_dns_name(packet, owner_offset, &mut name_bytes)?)
         };
         if record_class == 1 {
             match record_type {
@@ -5507,8 +5606,7 @@ fn parse_complete_dns_response(
                 }
                 5 if owner_is_root
                     || record_index >= answer_count
-                    || skip_dns_name(packet, data_offset) != Some(data_end)
-                    || parse_dns_name(packet, data_offset).is_none() =>
+                    || skip_dns_name(packet, data_offset) != Some(data_end) =>
                 {
                     return None;
                 }
@@ -5533,16 +5631,22 @@ fn parse_complete_dns_response(
                 }
                 5 => records.aliases.push(DnsCnameAnswer {
                     owner: owner.expect("CNAME owner checked above"),
-                    target: parse_dns_name(packet, data_offset)
-                        .expect("CNAME target checked above"),
+                    target: parse_dns_name(packet, data_offset, &mut name_bytes)?,
                     ttl_seconds,
                 }),
-                _ => {}
+                _ => continue,
             }
+            // Change only address and CNAME answer TTLs, never OPT flags or
+            // signed fields such as the RRSIG Original TTL.
+            ttl_offsets.push(owner_end + 4);
         }
-        offset = data_end;
     }
-    (offset == packet.len()).then_some(records)
+    // Compression must not let rewriting a TTL change a name we just validated.
+    // Check after all records, including indirect pointers and terminating bytes.
+    let ttl_is_name = ttl_offsets
+        .iter()
+        .any(|&ttl| name_bytes[ttl..ttl + 4].contains(&true));
+    (offset == packet.len() && !ttl_is_name).then_some((records, ttl_offsets))
 }
 
 fn query_for_upstream(
@@ -5677,12 +5781,40 @@ fn refused_response(query: &[u8]) -> Option<Vec<u8>> {
 
 fn dns_response_for_disposition(
     query: &[u8],
-    response: &[u8],
+    mut response: Vec<u8>,
     disposition: DnsResponseDisposition,
-) -> Option<Vec<u8>> {
+    now: Instant,
+    write_budget: Duration,
+) -> Option<(Vec<u8>, Instant)> {
+    let write_until = now + write_budget;
     match disposition {
-        DnsResponseDisposition::ForwardOriginal => Some(response.to_vec()),
-        DnsResponseDisposition::RetryableFailure => server_failure_response(query),
+        DnsResponseDisposition::ForwardOriginal => Some((response, write_until)),
+        DnsResponseDisposition::LimitAnswerTtls {
+            lifetime,
+            ttl_offsets,
+        } => {
+            if now >= lifetime.covered_until {
+                return Some((server_failure_response(query)?, write_until));
+            }
+            // UDP sends a datagram now. TCP must write the whole frame by this same
+            // deadline; shorten its write window, not the grant, for a short-lived answer.
+            let write_until = write_until.min(lifetime.covered_until);
+            let remaining = lifetime
+                .cache_until
+                .saturating_duration_since(write_until)
+                .as_secs();
+            let limit = u32::try_from(remaining).unwrap_or(u32::MAX);
+            for offset in ttl_offsets {
+                let ttl: &mut [u8; 4] = (&mut response[offset..offset + 4])
+                    .try_into()
+                    .expect("four-byte TTL from this DNS answer");
+                *ttl = u32::from_be_bytes(*ttl).min(limit).to_be_bytes();
+            }
+            Some((response, write_until))
+        }
+        DnsResponseDisposition::RetryableFailure => {
+            Some((server_failure_response(query)?, write_until))
+        }
     }
 }
 
@@ -5747,17 +5879,19 @@ fn parse_dns_question(packet: &[u8]) -> Option<(String, u16)> {
     ))
 }
 
-fn parse_dns_name(packet: &[u8], offset: usize) -> Option<String> {
+fn parse_dns_name(packet: &[u8], offset: usize, name_bytes: &mut [bool]) -> Option<String> {
     let mut current = offset;
     let mut labels = Vec::new();
     let mut pointers_followed = 0;
     loop {
         let length = *packet.get(current)?;
+        name_bytes[current] = true;
         if length == 0 {
             break;
         }
         if length & 0xc0 == 0xc0 {
             let next = *packet.get(current + 1)?;
+            name_bytes[current + 1] = true;
             current = usize::from(length & 0x3f) << 8 | usize::from(next);
             pointers_followed += 1;
             if pointers_followed > MAX_DERIVED_CNAME_DEPTH as usize {
@@ -5771,6 +5905,7 @@ fn parse_dns_name(packet: &[u8], offset: usize) -> Option<String> {
         current += 1;
         let end = current.checked_add(usize::from(length))?;
         let label = std::str::from_utf8(packet.get(current..end)?).ok()?;
+        name_bytes[current..end].fill(true);
         if !label
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
@@ -7456,7 +7591,7 @@ mod tests {
         );
         assert!(authorizations.active.is_empty());
         assert!(active.is_empty());
-        complete_materialization_requests(accepted, MaterializationCompletion::Failed);
+        complete_materialization_requests(accepted, |_| None);
         assert_eq!(
             failed_result.try_recv().unwrap(),
             MaterializationCompletion::Failed
@@ -7486,11 +7621,31 @@ mod tests {
         .unwrap();
         assert!(!authorizations.active.is_empty());
         assert!(!active.is_empty());
-        drop(authorizations);
-        complete_materialization_requests(
-            accepted,
-            MaterializationCompletion::AppliedVerifiedAndCommitted,
-        );
+        complete_materialization_requests(accepted, |request| {
+            request.verified_answer_lifetime(&authorizations, &active)
+        });
+    }
+
+    fn confirm_test_cache_deadline(
+        request: MaterializationRequest,
+        caller: thread::JoinHandle<DnsResponseDisposition>,
+    ) {
+        let cache_until = request.response.valid_until.unwrap();
+        let expected = VerifiedAnswerLifetime {
+            cache_until,
+            covered_until: cache_until,
+        };
+        request
+            .completion
+            .send(MaterializationCompletion::AppliedVerifiedAndCommitted(
+                expected,
+            ))
+            .unwrap();
+        assert!(matches!(
+            caller.join().unwrap(),
+            DnsResponseDisposition::LimitAnswerTtls { lifetime, ttl_offsets }
+                if lifetime == expected && !ttl_offsets.is_empty()
+        ));
     }
 
     #[test]
@@ -7941,14 +8096,7 @@ mod tests {
         let request = requests.recv().unwrap();
         thread::sleep(Duration::from_millis(150));
         assert!(!caller.is_finished());
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
-            .unwrap();
-        assert_eq!(
-            caller.join().unwrap(),
-            DnsResponseDisposition::ForwardOriginal
-        );
+        confirm_test_cache_deadline(request, caller);
         assert_materialization_rejections(
             &observations,
             MaterializationRejectionReasons::default(),
@@ -7993,14 +8141,7 @@ mod tests {
             1
         );
         assert!(!caller.is_finished());
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
-            .unwrap();
-        assert_eq!(
-            caller.join().unwrap(),
-            DnsResponseDisposition::ForwardOriginal
-        );
+        confirm_test_cache_deadline(request, caller);
         let _ = fs::remove_file(report_path);
     }
 
@@ -8035,14 +8176,7 @@ mod tests {
         assert_eq!(materialization.protocol, Protocol::Tcp);
         assert_eq!(materialization.port, 443);
         assert!(!caller.is_finished());
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
-            .unwrap();
-        assert_eq!(
-            caller.join().unwrap(),
-            DnsResponseDisposition::ForwardOriginal
-        );
+        confirm_test_cache_deadline(request, caller);
         let _ = fs::remove_file(report_path);
     }
 
@@ -8086,14 +8220,7 @@ mod tests {
             BTreeSet::from([(Protocol::Tcp, 443), (Protocol::Tcp, 8443)])
         );
         assert!(!caller.is_finished());
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
-            .unwrap();
-        assert_eq!(
-            caller.join().unwrap(),
-            DnsResponseDisposition::ForwardOriginal
-        );
+        confirm_test_cache_deadline(request, caller);
         let _ = fs::remove_file(report_path);
     }
 
@@ -8137,14 +8264,7 @@ mod tests {
                         && matches!(materialization.port, 443 | 8443)
                 })
         );
-        request
-            .completion
-            .send(MaterializationCompletion::AppliedVerifiedAndCommitted)
-            .unwrap();
-        assert_eq!(
-            caller.join().unwrap(),
-            DnsResponseDisposition::ForwardOriginal
-        );
+        confirm_test_cache_deadline(request, caller);
         let _ = fs::remove_file(report_path);
     }
 
@@ -8256,6 +8376,55 @@ mod tests {
     }
 
     #[test]
+    fn compressed_names_cannot_depend_on_answer_ttls() {
+        let name = "github.com";
+        let first_owner = query(name, 1).len();
+        let first_ttl = first_owner + 6;
+        let pointer = |offset| (0xc000 | u16::try_from(offset).unwrap()).to_be_bytes();
+        let ttl_with_pointer = u32::from_be_bytes([0, 0xc0, 0x0c, 0]);
+        let mut owners = response_with_address(name, 1, ttl_with_pointer, &[192, 0, 2, 10]);
+        owners[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        let first_record = owners[first_owner..].to_vec();
+        let second_owner = owners.len();
+        owners.extend_from_slice(&first_record);
+        // An ordinary pointer to a compressed owner works. A pointer into a TTL
+        // initially decodes to the same name, but could change when we cap that TTL.
+        owners[second_owner..second_owner + 2].copy_from_slice(&pointer(first_owner));
+        assert!(parse_complete_dns_response(&owners, name, 1).is_some());
+        owners[second_owner..second_owner + 2].copy_from_slice(&pointer(first_ttl + 1));
+
+        // A CNAME target whose label comes from its own TTL, followed by an A owner
+        // that reaches the same TTL indirectly through that target.
+        let ttl_with_label = u32::from_be_bytes([1, b'a', 0, 0]);
+        let mut alias = response_with_cname(name, "a", ttl_with_label);
+        alias[6..8].copy_from_slice(&2_u16.to_be_bytes());
+        let target = alias.len() - 3;
+        alias.truncate(target - 2);
+        alias.extend_from_slice(&2_u16.to_be_bytes());
+        alias.extend_from_slice(&pointer(first_ttl));
+        alias.extend_from_slice(&pointer(target));
+        alias.extend_from_slice(&first_record[2..]);
+
+        let (recorder, report) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        let malformed = [&owners, &alias];
+        for response in malformed {
+            assert!(parse_complete_dns_response(response, name, 1).is_none());
+            assert_eq!(
+                recorder.record_response(name, 1, response, None),
+                DnsResponseDisposition::RetryableFailure
+            );
+        }
+        assert_materialization_rejections(
+            &recorder,
+            MaterializationRejectionReasons {
+                invalid_response: malformed.len() as u64,
+                ..MaterializationRejectionReasons::default()
+            },
+        );
+        let _ = fs::remove_file(report);
+    }
+
+    #[test]
     fn user_hostname_answers_materialize_every_transport_and_cname_descendant() {
         let config = parse_and_normalize(
             br#"{"schema_version":1,"mode":"block","invocation_id":"user-host","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":8443},{"destination_type":"hostname","destination":"example.com","protocol":"udp","port":53}]}"#,
@@ -8308,10 +8477,10 @@ mod tests {
                 .all(|materialization| { materialization.origins == [HostnamePolicyOrigin::User] })
         );
         stage_and_complete_test_request(&recorder, request);
-        assert_eq!(
+        assert!(matches!(
             caller.join().unwrap(),
-            DnsResponseDisposition::ForwardOriginal
-        );
+            DnsResponseDisposition::LimitAnswerTtls { .. }
+        ));
         assert!(
             recorder
                 .cname_authorizations
@@ -9069,6 +9238,96 @@ mod tests {
     }
 
     #[test]
+    fn client_cache_limit_is_applied_at_publication_without_changing_other_records() {
+        let name = "github.com";
+        let query = query(name, 1);
+        let packet = |ttl| {
+            let mut bytes = response_with_cname_and_address(
+                name,
+                "edge.example.net",
+                ttl,
+                ttl,
+                &[192, 0, 2, 10],
+            );
+            bytes[6..8].copy_from_slice(&3_u16.to_be_bytes());
+            bytes[10..12].copy_from_slice(&1_u16.to_be_bytes());
+            // A CNAME RRSIG with its own TTL and a signed Original TTL.
+            let rrsig = [
+                0, 5, 15, 2, 0, 0, 2, 88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 99,
+            ];
+            bytes.extend_from_slice(&[0xc0, 0x0c, 0, 46, 0, 1]);
+            bytes.extend_from_slice(&600_u32.to_be_bytes());
+            bytes.extend_from_slice(&(rrsig.len() as u16).to_be_bytes());
+            bytes.extend_from_slice(&rrsig);
+            // An OPT record with the DNSSEC OK bit in its TTL-shaped field.
+            bytes.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0x80, 0, 0, 0]);
+            bytes
+        };
+        let now = Instant::now();
+        let cache_until = now + Duration::from_secs(u64::from(MAX_DYNAMIC_TTL_SECONDS));
+        let long_ttl = MAX_DYNAMIC_TTL_SECONDS + 1;
+        let reply = |upstream_ttl, publish_at| {
+            let upstream = packet(upstream_ttl);
+            let (_, ttl_offsets) = parse_dns_answer_records(&upstream, name, 1).unwrap();
+            let disposition = DnsResponseDisposition::LimitAnswerTtls {
+                lifetime: VerifiedAnswerLifetime {
+                    cache_until,
+                    covered_until: cache_until + DNS_MATERIALIZATION_REFRESH_OVERLAP,
+                },
+                ttl_offsets,
+            };
+            dns_response_for_disposition(&query, upstream, disposition, publish_at, Duration::ZERO)
+                .unwrap()
+                .0
+        };
+
+        let delayed = cache_until - Duration::from_millis(2_500);
+        assert_eq!(reply(long_ttl, now), packet(MAX_DYNAMIC_TTL_SECONDS));
+        assert_eq!(reply(long_ttl, delayed), packet(2));
+        assert_eq!(reply(0, now), packet(0));
+        assert_eq!(reply(long_ttl, cache_until), packet(0));
+        assert_eq!(
+            reply(long_ttl, cache_until + DNS_MATERIALIZATION_REFRESH_OVERLAP),
+            server_failure_response(&query).unwrap()
+        );
+    }
+
+    #[test]
+    fn tcp_cache_lifetime_and_write_deadline_fit_within_the_grant() {
+        let name = "github.com";
+        let query = query(name, 1);
+        let packet = |ttl| response_with_address(name, 1, ttl, &[192, 0, 2, 10]);
+        let now = Instant::now();
+        let expires = now + DNS_FORWARD_TIMEOUT + Duration::from_secs(1);
+        let prepare = |at| {
+            let upstream = packet(MAX_DYNAMIC_TTL_SECONDS);
+            let (_, ttl_offsets) = parse_dns_answer_records(&upstream, name, 1).unwrap();
+            let disposition = DnsResponseDisposition::LimitAnswerTtls {
+                lifetime: VerifiedAnswerLifetime {
+                    cache_until: expires,
+                    covered_until: expires,
+                },
+                ttl_offsets,
+            };
+            dns_response_for_disposition(&query, upstream, disposition, at, DNS_FORWARD_TIMEOUT)
+                .unwrap()
+        };
+        assert_eq!(prepare(now), (packet(1), now + DNS_FORWARD_TIMEOUT));
+        // A short-lived CNAME still works. Send it before expiry, with a zero cache TTL.
+        assert_eq!(
+            prepare(expires - Duration::from_secs(1)),
+            (packet(0), expires)
+        );
+        assert_eq!(
+            prepare(expires),
+            (
+                server_failure_response(&query).unwrap(),
+                expires + DNS_FORWARD_TIMEOUT
+            )
+        );
+    }
+
+    #[test]
     fn server_failure_preserves_only_the_dns_question() {
         let mut request = query("api.github.com", 1);
         request[..2].copy_from_slice(&0x1234_u16.to_be_bytes());
@@ -9079,14 +9338,23 @@ mod tests {
         assert_eq!(
             dns_response_for_disposition(
                 &request,
-                &original,
+                original.clone(),
                 DnsResponseDisposition::ForwardOriginal,
-            ),
+                Instant::now(),
+                Duration::ZERO,
+            )
+            .map(|(response, _)| response),
             Some(original)
         );
-        let response =
-            dns_response_for_disposition(&request, &[], DnsResponseDisposition::RetryableFailure)
-                .unwrap();
+        let response = dns_response_for_disposition(
+            &request,
+            Vec::new(),
+            DnsResponseDisposition::RetryableFailure,
+            Instant::now(),
+            Duration::ZERO,
+        )
+        .unwrap()
+        .0;
         assert_eq!(response.len(), question_length);
         assert_eq!(&response[..2], &0x1234_u16.to_be_bytes());
         assert_eq!(u16::from_be_bytes([response[2], response[3]]), 0x8102);
@@ -11042,10 +11310,9 @@ mod tests {
             rejected[0].1,
             MaterializationRejectionReason::AuthorizationChanged
         );
-        complete_materialization_requests(
-            rejected.into_iter().map(|(request, _)| request),
-            MaterializationCompletion::Failed,
-        );
+        complete_materialization_requests(rejected.into_iter().map(|(request, _)| request), |_| {
+            None
+        });
         assert_eq!(
             result.try_recv().unwrap(),
             MaterializationCompletion::Failed
@@ -11097,7 +11364,7 @@ mod tests {
             &policy,
         )
         .unwrap();
-        let (completion, _result) = mpsc::sync_channel(1);
+        let (completion, result) = mpsc::sync_channel(1);
         let (staged, materializations, accepted, rejected, capacity_rejected) =
             stage_materialization_transactions(
                 &authorizations,
@@ -11136,6 +11403,20 @@ mod tests {
             .get("shared.example")
             .unwrap()
             .expires_at;
+        // The converging response proposed a longer address and CNAME lifetime.
+        // Its client may cache only until the original, retained CNAME expires.
+        let mut active = BTreeMap::new();
+        merge_materializations(&mut active, materializations, now + Duration::from_secs(5));
+        complete_materialization_requests(accepted, |request| {
+            request.verified_answer_lifetime(&staged, &active)
+        });
+        assert_eq!(
+            result.try_recv().unwrap(),
+            MaterializationCompletion::AppliedVerifiedAndCommitted(VerifiedAnswerLifetime {
+                cache_until: original_expiry,
+                covered_until: original_expiry,
+            })
+        );
         let same_lineage = cname_test_validated_response(
             "github.com",
             "shared.example",
@@ -11522,7 +11803,7 @@ mod tests {
         longer_duplicate.expires_at = now + Duration::from_secs(90);
         let merge = merge_materializations(
             &mut active,
-            [longer_duplicate, materialization.clone()],
+            [longer_duplicate.clone(), materialization.clone()],
             now,
         );
 
@@ -11534,6 +11815,34 @@ mod tests {
             active.values().next().unwrap().expires_at,
             now + Duration::from_secs(30) + DNS_MATERIALIZATION_REFRESH_OVERLAP,
         );
+
+        // Both DNS clients get the shorter verified deadline, without the overlap.
+        for pending in [&materialization, &longer_duplicate] {
+            let response = direct_test_validated_response(
+                &pending.hostname,
+                pending.address,
+                pending.ttl_seconds,
+                now,
+                &test_hostname_policy(false),
+            );
+            let (completion, result) = mpsc::sync_channel(1);
+            let request = MaterializationRequest {
+                queried_hostname: pending.hostname.clone(),
+                response,
+                completion,
+            };
+            complete_materialization_requests([request], |request| {
+                request.verified_answer_lifetime(&CnameAuthorizationState::default(), &active)
+            });
+            assert_eq!(
+                result.try_recv().unwrap(),
+                MaterializationCompletion::AppliedVerifiedAndCommitted(VerifiedAnswerLifetime {
+                    cache_until: materialization.expires_at,
+                    covered_until: materialization.expires_at + DNS_MATERIALIZATION_REFRESH_OVERLAP,
+                }),
+            );
+        }
+
         assert_eq!(
             effective_allowances_with_materializations(&[], &active),
             vec![EffectiveAllowance {
@@ -11652,6 +11961,49 @@ mod tests {
             &policy,
             &original_root,
         );
+        // A shorter AAAA response in the same batch can shorten the derived root
+        // of an earlier A response without shortening that response's address grant.
+        let shorter = cname_test_validated_response(
+            "github.com",
+            "derived.example",
+            "2001:db8::53".parse().unwrap(),
+            1,
+            now,
+            &policy,
+            &original_root,
+        );
+        let (committed, grants, accepted, rejected, _) = stage_materialization_transactions(
+            &original_root,
+            &policy,
+            BTreeSet::new(),
+            vec![
+                request("derived.example", extension.clone()),
+                request("github.com", shorter),
+            ],
+            now,
+        );
+        assert!(rejected.is_empty());
+        let expires = now + Duration::from_secs(1);
+        let mut active = BTreeMap::new();
+        merge_materializations(&mut active, grants, now);
+        let earlier = &accepted[0];
+        assert_eq!(
+            earlier.verified_answer_lifetime(&committed, &active),
+            Some(VerifiedAnswerLifetime {
+                cache_until: expires,
+                covered_until: expires
+            })
+        );
+        for required in ["derived.example", "extended.example"] {
+            let mut incomplete = committed.clone();
+            incomplete.active.remove(required);
+            assert_eq!(earlier.verified_answer_lifetime(&incomplete, &active), None);
+        }
+        assert_eq!(
+            earlier.verified_answer_lifetime(&committed, &BTreeMap::new()),
+            None
+        );
+
         let mut changed_root = original_root.clone();
         changed_root
             .active
@@ -13080,10 +13432,22 @@ mod tests {
     fn bounds_tcp_dns_socket_io_and_external_docker_configuration_inputs() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (server, _) = listener.accept().unwrap();
+        let (mut server, _) = listener.accept().unwrap();
         set_dns_tcp_deadlines(&server).unwrap();
         assert_eq!(server.read_timeout().unwrap(), Some(DNS_FORWARD_TIMEOUT));
         assert_eq!(server.write_timeout().unwrap(), Some(DNS_FORWARD_TIMEOUT));
+        // If preparation used the write budget, do not even send a frame length.
+        assert!(!write_tcp_dns_response(
+            &mut server,
+            b"answer",
+            Instant::now(),
+            &AtomicBool::new(false)
+        ));
+        client.set_nonblocking(true).unwrap();
+        assert_eq!(
+            client.peek(&mut [0; 2]).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
         drop(client);
 
         let root = Path::new("target/tmp/dns-mediator-safe-file-tests");

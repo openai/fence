@@ -55,6 +55,8 @@ Add destinations your workflow needs to the `allowlist`:
 
 Bare hostnames default to TCP port `443`. Fence also supports IPv6, custom ports, TCP, UDP, CIDR ranges, and one- or two-level hostname wildcards. An allowlist can contain up to 64 unique entries.
 
+In block mode, Fence can shorten DNS cache lifetimes to match its firewall rules. Allowlist the hostname, not each IP it resolves to.
+
 See [allowlist syntax](docs/allowlist.md) for all supported formats.
 
 ## Try Audit Mode 🔍
