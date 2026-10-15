@@ -13,6 +13,7 @@ type RuntimePaths = {
   report: string;
   dnsReport: string;
   unit: string;
+  launcherHostClaim: string;
   launcherDirectory: string;
   launcherActionDirectory: string;
   launcherIntegrity: string;
@@ -683,6 +684,25 @@ function readJsonBounded(file: string, maximumBytes: number, description: string
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
+function readReady(file: string): any {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.uid !== 0 || (stat.mode & 0o7777) !== 0o644 || stat.size > 64 * 1024) {
+      throw new Error();
+    }
+    const bytes = Buffer.alloc(stat.size);
+    if (fs.readSync(fd, bytes) !== bytes.length) throw new Error();
+    return JSON.parse(bytes.toString("utf8"));
+  } catch {
+    // Do not expose filesystem errors or fragments of an invalid marker in the job log.
+    fail("Fence readiness commit marker is missing, unsafe, or invalid");
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 function validateStrictJsonTokens(raw: string): void {
   const frames: StrictJsonFrame[] = [];
 
@@ -921,6 +941,7 @@ function runtimePaths(invocationId: unknown): RuntimePaths {
     report: path.join(directory, "report.json"),
     dnsReport: path.join(directory, "dns-report.json"),
     unit: `fence-${invocationId}.service`,
+    launcherHostClaim: path.join(LAUNCHER_RUNTIME_ROOT, ".active"),
     launcherDirectory,
     launcherActionDirectory: path.join(launcherDirectory, "action"),
     launcherIntegrity: path.join(launcherDirectory, "integrity.json"),
@@ -1592,7 +1613,7 @@ function validateReport(report: any, failOnCritical = true): any {
   return report;
 }
 
-function validateReady(ready: any, report: any): any {
+function validateReady(ready: any, report: any, phase: "setup" | "post" = "setup"): any {
   if (ready === null || Array.isArray(ready) || typeof ready !== "object") {
     fail("Fence readiness must be a JSON object");
   }
@@ -1605,6 +1626,7 @@ function validateReady(ready: any, report: any): any {
     selectsReviewedProfile(ready.platform_profile_id, ready.profile_realization_id) &&
     ready.platform_profile_id === report.platform_profile_id &&
     ready.profile_realization_id === report.profile_realization_id &&
+    ready.mode === report.mode &&
     typeof ready.allow_github_artifacts === "boolean" &&
     ready.allow_github_artifacts === report.allow_github_artifacts &&
     ready.policy_hash_schema_version === report.policy_hash_schema_version &&
@@ -1615,10 +1637,15 @@ function validateReady(ready: any, report: any): any {
   if (!validIdentity) {
     fail("Fence readiness identity does not match the resident report");
   }
-  const readyHealth = validateResidentHealth(ready.resident_health);
+  // At post this is the healthy commit, not the latest heartbeat or materialized ruleset.
+  const readyHealth = validateResidentHealth(ready.resident_health, phase === "post" ? "historical" : Date.now());
+  const current = report.resident_health;
   if (
-    readyHealth.resident_pid !== report.resident_health.resident_pid ||
-    !sameResidentWorkers(readyHealth, report.resident_health)
+    readyHealth.resident_pid !== current.resident_pid ||
+    readyHealth.verification_sequence > current.verification_sequence ||
+    readyHealth.last_successful_verification_unix_milliseconds >
+      current.last_successful_verification_unix_milliseconds + RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS ||
+    !sameResidentWorkers(readyHealth, current)
   ) {
     fail("Fence readiness resident process does not match the report");
   }
@@ -1654,13 +1681,15 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
   ) {
     fail("Fence DNS evidence resident process does not match the report");
   }
-  const expectedWorkers = dnsEvidence.docker_dns_routing === "local_root_resident_mediator"
-    ? REQUIRED_RESIDENT_WORKERS
-    : dnsEvidence.docker_dns_routing === "not_present" && (
-      (report.mode === "block" && report.container_status === "disabled_verified") ||
-      (report.mode === "audit" && report.container_status === "preserved_verified")
-    )
+  const standardBlock = report.status === "protected_host_block";
+  const routing = dnsEvidence.docker_dns_routing;
+  const hostOnly = standardBlock
+    ? routing === "not_configured_standard_block"
+    : report.mode === "audit" && routing === "not_present";
+  const expectedWorkers = hostOnly
     ? REQUIRED_HOST_RESIDENT_WORKERS
+    : !standardBlock && routing === "local_root_resident_mediator"
+    ? REQUIRED_RESIDENT_WORKERS
     : undefined;
   if (
     expectedWorkers === undefined ||
@@ -1774,7 +1803,6 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
   const wildcardRejections = dnsEvidence.user_wildcard_request_rejections;
   if (
     dnsEvidence.host_dns_routing !== "direct_client_to_root_resident_mediator" ||
-    !["local_root_resident_mediator", "not_present"].includes(dnsEvidence.docker_dns_routing) ||
     dnsEvidence.answer_attribution_status !== "bounded_reportable_hostname_answers_only" ||
     !Array.isArray(authorizations) ||
     authorizations.length > MAX_RESULTS_STORAGE_AUTHORIZATIONS ||
@@ -1862,7 +1890,7 @@ function isNonnegativeSafeInteger(value: unknown): boolean {
 
 function validateResidentHealth(
   health: any,
-  nowMilliseconds = Date.now(),
+  nowMilliseconds: number | "historical" = Date.now(),
   allowCritical = false,
 ): any {
   if (health === null || Array.isArray(health) || typeof health !== "object") {
@@ -1884,9 +1912,11 @@ function validateResidentHealth(
     fail("Fence resident health evidence is invalid or unhealthy");
   }
   if (
-    !Number.isSafeInteger(nowMilliseconds) ||
-    verifiedAt > nowMilliseconds + RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS ||
-    nowMilliseconds - verifiedAt > RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS
+    nowMilliseconds !== "historical" && (
+      !Number.isSafeInteger(nowMilliseconds) ||
+      verifiedAt > nowMilliseconds + RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS ||
+      nowMilliseconds - verifiedAt > RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS
+    )
   ) {
     fail("Fence resident health evidence is stale or has an invalid timestamp");
   }
@@ -2325,11 +2355,16 @@ function criticalFindingLines(report: any): string[] {
 }
 
 function controlsSummary(report: any): string[] {
+  const audit = report.mode === "audit";
+  const degraded = report.status === "protected_host_block_degraded";
+  const mode = audit ? "👀 Audit" : degraded ? "⚠️ Block with Docker available" : "🔒 Block";
   const network = report.network_verification_status !== "verified"
     ? "❌ Verification failed"
-    : report.mode === "audit"
+    : audit
       ? "⚠️ Observing only"
-      : "✅ Restricted";
+      : degraded
+        ? "⚠️ Host traffic filtered; Docker can bypass Fence"
+        : "✅ Restricted";
   const sudo = report.sudo_status === "disabled_verified"
     ? "✅ Disabled"
     : report.sudo_status === "preserved_verified"
@@ -2338,7 +2373,7 @@ function controlsSummary(report: any): string[] {
   const containers = report.container_status === "disabled_verified"
     ? "✅ Disabled"
     : report.container_status === "preserved_unsafe"
-      ? "⚠️ Available; limited assurance"
+      ? "⚠️ Available; later steps can use Docker to bypass Fence"
       : report.container_status === "preserved_verified"
         ? "➖ Available in audit mode"
         : "❌ Unverified";
@@ -2347,7 +2382,7 @@ function controlsSummary(report: any): string[] {
     "",
     "| Control | Result |",
     "| --- | --- |",
-    `| Mode | ${report.mode === "audit" ? "👀 Audit" : "🔒 Block"} |`,
+    `| Mode | ${mode} |`,
     `| Outbound network | ${network} |`,
     `| Passwordless sudo | ${sudo} |`,
     `| Docker/container access | ${containers} |`,
@@ -3041,6 +3076,7 @@ module.exports = {
   renderNetworkReport,
   nativeInputsFromEnvironment,
   readJsonBounded,
+  readReady,
   readLauncherIntegrity,
   launcherIntegrityDocument,
   rejectCriticalFindings,

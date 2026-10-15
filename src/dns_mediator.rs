@@ -150,7 +150,9 @@ const HOST_DNS_BIND: &str = "127.0.0.1:53";
 const DOCKER_DNS_BIND: &str = "172.17.0.1:53";
 const HOST_UDP_BIND_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_UDP_BIND_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const HOST_RESOLVER_PATH: &str = "/etc/resolv.conf";
 const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
+const DNS_ROUTING_MARKER: &str = "dns-routing-owned";
 const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
 const REVIEWED_RESOLVER_TARGETS: [&str; 2] = [
     "/run/systemd/resolve/stub-resolv.conf",
@@ -379,22 +381,25 @@ enum DnsEvidenceScope {
 }
 
 impl DnsEvidenceScope {
-    fn mode(self) -> Mode {
+    fn lockdown_posture(self) -> LockdownPosture {
         match self {
-            Self::ProtectedHostAudit => Mode::Audit,
-            Self::SelectedProfileRuntimeTest
-            | Self::ProtectedHostBlock
-            | Self::ProtectedHostBlockDegraded => Mode::Block,
+            Self::ProtectedHostAudit => LockdownPosture::Audit,
+            Self::SelectedProfileRuntimeTest | Self::ProtectedHostBlock => {
+                LockdownPosture::StandardBlock
+            }
+            Self::ProtectedHostBlockDegraded => LockdownPosture::UnsafePreserve,
+        }
+    }
+
+    fn mode(self) -> Mode {
+        match self.lockdown_posture() {
+            LockdownPosture::Audit => Mode::Audit,
+            LockdownPosture::StandardBlock | LockdownPosture::UnsafePreserve => Mode::Block,
         }
     }
 
     fn is_block(self) -> bool {
-        matches!(
-            self,
-            Self::SelectedProfileRuntimeTest
-                | Self::ProtectedHostBlock
-                | Self::ProtectedHostBlockDegraded
-        )
+        self.mode() == Mode::Block
     }
 
     #[cfg(test)]
@@ -507,10 +512,7 @@ impl DnsBlockRuntimeScope {
     }
 
     fn lockdown_posture(self) -> LockdownPosture {
-        match self {
-            Self::TestEvidence | Self::ProductionStandardBlock => LockdownPosture::StandardBlock,
-            Self::ProductionUnsafePreserve => LockdownPosture::UnsafePreserve,
-        }
+        self.dns_scope().lockdown_posture()
     }
 }
 
@@ -518,6 +520,7 @@ impl DnsBlockRuntimeScope {
 pub struct DnsMediationError {
     pub code: &'static str,
     pub message: String,
+    resolver_layout_failure: Option<ResolverLayoutFailure>,
 }
 
 impl DnsMediationError {
@@ -525,6 +528,22 @@ impl DnsMediationError {
         Self {
             code,
             message: message.into(),
+            resolver_layout_failure: None,
+        }
+    }
+
+    fn report_resolver_startup_failure(&self) {
+        self.write_resolver_startup_diagnostic(&mut std::io::stderr().lock());
+    }
+
+    fn write_resolver_startup_diagnostic(&self, journal: &mut impl Write) {
+        if let Some(reason) = self.resolver_layout_failure {
+            // Only the failed check, never the observed path, owner, mode, PID or system error.
+            let _ = writeln!(
+                journal,
+                "{}",
+                serde_json::json!({"fence_resolver_layout": {"reason": reason}})
+            );
         }
     }
 }
@@ -1529,6 +1548,28 @@ impl ObservationRecorder {
             &self.evidence_from_state(&state, self.scope.active_routing_status()),
         )
     }
+
+    fn publish_initial_verified_health(
+        &self,
+        host_verification: Result<(), DnsMediationError>,
+        workers: Vec<ResidentWorkerHealth>,
+    ) -> Result<ResidentHealth, DnsMediationError> {
+        host_verification?;
+        let health = self.mark_verification_successful(workers);
+        self.refresh_report()?;
+        Ok(health)
+    }
+
+    fn mark_verification_successful(&self, workers: Vec<ResidentWorkerHealth>) -> ResidentHealth {
+        let mut health = self
+            .resident_health
+            .lock()
+            .expect("resident health lock poisoned");
+        if health.status != "critical" {
+            advance_resident_health(&mut health, workers, unix_time_milliseconds());
+        }
+        health.clone()
+    }
 }
 
 fn query_authorization(
@@ -1547,38 +1588,124 @@ fn query_authorization(
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DockerDns {
+    DisabledByPolicy,
+    Unavailable,
+    Mediated,
+}
+
 struct DnsRouting {
     executables: Arc<TrustedExecutableSet>,
-    docker_available: bool,
+    docker_dns: DockerDns,
     docker_original: Option<Vec<u8>>,
     resolver_source: PathBuf,
     resolver_target: PathBuf,
+    routing_marker: PathBuf,
+    provisional: ProvisionalDnsRouting,
+}
+
+#[derive(Default)]
+struct ProvisionalDnsRouting {
+    routing_marker_created: bool,
     resolver_source_created: bool,
-    resolver_mounted: bool,
+    resolver_mount: ResolverMount,
     docker_changed: bool,
+    committed: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum ResolverMount {
+    #[default]
+    NotMounted,
+    Mounted,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DnsRollbackStep {
+    RestoreDockerConfiguration,
+    RestartDocker,
+    UnmountResolver,
+    RemoveResolverSource,
+    RemoveRoutingMarker,
+}
+
+impl ProvisionalDnsRouting {
+    fn rollback(
+        &mut self,
+        other_controls_restored: bool,
+        mut apply: impl FnMut(DnsRollbackStep) -> Result<(), DnsMediationError>,
+    ) -> Result<bool, DnsMediationError> {
+        if self.committed {
+            return Err(DnsMediationError::new(
+                "dns_routing_rollback_after_commit",
+                "DNS routing cannot be restored after readiness",
+            ));
+        }
+        // The marker is created before the first mutation; remove it only after full rollback.
+        if !self.routing_marker_created {
+            return Ok(false);
+        }
+        let docker = (|| {
+            if self.docker_changed {
+                apply(DnsRollbackStep::RestoreDockerConfiguration)?;
+                apply(DnsRollbackStep::RestartDocker)?;
+                self.docker_changed = false;
+            }
+            Ok(())
+        })();
+        // Always try host cleanup, but never unlink the source of a surviving mount.
+        let resolver = (|| {
+            match self.resolver_mount {
+                ResolverMount::NotMounted => {}
+                ResolverMount::Mounted => {
+                    apply(DnsRollbackStep::UnmountResolver)?;
+                    self.resolver_mount = ResolverMount::NotMounted;
+                }
+                ResolverMount::Unknown => {
+                    return Err(DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "cannot determine whether the provisional resolver was mounted",
+                    ));
+                }
+            }
+            if self.resolver_source_created {
+                apply(DnsRollbackStep::RemoveResolverSource)?;
+                self.resolver_source_created = false;
+            }
+            Ok(())
+        })();
+        docker.and(resolver)?;
+        // Do not authorize a new launch over uncertain firewall or lockdown state.
+        if !other_controls_restored {
+            return Err(DnsMediationError::new(
+                "dns_routing_rollback_failed",
+                "cannot release provisional ownership after incomplete host-control rollback",
+            ));
+        }
+        apply(DnsRollbackStep::RemoveRoutingMarker)?;
+        self.routing_marker_created = false;
+        Ok(true)
+    }
 }
 
 impl DnsRouting {
     fn activate(
         runtime_directory: &Path,
         executables: Arc<TrustedExecutableSet>,
-        docker_available: bool,
+        docker_dns: DockerDns,
     ) -> Result<Self, DnsMediationError> {
-        let resolver_target = fs::canonicalize("/etc/resolv.conf").map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver target could not be resolved safely",
-            )
-        })?;
+        // Mount and roll back only the target we reviewed, never a later link destination.
+        let resolver_target = Self::reviewed_resolver_target(&executables)?;
         let mut routing = Self {
             executables,
-            docker_available,
+            docker_dns,
             docker_original: None,
             resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
             resolver_target,
-            resolver_source_created: false,
-            resolver_mounted: false,
-            docker_changed: false,
+            routing_marker: runtime_directory.join(DNS_ROUTING_MARKER),
+            provisional: ProvisionalDnsRouting::default(),
         };
         let result = routing.activate_inner();
         if result.is_err() {
@@ -1588,20 +1715,30 @@ impl DnsRouting {
     }
 
     fn activate_inner(&mut self) -> Result<(), DnsMediationError> {
-        self.verify_supported_resolver_layout()?;
         if self.resolver_source.exists() {
             return Err(DnsMediationError::new(
                 "dns_routing_conflict",
                 "DNS routing refuses a preexisting owned resolver file",
             ));
         }
-        write_new_file(&self.resolver_source, RESOLVER_SOURCE_CONTENTS, 0o644).map_err(|_| {
+        write_new_file(
+            &self.routing_marker,
+            b"",
+            0o600,
+            &mut self.provisional.routing_marker_created,
+        )?;
+        write_new_file(
+            &self.resolver_source,
+            RESOLVER_SOURCE_CONTENTS,
+            0o644,
+            &mut self.provisional.resolver_source_created,
+        )
+        .map_err(|_| {
             DnsMediationError::new(
                 "dns_routing_setup_failed",
                 "failed to create the owned resolver routing file",
             )
         })?;
-        self.resolver_source_created = true;
         let source = self.resolver_source.to_str().ok_or_else(|| {
             DnsMediationError::new(
                 "dns_routing_setup_failed",
@@ -1619,13 +1756,11 @@ impl DnsRouting {
             TrustedExecutable::Mount,
             &["--bind", source, target],
         ) {
-            self.resolver_mounted = paths_have_same_identity(
-                self.resolver_source.as_path(),
-                self.resolver_target.as_path(),
-            );
+            self.provisional.resolver_mount =
+                resolver_mount_after_failed_bind(&self.resolver_source, &self.resolver_target);
             return Err(error);
         }
-        self.resolver_mounted = true;
+        self.provisional.resolver_mount = ResolverMount::Mounted;
         fixed_command(
             &self.executables,
             TrustedExecutable::Mount,
@@ -1633,7 +1768,7 @@ impl DnsRouting {
         )?;
         self.verify_active_resolver_mount()?;
 
-        if !self.docker_available {
+        if self.docker_dns != DockerDns::Mediated {
             return Ok(());
         }
         let docker_path = Path::new(DOCKER_DAEMON_PATH);
@@ -1663,8 +1798,9 @@ impl DnsRouting {
                 "failed to serialize Docker DNS configuration",
             )
         })?;
-        replace_external_file(docker_path, &docker_bytes)?;
-        self.docker_changed = true;
+        replace_external_file(docker_path, &docker_bytes, || {
+            self.provisional.docker_changed = true;
+        })?;
         fixed_command(
             &self.executables,
             TrustedExecutable::Systemctl,
@@ -1674,121 +1810,138 @@ impl DnsRouting {
     }
 
     fn rollback(&mut self) -> Result<bool, DnsMediationError> {
-        let changed = self.resolver_source_created || self.resolver_mounted || self.docker_changed;
-        if self.docker_changed {
-            match self.docker_original.as_deref() {
-                Some(bytes) => replace_external_file(Path::new(DOCKER_DAEMON_PATH), bytes)?,
-                None => {
-                    let _ = fs::remove_file(DOCKER_DAEMON_PATH);
-                }
-            }
-            fixed_command(
+        self.rollback_after_host_controls(true)
+    }
+
+    fn rollback_after_host_controls(
+        &mut self,
+        other_controls_restored: bool,
+    ) -> Result<bool, DnsMediationError> {
+        let apply = |step| match step {
+            DnsRollbackStep::RestoreDockerConfiguration => match self.docker_original.as_deref() {
+                Some(bytes) => replace_external_file(Path::new(DOCKER_DAEMON_PATH), bytes, || {}),
+                None => match fs::remove_file(DOCKER_DAEMON_PATH) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(_) => Err(DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "failed to remove provisional Docker DNS configuration",
+                    )),
+                },
+            },
+            DnsRollbackStep::RestartDocker => fixed_command(
                 &self.executables,
                 TrustedExecutable::Systemctl,
                 &["restart", "docker.service"],
-            )?;
-            self.docker_changed = false;
+            ),
+            DnsRollbackStep::UnmountResolver => {
+                let target = self.resolver_target.to_str().ok_or_else(|| {
+                    DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "accepted resolver target path is not valid UTF-8",
+                    )
+                })?;
+                fixed_command(&self.executables, TrustedExecutable::Umount, &[target])
+            }
+            DnsRollbackStep::RemoveResolverSource => fs::remove_file(&self.resolver_source)
+                .map_err(|_| {
+                    DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "failed to remove provisional resolver routing",
+                    )
+                }),
+            DnsRollbackStep::RemoveRoutingMarker => {
+                fs::remove_file(&self.routing_marker).map_err(|_| {
+                    DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "failed to clear provisional DNS routing ownership",
+                    )
+                })
+            }
+        };
+        let result = self.provisional.rollback(other_controls_restored, apply);
+        if result.is_err() {
+            // This fixed secondary diagnostic must not replace the original startup failure.
+            let _ = std::io::stderr().write_all(
+                b"Fence could not confirm complete rollback of provisional routing and host controls\n",
+            );
         }
-        if self.resolver_mounted {
-            let target = self.resolver_target.to_str().ok_or_else(|| {
-                DnsMediationError::new(
-                    "dns_routing_rollback_failed",
-                    "accepted resolver target path is not valid UTF-8",
-                )
-            })?;
-            fixed_command(&self.executables, TrustedExecutable::Umount, &[target])?;
-            self.resolver_mounted = false;
-        }
-        if self.resolver_source_created {
-            fs::remove_file(&self.resolver_source).map_err(|_| {
-                DnsMediationError::new(
-                    "dns_routing_rollback_failed",
-                    "failed to remove provisional resolver routing",
-                )
-            })?;
-            self.resolver_source_created = false;
-        }
-        Ok(changed)
+        result
     }
 
     fn verify_active(&self) -> Result<(), DnsMediationError> {
         self.verify_active_resolver_mount()?;
-        if self.docker_available {
-            verify_docker_dns_route()
-        } else if runner_docker_available(&self.executables).map_err(lockdown_error)? {
-            Err(DnsMediationError::new(
+        match self.docker_dns {
+            // Standard block verifies container lockdown, not a Docker DNS route.
+            DockerDns::DisabledByPolicy => Ok(()),
+            DockerDns::Mediated => verify_docker_dns_route(),
+            DockerDns::Unavailable
+                if !runner_docker_available(&self.executables).map_err(lockdown_error)? =>
+            {
+                Ok(())
+            }
+            DockerDns::Unavailable => Err(DnsMediationError::new(
                 "dns_routing_verification_failed",
                 "a container runtime appeared after host-only DNS routing was selected",
-            ))
-        } else {
-            Ok(())
+            )),
         }
     }
 
-    fn verify_supported_resolver_layout(&self) -> Result<(), DnsMediationError> {
-        let resolv_conf = Path::new("/etc/resolv.conf");
-        let metadata = fs::symlink_metadata(resolv_conf).map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver layout does not match the reviewed runner fingerprint",
-            )
-        })?;
-        let canonical = fs::canonicalize(resolv_conf).map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver target could not be resolved safely",
-            )
-        })?;
-        let target_metadata = fs::symlink_metadata(&canonical).map_err(|_| {
-            DnsMediationError::new(
-                "unsupported_resolver_layout",
-                "host resolver target could not be inspected safely",
-            )
-        })?;
-        let (resolver_uid, resolver_gid) = self.reviewed_resolver_service_identity()?;
+    fn reviewed_resolver_target(
+        executables: &TrustedExecutableSet,
+    ) -> Result<PathBuf, DnsMediationError> {
+        use ResolverLayoutFailure as Failure;
+        let canonical = reviewed_resolver_link(
+            Path::new(HOST_RESOLVER_PATH),
+            &REVIEWED_RESOLVER_TARGETS.map(Path::new),
+        )?;
+        let target_metadata =
+            fs::symlink_metadata(&canonical).map_err(|_| Failure::TargetUnavailable)?;
+        let (resolver_uid, resolver_gid) = Self::reviewed_resolver_service_identity(executables)?;
         for path in ["/run", "/run/systemd", "/run/systemd/resolve"] {
-            let metadata = fs::symlink_metadata(path).map_err(|_| unsupported_resolver_layout())?;
+            let metadata = fs::symlink_metadata(path).map_err(|_| Failure::DirectoryUnavailable)?;
             if !metadata.file_type().is_dir()
                 || fs::canonicalize(path).ok().as_deref() != Some(Path::new(path))
-                || (metadata.uid() != 0 && metadata.uid() != resolver_uid)
-                || (metadata.gid() != 0 && metadata.gid() != resolver_gid)
-                || metadata.permissions().mode() & 0o022 != 0
-                || runner_path_writable(&self.executables, path.as_ref(), SOCKET_PROBE_TIMEOUT)
-                    .map_err(lockdown_error)?
             {
-                return Err(unsupported_resolver_layout());
+                return Err(Failure::DirectoryNotCanonical.into());
+            }
+            if (metadata.uid() != 0 && metadata.uid() != resolver_uid)
+                || (metadata.gid() != 0 && metadata.gid() != resolver_gid)
+            {
+                return Err(Failure::DirectoryOwnerNotReviewed.into());
+            }
+            if metadata.permissions().mode() & 0o022 != 0 {
+                return Err(Failure::DirectoryPermissionsUnsafe.into());
+            }
+            if runner_path_writable(executables, path.as_ref(), SOCKET_PROBE_TIMEOUT)
+                .map_err(lockdown_error)?
+            {
+                return Err(Failure::DirectoryWritableByRunner.into());
             }
         }
-        if !resolver_layout_is_supported(
-            metadata.file_type().is_symlink(),
-            &canonical,
+        validate_resolver_target_metadata(
             target_metadata.file_type().is_file(),
-            target_metadata.file_type().is_symlink(),
             (target_metadata.uid(), target_metadata.gid()),
             target_metadata.permissions().mode() & 0o7777,
             (resolver_uid, resolver_gid),
-        ) {
-            return Err(unsupported_resolver_layout());
-        }
-        if runner_path_writable(
-            &self.executables,
-            canonical.as_os_str(),
-            SOCKET_PROBE_TIMEOUT,
-        )
-        .map_err(lockdown_error)?
+        )?;
+        if runner_path_writable(executables, canonical.as_os_str(), SOCKET_PROBE_TIMEOUT)
+            .map_err(lockdown_error)?
         {
-            return Err(unsupported_resolver_layout());
+            return Err(Failure::TargetWritableByRunner.into());
         }
-        Ok(())
+        Ok(canonical)
     }
 
-    fn reviewed_resolver_service_identity(&self) -> Result<(u32, u32), DnsMediationError> {
-        let (uid, gid) = self
-            .executables
+    fn reviewed_resolver_service_identity(
+        executables: &TrustedExecutableSet,
+    ) -> Result<(u32, u32), DnsMediationError> {
+        use ResolverLayoutFailure as Failure;
+        let (uid, gid) = executables
             .reviewed_resolver_identity()
             .map_err(|error| DnsMediationError::new(error.code, error.message))?;
         let output = lockdown_fixed_command(
-            &self.executables,
+            executables,
             TrustedExecutable::Systemctl,
             &[
                 "show",
@@ -1798,28 +1951,31 @@ impl DnsRouting {
             ],
         )
         .map_err(lockdown_error)?;
+        if !output.status.success() {
+            return Err(Failure::ServiceQueryFailed.into());
+        }
         let pid = std::str::from_utf8(&output.stdout)
             .ok()
             .and_then(reviewed_resolver_service_pid)
-            .ok_or_else(unsupported_resolver_layout)?;
-        if !output.status.success() {
-            return Err(unsupported_resolver_layout());
-        }
+            .ok_or(Failure::ServicePidUnavailable)?;
         let process = PathBuf::from(format!("/proc/{pid}"));
-        let process_metadata = fs::metadata(&process).map_err(|_| unsupported_resolver_layout())?;
+        let process_metadata =
+            fs::metadata(&process).map_err(|_| Failure::ServiceProcessUnavailable)?;
+        if process_metadata.uid() != uid {
+            return Err(Failure::ServiceOwnerNotReviewed.into());
+        }
         let executable = process.join("exe");
         let executable_path =
-            fs::canonicalize(executable).map_err(|_| unsupported_resolver_layout())?;
+            fs::canonicalize(executable).map_err(|_| Failure::ServiceExecutableUnavailable)?;
         let executable_metadata =
-            fs::metadata(&executable_path).map_err(|_| unsupported_resolver_layout())?;
-        if process_metadata.uid() != uid
-            || executable_path != Path::new("/usr/lib/systemd/systemd-resolved")
+            fs::metadata(&executable_path).map_err(|_| Failure::ServiceExecutableUnavailable)?;
+        if executable_path != Path::new("/usr/lib/systemd/systemd-resolved")
             || !executable_metadata.file_type().is_file()
             || executable_metadata.uid() != 0
             || executable_metadata.gid() != 0
             || executable_metadata.permissions().mode() & 0o022 != 0
         {
-            return Err(unsupported_resolver_layout());
+            return Err(Failure::ServiceExecutableNotReviewed.into());
         }
         Ok((uid, gid))
     }
@@ -1864,31 +2020,59 @@ impl DnsRouting {
                 "active resolver mount does not match the reviewed direct-query routing",
             ));
         }
+        // Matching mount evidence is not enough if the host now uses a different path.
+        verify_live_resolver_target(Path::new(HOST_RESOLVER_PATH), &self.resolver_target)?;
         Ok(())
     }
 }
 
-fn resolver_layout_is_supported(
-    resolv_conf_is_symlink: bool,
-    canonical_target: &Path,
+fn resolver_link_target(link: &Path) -> Result<PathBuf, ResolverLayoutFailure> {
+    let metadata =
+        fs::symlink_metadata(link).map_err(|_| ResolverLayoutFailure::LinkUnavailable)?;
+    if !metadata.file_type().is_symlink() {
+        return Err(ResolverLayoutFailure::LinkNotSymlink);
+    }
+    fs::canonicalize(link).map_err(|_| ResolverLayoutFailure::TargetUnavailable)
+}
+
+fn reviewed_resolver_link(
+    link: &Path,
+    reviewed: &[&Path],
+) -> Result<PathBuf, ResolverLayoutFailure> {
+    let target = resolver_link_target(link)?;
+    if !reviewed.contains(&target.as_path()) {
+        return Err(ResolverLayoutFailure::TargetNotReviewed);
+    }
+    Ok(target)
+}
+
+fn verify_live_resolver_target(link: &Path, expected: &Path) -> Result<(), ResolverLayoutFailure> {
+    if resolver_link_target(link)? != expected {
+        return Err(ResolverLayoutFailure::TargetChanged);
+    }
+    Ok(())
+}
+
+fn validate_resolver_target_metadata(
     target_is_file: bool,
-    target_is_symlink: bool,
     target_identity: (u32, u32),
     target_mode: u32,
     resolver_identity: (u32, u32),
-) -> bool {
+) -> Result<(), ResolverLayoutFailure> {
     let (target_uid, target_gid) = target_identity;
     let (resolver_uid, resolver_gid) = resolver_identity;
-    resolv_conf_is_symlink
-        && REVIEWED_RESOLVER_TARGETS
-            .iter()
-            .any(|target| canonical_target == Path::new(target))
-        && target_is_file
-        && !target_is_symlink
-        && (target_uid == 0 || target_uid == resolver_uid)
-        && (target_gid == 0 || target_gid == resolver_gid)
-        && target_mode & 0o7022 == 0
-        && target_mode & 0o400 != 0
+    if !target_is_file {
+        return Err(ResolverLayoutFailure::TargetNotRegularFile);
+    }
+    if (target_uid != 0 && target_uid != resolver_uid)
+        || (target_gid != 0 && target_gid != resolver_gid)
+    {
+        return Err(ResolverLayoutFailure::TargetOwnerNotReviewed);
+    }
+    if target_mode & 0o7022 != 0 || target_mode & 0o400 == 0 {
+        return Err(ResolverLayoutFailure::TargetPermissionsUnsafe);
+    }
+    Ok(())
 }
 
 fn reviewed_resolver_service_pid(contents: &str) -> Option<u32> {
@@ -1897,21 +2081,52 @@ fn reviewed_resolver_service_pid(contents: &str) -> Option<u32> {
     (pid != 0 && lines.next().is_none()).then_some(pid)
 }
 
-fn unsupported_resolver_layout() -> DnsMediationError {
-    DnsMediationError::new(
-        "unsupported_resolver_layout",
-        "host DNS resolver does not meet the reviewed ownership and routing requirements",
-    )
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ResolverLayoutFailure {
+    LinkUnavailable,
+    LinkNotSymlink,
+    TargetUnavailable,
+    TargetNotReviewed,
+    TargetChanged,
+    TargetNotRegularFile,
+    TargetOwnerNotReviewed,
+    TargetPermissionsUnsafe,
+    TargetWritableByRunner,
+    DirectoryUnavailable,
+    DirectoryNotCanonical,
+    DirectoryOwnerNotReviewed,
+    DirectoryPermissionsUnsafe,
+    DirectoryWritableByRunner,
+    ServiceQueryFailed,
+    ServicePidUnavailable,
+    ServiceProcessUnavailable,
+    ServiceOwnerNotReviewed,
+    ServiceExecutableUnavailable,
+    ServiceExecutableNotReviewed,
 }
 
-fn paths_have_same_identity(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::symlink_metadata(left) else {
-        return false;
-    };
-    let Ok(right) = fs::symlink_metadata(right) else {
-        return false;
-    };
-    left.dev() == right.dev() && left.ino() == right.ino()
+impl From<ResolverLayoutFailure> for DnsMediationError {
+    fn from(reason: ResolverLayoutFailure) -> Self {
+        // Resident drift checks use the same error without emitting a startup diagnostic.
+        Self {
+            code: "unsupported_resolver_layout",
+            message: "host DNS resolver failed a reviewed layout check".into(),
+            resolver_layout_failure: Some(reason),
+        }
+    }
+}
+
+fn resolver_mount_after_failed_bind(source: &Path, target: &Path) -> ResolverMount {
+    match (fs::symlink_metadata(source), fs::symlink_metadata(target)) {
+        (Ok(source), Ok(target))
+            if (source.dev(), source.ino()) == (target.dev(), target.ino()) =>
+        {
+            ResolverMount::Mounted
+        }
+        (Ok(_), Ok(_)) => ResolverMount::NotMounted,
+        _ => ResolverMount::Unknown,
+    }
 }
 
 pub struct DnsMediationSession {
@@ -1939,7 +2154,14 @@ impl DnsMediationSession {
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
-        let docker_available = runner_docker_available(&executables).map_err(lockdown_error)?;
+        let docker_dns = if scope.lockdown_posture() == LockdownPosture::StandardBlock {
+            DockerDns::DisabledByPolicy
+        } else if runner_docker_available(&executables).map_err(lockdown_error)? {
+            DockerDns::Mediated
+        } else {
+            DockerDns::Unavailable
+        };
+        let mediate_docker = docker_dns == DockerDns::Mediated;
         let fence_owner =
             PinnedCurrentFenceOwner::capture(Path::new("/proc")).map_err(local_control_error)?;
         let trusted_runner_worker = Arc::new(
@@ -1947,7 +2169,7 @@ impl DnsMediationSession {
                 .map_err(|error| DnsMediationError::new(error.code, error.message))?,
         );
         let report_path = runtime_directory.join("dns-report.json");
-        let resident_health = Arc::new(Mutex::new(initial_resident_health(docker_available)));
+        let resident_health = Arc::new(Mutex::new(initial_resident_health(mediate_docker)));
         let stop_workers = Arc::new(AtomicBool::new(false));
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
@@ -1984,11 +2206,7 @@ impl DnsMediationSession {
             mut threads,
             mut supervisor,
             attribution,
-        } = start_dns_proxy(
-            recorder.clone(),
-            Arc::clone(&stop_workers),
-            docker_available,
-        )?;
+        } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers), mediate_docker)?;
         if let Err(error) = supervisor.wait_for_startup() {
             shutdown_dns_workers(&stop_workers, &mut threads);
             return Err(error);
@@ -1999,7 +2217,9 @@ impl DnsMediationSession {
                 .expect("resident health lock poisoned");
             health.workers = supervisor.worker_health();
         }
-        let routing = match DnsRouting::activate(runtime_directory, executables, docker_available) {
+        let routing = match DnsRouting::activate(runtime_directory, executables, docker_dns)
+            .inspect_err(DnsMediationError::report_resolver_startup_failure)
+        {
             Ok(routing) => routing,
             Err(error) => {
                 shutdown_dns_workers(&stop_workers, &mut threads);
@@ -2045,16 +2265,24 @@ impl DnsMediationSession {
         self.attribution.drain()
     }
 
-    fn mark_verification_successful(&mut self) {
-        let workers = self.supervisor.worker_health();
-        let mut health = self
-            .resident_health
-            .lock()
-            .expect("resident health lock poisoned");
-        if health.status == "critical" {
-            return;
-        }
-        advance_resident_health(&mut health, workers, unix_time_milliseconds());
+    fn verify_before_readiness(
+        &self,
+        baseline: &LocalControlSnapshot,
+    ) -> Result<ResidentHealth, DnsMediationError> {
+        let verified = verify_resident_local_control(self, baseline)
+            .map_err(local_control_error)
+            .and_then(|()| {
+                self.routing
+                    .verify_active_resolver_mount()
+                    .inspect_err(DnsMediationError::report_resolver_startup_failure)
+            });
+        self.recorder
+            .publish_initial_verified_health(verified, self.supervisor.worker_health())
+    }
+
+    fn mark_verification_successful(&self) -> ResidentHealth {
+        self.recorder
+            .mark_verification_successful(self.supervisor.worker_health())
     }
 
     fn mark_resident_critical(&mut self) {
@@ -2257,7 +2485,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_available {
+            if mediation.routing.docker_dns == DockerDns::Mediated {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -2270,7 +2498,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 .map_err(backend_error)?;
             evidence.network_verification_status = "verified";
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_available {
+            if mediation.routing.docker_dns == DockerDns::Mediated {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -2316,29 +2544,20 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        mediation.mark_verification_successful();
-        evidence.resident_health = mediation.resident_health();
-        if let Err(error) = mediation.recorder.refresh_report() {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
-        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline) {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(local_control_error(error));
-        }
+        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
+        {
+            Ok(health) => health,
+            Err(error) => {
+                evidence.setup_status = "failed_pre_ready";
+                evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
+                let _ = runtime.replace_report(&evidence);
+                return Err(error);
+            }
+        };
 
-        evidence.setup_status = "verified_before_observation_ready";
-        if let Err(error) = runtime.replace_report(&evidence) {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(runtime_error(error));
-        }
-        if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedAuditReady {
+        evidence.setup_status = "resident_observation_only";
+        evidence.readiness_status = PROTECTED_AUDIT_READY_STATUS;
+        let ready = DnsMediatedAuditReady {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: PROTECTED_AUDIT_READY_STATUS,
             mode: Mode::Audit,
@@ -2354,16 +2573,16 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             limitations: protected_audit_limitations(
                 plan.runtime_hostname_policy.has_user_wildcards(),
             ),
-        }) {
+        };
+        if let Err(error) = runtime.publish_readiness(&evidence, &ready) {
             evidence.setup_status = "failed_pre_ready";
+            evidence.readiness_status = "not_emitted";
             evidence.rollback_status = rollback_dns_audit_setup(&mut backend, &mut mediation);
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
+        mediation.routing.provisional.committed = true;
         lockdown.commit_no_restore();
-        evidence.setup_status = "resident_observation_only";
-        evidence.readiness_status = PROTECTED_AUDIT_READY_STATUS;
-        runtime.replace_report(&evidence).map_err(runtime_error)?;
         Ok(Self {
             _mediation: mediation,
             backend,
@@ -2457,7 +2676,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                     "measured passwordless sudo availability drifted after observation readiness",
                 );
             }
-            if self._mediation.routing.docker_available
+            if self._mediation.routing.docker_dns == DockerDns::Mediated
                 && self.lockdown.verify_containers_available().is_err()
             {
                 verification_succeeded = false;
@@ -2495,8 +2714,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 );
             }
             if verification_succeeded && self.evidence.critical_findings.is_empty() {
-                self._mediation.mark_verification_successful();
-                self.evidence.resident_health = self._mediation.resident_health();
+                self.evidence.resident_health = self._mediation.mark_verification_successful();
                 if self._mediation.recorder.refresh_report().is_err() {
                     self.record_critical(
                         "dns_audit_evidence_write_failed",
@@ -2649,9 +2867,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let setup_result = (|| {
             lockdown.verify_supported_host().map_err(lockdown_error)?;
             lockdown.verify_sudo_available().map_err(lockdown_error)?;
-            if mediation.routing.docker_available
-                || scope.lockdown_posture() == LockdownPosture::UnsafePreserve
-            {
+            if scope.lockdown_posture() == LockdownPosture::UnsafePreserve {
                 lockdown
                     .verify_containers_available()
                     .map_err(lockdown_error)?;
@@ -2725,31 +2941,20 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        mediation.mark_verification_successful();
-        evidence.resident_health = mediation.resident_health();
-        if let Err(error) = mediation.recorder.refresh_report() {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(error);
-        }
-        if let Err(error) = verify_resident_local_control(&mediation, &local_control_baseline) {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(local_control_error(error));
-        }
-        evidence.setup_status = "verified_before_test_ready";
-        if let Err(error) = runtime.replace_report(&evidence) {
-            evidence.setup_status = "failed_pre_ready";
-            evidence.rollback_status =
-                rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
-            let _ = runtime.replace_report(&evidence);
-            return Err(runtime_error(error));
-        }
-        if let Err(error) = runtime.write_ready_exclusive(&DnsMediatedBlockReady {
+        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
+        {
+            Ok(health) => health,
+            Err(error) => {
+                evidence.setup_status = "failed_pre_ready";
+                evidence.rollback_status =
+                    rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
+                let _ = runtime.replace_report(&evidence);
+                return Err(error);
+            }
+        };
+        evidence.setup_status = scope.resident_status();
+        evidence.readiness_status = scope.ready_status();
+        let ready = DnsMediatedBlockReady {
             runtime_evidence_schema_version: RUNTIME_EVIDENCE_SCHEMA_VERSION,
             status: scope.ready_status(),
             mode: Mode::Block,
@@ -2767,17 +2972,17 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 plan.runtime_hostname_policy.has_user_wildcards(),
                 plan.allow_github_artifacts,
             ),
-        }) {
+        };
+        if let Err(error) = runtime.publish_readiness(&evidence, &ready) {
             evidence.setup_status = "failed_pre_ready";
+            evidence.readiness_status = "not_emitted";
             evidence.rollback_status =
                 rollback_dns_block_setup(&mut backend, &mut lockdown, &mut mediation);
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
+        mediation.routing.provisional.committed = true;
         lockdown.commit_no_restore();
-        evidence.setup_status = scope.resident_status();
-        evidence.readiness_status = scope.ready_status();
-        runtime.replace_report(&evidence).map_err(runtime_error)?;
         let next_hostname_refresh =
             hostname_refresh_schedule(&hostname_policy, &active, Duration::ZERO);
         Ok(Self {
@@ -3097,8 +3302,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 );
             }
             if verification_succeeded && self.evidence.critical_findings.is_empty() {
-                self._mediation.mark_verification_successful();
-                self.evidence.resident_health = self._mediation.resident_health();
+                self.evidence.resident_health = self._mediation.mark_verification_successful();
                 if self._mediation.recorder.refresh_report().is_err() {
                     self.record_critical(
                         "dns_block_evidence_write_failed",
@@ -4450,7 +4654,9 @@ fn rollback_dns_block_setup(
 ) -> &'static str {
     let lockdown_result = lockdown.rollback_pre_ready();
     let network_result = backend.rollback_pre_activation();
-    let dns_result = mediation.routing.rollback();
+    let dns_result = mediation
+        .routing
+        .rollback_after_host_controls(lockdown_result.is_ok() && network_result.is_ok());
     match (lockdown_result, network_result, dns_result) {
         (Ok(lockdown_changed), Ok(network_changed), Ok(dns_changed))
             if lockdown_changed || network_changed || dns_changed =>
@@ -4467,7 +4673,9 @@ fn rollback_dns_audit_setup(
     mediation: &mut DnsMediationSession,
 ) -> &'static str {
     let network_result = backend.rollback_pre_activation();
-    let dns_result = mediation.routing.rollback();
+    let dns_result = mediation
+        .routing
+        .rollback_after_host_controls(network_result.is_ok());
     match (network_result, dns_result) {
         (Ok(network_changed), Ok(dns_changed)) if network_changed || dns_changed => {
             "rolled_back_pre_ready"
@@ -6279,7 +6487,7 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
-        &initial_resident_health(true),
+        &initial_resident_health(scope.lockdown_posture() != LockdownPosture::StandardBlock),
     )
 }
 
@@ -6317,7 +6525,11 @@ fn evidence_from_state_and_authorizations(
             .iter()
             .any(|worker| worker.name == "docker_udp_dns")
         {
-            "not_present"
+            if scope.lockdown_posture() == LockdownPosture::StandardBlock {
+                "not_configured_standard_block"
+            } else {
+                "not_present"
+            }
         } else {
             match scope {
                 DnsEvidenceScope::ProtectedHostAudit
@@ -6537,7 +6749,12 @@ fn write_report(path: &Path, evidence: &DnsMediationEvidence) -> Result<(), DnsM
     })
 }
 
-fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediationError> {
+fn write_new_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    created: &mut bool,
+) -> Result<(), DnsMediationError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -6550,6 +6767,7 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediati
                 "failed to create bounded DNS mediation evidence file",
             )
         })?;
+    *created = true;
     file.write_all(bytes).map_err(|_| {
         DnsMediationError::new(
             "dns_evidence_write_failed",
@@ -6558,7 +6776,11 @@ fn write_new_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), DnsMediati
     })
 }
 
-fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationError> {
+fn replace_external_file(
+    path: &Path,
+    bytes: &[u8],
+    opened: impl FnOnce(),
+) -> Result<(), DnsMediationError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
             return Err(DnsMediationError::new(
@@ -6588,6 +6810,8 @@ fn replace_external_file(path: &Path, bytes: &[u8]) -> Result<(), DnsMediationEr
                 "failed to write fixed DNS routing configuration",
             )
         })?;
+    // A successful open has already created or truncated the configuration.
+    opened();
     let metadata = file.metadata().map_err(|_| {
         DnsMediationError::new(
             "dns_routing_setup_failed",
@@ -6797,7 +7021,9 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(
+                scope.lockdown_posture() != LockdownPosture::StandardBlock,
+            ))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: report_path.clone(),
             scope,
@@ -6838,6 +7064,38 @@ mod tests {
         recorder.refresh_report().unwrap();
         assert!(report.is_file());
 
+        fs::remove_file(report).unwrap();
+    }
+
+    #[test]
+    fn first_heartbeat_is_published_only_after_pre_ready_host_verification_succeeds() {
+        let (recorder, report) = test_recorder(DnsEvidenceScope::ProtectedHostAudit, None);
+        recorder.refresh_report().unwrap();
+        let starting_report = fs::read(&report).unwrap();
+        let starting = recorder.resident_health.lock().unwrap().clone();
+        assert_eq!(starting.status, "starting");
+        assert_eq!(starting.verification_sequence, 0);
+        assert_eq!(starting.last_successful_verification_unix_milliseconds, 0);
+
+        let workers = starting.workers.clone();
+        let failed = DnsMediationError::from(ResolverLayoutFailure::TargetChanged);
+        assert_eq!(
+            recorder.publish_initial_verified_health(Err(failed.clone()), workers.clone()),
+            Err(failed)
+        );
+        assert_eq!(*recorder.resident_health.lock().unwrap(), starting);
+        assert_eq!(fs::read(&report).unwrap(), starting_report);
+
+        let verified = recorder
+            .publish_initial_verified_health(Ok(()), workers)
+            .unwrap();
+        assert_eq!(verified.status, "healthy");
+        assert_eq!(verified.verification_sequence, 1);
+        let published: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(
+            published["resident_health"],
+            serde_json::to_value(verified).unwrap()
+        );
         fs::remove_file(report).unwrap();
     }
 
@@ -12856,7 +13114,9 @@ mod tests {
             "dns_routing_setup_failed"
         );
         assert_eq!(
-            replace_external_file(&linked, b"{}").unwrap_err().code,
+            replace_external_file(&linked, b"{}", || panic!("symlink was opened"))
+                .unwrap_err()
+                .code,
             "dns_routing_setup_failed"
         );
 
@@ -12867,10 +13127,135 @@ mod tests {
             "dns_routing_setup_failed"
         );
         assert_eq!(
-            replace_external_file(&directory, b"{}").unwrap_err().code,
+            replace_external_file(&directory, b"{}", || panic!("directory was opened"))
+                .unwrap_err()
+                .code,
             "dns_routing_setup_failed"
         );
+        let mut truncated = false;
+        replace_external_file(&config, b"{}", || {
+            assert_eq!(fs::metadata(&config).unwrap().len(), 0);
+            truncated = true;
+        })
+        .unwrap();
+        assert!(truncated);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provisional_dns_rollback_attempts_both_routes_and_retains_only_unfinished_work() {
+        use DnsRollbackStep::{
+            RemoveResolverSource, RemoveRoutingMarker, RestartDocker, RestoreDockerConfiguration,
+            UnmountResolver,
+        };
+        for docker_failure in [None, Some(RestoreDockerConfiguration), Some(RestartDocker)] {
+            for resolver_failure in [None, Some(UnmountResolver), Some(RemoveResolverSource)] {
+                let mut routing = ProvisionalDnsRouting {
+                    docker_changed: true,
+                    resolver_mount: ResolverMount::Mounted,
+                    resolver_source_created: true,
+                    routing_marker_created: true,
+                    committed: false,
+                };
+                let mut steps = Vec::new();
+                let result = routing.rollback(true, |step| {
+                    steps.push(step);
+                    if [docker_failure, resolver_failure].contains(&Some(step)) {
+                        Err(DnsMediationError::new("test_failure", format!("{step:?}")))
+                    } else {
+                        Ok(())
+                    }
+                });
+                if let Some(first_failure) = docker_failure.or(resolver_failure) {
+                    assert_eq!(result.unwrap_err().message, format!("{first_failure:?}"));
+                    assert!(!steps.contains(&RemoveRoutingMarker));
+                    assert!(routing.routing_marker_created);
+                } else {
+                    assert_eq!(result, Ok(true));
+                    assert_eq!(steps.last(), Some(&RemoveRoutingMarker));
+                }
+                assert!(steps.contains(&UnmountResolver));
+                assert_eq!(
+                    steps.contains(&RestartDocker),
+                    docker_failure != Some(RestoreDockerConfiguration)
+                );
+                assert_eq!(
+                    steps.contains(&RemoveResolverSource),
+                    resolver_failure != Some(UnmountResolver)
+                );
+                assert_eq!(routing.docker_changed, docker_failure.is_some());
+                assert_eq!(
+                    routing.resolver_mount == ResolverMount::Mounted,
+                    resolver_failure == Some(UnmountResolver)
+                );
+                assert_eq!(routing.resolver_source_created, resolver_failure.is_some());
+                routing.rollback(true, |_| Ok(())).unwrap();
+                assert_eq!(
+                    routing.rollback(true, |_| panic!("nothing left to undo")),
+                    Ok(false)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_bind_failure_preserves_the_resolver_and_routing_marker_without_unmounting() {
+        let mut routing = ProvisionalDnsRouting {
+            routing_marker_created: true,
+            resolver_mount: ResolverMount::Unknown,
+            resolver_source_created: true,
+            ..ProvisionalDnsRouting::default()
+        };
+        let result = routing.rollback(true, |_| {
+            panic!("must not unmount or remove a resolver of unknown identity")
+        });
+        assert_eq!(result.unwrap_err().code, "dns_routing_rollback_failed");
+        assert!(routing.resolver_source_created && routing.routing_marker_created);
+    }
+
+    #[test]
+    fn failure_to_remove_the_last_marker_is_not_successful_rollback() {
+        let mut routing = ProvisionalDnsRouting {
+            routing_marker_created: true,
+            ..ProvisionalDnsRouting::default()
+        };
+        let result = routing.rollback(true, |step| {
+            assert_eq!(step, DnsRollbackStep::RemoveRoutingMarker);
+            Err(DnsMediationError::new(
+                "test_failure",
+                "could not remove marker",
+            ))
+        });
+        assert_eq!(result.unwrap_err().code, "test_failure");
+        assert!(routing.routing_marker_created);
+    }
+
+    #[test]
+    fn incomplete_host_control_rollback_still_cleans_dns_and_preserves_ownership() {
+        let mut routing = ProvisionalDnsRouting {
+            resolver_source_created: true,
+            routing_marker_created: true,
+            ..ProvisionalDnsRouting::default()
+        };
+        let result = routing.rollback(false, |step| {
+            assert_eq!(step, DnsRollbackStep::RemoveResolverSource);
+            Ok(())
+        });
+        assert_eq!(result.unwrap_err().code, "dns_routing_rollback_failed");
+        assert!(!routing.resolver_source_created && routing.routing_marker_created);
+    }
+
+    #[test]
+    fn committed_dns_routing_refuses_every_rollback_step() {
+        let mut routing = ProvisionalDnsRouting {
+            committed: true,
+            ..ProvisionalDnsRouting::default()
+        };
+        let result = routing.rollback(true, |_| panic!("must not restore DNS after readiness"));
+        assert_eq!(
+            result.unwrap_err().code,
+            "dns_routing_rollback_after_commit"
+        );
     }
 
     #[test]
@@ -12904,105 +13289,122 @@ mod tests {
         fs::write(&source, RESOLVER_SOURCE_CONTENTS).unwrap();
         fs::hard_link(&source, &same).unwrap();
         fs::write(&different, RESOLVER_SOURCE_CONTENTS).unwrap();
-        assert!(paths_have_same_identity(&source, &same));
-        assert!(!paths_have_same_identity(&source, &different));
+        let missing = root.join("missing");
+        for (source, target, expected) in [
+            (&source, &same, ResolverMount::Mounted),
+            (&source, &different, ResolverMount::NotMounted),
+            (&source, &missing, ResolverMount::Unknown),
+            (&missing, &same, ResolverMount::Unknown),
+        ] {
+            assert_eq!(resolver_mount_after_failed_bind(source, target), expected);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn resolver_layout_rejects_unreviewed_targets_owners_and_modes() {
-        let accepted_target = Path::new(REVIEWED_RESOLVER_TARGETS[0]);
-        for target in REVIEWED_RESOLVER_TARGETS {
-            for (uid, gid, mode) in [(991, 992, 0o644), (0, 0, 0o640), (1201, 1202, 0o444)] {
-                let resolver_uid = if uid == 0 { 991 } else { uid };
-                let resolver_gid = if gid == 0 { 992 } else { gid };
-                assert!(resolver_layout_is_supported(
-                    true,
-                    Path::new(target),
-                    true,
-                    false,
-                    (uid, gid),
-                    mode,
-                    (resolver_uid, resolver_gid),
-                ));
-            }
+    fn live_resolver_link_must_reach_the_reviewed_path_even_when_backing_identity_matches() {
+        use ResolverLayoutFailure as Failure;
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!(
+            "fence-resolver-link-{}-{}",
+            std::process::id(),
+            TEST_REPORT_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        let link = root.join("resolv.conf");
+        let first = root.join("first");
+        let second = root.join("second");
+        assert_eq!(resolver_link_target(&link), Err(Failure::LinkUnavailable));
+        symlink(&first, &link).unwrap();
+        assert_eq!(resolver_link_target(&link), Err(Failure::TargetUnavailable));
+        fs::write(&first, RESOLVER_SOURCE_CONTENTS).unwrap();
+        assert_eq!(resolver_link_target(&first), Err(Failure::LinkNotSymlink));
+        assert_eq!(
+            reviewed_resolver_link(&link, &[&second]),
+            Err(Failure::TargetNotReviewed)
+        );
+        let reviewed = reviewed_resolver_link(&link, &[&first, &second]).unwrap();
+        assert_eq!(reviewed, first);
+        assert_eq!(verify_live_resolver_target(&link, &reviewed), Ok(()));
+
+        fs::hard_link(&first, &second).unwrap();
+        let pending_link = root.join("new-link");
+        symlink(&second, &pending_link).unwrap();
+        fs::rename(pending_link, &link).unwrap();
+        assert_eq!(
+            resolver_mount_after_failed_bind(&first, &second),
+            ResolverMount::Mounted
+        );
+        for _ in 0..2 {
+            let failed = verify_live_resolver_target(&link, &reviewed).unwrap_err();
+            assert_eq!(failed, Failure::TargetChanged);
+            assert_eq!(
+                DnsMediationError::from(failed).code,
+                "unsupported_resolver_layout"
+            );
         }
-        for unsupported in [
-            resolver_layout_is_supported(
-                false,
-                accepted_target,
-                true,
-                false,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                Path::new("/run/unreviewed/resolv.conf"),
-                true,
-                false,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                false,
-                false,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                true,
-                (991, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (1000, 992),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (991, 1000),
-                0o644,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (991, 992),
-                0o666,
-                (991, 992),
-            ),
-            resolver_layout_is_supported(
-                true,
-                accepted_target,
-                true,
-                false,
-                (991, 992),
-                0o244,
-                (991, 992),
-            ),
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_live_resolver_drift_checks_do_not_write_startup_diagnostics_to_stderr() {
+        // Isolate stderr from the other parallel tests.
+        let drift_test =
+            "live_resolver_link_must_reach_the_reviewed_path_even_when_backing_identity_matches";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([drift_test, "--nocapture"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn resolver_layout_checks_regular_target_owner_and_permissions() {
+        use ResolverLayoutFailure as Failure;
+        for (uid, gid, mode) in [(991, 992, 0o644), (0, 0, 0o640), (1201, 1202, 0o444)] {
+            let resolver = if uid == 0 { (991, 992) } else { (uid, gid) };
+            assert_eq!(
+                validate_resolver_target_metadata(true, (uid, gid), mode, resolver),
+                Ok(())
+            );
+        }
+        for (regular, uid, gid, mode, reason) in [
+            (false, 991, 992, 0o644, Failure::TargetNotRegularFile),
+            (true, 1000, 992, 0o644, Failure::TargetOwnerNotReviewed),
+            (true, 991, 1000, 0o644, Failure::TargetOwnerNotReviewed),
+            (true, 991, 992, 0o666, Failure::TargetPermissionsUnsafe),
+            (true, 991, 992, 0o244, Failure::TargetPermissionsUnsafe),
         ] {
-            assert!(!unsupported);
+            assert_eq!(
+                validate_resolver_target_metadata(regular, (uid, gid), mode, (991, 992)),
+                Err(reason)
+            );
         }
+    }
+
+    #[test]
+    fn unsupported_resolver_layout_reports_only_the_failed_check_at_startup() {
+        let mut journal = Vec::new();
+        let error = DnsMediationError::from(ResolverLayoutFailure::TargetChanged);
+        assert_eq!(error.code, "unsupported_resolver_layout");
+        error.write_resolver_startup_diagnostic(&mut journal);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&journal).unwrap(),
+            serde_json::json!({"fence_resolver_layout": {"reason": "target_changed"}}),
+        );
+        assert_eq!(journal.iter().filter(|&&byte| byte == b'\n').count(), 1);
+
+        journal.clear();
+        DnsMediationError::new("lockdown_command_timeout", "private host details")
+            .write_resolver_startup_diagnostic(&mut journal);
+        assert!(journal.is_empty());
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct BackendError {
     pub code: &'static str,
     pub message: String,
+    outcome_unknown: bool,
 }
 
 impl BackendError {
@@ -40,6 +41,16 @@ impl BackendError {
         Self {
             code,
             message: message.into(),
+            outcome_unknown: false,
+        }
+    }
+
+    // Once nft has been dispatched, losing its reply does not undo a kernel commit.
+    #[cfg(any(target_os = "linux", test))]
+    fn unknown_outcome(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            outcome_unknown: true,
+            ..Self::new(code, message)
         }
     }
 }
@@ -165,14 +176,21 @@ impl NftExecutor for SystemNftExecutor {
 
 pub struct NativeNftBackend<E: NftExecutor> {
     executor: E,
-    created_table: bool,
+    provisional_table: ProvisionalTable,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProvisionalTable {
+    Absent,
+    Unconfirmed,
+    Owned,
 }
 
 impl<E: NftExecutor> NativeNftBackend<E> {
     pub fn new(executor: E) -> Self {
         Self {
             executor,
-            created_table: false,
+            provisional_table: ProvisionalTable::Absent,
         }
     }
 
@@ -184,13 +202,18 @@ impl<E: NftExecutor> NativeNftBackend<E> {
 
     pub fn apply_provisional(&mut self, program: &str) -> Result<(), BackendError> {
         self.executor
-            .execute(NftOperation::ApplyProvisional, program.as_bytes())?;
-        self.created_table = true;
+            .execute(NftOperation::ApplyProvisional, program.as_bytes())
+            .inspect_err(|error| {
+                if error.outcome_unknown {
+                    self.provisional_table = ProvisionalTable::Unconfirmed;
+                }
+            })?;
+        self.provisional_table = ProvisionalTable::Owned;
         Ok(())
     }
 
     pub fn replace_owned_state(&mut self, program: &str) -> Result<(), BackendError> {
-        if !self.created_table {
+        if self.provisional_table != ProvisionalTable::Owned {
             return Err(BackendError::new(
                 "owned_nft_state_not_created",
                 "cannot replace owned nftables state before provisional activation",
@@ -219,11 +242,18 @@ impl<E: NftExecutor> NativeNftBackend<E> {
     }
 
     pub fn rollback_pre_activation(&mut self) -> Result<bool, BackendError> {
-        if !self.created_table {
-            return Ok(false);
+        match self.provisional_table {
+            ProvisionalTable::Absent => return Ok(false),
+            ProvisionalTable::Unconfirmed => {
+                return Err(BackendError::new(
+                    "provisional_nft_state_unknown",
+                    "cannot confirm whether provisional nftables activation committed; leaving the table untouched",
+                ));
+            }
+            ProvisionalTable::Owned => {}
         }
         self.executor.execute(NftOperation::DeleteOwnedState, &[])?;
-        self.created_table = false;
+        self.provisional_table = ProvisionalTable::Absent;
         Ok(true)
     }
 }
@@ -253,10 +283,9 @@ fn run_process_bounded(
     let mut child = command.spawn().map_err(|error| {
         BackendError::new("nft_spawn_failed", bounded_message(&error.to_string()))
     })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| BackendError::new("nft_stdin_failed", "failed to open nft stdin"))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        BackendError::unknown_outcome("nft_stdin_failed", "failed to open nft stdin")
+    })?;
     let input = input.to_vec();
     let stdin_writer = thread::spawn(move || {
         stdin.write_all(&input)?;
@@ -264,21 +293,19 @@ fn run_process_bounded(
         Ok::<(), std::io::Error>(())
     });
 
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| BackendError::new("nft_stdout_failed", "failed to capture nft stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| BackendError::new("nft_stderr_failed", "failed to capture nft stderr"))?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        BackendError::unknown_outcome("nft_stdout_failed", "failed to capture nft stdout")
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        BackendError::unknown_outcome("nft_stderr_failed", "failed to capture nft stderr")
+    })?;
     let stdout_reader = thread::spawn(move || read_bounded(stdout, output_limit));
     let stderr_reader = thread::spawn(move || read_bounded(stderr, output_limit));
     let deadline = Instant::now() + timeout;
 
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|error| {
-            BackendError::new("nft_wait_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_wait_failed", bounded_message(&error.to_string()))
         })? {
             break status;
         }
@@ -288,7 +315,7 @@ fn run_process_bounded(
             let _ = stdin_writer.join();
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
-            return Err(BackendError::new(
+            return Err(BackendError::unknown_outcome(
                 "nft_command_timeout",
                 "nft command exceeded its execution deadline",
             ));
@@ -298,30 +325,41 @@ fn run_process_bounded(
 
     stdin_writer
         .join()
-        .map_err(|_| BackendError::new("nft_stdin_failed", "nft stdin writer failed"))?
+        .map_err(|_| BackendError::unknown_outcome("nft_stdin_failed", "nft stdin writer failed"))?
         .map_err(|error| {
-            BackendError::new("nft_stdin_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_stdin_failed", bounded_message(&error.to_string()))
         })?;
     let stdout = stdout_reader
         .join()
-        .map_err(|_| BackendError::new("nft_stdout_failed", "nft stdout reader failed"))?
+        .map_err(|_| {
+            BackendError::unknown_outcome("nft_stdout_failed", "nft stdout reader failed")
+        })?
         .map_err(|error| {
-            BackendError::new("nft_stdout_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_stdout_failed", bounded_message(&error.to_string()))
         })?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| BackendError::new("nft_stderr_failed", "nft stderr reader failed"))?
+        .map_err(|_| {
+            BackendError::unknown_outcome("nft_stderr_failed", "nft stderr reader failed")
+        })?
         .map_err(|error| {
-            BackendError::new("nft_stderr_failed", bounded_message(&error.to_string()))
+            BackendError::unknown_outcome("nft_stderr_failed", bounded_message(&error.to_string()))
         })?;
     if stdout.overflowed || stderr.overflowed {
-        return Err(BackendError::new(
+        return Err(BackendError::unknown_outcome(
             "nft_output_too_large",
             "nft command output exceeded its fixed capture limit",
         ));
     }
     if !status.success() {
-        return Err(BackendError::new(
+        if status.code().is_none() {
+            return Err(BackendError::unknown_outcome(
+                "nft_command_interrupted",
+                "nft was interrupted before confirming the command outcome",
+            ));
+        }
+        // A normal diagnostic exit can also mean the kernel acknowledgement was lost.
+        return Err(BackendError::unknown_outcome(
             "nft_command_failed",
             bounded_message(&String::from_utf8_lossy(&stderr.bytes)),
         ));
@@ -548,7 +586,9 @@ fn parse_rule(value: &Value) -> Result<OwnedRule, BackendError> {
             parse_dns_mediator_upstream_dispatch_rule(chain, expressions)
         }
         "fence:dns_mediator_upstream" => parse_dns_mediator_upstream_rule(chain, expressions),
-        "fence:wireserver_platform" => parse_wireserver_platform_rule(chain, expressions),
+        "fence:wireserver_platform" | "fence:wireserver_violation" => {
+            parse_wireserver_rule(chain, expressions, comment == "fence:wireserver_platform")
+        }
         "fence:instance_metadata_platform" => {
             parse_instance_metadata_platform_rule(chain, expressions)
         }
@@ -649,26 +689,38 @@ fn parse_dns_mediator_upstream_rule(
     })
 }
 
-fn parse_wireserver_platform_rule(
+fn parse_wireserver_rule(
     chain: String,
     expressions: &[Value],
+    allow_root: bool,
 ) -> Result<OwnedRule, BackendError> {
-    if expressions.len() != 4
-        || !has_meta_uid(
-            expressions.first(),
-            crate::platform_profile::AZURE_WIRESERVER_ROOT_UID.into(),
-        )
-        || !is_exact_verdict(&expressions[3], "accept")
-    {
-        return Err(BackendError::new(
-            "unexpected_nft_state",
-            "WireServer platform rule does not have the exact expected expression shape",
-        ));
-    }
-    let (address_family, destination) = extract_destination(&expressions[1..2])?;
-    let (protocol, port) = extract_transport(&expressions[2..3])?;
-    if chain != NFT_CLASSIFY_CHAIN
-        || address_family != "ip"
+    use crate::platform_profile::AZURE_WIRESERVER_ROOT_UID as ROOT;
+    let (address, transport) = match expressions {
+        [uid, address, transport, verdict]
+            if allow_root
+                && chain == NFT_OUTPUT_CHAIN
+                && has_meta_uid(Some(uid), ROOT.into())
+                && is_exact_verdict(verdict, "accept") =>
+        {
+            (address, transport)
+        }
+        [address, transport, verdict]
+            if !allow_root
+                && matches!(chain.as_str(), NFT_OUTPUT_CHAIN | NFT_FORWARD_CHAIN)
+                && is_exact_jump_rule(std::slice::from_ref(verdict), NFT_VIOLATION_CHAIN) =>
+        {
+            (address, transport)
+        }
+        _ => {
+            return Err(BackendError::new(
+                "unexpected_nft_state",
+                "WireServer rule does not have the exact expected expression shape",
+            ));
+        }
+    };
+    let (address_family, destination) = extract_destination(std::slice::from_ref(address))?;
+    let (protocol, port) = extract_transport(std::slice::from_ref(transport))?;
+    if address_family != "ip"
         || destination != crate::platform_profile::AZURE_WIRESERVER_ADDRESS
         || protocol != "tcp"
         || !crate::platform_profile::AZURE_WIRESERVER_TCP_PORTS.contains(&port)
@@ -678,12 +730,16 @@ fn parse_wireserver_platform_rule(
             "WireServer platform rule does not match its fixed destination",
         ));
     }
-    Ok(OwnedRule::WireServerPlatform {
-        chain,
-        uid: crate::platform_profile::AZURE_WIRESERVER_ROOT_UID,
-        destination,
-        protocol,
-        port,
+    Ok(if allow_root {
+        OwnedRule::WireServerPlatform {
+            chain,
+            uid: ROOT,
+            destination,
+            protocol,
+            port,
+        }
+    } else {
+        OwnedRule::WireServerViolationDispatch { chain, port }
     })
 }
 
@@ -1376,9 +1432,10 @@ mod tests {
             {"accept": null}
         ]);
         assert!(matches!(
-            parse_wireserver_platform_rule(
-                NFT_CLASSIFY_CHAIN.to_owned(),
-                expressions.as_array().unwrap()
+            parse_wireserver_rule(
+                NFT_OUTPUT_CHAIN.to_owned(),
+                expressions.as_array().unwrap(),
+                true,
             )
             .unwrap(),
             OwnedRule::WireServerPlatform {
@@ -1388,7 +1445,7 @@ mod tests {
             }
         ));
         let serialized = json!({
-            "chain": NFT_CLASSIFY_CHAIN,
+            "chain": NFT_OUTPUT_CHAIN,
             "comment": "fence:wireserver_platform",
             "expr": expressions.clone(),
         });
@@ -1429,22 +1486,34 @@ mod tests {
                 2
             };
             bad[index] = replacement;
-            assert!(parse_wireserver_platform_rule(NFT_CLASSIFY_CHAIN.to_owned(), &bad).is_err());
+            assert!(parse_wireserver_rule(NFT_OUTPUT_CHAIN.to_owned(), &bad, true).is_err());
         }
         assert!(
-            parse_wireserver_platform_rule(
-                NFT_OUTPUT_CHAIN.to_owned(),
-                expressions.as_array().unwrap()
+            parse_wireserver_rule(
+                NFT_FORWARD_CHAIN.to_owned(),
+                expressions.as_array().unwrap(),
+                true,
             )
             .is_err()
         );
         assert!(
-            parse_wireserver_platform_rule(
-                NFT_CLASSIFY_CHAIN.to_owned(),
-                &expressions.as_array().unwrap()[..3]
+            parse_wireserver_rule(
+                NFT_OUTPUT_CHAIN.to_owned(),
+                &expressions.as_array().unwrap()[..3],
+                true,
             )
             .is_err()
         );
+        let mut guard = expressions.as_array().unwrap()[1..].to_vec();
+        guard[2] = json!({"jump": {"target": NFT_VIOLATION_CHAIN}});
+        for chain in [NFT_OUTPUT_CHAIN, NFT_FORWARD_CHAIN] {
+            assert!(matches!(
+                parse_wireserver_rule(chain.to_owned(), &guard, false).unwrap(),
+                OwnedRule::WireServerViolationDispatch { port: 80, .. }
+            ));
+        }
+        guard[2] = json!({"jump": {"target": NFT_CLASSIFY_CHAIN}});
+        assert!(parse_wireserver_rule(NFT_FORWARD_CHAIN.to_owned(), &guard, false).is_err());
     }
 
     #[test]
@@ -1528,6 +1597,26 @@ mod tests {
             "apply_failed"
         );
         assert!(!backend.rollback_pre_activation().unwrap());
+    }
+
+    #[test]
+    fn unconfirmed_activation_is_neither_successful_rollback_nor_permission_to_delete_a_table() {
+        let timeout = BackendError::unknown_outcome("nft_command_timeout", "reply lost");
+        let executor = FakeExecutor::with_responses(vec![Err(timeout)]);
+        let mut backend = NativeNftBackend::new(executor);
+        assert_eq!(
+            backend.apply_provisional("program").unwrap_err().code,
+            "nft_command_timeout"
+        );
+        assert_eq!(
+            backend.rollback_pre_activation().unwrap_err().code,
+            "provisional_nft_state_unknown"
+        );
+        // In particular, we did not issue DeleteOwnedState for an unconfirmed owner.
+        assert_eq!(
+            backend.executor.operations.borrow().as_slice(),
+            &[NftOperation::ApplyProvisional]
+        );
     }
 
     #[test]
@@ -1881,6 +1970,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(failed.code, "nft_command_failed");
         assert_eq!(failed.message, "denied");
+        assert!(failed.outcome_unknown);
+
+        let interrupted = run_process_bounded(
+            Command::new("/bin/sh"),
+            &["-c", "kill -TERM $$"],
+            b"",
+            Duration::from_secs(1),
+            32,
+        )
+        .unwrap_err();
+        assert_eq!(interrupted.code, "nft_command_interrupted");
+        assert!(interrupted.outcome_unknown);
 
         let overflow = run_process_bounded(
             Command::new("/bin/sh"),
@@ -1891,6 +1992,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(overflow.code, "nft_output_too_large");
+        assert!(overflow.outcome_unknown);
 
         let timeout = run_process_bounded(
             Command::new("/bin/sleep"),
@@ -1901,6 +2003,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(timeout.code, "nft_command_timeout");
+        assert!(timeout.outcome_unknown);
 
         let blocked_stdin_timeout = run_process_bounded(
             Command::new("/bin/sleep"),
@@ -1911,6 +2014,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(blocked_stdin_timeout.code, "nft_command_timeout");
+        assert!(blocked_stdin_timeout.outcome_unknown);
 
         let missing = run_process_bounded(
             Command::new("/missing/fence-command"),
@@ -1921,6 +2025,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(missing.code, "nft_spawn_failed");
+        assert!(!missing.outcome_unknown, "nft was never dispatched");
         assert!(bounded_message(&"x".repeat(600)).ends_with("..."));
     }
 

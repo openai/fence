@@ -158,6 +158,10 @@ pub enum OwnedRule {
         protocol: String,
         port: u16,
     },
+    WireServerViolationDispatch {
+        chain: String,
+        port: u16,
+    },
     InstanceMetadataPlatform {
         chain: String,
         destination: String,
@@ -418,12 +422,7 @@ fn build_rules(
     let control = implicit_ipv6_control();
     let mut rules = Vec::new();
     if dns_mediator_upstream {
-        rules.push(OwnedRule::DnsMediatorUpstreamDispatch {
-            chain: NFT_OUTPUT_CHAIN.to_owned(),
-            destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
-            protocol: "udp".to_owned(),
-            port: DNS_MEDIATOR_UPSTREAM_PORT,
-        });
+        push_platform_dispatches(&mut rules, NFT_OUTPUT_CHAIN);
     }
     rules.extend([
         OwnedRule::Loopback {
@@ -446,12 +445,7 @@ fn build_rules(
         },
     ]);
     if dns_mediator_upstream {
-        rules.push(OwnedRule::DnsMediatorUpstreamDispatch {
-            chain: NFT_FORWARD_CHAIN.to_owned(),
-            destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
-            protocol: "udp".to_owned(),
-            port: DNS_MEDIATOR_UPSTREAM_PORT,
-        });
+        push_platform_dispatches(&mut rules, NFT_FORWARD_CHAIN);
     }
     rules.extend([
         OwnedRule::EstablishedRelated {
@@ -469,15 +463,6 @@ fn build_rules(
             protocol: "udp".to_owned(),
             port: DNS_MEDIATOR_UPSTREAM_PORT,
         });
-        rules.extend(
-            AZURE_WIRESERVER_TCP_PORTS.map(|port| OwnedRule::WireServerPlatform {
-                chain: NFT_CLASSIFY_CHAIN.to_owned(),
-                uid: AZURE_WIRESERVER_ROOT_UID,
-                destination: AZURE_WIRESERVER_ADDRESS.to_owned(),
-                protocol: "tcp".to_owned(),
-                port,
-            }),
-        );
         rules.push(OwnedRule::InstanceMetadataPlatform {
             chain: NFT_CLASSIFY_CHAIN.to_owned(),
             destination: AZURE_INSTANCE_METADATA_ADDRESS.to_owned(),
@@ -518,6 +503,32 @@ fn build_rules(
         },
     });
     rules
+}
+
+fn push_platform_dispatches(rules: &mut Vec<OwnedRule>, chain: &str) {
+    rules.push(OwnedRule::DnsMediatorUpstreamDispatch {
+        chain: chain.to_owned(),
+        destination: DNS_MEDIATOR_UPSTREAM_ADDRESS.to_owned(),
+        protocol: "udp".to_owned(),
+        port: DNS_MEDIATOR_UPSTREAM_PORT,
+    });
+    // WireServer is a host privilege, not an allowance. Decide before conntrack
+    // or DNS-derived policy can accept the packet, including when it has no socket UID.
+    for port in AZURE_WIRESERVER_TCP_PORTS {
+        if chain == NFT_OUTPUT_CHAIN {
+            rules.push(OwnedRule::WireServerPlatform {
+                chain: chain.to_owned(),
+                uid: AZURE_WIRESERVER_ROOT_UID,
+                destination: AZURE_WIRESERVER_ADDRESS.to_owned(),
+                protocol: "tcp".to_owned(),
+                port,
+            });
+        }
+        rules.push(OwnedRule::WireServerViolationDispatch {
+            chain: chain.to_owned(),
+            port,
+        });
+    }
 }
 
 fn render_rule(program: &mut String, rule: &OwnedRule) {
@@ -602,6 +613,13 @@ fn render_rule(program: &mut String, rule: &OwnedRule) {
             writeln!(
                 program,
                 "add rule {NFT_FAMILY} {NFT_TABLE} {chain} meta skuid {uid} ip daddr {destination} {protocol} dport {port} accept comment \"fence:wireserver_platform\""
+            )
+            .unwrap();
+        }
+        OwnedRule::WireServerViolationDispatch { chain, port } => {
+            writeln!(
+                program,
+                "add rule {NFT_FAMILY} {NFT_TABLE} {chain} ip daddr {AZURE_WIRESERVER_ADDRESS} tcp dport {port} jump {NFT_VIOLATION_CHAIN} comment \"fence:wireserver_violation\""
             )
             .unwrap();
         }
@@ -976,7 +994,7 @@ mod tests {
             .position(|rule| matches!(rule, OwnedRule::WireServerPlatform { port: 32526, .. }))
             .unwrap();
         broadened.rules[index] = OwnedRule::WireServerPlatform {
-            chain: NFT_CLASSIFY_CHAIN.to_owned(),
+            chain: NFT_OUTPUT_CHAIN.to_owned(),
             uid: 1001,
             destination: AZURE_WIRESERVER_ADDRESS.to_owned(),
             protocol: "tcp".to_owned(),
