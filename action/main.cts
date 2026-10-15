@@ -14,6 +14,7 @@ const {
   launcherIntegrityDocument,
   nativeInputsFromEnvironment,
   readJsonBounded,
+  readReady,
   readLauncherIntegrity,
   runtimePaths,
   validateBundle,
@@ -249,6 +250,29 @@ function dnsStartupDiagnosticFromJournal(output: string): string | undefined {
   return undefined;
 }
 
+function resolverLayoutDiagnosticFromJournal(output: string): string | undefined {
+  // Match the native ResolverLayoutFailure enum, never observed resolver or process details.
+  const reasons = new Set([
+    "link_unavailable", "link_not_symlink", "target_unavailable", "target_not_reviewed",
+    "target_changed", "target_not_regular_file", "target_owner_not_reviewed",
+    "target_permissions_unsafe", "target_writable_by_runner", "directory_unavailable",
+    "directory_not_canonical", "directory_owner_not_reviewed", "directory_permissions_unsafe",
+    "directory_writable_by_runner", "service_query_failed", "service_pid_unavailable",
+    "service_process_unavailable", "service_owner_not_reviewed", "service_executable_unavailable",
+    "service_executable_not_reviewed",
+  ]);
+  for (const line of output.split(/\r?\n/).reverse()) {
+    if (line.length === 0 || line.length > 4096) continue;
+    try {
+      const reason = JSON.parse(line)?.fence_resolver_layout?.reason;
+      if (reasons.has(reason)) return reason.replaceAll("_", " ");
+    } catch {
+      // Ignore unrelated journal messages and malformed diagnostics.
+    }
+  }
+  return undefined;
+}
+
 function captureServiceStatus(unit: string): ReturnType<typeof capture> {
   return capture("/usr/bin/systemctl", [
     "show",
@@ -305,6 +329,12 @@ function emitCapturedServiceDiagnostics(
     const dnsDiagnostic = dnsStartupDiagnosticFromJournal(journal.stdout);
     if (dnsDiagnostic !== undefined) {
       log.warning(`Fence DNS startup: ${dnsDiagnostic}`);
+    }
+  }
+  if (errorCode === "unsupported_resolver_layout") {
+    const resolverDiagnostic = resolverLayoutDiagnosticFromJournal(journal.stdout);
+    if (resolverDiagnostic !== undefined) {
+      log.warning(`Fence host resolver: ${resolverDiagnostic}`);
     }
   }
 }
@@ -581,7 +611,7 @@ function waitForReady(paths: { ready: string; report: string; unit: string }): a
         readJsonBounded(paths.report, MAX_REPORT_BYTES, "Fence report"),
         true,
       );
-      const ready = readJsonBounded(paths.ready, 64 * 1024, "Fence readiness");
+      const ready = readReady(paths.ready);
       validateReady(ready, report);
       const service = capture("/usr/bin/systemctl", [
         "show",
@@ -702,4 +732,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, run, terminalServiceStatus };
+module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, residentServiceArgs, resolverLayoutDiagnosticFromJournal, run, terminalServiceStatus };

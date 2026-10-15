@@ -99,15 +99,15 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 
 ## How It Works 🔧
 
-If Fence fails during setup, it can report recognized [host and DNS diagnostics](docs/troubleshooting.md#fence-fails-to-start) without copying raw service logs into the job log.
+If Fence fails during setup, it can report recognized [host, resolver, and DNS listener diagnostics](docs/troubleshooting.md#fence-fails-to-start) without copying raw service logs into the job log.
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 
 1. It checks that the runner and bundled agent are supported.
 2. It allows required GitHub and runner connections, plus your `allowlist`.
 3. It blocks other outbound connections and turns off passwordless `sudo` and Docker.
-4. It keeps those protections in place until the job ends.
-5. It reports network activity and fails the job if its protections change unexpectedly.
+4. It signals readiness only after verifying those protections, then keeps them in place until the job ends.
+5. At job end, it verifies that readiness was committed and its protections are still healthy, reports network activity, and fails the job if they changed unexpectedly.
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
@@ -138,7 +138,7 @@ Fence makes it harder for later workflow steps to send data to unexpected destin
 
 - **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Fence checks the runner's security controls instead of rejecting routine image updates.
 - **Built-in connections:** GitHub Actions, job reporting, and the hosted runner still need a small set of GitHub and Azure connections.
-- **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. Azure WireServer access is limited to root-owned host processes.
+- **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. In block mode, only root-owned host sockets can reach Azure WireServer. Neither service needs an allowlist entry.
 - **Artifacts:** `allow_github_artifacts: true` allows limited access to storage used by GitHub Actions.
 - **Docker:** Fence disables Docker without changing its DNS settings. If you keep Docker available, later steps can bypass Fence.
 - **Release pinning:** Use the full commit SHA from a published Fence release. Do not run the Action from `main`.

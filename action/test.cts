@@ -53,6 +53,7 @@ const {
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
   residentServiceArgs,
+  resolverLayoutDiagnosticFromJournal,
   run,
   terminalServiceStatus,
 } = require("./main.cts");
@@ -202,6 +203,19 @@ function readinessFor(currentReport: any): Record<string, unknown> {
       ? [...githubArtifactCompatibilityLimitations]
       : [],
   };
+}
+
+function writeRootOwnedTestReadiness(t: any, file: string, initialReport: any): void {
+  fs.writeFileSync(file, JSON.stringify(readinessFor(initialReport)));
+  fs.chmodSync(file, 0o644);
+  // Rootless tests use the real file, open flags, mode, and bytes; simulate only the resident's UID.
+  const { ino } = fs.statSync(file);
+  const fstat = fs.fstatSync;
+  t.mock.method(fs, "fstatSync", (fd: number) => {
+    const stat = fstat(fd);
+    if (stat.ino === ino) stat.uid = 0;
+    return stat;
+  });
 }
 
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
@@ -1134,6 +1148,7 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
       `arbitrary journal text ${sensitive}`,
       JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code: "dns_proxy_bind_failed", message: sensitive } }),
       JSON.stringify({ fence_dns_startup: { listener: "host", protocol: "udp", operation: "bind", reason: "address_in_use", detail: sensitive } }),
+      JSON.stringify({ fence_resolver_layout: { reason: "target_changed", path: sensitive } }),
     ].join("\n"),
   };
   const previousDebug = process.env.RUNNER_DEBUG;
@@ -1145,6 +1160,13 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
     assert.match(output, /Fence resident error code: dns_proxy_bind_failed/);
     assert.match(output, /Fence DNS startup: host UDP bind: address already in use/);
     assert.ok(!output.includes(sensitive));
+    assert.doesNotMatch(output, /Fence host resolver:/);
+
+    journal.stdout = journal.stdout.replace("dns_proxy_bind_failed", "unsupported_resolver_layout");
+    const resolverOutput = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    assert.match(resolverOutput, /Fence host resolver: target changed/);
+    assert.doesNotMatch(resolverOutput, /Fence DNS startup:/);
+    assert.ok(!resolverOutput.includes(sensitive));
   } finally {
     if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
     else process.env.RUNNER_DEBUG = previousDebug;
@@ -1257,6 +1279,20 @@ test("DNS startup diagnostics never forward arbitrary error details or injected 
   assert.equal(dnsStartupDiagnosticFromJournal(line({ ...d, extra: "x".repeat(4096) })), undefined);
   assert.equal(dnsStartupDiagnosticFromJournal(`${line(d)}\n${line({ ...d, reason: "::error::secret" })}`),
     "docker UDP bind: address unavailable");
+});
+
+test("host resolver diagnostics show only a fixed failed check, never journal details", () => {
+  const parse = resolverLayoutDiagnosticFromJournal;
+  const line = (reason: unknown, detail: unknown = undefined) =>
+    JSON.stringify({ fence_resolver_layout: { reason, detail } });
+  for (const reason of ["link_unavailable", "target_changed", "directory_writable_by_runner", "service_pid_unavailable"]) {
+    assert.equal(parse(line(reason, "secret path\n::error::injected")), reason.replaceAll("_", " "));
+  }
+  for (const reason of [undefined, null, {}, [], ["target_changed"], 1, "__proto__", "constructor", "target_changed\n::error::injected"]) {
+    assert.equal(parse(line(reason)), undefined);
+  }
+  assert.equal(parse(line("target_changed", "x".repeat(4096))), undefined);
+  assert.equal(parse(`${line("target_changed")}\nnoise\n${line("secret reason")}`), "target changed");
 });
 
 test("derives only bounded fixed runtime paths", () => {
@@ -2193,6 +2229,7 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
+    mode: report.mode,
     allow_github_artifacts: false,
     platform_profile_id: "github_hosted_workflow_bootstrap_v5",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
@@ -2206,6 +2243,7 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
+    mode: report.mode,
     allow_github_artifacts: false,
     platform_profile_id: "github_hosted_workflow_bootstrap_v5",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
@@ -3641,11 +3679,39 @@ test("counts only fixed reasons for unmappable audit findings without changing d
   }
 });
 
-test("publishes post evidence from one fresh report and rejects stale or critical evidence", (t: any) => {
+test("post requires the readiness commit even when the final resident report looks healthy", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-readiness-commit-"));
+  const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
+  const current = { ...report, resident_health: residentHealth() };
+  const publish = () => publishPostEvidence(current, { observations: [] }, paths);
+  try {
+    assert.equal(captureStdout(() => assert.throws(publish, /readiness commit marker/)), "");
+    writeRootOwnedTestReadiness(t, paths.ready, current);
+    fs.writeFileSync(paths.ready, "invalid private bytes");
+    assert.equal(captureStdout(() => assert.throws(publish, /readiness commit marker/)), "");
+    const marker = readinessFor(current);
+    const health = current.resident_health;
+    for (const [override, error] of [
+      [{ base_ruleset_hash: "e".repeat(64) }, /readiness identity/],
+      [{ resident_health: { ...health, verification_sequence: Number(health.verification_sequence) + 1 } }, /resident process/],
+      [{ resident_health: { ...health, resident_pid: Number(health.resident_pid) + 1 } }, /resident process/],
+    ] as [object, RegExp][]) {
+      fs.writeFileSync(paths.ready, JSON.stringify({ ...marker, ...override }));
+      assert.equal(captureStdout(() => assert.throws(publish, error)), "");
+    }
+    fs.writeFileSync(paths.ready, JSON.stringify(marker));
+    fs.chmodSync(paths.ready, 0o666);
+    assert.equal(captureStdout(() => assert.throws(publish, /readiness commit marker/)), "");
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("post validates an old readiness commit with a fresh dynamic ruleset and reports later critical worker drift", (t: any) => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-summary-"));
   const summaryPath = path.join(temporary, "summary");
   fs.writeFileSync(summaryPath, "");
-  const verifiedAt = 1_000_000;
+  const verifiedAt = 10_000_000;
   const currentReport = {
     ...report,
     resident_health: { ...report.resident_health, last_successful_verification_unix_milliseconds: verifiedAt },
@@ -3655,7 +3721,16 @@ test("publishes post evidence from one fresh report and rejects stale or critica
   const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
   process.env.GITHUB_STEP_SUMMARY = summaryPath;
   try {
-    const paths = runtimePaths("action-test");
+    const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
+    writeRootOwnedTestReadiness(t, paths.ready, {
+      ...currentReport,
+      ruleset_hash: "d".repeat(64),
+      resident_health: {
+        ...currentReport.resident_health,
+        verification_sequence: 1,
+        last_successful_verification_unix_milliseconds: verifiedAt - 3_600_000,
+      },
+    });
     const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
     const records = output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON="));
     assert.equal(records.length, 1);
@@ -3674,9 +3749,15 @@ test("publishes post evidence from one fresh report and rejects stale or critica
 
     const criticalReport = {
       ...currentReport,
-      network_verification_status: "critical_drift",
-      resident_health: { ...currentReport.resident_health, status: "critical", last_successful_verification_unix_milliseconds: verifiedAt + 20_000 },
-      critical_findings: [{ code: "owned_nftables_state_missing", message: "Verified drift" }],
+      resident_health: {
+        ...currentReport.resident_health,
+        status: "critical",
+        last_successful_verification_unix_milliseconds: verifiedAt + 20_000,
+        workers: (currentReport.resident_health.workers as any[]).map((worker, index) =>
+          index === 0 ? { ...worker, status: "failed" } : worker
+        ),
+      },
+      critical_findings: [{ code: "dns_tcp_listener_failed", message: "Verified worker drift" }],
     };
     const criticalOutput = captureStdout(() => {
       assert.throws(() => publishPostEvidence(criticalReport, { observations: [] }, paths), /critical resident findings/);
@@ -3696,9 +3777,10 @@ test("keeps the verified job-log report available when the job summary cannot be
   const summaryPath = path.join(temporary, "summary");
   const linkPath = path.join(temporary, "symlink");
   const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
-  const paths = runtimePaths("action-test");
+  const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
   const currentReport = { ...report, resident_health: residentHealth() };
   try {
+    writeRootOwnedTestReadiness(t, paths.ready, currentReport);
     fs.writeFileSync(summaryPath, "unchanged");
     fs.symlinkSync(summaryPath, linkPath);
     for (const unavailablePath of [path.join(temporary, "missing"), linkPath, "/dev/null"]) {
