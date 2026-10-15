@@ -14,6 +14,7 @@ fi
 require_cmd node
 require_cmd sudo
 require_cmd systemctl
+require_cmd findmnt
 if [[ ! -x /usr/sbin/nft ]]; then
   die "Action setup-failure evidence requires /usr/sbin/nft"
 fi
@@ -310,6 +311,11 @@ runtime_failure_unit="fence-$runtime_failure_invocation.service"
 if [[ "$(systemctl show "$runtime_failure_unit" --property=LoadState --value)" != "not-found" ]]; then
   die "Action runtime-failure evidence requires an unused transient service name"
 fi
+host_resolver_identity() {
+  stat --dereference --format='%d:%i' /etc/resolv.conf &&
+    findmnt --noheadings --target /etc/resolv.conf --output ID
+}
+resolver_before="$(host_resolver_identity)"
 : >"$state"
 : >"$summary"
 : >"$stdout"
@@ -329,6 +335,9 @@ fi
 if [[ -e "/run/fence/$runtime_failure_invocation" || -e "/run/fence-launcher/$runtime_failure_invocation" ]]; then
   die "Action runtime-failure evidence left provisional runtime state"
 fi
+[[ ! -e /run/fence-launcher/.active ]] || die "failed Fence startup retained its provisional host claim"
+resolver_after="$(host_resolver_identity)"
+[[ "$resolver_after" == "$resolver_before" ]] || die "failed Fence startup did not restore the original host resolver"
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
   die "Action runtime-failure evidence unexpectedly created inet fence_v0"
 fi

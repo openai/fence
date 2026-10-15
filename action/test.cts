@@ -52,12 +52,14 @@ const {
   fenceErrorCodeFromJournal,
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
+  provisionalCleanupPreservationReason,
   residentServiceArgs,
+  resolverLayoutDiagnosticFromJournal,
   run,
   terminalServiceStatus,
 } = require("./main.cts");
 
-function residentHealth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function residentHealth(overrides: Record<string, unknown> = {}, dockerDns = false): Record<string, unknown> {
   return {
     status: "healthy",
     resident_pid: 4242,
@@ -65,8 +67,10 @@ function residentHealth(overrides: Record<string, unknown> = {}): Record<string,
     last_successful_verification_unix_milliseconds: Date.now() - 1_000,
     verification_interval_seconds: 5,
     workers: [
-      { name: "docker_tcp_dns", status: "running" },
-      { name: "docker_udp_dns", status: "running" },
+      ...(dockerDns ? [
+        { name: "docker_tcp_dns", status: "running" },
+        { name: "docker_udp_dns", status: "running" },
+      ] : []),
       { name: "host_tcp_dns", status: "running" },
       { name: "host_udp_dns", status: "running" },
       { name: "process_attribution", status: "running" },
@@ -136,7 +140,11 @@ function dnsEvidenceFor(
     protection_available: currentReport.protection_available,
     routing_status: "active",
     host_dns_routing: "direct_client_to_root_resident_mediator",
-    docker_dns_routing: "local_root_resident_mediator",
+    docker_dns_routing: currentReport.status === "protected_host_block"
+      ? "not_configured_standard_block"
+      : currentReport.resident_health.workers.some((worker: any) => worker.name === "docker_udp_dns")
+      ? "local_root_resident_mediator"
+      : "not_present",
     answer_attribution_status: "bounded_reportable_hostname_answers_only",
     proxy_policy_status: currentReport.mode === "audit"
       ? "audit_forwards_while_simulating_name_authorization"
@@ -196,6 +204,19 @@ function readinessFor(currentReport: any): Record<string, unknown> {
       ? [...githubArtifactCompatibilityLimitations]
       : [],
   };
+}
+
+function writeRootOwnedTestReadiness(t: any, file: string, initialReport: any): void {
+  fs.writeFileSync(file, JSON.stringify(readinessFor(initialReport)));
+  fs.chmodSync(file, 0o644);
+  // Rootless tests use the real file, open flags, mode, and bytes; simulate only the resident's UID.
+  const { ino } = fs.statSync(file);
+  const fstat = fs.fstatSync;
+  t.mock.method(fs, "fstatSync", (fd: number) => {
+    const stat = fstat(fd);
+    if (stat.ino === ino) stat.uid = 0;
+    return stat;
+  });
 }
 
 function manifestFor(binary: string, overrides = {}): Record<string, unknown> {
@@ -878,8 +899,8 @@ test("formats concise setup and ready logs without raw evidence fields", () => {
   assert.doesNotMatch(lines, /runtime_evidence_schema_version/);
 
   assert.equal(
-    actionLog.readyLine(report),
-    "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down",
+    captureStdout(() => actionLog.ready(report, { NO_COLOR: "1" })),
+    "✅ Fence ready: network restrictions active; passwordless sudo and Docker/container access locked down\n",
   );
 });
 
@@ -925,8 +946,8 @@ test("formats audit and degraded log wording accurately", () => {
     container_status: "preserved_verified",
   };
   assert.equal(
-    actionLog.readyLine(auditReport),
-    "✅ Fence ready: audit mode is observing traffic, not blocking it",
+    captureStdout(() => actionLog.ready(auditReport, { NO_COLOR: "1" })),
+    "✅ Fence ready: audit mode is observing traffic, not blocking it\n",
   );
   assert.equal(
     actionLog.postEvidenceLine(auditReport, 2),
@@ -942,12 +963,12 @@ test("formats audit and degraded log wording accurately", () => {
     container_status: "preserved_unsafe",
   };
   assert.equal(
-    actionLog.readyLine(degraded),
-    "✅ Fence ready: network restrictions active; passwordless sudo locked down; Docker/container access preserved",
+    captureStdout(() => actionLog.ready(degraded)),
+    "::warning::⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence\n",
   );
   assert.equal(
     actionLog.postEvidenceLine(degraded, 0),
-    "⚠️ Limited assurance: Docker/container access was preserved",
+    "⚠️ Docker was kept available; later steps could use it to gain root access and bypass Fence",
   );
 });
 
@@ -1087,8 +1108,8 @@ test("recognizes terminal service state and only bounded structured Fence error 
     undefined,
   );
   assert.equal(
-    terminalServiceStatus("LoadState=not-found\nActiveState=inactive\nSubState=dead\n"),
-    "LoadState=not-found; ActiveState=inactive; SubState=dead",
+    terminalServiceStatus("LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n"),
+    "LoadState=not-found; ActiveState=inactive; SubState=dead; MainPID=0",
   );
 
   const structuredFailure = JSON.stringify({
@@ -1116,6 +1137,38 @@ test("recognizes terminal service state and only bounded structured Fence error 
   }
 });
 
+test("failed launches permit cleanup only for a stopped resident with no readiness or DNS ownership marker", () => {
+  const stopped = { error: false, status: 0, stdout: "ActiveState=failed\nSubState=failed\nMainPID=0\n" };
+  const absent = () => undefined;
+  assert.equal(provisionalCleanupPreservationReason(stopped, absent), undefined);
+
+  // An incomplete or unreadable observation must not race marker publication.
+  for (const status of [
+    { ...stopped, error: true },
+    { ...stopped, status: 1 },
+    { ...stopped, stdout: stopped.stdout.replace("MainPID=0", "MainPID=4321") },
+    { ...stopped, stdout: "ActiveState=active\nSubState=running\nMainPID=4321\n" },
+    { ...stopped, stdout: "ActiveState=inactive\n" },
+  ]) {
+    assert.match(provisionalCleanupPreservationReason(status, () => {
+      throw new Error("must establish the resident stopped before looking for readiness");
+    }), /resident may still be running/);
+  }
+
+  const rootFile = { uid: 0, mode: 0o644, isFile: () => true };
+  assert.match(provisionalCleanupPreservationReason(stopped, () => rootFile), /root-owned readiness marker/);
+  assert.match(provisionalCleanupPreservationReason(stopped,
+    (name: string) => name === "dns-routing-owned" ? rootFile : undefined), /provisional DNS or host-control rollback may be incomplete/);
+  for (const untrusted of [
+    () => ({ ...rootFile, uid: 1000 }),
+    () => ({ ...rootFile, mode: 0o666 }),
+    () => ({ ...rootFile, isFile: () => false }),
+    () => { throw new Error("unable to inspect readiness"); },
+  ]) {
+    assert.match(provisionalCleanupPreservationReason(stopped, untrusted), /could not be safely determined/);
+  }
+});
+
 test("service diagnostics never emit raw command output, even in debug mode", () => {
   const sensitive = "sensitive_marker";
   const status = {
@@ -1128,6 +1181,7 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
       `arbitrary journal text ${sensitive}`,
       JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code: "dns_proxy_bind_failed", message: sensitive } }),
       JSON.stringify({ fence_dns_startup: { listener: "host", protocol: "udp", operation: "bind", reason: "address_in_use", detail: sensitive } }),
+      JSON.stringify({ fence_resolver_layout: { reason: "target_changed", path: sensitive } }),
     ].join("\n"),
   };
   const previousDebug = process.env.RUNNER_DEBUG;
@@ -1139,6 +1193,13 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
     assert.match(output, /Fence resident error code: dns_proxy_bind_failed/);
     assert.match(output, /Fence DNS startup: host UDP bind: address already in use/);
     assert.ok(!output.includes(sensitive));
+    assert.doesNotMatch(output, /Fence host resolver:/);
+
+    journal.stdout = journal.stdout.replace("dns_proxy_bind_failed", "unsupported_resolver_layout");
+    const resolverOutput = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    assert.match(resolverOutput, /Fence host resolver: target changed/);
+    assert.doesNotMatch(resolverOutput, /Fence DNS startup:/);
+    assert.ok(!resolverOutput.includes(sensitive));
   } finally {
     if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
     else process.env.RUNNER_DEBUG = previousDebug;
@@ -1253,6 +1314,20 @@ test("DNS startup diagnostics never forward arbitrary error details or injected 
     "docker UDP bind: address unavailable");
 });
 
+test("host resolver diagnostics show only a fixed failed check, never journal details", () => {
+  const parse = resolverLayoutDiagnosticFromJournal;
+  const line = (reason: unknown, detail: unknown = undefined) =>
+    JSON.stringify({ fence_resolver_layout: { reason, detail } });
+  for (const reason of ["link_unavailable", "target_changed", "directory_writable_by_runner", "service_pid_unavailable"]) {
+    assert.equal(parse(line(reason, "secret path\n::error::injected")), reason.replaceAll("_", " "));
+  }
+  for (const reason of [undefined, null, {}, [], ["target_changed"], 1, "__proto__", "constructor", "target_changed\n::error::injected"]) {
+    assert.equal(parse(line(reason)), undefined);
+  }
+  assert.equal(parse(line("target_changed", "x".repeat(4096))), undefined);
+  assert.equal(parse(`${line("target_changed")}\nnoise\n${line("secret reason")}`), "target changed");
+});
+
 test("derives only bounded fixed runtime paths", () => {
   assert.deepEqual(runtimePaths("action-test"), {
     directory: "/run/fence/action-test",
@@ -1261,10 +1336,12 @@ test("derives only bounded fixed runtime paths", () => {
     report: "/run/fence/action-test/report.json",
     dnsReport: "/run/fence/action-test/dns-report.json",
     unit: "fence-action-test.service",
+    launcherHostClaim: "/run/fence-launcher/.active",
     launcherDirectory: "/run/fence-launcher/action-test",
     launcherActionDirectory: "/run/fence-launcher/action-test/action",
     launcherIntegrity: "/run/fence-launcher/action-test/integrity.json",
   });
+  assert.throws(() => runtimePaths(".active"), /slug grammar/);
   assert.throws(() => runtimePaths("../action-test"), /slug grammar/);
   assert.throws(() => runtimePaths("action--test"), /slug grammar/);
 });
@@ -2155,33 +2232,7 @@ test("validates stable runtime evidence", () => {
     container_status: "preserved_verified",
   };
   validateReport(auditReport);
-  validateDnsEvidence({
-    ...dnsEvidence,
-    status: auditReport.status,
-    mode: auditReport.mode,
-    protection_available: false,
-    proxy_policy_status: "audit_forwards_while_simulating_name_authorization",
-  }, auditReport);
-  const hostOnlyHealth = residentHealth({
-    workers: residentHealth().workers.filter((worker: any) =>
-      !worker.name.startsWith("docker_")
-    ),
-  });
-  for (const currentReport of [
-    { ...report, resident_health: hostOnlyHealth },
-    { ...auditReport, resident_health: hostOnlyHealth },
-  ]) {
-    validateReport(currentReport);
-    validateDnsEvidence(dnsEvidenceFor(currentReport, {
-      docker_dns_routing: "not_present",
-    }), currentReport);
-    assert.throws(
-      () => validateDnsEvidence(dnsEvidenceFor(currentReport, {
-        docker_dns_routing: "local_root_resident_mediator",
-      }), currentReport),
-      /worker set/,
-    );
-  }
+  validateDnsEvidence(dnsEvidenceFor(auditReport), auditReport);
   assert.throws(
     () => validateDnsEvidence({ ...dnsEvidence, docker_dns_routing: "not_present" }, report),
     /worker set/,
@@ -2193,7 +2244,6 @@ test("validates stable runtime evidence", () => {
     setup_status: "resident_degraded",
     protection_available: false,
     container_status: "preserved_unsafe",
-    resident_health: hostOnlyHealth,
   };
   assert.throws(
     () => validateDnsEvidence(dnsEvidenceFor(degradedReport, {
@@ -2201,9 +2251,20 @@ test("validates stable runtime evidence", () => {
     }), degradedReport),
     /worker set/,
   );
+  const dockerHealth = residentHealth({}, true);
+  for (const preserved of [auditReport, degradedReport]) {
+    const withDocker = { ...preserved, resident_health: dockerHealth };
+    validateDnsEvidence(dnsEvidenceFor(withDocker), withDocker);
+  }
+  const unexpectedDocker = { ...report, resident_health: dockerHealth };
+  assert.throws(() => validateDnsEvidence(dnsEvidenceFor(unexpectedDocker), unexpectedDocker), /worker set/);
+  assert.throws(() => validateDnsEvidence(dnsEvidenceFor(unexpectedDocker, {
+    docker_dns_routing: "local_root_resident_mediator",
+  }), unexpectedDocker), /worker set/);
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
+    mode: report.mode,
     allow_github_artifacts: false,
     platform_profile_id: "github_hosted_workflow_bootstrap_v5",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
@@ -2217,6 +2278,7 @@ test("validates stable runtime evidence", () => {
   validateReady({
     runtime_evidence_schema_version: 5,
     status: "ready",
+    mode: report.mode,
     allow_github_artifacts: false,
     platform_profile_id: "github_hosted_workflow_bootstrap_v5",
     profile_realization_id: "github_hosted_workflow_bootstrap_dns_provenance_v5",
@@ -3181,7 +3243,9 @@ test("reports source-produced sudo and container drift in every runtime mode", (
       const critical = {
         ...currentMode,
         ...Object.fromEntries(controls.map((control) => [control, "critical_drift"])),
-        resident_health: residentHealth({ status: "critical" }),
+        resident_health: residentHealth(
+          { status: "critical" }, currentMode.status === "protected_host_block_degraded",
+        ),
         critical_findings: controls.map((control, index) => ({
           timestamp: `unix-ms:${index + 1}`,
           code: `dns_${currentMode.mode === "audit" ? "audit" : "block"}_${
@@ -3192,10 +3256,9 @@ test("reports source-produced sudo and container drift in every runtime mode", (
       };
 
       assert.equal(validateReport(critical, false), critical);
-      const document = parsedStructuredNetworkReport(critical, {
-        observations: [],
-        observations_truncated: false,
-      });
+      const dns = dnsEvidenceFor(critical);
+      validateDnsEvidence(dns, critical);
+      const document = parsedStructuredNetworkReport(critical, dns);
       assert.equal(document.mode, currentMode.mode);
       assert.equal(document.result, "critical");
       assert.equal(document.controls.resident_health, "critical");
@@ -3376,6 +3439,33 @@ test("renders audit network decisions and hostname and direct-IP allowlist sugge
     "api.example.com",
     "ip 2001:db8::10 udp 53",
   ]);
+  const matched = {
+    ...audit.findings[0],
+    rule_class: "matches_recent_hostname_policy",
+  };
+  const matchedReport = { ...audit, findings: [matched] };
+  // A known outside-policy name still gets a narrow suggestion, even on a shared IP.
+  const shared = parsedStructuredNetworkReport(matchedReport, dnsEvidence);
+  assert.deepEqual(shared.suggested_allowlist, ["api.example.com"]);
+  const allowedDns = { observations: dnsEvidence.observations.map((observation: any) => ({
+    ...observation, policy_classification: "user_allowlist",
+  })) };
+  const covered = parsedStructuredNetworkReport(matchedReport, allowedDns);
+  assert.deepEqual(covered.suggested_allowlist, []);
+  const observed = covered.network.find((row: any) => row.destination === matched.remote_address);
+  assert.equal(observed.decision, "would_block");
+  assert.deepEqual(observed.activities, [{
+    kind: "connection_attempt", protocol: matched.protocol, port: matched.remote_port, count: 1,
+  }]);
+  // The post hook must not infer coverage from DNS alone (or from a different finding for the same IP).
+  const unmatched = parsedStructuredNetworkReport({ ...audit, findings: [matched, audit.findings[0]] }, allowedDns);
+  assert.deepEqual(unmatched.suggested_allowlist, ["ip 203.0.113.10 tcp 443"]);
+  const attempts = unmatched.network.find((row: any) => row.destination === matched.remote_address);
+  assert.deepEqual(attempts.activities, [{
+    kind: "connection_attempt", protocol: matched.protocol, port: matched.remote_port, count: 2,
+  }]);
+  const query = unmatched.network.find((row: any) => row.destination === "api.example.com");
+  assert.deepEqual(query.activities, [{ kind: "dns_query", query_type: "a", count: 1 }]);
   const humanReport = networkReportLines(audit, dnsEvidence).join("\n");
   assert.match(humanReport, /would.block/i);
   assert.match(humanReport, /api\.example\.com/);
@@ -3651,11 +3741,39 @@ test("counts only fixed reasons for unmappable audit findings without changing d
   }
 });
 
-test("publishes post evidence from one fresh report and rejects stale or critical evidence", (t: any) => {
+test("post requires the readiness commit even when the final resident report looks healthy", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-readiness-commit-"));
+  const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
+  const current = { ...report, resident_health: residentHealth() };
+  const publish = () => publishPostEvidence(current, { observations: [] }, paths);
+  try {
+    assert.equal(captureStdout(() => assert.throws(publish, /readiness commit marker/)), "");
+    writeRootOwnedTestReadiness(t, paths.ready, current);
+    fs.writeFileSync(paths.ready, "invalid private bytes");
+    assert.equal(captureStdout(() => assert.throws(publish, /readiness commit marker/)), "");
+    const marker = readinessFor(current);
+    const health = current.resident_health;
+    for (const [override, error] of [
+      [{ base_ruleset_hash: "e".repeat(64) }, /readiness identity/],
+      [{ resident_health: { ...health, verification_sequence: Number(health.verification_sequence) + 1 } }, /resident process/],
+      [{ resident_health: { ...health, resident_pid: Number(health.resident_pid) + 1 } }, /resident process/],
+    ] as [object, RegExp][]) {
+      fs.writeFileSync(paths.ready, JSON.stringify({ ...marker, ...override }));
+      assert.equal(captureStdout(() => assert.throws(publish, error)), "");
+    }
+    fs.writeFileSync(paths.ready, JSON.stringify(marker));
+    fs.chmodSync(paths.ready, 0o666);
+    assert.equal(captureStdout(() => assert.throws(publish, /readiness commit marker/)), "");
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("post validates an old readiness commit with a fresh dynamic ruleset and reports later critical worker drift", (t: any) => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-summary-"));
   const summaryPath = path.join(temporary, "summary");
   fs.writeFileSync(summaryPath, "");
-  const verifiedAt = 1_000_000;
+  const verifiedAt = 10_000_000;
   const currentReport = {
     ...report,
     resident_health: { ...report.resident_health, last_successful_verification_unix_milliseconds: verifiedAt },
@@ -3665,7 +3783,16 @@ test("publishes post evidence from one fresh report and rejects stale or critica
   const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
   process.env.GITHUB_STEP_SUMMARY = summaryPath;
   try {
-    const paths = runtimePaths("action-test");
+    const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
+    writeRootOwnedTestReadiness(t, paths.ready, {
+      ...currentReport,
+      ruleset_hash: "d".repeat(64),
+      resident_health: {
+        ...currentReport.resident_health,
+        verification_sequence: 1,
+        last_successful_verification_unix_milliseconds: verifiedAt - 3_600_000,
+      },
+    });
     const output = captureStdout(() => publishPostEvidence(currentReport, { observations: [] }, paths));
     const records = output.split("\n").filter((line: string) => line.startsWith("FENCE_REPORT_JSON="));
     assert.equal(records.length, 1);
@@ -3684,9 +3811,15 @@ test("publishes post evidence from one fresh report and rejects stale or critica
 
     const criticalReport = {
       ...currentReport,
-      network_verification_status: "critical_drift",
-      resident_health: { ...currentReport.resident_health, status: "critical", last_successful_verification_unix_milliseconds: verifiedAt + 20_000 },
-      critical_findings: [{ code: "owned_nftables_state_missing", message: "Verified drift" }],
+      resident_health: {
+        ...currentReport.resident_health,
+        status: "critical",
+        last_successful_verification_unix_milliseconds: verifiedAt + 20_000,
+        workers: (currentReport.resident_health.workers as any[]).map((worker, index) =>
+          index === 0 ? { ...worker, status: "failed" } : worker
+        ),
+      },
+      critical_findings: [{ code: "dns_tcp_listener_failed", message: "Verified worker drift" }],
     };
     const criticalOutput = captureStdout(() => {
       assert.throws(() => publishPostEvidence(criticalReport, { observations: [] }, paths), /critical resident findings/);
@@ -3706,9 +3839,10 @@ test("keeps the verified job-log report available when the job summary cannot be
   const summaryPath = path.join(temporary, "summary");
   const linkPath = path.join(temporary, "symlink");
   const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
-  const paths = runtimePaths("action-test");
+  const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
   const currentReport = { ...report, resident_health: residentHealth() };
   try {
+    writeRootOwnedTestReadiness(t, paths.ready, currentReport);
     fs.writeFileSync(summaryPath, "unchanged");
     fs.symlinkSync(summaryPath, linkPath);
     for (const unavailablePath of [path.join(temporary, "missing"), linkPath, "/dev/null"]) {
@@ -3995,9 +4129,11 @@ test("renders degraded and critical summaries without a healthy signal", () => {
   validateReport(degraded);
   const degradedSummary = summaryLines(degraded).join("\n");
   assert.match(degradedSummary, /^### 🟡 Fence Summary/);
-  assert.doesNotMatch(degradedSummary, /🟢/);
+  assert.doesNotMatch(degradedSummary, /🟢|🔒 Block|✅ Restricted/);
+  assert.match(degradedSummary, /⚠️ Block with Docker available/);
+  assert.match(degradedSummary, /⚠️ Host traffic filtered; Docker can bypass Fence/);
   assert.match(degradedSummary, /\| Passwordless sudo \| ✅ Disabled \|/);
-  assert.match(degradedSummary, /\| Docker\/container access \| ⚠️ Available; limited assurance \|/);
+  assert.match(degradedSummary, /\| Docker\/container access \| ⚠️ Available; later steps can use Docker to bypass Fence \|/);
 
   const critical = {
     ...report,
@@ -4133,7 +4269,8 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
   assert.match(summary, /\| Passwordless sudo \| ➖ Available in audit mode \|/);
   assert.match(summary, /\| Docker\/container access \| ➖ Available in audit mode \|/);
   assert.match(summary, /#### Network activity/);
-  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query, 2 TCP\/443 attempts \|/);
+  assert.match(summary, /\| `www.google.com` \| ⚠️ Would block \| 1 A query \|/);
+  assert.match(summary, /\| `203.0.113.10` \| ⚠️ Would block \| 2 TCP\/443 attempts \|/);
   assert.match(summary, /\| `192.0.2.10` \| ⚠️ Would block \| 1 UDP\/443 attempt \|/);
   assert.match(summary, /\| `2001:db8::10` \| ⚠️ Would block \| 1 TCP\/8443 attempt \|/);
   assert.match(summary, /<summary>View allowlist example<\/summary>/);
@@ -4193,9 +4330,10 @@ test("renders only bounded approved local attribution beside network findings", 
 
   const summary = summaryLines(audit, dnsEvidence).join("\n");
   assert.match(summary, /\| Destination \| Result \| Activity \| Actor \|/);
+  assert.match(summary, /\| `example.com` \| ⚠️ Would block \| 1 A query \| ➖ \|/);
   assert.match(
     summary,
-    /\| `example.com` \| ⚠️ Would block \| 1 A query, 1 TCP\/443 attempt \| runner: curl \(PID 4242\) \|/,
+    /\| `203.0.113.10` \| ⚠️ Would block \| 1 TCP\/443 attempt \| runner: curl \(PID 4242\) \|/,
   );
   assert.doesNotMatch(summary, /secret-payload-marker/);
   assert.doesNotMatch(summary, /private\/operator/);
