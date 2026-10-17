@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-build-arguments"
+fi
+
+ensure_rust_toolchain
+
+tmp_root="$(make_temp_dir fence-build-arguments "$RUNNER_TEMP")"
+cleanup() {
+  remove_generated_path "$tmp_root" "build argument test root"
+}
+trap cleanup EXIT
+
+output=""
+if output="$(script/build --release --targets "," --dist-dir "$tmp_root/dist" 2>&1)"; then
+  die "release build unexpectedly accepted an all-empty target list"
+fi
+if ! grep -Fq "release build requires at least one non-empty target" <<< "$output"; then
+  die "release build did not report the empty target-list failure"
+fi
+if [[ -e "$tmp_root/dist" ]]; then
+  die "empty target-list validation mutated the distribution directory"
+fi
+
+echo -e "${GREEN}build argument validation regression passed${OFF}"

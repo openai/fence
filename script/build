@@ -181,6 +181,17 @@ if [[ ${#targets[@]} -eq 0 ]]; then
   targets=("$host_target")
 fi
 
+has_target=false
+for target in "${targets[@]}"; do
+  if [[ -n "$target" ]]; then
+    has_target=true
+    break
+  fi
+done
+if [[ "$has_target" != "true" ]]; then
+  die "release build requires at least one non-empty target"
+fi
+
 build_version="${BUILD_VERSION:-}"
 if [[ -z "$build_version" && -n "${GITHUB_REF_NAME:-}" ]]; then
   build_version="$GITHUB_REF_NAME"
