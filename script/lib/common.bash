@@ -124,11 +124,30 @@ require_generated_path() {
   fi
 }
 
+require_no_generated_symlink_components() {
+  local path="$1"
+  local description="$2"
+  local include_path="$3"
+  local candidate="$path"
+
+  if [[ "$include_path" != "true" ]]; then
+    candidate="${candidate%/*}"
+  fi
+  while [[ -n "$candidate" && "$candidate" != "/" && "$candidate" != "$DIR" && "$candidate" != "${RUNNER_TEMP:-__unset__}" && "$candidate" != "${TMPDIR:-__unset__}" ]]; do
+    if [[ -L "$candidate" ]]; then
+      die "${description} must not traverse a symbolic link: $candidate"
+    fi
+    candidate="${candidate%/*}"
+    [[ -n "$candidate" ]] || candidate="/"
+  done
+}
+
 remove_generated_path() {
   local path="$1"
   local description="$2"
 
   require_generated_path "$path" "$description"
+  require_no_generated_symlink_components "$path" "$description" false
   rm -rf "$path"
 }
 
@@ -137,6 +156,7 @@ clear_generated_dir() {
   local description="$2"
 
   require_generated_path "$path" "$description"
+  require_no_generated_symlink_components "$path" "$description" true
   mkdir -p "$path"
   find "$path" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 }
