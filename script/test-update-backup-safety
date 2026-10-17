@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-update-backup-safety"
+fi
+
+config="$DIR/.cargo/config.toml"
+backup="$DIR/.cargo/config.toml.bak"
+
+if [[ ! -f "$config" ]]; then
+  die "missing .cargo/config.toml test fixture"
+fi
+if [[ -e "$backup" || -L "$backup" ]]; then
+  die "Cargo config backup path must be absent before the regression"
+fi
+
+config_sha256="$(sha256_file "$config")"
+mkdir "$backup"
+cleanup() {
+  if [[ -d "$backup" ]]; then
+    rmdir "$backup"
+  fi
+}
+trap cleanup EXIT
+
+output=""
+if output="$(script/update 2>&1)"; then
+  die "script/update unexpectedly accepted an existing backup directory"
+fi
+if ! grep -Fq "refusing to overwrite existing backup" <<< "$output"; then
+  die "script/update did not report the backup collision"
+fi
+if [[ ! -f "$config" || "$(sha256_file "$config")" != "$config_sha256" ]]; then
+  die "script/update changed .cargo/config.toml after a backup collision"
+fi
+if [[ ! -d "$backup" ]] || find "$backup" -mindepth 1 -print -quit | grep -q .; then
+  die "script/update changed the pre-existing backup directory"
+fi
+
+echo -e "${GREEN}update backup collision regression passed${OFF}"
