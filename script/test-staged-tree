@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+source "$DIR/script/lib/staged-tree.bash"
+
+if [[ $# -ne 0 ]]; then
+  die "usage: script/test-staged-tree"
+fi
+
+tmpdir="$(make_temp_dir fence-staged-tree-test)"
+cleanup() {
+  remove_generated_path "$tmpdir" "staged tree test directory"
+}
+trap cleanup EXIT
+
+destination="$tmpdir/destination"
+backup="$tmpdir/backup"
+staged="$tmpdir/staged"
+mkdir -p "$destination" "$staged"
+printf '%s\n' old > "$destination/value"
+printf '%s\n' new > "$staged/value"
+
+publish_staged_generated_tree "$staged" "$destination" "$backup" "staged tree test" true
+[[ "$(cat "$destination/value")" == "new" ]] || die "staged tree publication did not install the prepared tree"
+[[ ! -e "$backup" ]] || die "staged tree publication retained its previous-tree backup"
+
+mkdir -p "$staged"
+printf '%s\n' rejected > "$staged/value"
+reject_validation() {
+  return 7
+}
+
+set +e
+publish_staged_generated_tree "$staged" "$destination" "$backup" "staged tree test" reject_validation
+status="$?"
+set -e
+[[ "$status" -eq 7 ]] || die "staged tree publication did not preserve validator failure status"
+[[ "$(cat "$destination/value")" == "new" ]] || die "staged tree publication did not restore the previous tree after validation failure"
+[[ ! -e "$backup" ]] || die "staged tree rollback left its previous-tree backup behind"
+
+rm -rf "$destination"
+mkdir -p "$staged"
+printf '%s\n' rejected > "$staged/value"
+set +e
+publish_staged_generated_tree "$staged" "$destination" "$backup" "staged tree test" reject_validation
+status="$?"
+set -e
+[[ "$status" -eq 7 ]] || die "staged tree publication without prior state lost validator failure status"
+[[ ! -e "$destination" ]] || die "failed staged publication created state where none existed before"
+
+echo -e "${GREEN}staged tree publication checks passed${OFF}"
