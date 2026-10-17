@@ -38,6 +38,7 @@ if ! diff -u <(test_tools_cargo_llvm_cov_license_entries "$lockfile" | sort) <(t
 fi
 
 artifact_count=0
+artifact_platforms="|"
 while IFS='|' read -r platform arch os target version url path sha256; do
   artifact_count=$((artifact_count + 1))
   if [[ -z "$platform" || -z "$arch" || -z "$os" || -z "$target" || -z "$version" || -z "$url" || -z "$path" || -z "$sha256" ]]; then
@@ -45,6 +46,25 @@ while IFS='|' read -r platform arch os target version url path sha256; do
   fi
   if [[ "$version" != "$cargo_llvm_cov_version" ]]; then
     die "cargo-llvm-cov entry version mismatch for ${platform}"
+  fi
+  case "${platform}|${arch}|${os}|${target}" in
+    "linux-x86_64|x86_64|linux|x86_64-unknown-linux-gnu"|\
+    "linux-aarch64|aarch64|linux|aarch64-unknown-linux-gnu"|\
+    "macos-x86_64|x86_64|macos|x86_64-apple-darwin"|\
+    "macos-aarch64|aarch64|macos|aarch64-apple-darwin") ;;
+    *) die "unexpected cargo-llvm-cov platform identity: ${platform}|${arch}|${os}|${target}" ;;
+  esac
+  if [[ "$artifact_platforms" == *"|${platform}|"* ]]; then
+    die "duplicate cargo-llvm-cov platform entry: ${platform}"
+  fi
+  artifact_platforms+="${platform}|"
+  expected_url="https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${version}/cargo-llvm-cov-${target}.tar.gz"
+  expected_path="vendor/test-tools/cargo-llvm-cov/cargo-llvm-cov-${target}.tar.gz"
+  if [[ "$url" != "$expected_url" ]]; then
+    die "cargo-llvm-cov artifact URL mismatch for ${platform}"
+  fi
+  if [[ "$path" != "$expected_path" ]]; then
+    die "cargo-llvm-cov artifact path mismatch for ${platform}"
   fi
   reject_unsafe_relative_path "$path" "cargo-llvm-cov manifest path for ${platform}"
   artifact="$DIR/$path"
@@ -78,6 +98,10 @@ while IFS='|' read -r name version url path sha256; do
   esac
   if [[ "$version" != "$cargo_llvm_cov_version" ]]; then
     die "cargo-llvm-cov license version mismatch for $name"
+  fi
+  expected_url="https://raw.githubusercontent.com/taiki-e/cargo-llvm-cov/v${version}/${name}"
+  if [[ "$url" != "$expected_url" ]]; then
+    die "cargo-llvm-cov license URL mismatch for $name"
   fi
   if [[ "$path" != "vendor/test-tools/cargo-llvm-cov/$name" ]]; then
     die "cargo-llvm-cov license has unexpected path: $path"
