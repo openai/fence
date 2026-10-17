@@ -46,12 +46,12 @@ A hostname without a port uses TCP port `443`. Use the explicit `ip` or `cidr` f
 
 ## Entry Limit
 
-An allowlist can contain up to 64 unique entries. Fence normalizes hostnames and IP addresses before counting, so duplicates, capitalization differences, and equivalent address formats count only once. Different ports, protocols, and destination types count separately.
+The native multiline `allowlist` input can contain up to 64 unique normalized entries. Fence normalizes hostnames and IP addresses before counting that input, so duplicates, capitalization differences, and equivalent address formats count only once. Different ports, protocols, and destination types count separately.
 
-The 65th unique entry fails before Fence changes the runner.
+The 65th unique native entry fails before Fence changes the runner.
 
 > [!NOTE]
-> The advanced JSON `config` input also has a 64-entry limit. It cannot be combined with native Action inputs.
+> The advanced JSON `config` input uses a stricter physical-entry boundary: its `allowlist` array may contain at most 64 entries before normalization and deduplication. Repeating the same JSON allowance still consumes an array entry. Advanced `config` cannot be combined with native Action inputs.
 
 ## Wildcards
 
