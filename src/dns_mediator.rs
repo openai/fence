@@ -1283,7 +1283,9 @@ impl ObservationRecorder {
         forwarded: bool,
         classification_override: Option<&'static str>,
     ) {
-        let normalized = normalize_hostname(hostname);
+        // A DNS question can look like an IPv4 address (including forms such as 127.1).
+        // Count it without retaining a name the Action cannot report as a hostname.
+        let normalized = crate::config::normalize_hostname(hostname);
         let mut state = self.state.lock().expect("DNS observation lock poisoned");
         if let Some(hostname) = normalized {
             let classification =
@@ -9390,6 +9392,36 @@ mod tests {
         assert!(records.addresses.is_empty());
         assert!(records.aliases.is_empty());
         assert!(refused_response(&[]).is_none());
+    }
+
+    #[test]
+    fn refuses_ip_like_dns_names_and_counts_them_without_retaining_them() {
+        let (recorder, report) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
+        let reportable = "127.1.example.com";
+        let unreportable = ["192.0.2.1", "127.1", "0x7f000001"];
+        for hostname in [reportable].into_iter().chain(unreportable) {
+            let request = query(hostname, 1);
+            let parsed = parse_dns_question(&request).unwrap();
+            let dispatch = query_for_upstream(&recorder, &request, Some(&parsed), None).unwrap();
+            let DnsQueryDispatch::Refused(classification) = dispatch else {
+                panic!("DNS query for {hostname} was not refused");
+            };
+            record_rejected_query(&recorder, Some(&parsed), classification);
+        }
+
+        let evidence: Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        let observations = evidence["observations"].as_array().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0]["hostname"], reportable);
+        assert_eq!(
+            evidence["excluded_unretained_query_count"],
+            unreportable.len()
+        );
+        assert_eq!(
+            evidence["blocked_non_profile_query_count"],
+            unreportable.len() + 1
+        );
+        fs::remove_file(report).unwrap();
     }
 
     #[test]
