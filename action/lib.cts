@@ -150,7 +150,6 @@ const ALLOWED_DNS_CLASSIFICATIONS = new Set([
   "user_wildcard_allowlist",
 ]);
 const DNS_CLASSIFICATIONS = new Set([...ALLOWED_DNS_CLASSIFICATIONS, "outside_policy"]);
-const OUTSIDE_POLICY_DNS_CLASSIFICATIONS = new Set(["outside_policy"]);
 const FORWARDED_DNS_QUERY_TYPES = new Set(["a", "aaaa"]);
 const INVOCATION_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const DNS_HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -163,6 +162,8 @@ const STATIC_RESULTS_STORAGE_HOSTNAMES = new Set([
   "productionresultssa17.blob.core.windows.net",
 ]);
 const MAX_RESULTS_STORAGE_AUTHORIZATIONS = 4;
+const AZURE_WIRESERVER_ADDRESS = "168.63.129.16";
+const AZURE_WIRESERVER_TCP_PORTS = new Set([80, 32526]);
 const GITHUB_ARTIFACT_COMPATIBILITY_LIMITATIONS = [
   "github_artifact_compatibility_explicitly_enabled",
   "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
@@ -385,15 +386,16 @@ function normalizeHostnameDestination(value: string): string | undefined {
   return suffix === undefined ? undefined : `${"*.".repeat(prefixLabels)}${suffix}`;
 }
 
+function isNonStaticResultsStorageHostname(hostname: string): boolean {
+  return RESULTS_STORAGE_HOSTNAME.test(hostname) && !STATIC_RESULTS_STORAGE_HOSTNAMES.has(hostname);
+}
+
 function validateHostname(value: string): string {
   const destination = normalizeHostnameDestination(value);
   if (destination === undefined) {
     fail("allowlist hostname entries must be valid exact names or bounded wildcard patterns");
   }
-  if (
-    RESULTS_STORAGE_HOSTNAME.test(destination) &&
-    !STATIC_RESULTS_STORAGE_HOSTNAMES.has(destination)
-  ) {
+  if (isNonStaticResultsStorageHostname(destination)) {
     fail("allowlist hostname entries must not target runner-authorized GitHub results storage");
   }
   return destination;
@@ -1867,8 +1869,7 @@ function validateDnsProvenanceEvidence(dnsEvidence: any): void {
       typeof authorization !== "object" ||
       Object.keys(authorization).sort().join(",") !== "authorization_origin,hostname" ||
       typeof authorization.hostname !== "string" ||
-      !RESULTS_STORAGE_HOSTNAME.test(authorization.hostname) ||
-      STATIC_RESULTS_STORAGE_HOSTNAMES.has(authorization.hostname) ||
+      !isNonStaticResultsStorageHostname(authorization.hostname) ||
       !(
         authorization.authorization_origin === "pinned_runner_worker_dns" ||
         (
@@ -2046,7 +2047,7 @@ function sortedRows(rows: Iterable<AuditFindingRow>): AuditFindingRow[] {
 
 function dnsAddressHostnameMap(
   dnsEvidence: any,
-  classifications: Set<string> | undefined = undefined,
+  include: (hostname: string, classification: string) => boolean = () => true,
 ): Map<string, Set<string>> {
   const addressMap = new Map<string, Set<string>>();
   if (dnsEvidence === undefined || dnsEvidence === null || !Array.isArray(dnsEvidence.observations)) {
@@ -2059,11 +2060,12 @@ function dnsAddressHostnameMap(
     if (observation.query_type !== "a" && observation.query_type !== "aaaa") {
       continue;
     }
-    if (classifications !== undefined && !classifications.has(observation.policy_classification)) {
-      continue;
-    }
     const hostname = observation.hostname;
-    if (!isSafeHostname(hostname) || !Array.isArray(observation.resolved_addresses)) {
+    if (
+      !isSafeHostname(hostname) ||
+      !Array.isArray(observation.resolved_addresses) ||
+      !include(hostname, observation.policy_classification)
+    ) {
       continue;
     }
     for (const address of observation.resolved_addresses) {
@@ -2086,7 +2088,10 @@ function auditMatchesRecentHostnamePolicy(report: any, finding: any): boolean {
 function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): AuditSummary {
   const hostnameRows = new Map<string, AuditFindingRow>();
   const ipRows = new Map<string, AuditFindingRow>();
-  const addressMap = dnsAddressHostnameMap(dnsEvidence, OUTSIDE_POLICY_DNS_CLASSIFICATIONS);
+  // Keep runner-gated names in the map so skipping them below never becomes a broader IP suggestion.
+  const addressMap = dnsAddressHostnameMap(dnsEvidence, (hostname, classification) =>
+    classification === "outside_policy" || isNonStaticResultsStorageHostname(hostname)
+  );
   let unparsedCount = 0;
   const unparsedReasons = Object.fromEntries(
     Object.keys(UNPARSED_FINDING_REASONS).map((key) => [key, 0]),
@@ -2126,9 +2131,20 @@ function correlateFindingsToDns(report: any, dnsEvidence: any = undefined): Audi
       continue;
     }
 
+    // WireServer is restricted to root-owned sockets before the firewall considers any allowlist.
+    if (
+      finding.remote_address === AZURE_WIRESERVER_ADDRESS &&
+      finding.protocol === "tcp" &&
+      AZURE_WIRESERVER_TCP_PORTS.has(finding.remote_port)
+    ) {
+      continue;
+    }
     const hostnames = Array.from(addressMap.get(finding.remote_address) || []).sort();
     if (hostnames.length > 0) {
       for (const hostname of hostnames) {
+        if (isNonStaticResultsStorageHostname(hostname)) {
+          continue;
+        }
         addRow(hostnameRows, {
           destination: hostname,
           destinationKind: "hostname",

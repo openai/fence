@@ -191,9 +191,9 @@ function ready(report: any, environment: LogEnvironment = process.env): void {
   }
 }
 
-function postEvidenceLine(report: any, auditDestinationCount = 0): string | undefined {
+function postEvidenceLine(report: any): string | undefined {
   if (report.mode === "audit") {
-    return `👀 Audit observed ${auditDestinationCount} would-block ${pluralize(auditDestinationCount, "destination")}; see the Fence report`;
+    return "👀 Audit complete; see the Fence report for network activity and allowlist suggestions";
   }
   if (report.status === "protected_host_block_degraded") {
     return "⚠️ Docker was kept available; later steps could use it to gain root access and bypass Fence";

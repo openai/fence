@@ -109,6 +109,17 @@ const report = {
   resident_health: residentHealth(),
 };
 
+const auditReport = {
+  ...report,
+  status: "protected_host_audit_observation",
+  mode: "audit",
+  readiness_status: "ready_observation_only",
+  setup_status: "resident_observation_only",
+  protection_available: false,
+  sudo_status: "preserved_verified",
+  container_status: "preserved_verified",
+};
+
 const githubArtifactCompatibilityLimitations = [
   "github_artifact_compatibility_explicitly_enabled",
   "runner_owned_workflow_processes_can_authorize_bounded_results_storage",
@@ -935,23 +946,13 @@ test("formats audit and degraded log wording accurately", () => {
     "🌐 Policy: observing GitHub workflow traffic + 0 allowlist entries",
   ].join("\n"));
 
-  const auditReport = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
-  };
   assert.equal(
     captureStdout(() => actionLog.ready(auditReport, { NO_COLOR: "1" })),
     "✅ Fence ready: audit mode is observing traffic, not blocking it\n",
   );
   assert.equal(
-    actionLog.postEvidenceLine(auditReport, 2),
-    "👀 Audit observed 2 would-block destinations; see the Fence report",
+    actionLog.postEvidenceLine(auditReport),
+    "👀 Audit complete; see the Fence report for network activity and allowlist suggestions",
   );
 
   const degraded = {
@@ -967,7 +968,7 @@ test("formats audit and degraded log wording accurately", () => {
     "::warning::⚠️ Fence ready: network rules installed; passwordless sudo disabled; later steps can use Docker to bypass Fence\n",
   );
   assert.equal(
-    actionLog.postEvidenceLine(degraded, 0),
+    actionLog.postEvidenceLine(degraded),
     "⚠️ Docker was kept available; later steps could use it to gain root access and bypass Fence",
   );
 });
@@ -3385,14 +3386,7 @@ test("rejects unbounded, inconsistent, and unsupported critical report evidence"
 
 test("renders audit network decisions and hostname and direct-IP allowlist suggestions", () => {
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [
       {
         timestamp: "unix-ms:1",
@@ -3470,6 +3464,71 @@ test("renders audit network decisions and hostname and direct-IP allowlist sugge
   assert.match(humanReport, /would.block/i);
   assert.match(humanReport, /api\.example\.com/);
   assert.match(humanReport, /2001:db8::10/);
+});
+
+test("reports runner-authorized results storage without suggesting its hostname or a broader IP allowance", () => {
+  const hostname = "productionresultssa8.blob.core.windows.net";
+  const address = "198.51.100.8";
+  const audit = {
+    ...auditReport,
+    findings: [{ classification: "would_block", protocol: "tcp", remote_address: address, remote_port: 443 }],
+  };
+  const observation = { hostname, query_type: "a", occurrences: 1, resolved_addresses: [address] };
+
+  for (const policy_classification of ["outside_policy", "runner_authorized_results_storage"]) {
+    const dns = { observations: [{ ...observation, policy_classification }] };
+    const document = parsedStructuredNetworkReport(audit, dns);
+    assert.deepEqual(document.suggested_allowlist, []);
+    const summary = summaryLines(audit, dns).join("\n");
+    assert.doesNotMatch(summary, /View allowlist example/);
+    for (const destination of [hostname, address]) {
+      assert.ok(document.network.some((row: any) => row.destination === destination));
+      assert.ok(summary.includes(`\`${destination}\``));
+    }
+  }
+
+  // A shared address can still yield a narrow, usable suggestion. An IP alone cannot identify results storage.
+  const ordinary = "downloads.example.com";
+  const observations = [hostname, ordinary].map((hostname) => ({
+    ...observation, hostname, policy_classification: "outside_policy",
+  }));
+  const shared = parsedStructuredNetworkReport(audit, { observations });
+  assert.deepEqual(shared.suggested_allowlist, [ordinary]);
+  const unknown = parsedStructuredNetworkReport(audit, { observations: [] });
+  assert.deepEqual(unknown.suggested_allowlist, [`ip ${address} tcp 443`]);
+});
+
+test("reports root-only WireServer attempts without suggesting an allowlist override", () => {
+  const address = "168.63.129.16";
+  const ports = [80, 32526];
+  const wireServer = ports.map((remote_port) => ({
+    classification: "would_block", protocol: "tcp", remote_address: address, remote_port,
+  }));
+  const audit = { ...auditReport, findings: wireServer };
+  const document = parsedStructuredNetworkReport(audit);
+  assert.deepEqual(document.suggested_allowlist, []);
+  const observed = document.network.find((row: any) => row.destination === address);
+  assert.equal(observed.decision, "would_block");
+  assert.deepEqual(new Set(observed.activities.map((activity: any) => activity.port)), new Set(ports));
+  const summary = summaryLines(audit).join("\n");
+  assert.ok(summary.includes(`\`${address}\``));
+  assert.doesNotMatch(summary, /View allowlist example/);
+
+  // A DNS match cannot override those tuples either. Other protocols, ports and addresses stay eligible.
+  const hostname = "platform.example.com";
+  const dns = { observations: [{
+    hostname, query_type: "a", occurrences: 1, resolved_addresses: [address], policy_classification: "outside_policy",
+  }] };
+  const findings = [
+    ...wireServer,
+    { ...wireServer[0], protocol: "udp" },
+    { ...wireServer[0], remote_port: 8080 },
+    { ...wireServer[0], remote_address: "192.0.2.16" },
+  ];
+  const nearby = parsedStructuredNetworkReport({ ...auditReport, findings }, dns);
+  assert.deepEqual(nearby.suggested_allowlist, [
+    `hostname ${hostname} udp 80`, "ip 192.0.2.16 tcp 80", `${hostname}:8080`,
+  ]);
 });
 
 test("retains both final denied burst destinations in one bounded warning report", () => {

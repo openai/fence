@@ -428,8 +428,7 @@ function publishPostEvidence(report: any, dnsEvidence: any, paths: { ready: stri
     log.warning(warning);
   }
   rejectCriticalFindings(report.critical_findings);
-  const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;
-  const evidenceLine = log.postEvidenceLine(report, auditDestinationCount);
+  const evidenceLine = log.postEvidenceLine(report);
   if (evidenceLine) {
     log.info(evidenceLine);
   }
