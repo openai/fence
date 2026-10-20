@@ -498,23 +498,15 @@ fn require_owned_table(value: &Value) -> Result<(), BackendError> {
             "nft JSON contains an unexpected table",
         ));
     }
-    // A dormant table still lists its rules, but none of its base chains are hooked.
-    // nft omits flags when empty and otherwise reports a string or an array of strings.
-    let active = match value.get("flags") {
-        None => true,
-        Some(Value::String(flag)) => flag != "dormant",
-        Some(Value::Array(flags)) => flags
-            .iter()
-            .all(|flag| flag.as_str().is_some_and(|flag| flag != "dormant")),
-        Some(_) => false,
-    };
-    if active {
-        Ok(())
-    } else {
-        Err(BackendError::new(
+    // A dormant table lists its rules without enforcing them. Fence sets no table
+    // flags, so even an nft version that misprints a single flag must not pass.
+    match value.get("flags") {
+        None => Ok(()),
+        Some(Value::Array(flags)) if flags.is_empty() => Ok(()),
+        _ => Err(BackendError::new(
             "unexpected_nft_state",
-            "could not verify that the owned nftables table is active",
-        ))
+            "owned nftables table has unexpected flags",
+        )),
     }
 }
 
@@ -1686,17 +1678,17 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_dormant_or_malformed_table_flags() {
+    fn parser_requires_the_unflagged_table_fence_creates() {
         let mut table = json!({"family": NFT_FAMILY, "name": NFT_TABLE});
         require_owned_table(&table).unwrap();
-        for flags in [json!([]), json!("owner"), json!(["owner", "persist"])] {
-            table["flags"] = flags;
-            require_owned_table(&table).unwrap();
-        }
+        table["flags"] = json!([]);
+        require_owned_table(&table).unwrap();
+
         for flags in [
             json!("dormant"),
+            json!(["dormant"]),
             json!(["owner", "dormant"]),
-            json!([null]),
+            json!(NFT_TABLE), // nftables 1.0.9 can print the table name instead of its single flag.
             Value::Null,
         ] {
             table["flags"] = flags;
