@@ -69,7 +69,7 @@ Not sure what your workflow needs? Start with audit mode:
     mode: audit
 ```
 
-Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. It may still restore root ownership of `/etc` and `/usr`. Use the job summary to build your allowlist, then switch back to block mode.
+Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. For example, if DNS requests exceed the user wildcard hostname limit, audit forwards them and reports what block mode would deny. It may still restore root ownership of `/etc` and `/usr`. Use the job summary to build your allowlist, then switch back to block mode.
 
 On supported runners, Fence accepts normal Ubuntu UUID service activation (for example, by `az version`) in audit and block modes. Incomplete socket observations or unexpected owners still fail the job.
 
