@@ -498,7 +498,16 @@ fn require_owned_table(value: &Value) -> Result<(), BackendError> {
             "nft JSON contains an unexpected table",
         ));
     }
-    Ok(())
+    // A dormant table lists its rules without enforcing them. Fence sets no table
+    // flags, so even an nft version that misprints a single flag must not pass.
+    match value.get("flags") {
+        None => Ok(()),
+        Some(Value::Array(flags)) if flags.is_empty() => Ok(()),
+        _ => Err(BackendError::new(
+            "unexpected_nft_state",
+            "owned nftables table has unexpected flags",
+        )),
+    }
 }
 
 fn require_owned_object(value: &Value) -> Result<(), BackendError> {
@@ -1666,6 +1675,28 @@ mod tests {
             *backend.executor.operations.borrow(),
             vec![NftOperation::ReadTotalViolationsCounter]
         );
+    }
+
+    #[test]
+    fn parser_requires_the_unflagged_table_fence_creates() {
+        let mut table = json!({"family": NFT_FAMILY, "name": NFT_TABLE});
+        require_owned_table(&table).unwrap();
+        table["flags"] = json!([]);
+        require_owned_table(&table).unwrap();
+
+        for flags in [
+            json!("dormant"),
+            json!(["dormant"]),
+            json!(["owner", "dormant"]),
+            json!(NFT_TABLE), // nftables 1.0.9 can print the table name instead of its single flag.
+            Value::Null,
+        ] {
+            table["flags"] = flags;
+            assert_eq!(
+                require_owned_table(&table).unwrap_err().code,
+                "unexpected_nft_state"
+            );
+        }
     }
 
     #[test]
