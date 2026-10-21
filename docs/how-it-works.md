@@ -161,6 +161,8 @@ Anyone who can read the job log can read this report. In audit mode, `would_bloc
 
 Fence may skip suggesting an IP if recent allowed DNS activity matches the address, protocol, and port. It checks when it reads the connection, not when the packet was sent, and keeps DNS matches briefly past their advertised lifetime. Treat the suggestion as a starting point, not proof that the connection used that name or that block mode would allow it.
 
+Fence doesn't suggest an allowlist entry for root-only Azure WireServer traffic (`168.63.129.16`, TCP ports `80` and `32526`) or for GitHub results-storage names that require runner authorization. If DNS links one of those storage names to an observed IP, Fence doesn't suggest allowing the IP instead. It still reports the activity and can suggest other names that share the address.
+
 In block mode, blocking a request is normal and does not turn a healthy job into a warning.
 
 For implementation details and the complete security contract, see the [v0 specification](v0.md), [threat model](threat-model.md), and [security guide](security.md).

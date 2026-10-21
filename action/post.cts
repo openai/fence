@@ -420,16 +420,16 @@ function publishPostEvidence(report: any, dnsEvidence: any, paths: { ready: stri
     log.warning(dnsWarning);
   }
   if (userWildcardRequestRejections > 0) {
+    const decision = report.mode === "audit" ? "would deny" : "denied";
     log.warning(
-      `Fence denied ${userWildcardRequestRejections} DNS request(s) after the user wildcard hostname authorization budget was exhausted`,
+      `Fence ${decision} ${userWildcardRequestRejections} DNS request(s) after the user wildcard hostname authorization budget was exhausted`,
     );
   }
   for (const warning of resultsStorageWarnings(dnsEvidence)) {
     log.warning(warning);
   }
   rejectCriticalFindings(report.critical_findings);
-  const auditDestinationCount = auditSummary.hostnameRows.length + auditSummary.ipRows.length;
-  const evidenceLine = log.postEvidenceLine(report, auditDestinationCount);
+  const evidenceLine = log.postEvidenceLine(report);
   if (evidenceLine) {
     log.info(evidenceLine);
   }

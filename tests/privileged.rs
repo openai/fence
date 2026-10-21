@@ -304,12 +304,11 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
     let (mut block_worker, block_findings_path) =
         start_nflog_worker(&topology.client, Mode::Block, "block-findings", 5);
     let mut block = backend(&topology.client);
+    let expected_block = expected_owned_state(Mode::Block, &block_allowances);
     let block_program = render_ruleset(Mode::Block, &block_allowances);
     block.preflight(&block_program).unwrap();
     block.apply_provisional(&block_program).unwrap();
-    block
-        .verify_owned_state(&expected_owned_state(Mode::Block, &block_allowances))
-        .unwrap();
+    block.verify_owned_state(&expected_block).unwrap();
     assert!(traffic_with_listener(&topology, "192.0.2.2", "tcp", 18443));
     assert!(traffic_with_listener(&topology, "192.0.2.2", "udp", 18444));
     assert!(traffic_with_listener(
@@ -380,13 +379,7 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
     };
     evidence.findings = block_findings.retained;
     evidence.findings_truncated = block_findings.truncated;
-    let directory = write_test_evidence(
-        &root,
-        "block-output",
-        &evidence,
-        &expected_owned_state(Mode::Block, &block_allowances),
-    )
-    .unwrap();
+    let directory = write_test_evidence(&root, "block-output", &evidence, &expected_block).unwrap();
     assert_eq!(fs::metadata(directory.join("state.json")).unwrap().uid(), 0);
     assert_eq!(
         fs::metadata(directory.join("report.json")).unwrap().uid(),
@@ -403,6 +396,19 @@ fn block_and_audit_output_paths_emit_only_test_evidence() {
             .contains(marker)
     );
     assert!(!directory.join("ready.json").exists());
+
+    // Disable this table without removing any rules. The TCP probe blocked above
+    // now reaches its listener, and the same verification must no longer succeed.
+    nft_in_namespace(
+        &topology.client,
+        &["add", "table", "inet", "fence_v0", "{ flags dormant; }"],
+    );
+    assert!(traffic_with_listener(&topology, "192.0.2.2", "tcp", 19443));
+    // Some nft versions emit invalid JSON for a single table flag. Either way,
+    // verification must fail; the exact parser error isn't part of this contract.
+    block
+        .verify_owned_state(&expected_block)
+        .expect_err("a dormant firewall table must not verify");
     assert!(block.rollback_pre_activation().unwrap());
 
     let audit_allowances = Vec::new();

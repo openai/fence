@@ -69,7 +69,7 @@ Not sure what your workflow needs? Start with audit mode:
     mode: audit
 ```
 
-Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. It may still restore root ownership of `/etc` and `/usr`. Use the job summary to build your allowlist, then switch back to block mode.
+Audit mode shows what Fence would block while leaving network, `sudo`, and Docker access available. For example, if DNS requests exceed the user wildcard hostname limit, audit forwards them and reports what block mode would deny. It may still restore root ownership of `/etc` and `/usr`. Use the job summary to build your allowlist, then switch back to block mode.
 
 On supported runners, Fence accepts normal Ubuntu UUID service activation (for example, by `az version`) in audit and block modes. Incomplete socket observations or unexpected owners still fail the job.
 
@@ -108,7 +108,7 @@ Fence runs before the rest of your job and controls which network destinations t
 1. It checks that the runner and bundled agent are supported.
 2. It allows required GitHub and runner connections, plus your `allowlist`.
 3. It blocks other outbound connections and turns off passwordless `sudo` and Docker.
-4. It signals readiness only after verifying those protections, then keeps them in place until the job ends.
+4. It checks that the firewall is active, not just that its rules exist, before reporting readiness and throughout the job.
 5. At job end, it verifies that readiness was committed and its protections are still healthy, reports network activity, and fails the job if they changed unexpectedly.
 
 See [how Fence works](docs/how-it-works.md) for more detail.
@@ -130,7 +130,7 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
   | jq .
 ```
 
-The report shows network activity and warnings. In audit mode, it lists DNS names and connection IPs separately and suggests allowlist entries. A recent DNS match can help Fence avoid suggesting an unnecessary IP entry; it doesn't prove what block mode would allow. Some activity may be missing, and a DNS warning can mean Fence safely refused an answer. Anyone who can read the job log can read the report.
+The report shows network activity and warnings. In audit mode, it lists DNS names and connection IPs separately and suggests allowlist entries. You'll still see the activity when an allowlist entry can't grant access. A recent DNS match can help Fence avoid suggesting an unnecessary IP entry; it doesn't prove what block mode would allow. Some activity may be missing, and a DNS warning can mean Fence safely refused an answer. Anyone who can read the job log can read the report.
 
 Fence counts DNS lookups for names that look like IP addresses under `Other DNS names`. That means a DNS query was observed, not a connection to that IP address.
 
