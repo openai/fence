@@ -2985,16 +2985,6 @@ test("warns when the results-storage authorization capacity is exhausted", () =>
 });
 
 test("reports exhausted audit results-storage capacity without claiming a request was denied", () => {
-  const auditReport = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
-  };
   const authorizations = [8, 10, 11, 12].map((account) => ({
     hostname: `productionresultssa${account}.blob.core.windows.net`,
     authorization_origin: "pinned_runner_worker_dns",
@@ -4649,17 +4639,37 @@ test("renders bounded results-storage provenance warnings without a healthy indi
   assert.match(summary, /Additional results-storage accounts were denied/);
 });
 
-test("renders wildcard authorization budget exhaustion as a bounded warning", () => {
-  const dnsEvidence = {
-    observations: [],
-    observations_truncated: false,
-    bounded_user_wildcard_authorizations_truncated: true,
-    user_wildcard_request_rejections: 3,
-  };
-  const summary = summaryLines(report, dnsEvidence).join("\n");
-  assert.match(summary, /^### 🟡 Fence Summary/);
-  assert.doesNotMatch(summary, /🟢/);
-  assert.match(summary, /User wildcard hostname authorization budget exhausted \| `3`/);
+test("post distinguishes blocked wildcard DNS requests from audit predictions", (t: any) => {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-post-wildcard-"));
+  const paths = { ...runtimePaths("action-test"), ready: path.join(temporary, "ready.json") };
+  const summaryPath = path.join(temporary, "summary");
+  const previousSummaryPath = process.env.GITHUB_STEP_SUMMARY;
+  process.env.GITHUB_STEP_SUMMARY = summaryPath;
+  t.after(() => {
+    if (previousSummaryPath === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+    else process.env.GITHUB_STEP_SUMMARY = previousSummaryPath;
+    fs.rmSync(temporary, { recursive: true, force: true });
+  });
+
+  const requests = 3;
+  for (const [modeReport, decision] of [[report, "denied"], [auditReport, "would deny"]] as const) {
+    const currentReport = { ...modeReport, resident_health: residentHealth() };
+    const dnsEvidence = dnsEvidenceFor(currentReport, {
+      bounded_user_wildcard_authorizations_truncated: true,
+      user_wildcard_request_rejections: requests,
+    });
+    validateDnsEvidence(dnsEvidence, currentReport);
+    writeRootOwnedTestReadiness(t, paths.ready, currentReport);
+    fs.writeFileSync(summaryPath, "");
+
+    const output = captureStdout(() => publishPostEvidence(currentReport, dnsEvidence, paths));
+    assert.deepEqual(output.split("\n").filter((line) => line.startsWith("::warning::")), [
+      `::warning::Fence ${decision} ${requests} DNS request(s) after the user wildcard hostname authorization budget was exhausted`,
+    ]);
+    const summary = fs.readFileSync(summaryPath, "utf8");
+    assert.match(summary, /^### 🟡 Fence Summary/);
+    assert.ok(summary.includes(`User wildcard hostname authorization budget exhausted | \`${requests}\` |`));
+  }
 });
 
 test("renders bounded allowlist YAML snippets", () => {
