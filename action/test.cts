@@ -4036,6 +4036,25 @@ test("reports missing DNS evidence and unretained observations without inventing
   assert.equal(unretainedRow.count, 3);
 });
 
+test("reports a blocked numeric-looking DNS name by count, never as a hostname or connection", () => {
+  const dns = dnsEvidenceFor(report, { excluded_unretained_query_count: 1, blocked_non_profile_query_count: 1 });
+  const validated = validateDnsEvidence(dns, report);
+  const { network } = parsedStructuredNetworkReport(report, validated);
+  assert.equal(network.length, 1);
+  assert.equal(network[0].destination_kind, "unretained");
+  assert.equal(network[0].destination, null);
+  assert.equal(network[0].decision, "blocked");
+  assert.deepEqual(network[0].activities, [{ kind: "dns_query", query_type: null, count: 1 }]);
+
+  assert.throws(
+    () => validateDnsEvidence({
+      ...dns,
+      observations: [{ hostname: "192.0.2.1", policy_classification: "outside_policy" }],
+    }, report),
+    /invalid hostname observation/,
+  );
+});
+
 test("excludes payloads, command arguments, private paths, and unsafe actors from reports", () => {
   const marker = "sensitive-example-marker";
   const currentReport = {

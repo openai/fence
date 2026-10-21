@@ -132,6 +132,8 @@ gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs \
 
 The report shows network activity and warnings. In audit mode, it lists DNS names and connection IPs separately and suggests allowlist entries. You'll still see the activity when an allowlist entry can't grant access. A recent DNS match can help Fence avoid suggesting an unnecessary IP entry; it doesn't prove what block mode would allow. Some activity may be missing, and a DNS warning can mean Fence safely refused an answer. Anyone who can read the job log can read the report.
 
+Fence counts DNS lookups for names that look like IP addresses under `Other DNS names`. That means a DNS query was observed, not a connection to that IP address.
+
 See [Network reports](docs/how-it-works.md#network-reports) for an example.
 
 ## Security Notes 🔒
