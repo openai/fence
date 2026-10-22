@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  die "usage: script/test-action-acceptance <standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit> [invocation-id]"
+  die "usage: script/test-action-acceptance <prepare-regular-resolver|standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit> [invocation-id]"
 fi
 
 scenario="$1"
 case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit) ;;
+  prepare-regular-resolver|standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit) ;;
   *) die "unknown Action acceptance scenario: $scenario" ;;
 esac
 
@@ -19,6 +19,24 @@ if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
   die "Action acceptance requires Linux x86_64"
+fi
+
+if [[ "$scenario" == "prepare-regular-resolver" ]]; then
+  [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]] || die "regular resolver fixture requires a disposable GitHub-hosted runner"
+  resolver=/etc/resolv.conf
+  target="$(realpath --canonicalize-existing -- "$resolver")"
+  case "$target" in
+    "$resolver"|/run/systemd/resolve/stub-resolv.conf|/run/systemd/resolve/resolv.conf) ;;
+    *) die "regular resolver fixture requires a reviewed initial resolver target" ;;
+  esac
+  if [[ "$target" != "$resolver" ]]; then
+    # Preserve working DNS and replace the symlink, not its target.
+    fixture="$(sudo --non-interactive mktemp /etc/fence-test-resolv.XXXXXXXX)"
+    sudo --non-interactive install --mode=0644 --owner=root --group=root -- "$target" "$fixture"
+    sudo --non-interactive mv --no-target-directory -- "$fixture" "$resolver"
+  fi
+  [[ -f "$resolver" && ! -L "$resolver" && ! -w "$resolver" && "$(stat --format='%u:%g' -- "$resolver")" == "0:0" ]] || die "expected a root-owned regular resolver the runner cannot write"
+  exit 0
 fi
 
 if [[ "$scenario" != "standard" && "$scenario" != "audit" ]]; then
@@ -580,6 +598,12 @@ PY
 
 if [[ "$scenario" == "standard" ]]; then
   assert_block_evidence_drains
+fi
+
+if [[ "${FENCE_EXPECT_REGULAR_RESOLVER:-}" == "true" ]]; then
+  resolver=/etc/resolv.conf
+  [[ ! -L "$resolver" && "$resolver" -ef "$directory/resolv.conf" ]] || die "Fence did not mount its resolver directly on the regular file"
+  findmnt --noheadings --mountpoint "$resolver" --options ro >/dev/null || die "regular resolver mount is not read-only"
 fi
 
 echo -e "${GREEN}Action acceptance verified:${OFF} $scenario"

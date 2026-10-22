@@ -23,6 +23,7 @@ from host_observation import (
     UNREVIEWED_SUDO_SOURCE_TARGET,
     UNREVIEWED_UNIT_STATE,
     observation_limits,
+    public_resolver_target,
     public_runner_group_name,
     public_sudo_source_name,
     supported_ubuntu_lts_version,
@@ -988,6 +989,14 @@ class ClassificationTests(unittest.TestCase):
         observation, support, transitions = fixture()
         observation["resolver"]["canonical_target"] = "/run/systemd/resolve/resolv.conf"
         observation["resolver"]["target_uid"] = 992
+        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+
+    def test_regular_host_resolver_is_reported_for_resident_verification(self):
+        observation, support, transitions = fixture()
+        resolver = observation["resolver"]
+        target = public_resolver_target(pathlib.Path(resolver["path"]))
+        self.assertEqual(target, "/etc/resolv.conf")
+        resolver.update(is_symlink=False, canonical_target=target, target_uid=0)
         self.assertTrue(classify(observation, support, transitions)["run_bundle"])
 
     def test_docker_absence_is_delegated_to_resident_security_verification(self):

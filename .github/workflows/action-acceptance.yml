@@ -201,6 +201,7 @@ jobs:
             allowlist: ''
           - scenario: azure-cli-block
             lifecycle: standard
+            regular_resolver: true
             mode: block
             invocation_id: action-azure-cli-block
             container_policy: disable
@@ -209,6 +210,7 @@ jobs:
             allowlist: ''
           - scenario: azure-cli-audit
             lifecycle: audit
+            regular_resolver: true
             mode: audit
             invocation_id: action-azure-cli-audit
             container_policy: ''
@@ -231,6 +233,10 @@ jobs:
         with:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
+
+      - name: prepare regular host resolver fixture
+        if: matrix.regular_resolver
+        run: script/test-action-acceptance prepare-regular-resolver
 
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
@@ -285,6 +291,7 @@ jobs:
 
       - name: verify Action lifecycle
         env:
+          FENCE_EXPECT_REGULAR_RESOLVER: ${{ matrix.regular_resolver }}
           FENCE_GITHUB_ARTIFACT_ID: ${{ steps.github-artifact-upload.outputs.artifact-id }}
           FENCE_GITHUB_ARTIFACT_DIGEST: ${{ steps.github-artifact-upload.outputs.artifact-digest }}
         run: script/test-action-acceptance "${{ matrix.lifecycle || matrix.scenario }}" "${{ matrix.invocation_id }}"

@@ -71,6 +71,7 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -154,7 +155,7 @@ const HOST_RESOLVER_PATH: &str = "/etc/resolv.conf";
 const RESOLVER_SOURCE_FILE_NAME: &str = "resolv.conf";
 const DNS_ROUTING_MARKER: &str = "dns-routing-owned";
 const RESOLVER_SOURCE_CONTENTS: &[u8] = b"nameserver 127.0.0.1\noptions attempts:1 timeout:2\n";
-const REVIEWED_RESOLVER_TARGETS: [&str; 2] = [
+const SYSTEMD_RESOLVER_TARGETS: [&str; 2] = [
     "/run/systemd/resolve/stub-resolv.conf",
     "/run/systemd/resolve/resolv.conf",
 ];
@@ -1628,6 +1629,7 @@ struct DnsRouting {
     docker_original: Option<Vec<u8>>,
     resolver_source: PathBuf,
     resolver_target: PathBuf,
+    resolver_before_mount: (u64, u64, u64),
     routing_marker: PathBuf,
     provisional: ProvisionalDnsRouting,
 }
@@ -1723,14 +1725,17 @@ impl DnsRouting {
         executables: Arc<TrustedExecutableSet>,
         docker_dns: DockerDns,
     ) -> Result<Self, DnsMediationError> {
-        // Mount and roll back only the target we reviewed, never a later link destination.
+        // Mount and roll back at the reviewed path, not a later link destination.
         let resolver_target = Self::reviewed_resolver_target(&executables)?;
+        let resolver_before_mount = resolver_file_identity(&resolver_target)
+            .ok_or(ResolverLayoutFailure::TargetUnavailable)?;
         let mut routing = Self {
             executables,
             docker_dns,
             docker_original: None,
             resolver_source: runtime_directory.join(RESOLVER_SOURCE_FILE_NAME),
             resolver_target,
+            resolver_before_mount,
             routing_marker: runtime_directory.join(DNS_ROUTING_MARKER),
             provisional: ProvisionalDnsRouting::default(),
         };
@@ -1784,7 +1789,7 @@ impl DnsRouting {
             &["--bind", source, target],
         ) {
             self.provisional.resolver_mount =
-                resolver_mount_after_failed_bind(&self.resolver_source, &self.resolver_target);
+                resolver_mount_identity(&self.resolver_source, &self.resolver_target);
             return Err(error);
         }
         self.provisional.resolver_mount = ResolverMount::Mounted;
@@ -1862,21 +1867,44 @@ impl DnsRouting {
                 &["restart", "docker.service"],
             ),
             DnsRollbackStep::UnmountResolver => {
+                // A failed read-only remount can leave our bind writable. Check its
+                // identity, not its final flags, at the already reviewed, protected path.
+                if resolver_mount_identity(&self.resolver_source, &self.resolver_target)
+                    != ResolverMount::Mounted
+                {
+                    return Err(DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "cannot identify the provisional resolver mount",
+                    ));
+                }
                 let target = self.resolver_target.to_str().ok_or_else(|| {
                     DnsMediationError::new(
                         "dns_routing_rollback_failed",
                         "accepted resolver target path is not valid UTF-8",
                     )
                 })?;
-                fixed_command(&self.executables, TrustedExecutable::Umount, &[target])
+                fixed_command(
+                    &self.executables,
+                    TrustedExecutable::Umount,
+                    &["--no-canonicalize", "--", target],
+                )
             }
-            DnsRollbackStep::RemoveResolverSource => fs::remove_file(&self.resolver_source)
-                .map_err(|_| {
+            DnsRollbackStep::RemoveResolverSource => {
+                // Unmounting one layer does not prove the original resolver is visible.
+                if resolver_file_identity(&self.resolver_target) != Some(self.resolver_before_mount)
+                {
+                    return Err(DnsMediationError::new(
+                        "dns_routing_rollback_failed",
+                        "cannot verify the original resolver file and mount",
+                    ));
+                }
+                fs::remove_file(&self.resolver_source).map_err(|_| {
                     DnsMediationError::new(
                         "dns_routing_rollback_failed",
                         "failed to remove provisional resolver routing",
                     )
-                }),
+                })
+            }
             DnsRollbackStep::RemoveRoutingMarker => {
                 fs::remove_file(&self.routing_marker).map_err(|_| {
                     DnsMediationError::new(
@@ -1918,14 +1946,20 @@ impl DnsRouting {
         executables: &TrustedExecutableSet,
     ) -> Result<PathBuf, DnsMediationError> {
         use ResolverLayoutFailure as Failure;
-        let canonical = reviewed_resolver_link(
-            Path::new(HOST_RESOLVER_PATH),
-            &REVIEWED_RESOLVER_TARGETS.map(Path::new),
-        )?;
+        let path = Path::new(HOST_RESOLVER_PATH);
+        let canonical = reviewed_resolver_path(path, &SYSTEMD_RESOLVER_TARGETS.map(Path::new))?;
         let target_metadata =
             fs::symlink_metadata(&canonical).map_err(|_| Failure::TargetUnavailable)?;
-        let (resolver_uid, resolver_gid) = Self::reviewed_resolver_service_identity(executables)?;
-        for path in ["/run", "/run/systemd", "/run/systemd/resolve"] {
+        // Only the systemd layout may use the verified resolver service's ownership.
+        let ((resolver_uid, resolver_gid), directories): (_, &[&str]) = if canonical == path {
+            ((0, 0), &["/", "/etc"])
+        } else {
+            (
+                Self::reviewed_resolver_service_identity(executables)?,
+                &["/run", "/run/systemd", "/run/systemd/resolve"],
+            )
+        };
+        for &path in directories {
             let metadata = fs::symlink_metadata(path).map_err(|_| Failure::DirectoryUnavailable)?;
             if !metadata.file_type().is_dir()
                 || fs::canonicalize(path).ok().as_deref() != Some(Path::new(path))
@@ -2014,24 +2048,25 @@ impl DnsRouting {
                 "owned resolver source is unavailable",
             )
         })?;
-        let target_metadata = fs::symlink_metadata(&self.resolver_target).map_err(|_| {
+        let inspect_target_error = |_| {
             DnsMediationError::new(
                 "dns_routing_verification_failed",
-                "active resolver mount target is unavailable",
+                "failed to inspect the active resolver mount target",
             )
-        })?;
+        };
+        let target = open_resolver_target(&self.resolver_target).map_err(inspect_target_error)?;
+        let target_metadata = target.metadata().map_err(inspect_target_error)?;
         let source_contents = fs::read(&self.resolver_source).map_err(|_| {
             DnsMediationError::new(
                 "dns_routing_verification_failed",
                 "owned resolver source could not be verified",
             )
         })?;
-        let target_contents = fs::read(&self.resolver_target).map_err(|_| {
-            DnsMediationError::new(
-                "dns_routing_verification_failed",
-                "active resolver contents could not be verified",
-            )
-        })?;
+        let mut target_contents = Vec::new();
+        (&target)
+            .take(RESOLVER_SOURCE_CONTENTS.len() as u64 + 1)
+            .read_to_end(&mut target_contents)
+            .map_err(inspect_target_error)?;
         if !source_metadata.file_type().is_file()
             || source_metadata.file_type().is_symlink()
             || source_metadata.uid() != 0
@@ -2040,7 +2075,7 @@ impl DnsRouting {
             || source_metadata.ino() != target_metadata.ino()
             || source_contents != RESOLVER_SOURCE_CONTENTS
             || target_contents != RESOLVER_SOURCE_CONTENTS
-            || !mount_has_required_options(&self.resolver_target)
+            || !mount_has_required_options(&self.resolver_target, &target)
         {
             return Err(DnsMediationError::new(
                 "dns_routing_verification_failed",
@@ -2053,28 +2088,33 @@ impl DnsRouting {
     }
 }
 
-fn resolver_link_target(link: &Path) -> Result<PathBuf, ResolverLayoutFailure> {
-    let metadata =
-        fs::symlink_metadata(link).map_err(|_| ResolverLayoutFailure::LinkUnavailable)?;
-    if !metadata.file_type().is_symlink() {
-        return Err(ResolverLayoutFailure::LinkNotSymlink);
+fn resolver_target(path: &Path) -> Result<PathBuf, ResolverLayoutFailure> {
+    use ResolverLayoutFailure as Failure;
+    let entry = fs::symlink_metadata(path).map_err(|_| Failure::LinkUnavailable)?;
+    if !entry.is_symlink() && !entry.is_file() {
+        return Err(Failure::TargetNotRegularFile);
     }
-    fs::canonicalize(link).map_err(|_| ResolverLayoutFailure::TargetUnavailable)
+    let target = fs::canonicalize(path).map_err(|_| Failure::TargetUnavailable)?;
+    // A regular file reached through a symlinked directory is not the direct layout.
+    if entry.is_file() && target != path {
+        return Err(Failure::TargetNotReviewed);
+    }
+    Ok(target)
 }
 
-fn reviewed_resolver_link(
-    link: &Path,
-    reviewed: &[&Path],
+fn reviewed_resolver_path(
+    path: &Path,
+    symlink_targets: &[&Path],
 ) -> Result<PathBuf, ResolverLayoutFailure> {
-    let target = resolver_link_target(link)?;
-    if !reviewed.contains(&target.as_path()) {
+    let target = resolver_target(path)?;
+    if target != path && !symlink_targets.contains(&target.as_path()) {
         return Err(ResolverLayoutFailure::TargetNotReviewed);
     }
     Ok(target)
 }
 
-fn verify_live_resolver_target(link: &Path, expected: &Path) -> Result<(), ResolverLayoutFailure> {
-    if resolver_link_target(link)? != expected {
+fn verify_live_resolver_target(path: &Path, expected: &Path) -> Result<(), ResolverLayoutFailure> {
+    if resolver_target(path)? != expected {
         return Err(ResolverLayoutFailure::TargetChanged);
     }
     Ok(())
@@ -2112,7 +2152,6 @@ fn reviewed_resolver_service_pid(contents: &str) -> Option<u32> {
 #[serde(rename_all = "snake_case")]
 enum ResolverLayoutFailure {
     LinkUnavailable,
-    LinkNotSymlink,
     TargetUnavailable,
     TargetNotReviewed,
     TargetChanged,
@@ -2144,7 +2183,20 @@ impl From<ResolverLayoutFailure> for DnsMediationError {
     }
 }
 
-fn resolver_mount_after_failed_bind(source: &Path, target: &Path) -> ResolverMount {
+fn open_resolver_target(path: &Path) -> std::io::Result<fs::File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+fn resolver_file_identity(path: &Path) -> Option<(u64, u64, u64)> {
+    let file = open_resolver_target(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    Some((metadata.dev(), metadata.ino(), resolver_mount_id(&file)?))
+}
+
+fn resolver_mount_identity(source: &Path, target: &Path) -> ResolverMount {
     match (fs::symlink_metadata(source), fs::symlink_metadata(target)) {
         (Ok(source), Ok(target))
             if (source.dev(), source.ino()) == (target.dev(), target.ino()) =>
@@ -7036,7 +7088,20 @@ fn verify_docker_dns_route() -> Result<(), DnsMediationError> {
     Ok(())
 }
 
-fn mount_has_required_options(target: &Path) -> bool {
+fn resolver_mount_id(resolver: &fs::File) -> Option<u64> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", resolver.as_raw_fd())).ok()?;
+    info.lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))?
+        .parse()
+        .ok()
+}
+
+fn mount_has_required_options(target: &Path, resolver: &fs::File) -> bool {
+    // The host resolver may itself be a mount. Check the visible mount's options,
+    // not those of a mount hidden beneath it at the same path.
+    let Some(mount_id) = resolver_mount_id(resolver) else {
+        return false;
+    };
     let Ok(file) = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -7059,13 +7124,13 @@ fn mount_has_required_options(target: &Path) -> bool {
     let Some(target) = target.to_str() else {
         return false;
     };
-    mountinfo_has_required_options(contents, target)
+    mountinfo_has_required_options(contents, target, mount_id)
 }
 
-fn mountinfo_has_required_options(contents: &str, target: &str) -> bool {
+fn mountinfo_has_required_options(contents: &str, target: &str, mount_id: u64) -> bool {
     contents.lines().any(|line| {
         let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() < 6 || fields[4] != target {
+        if fields.len() < 6 || fields[4] != target || fields[0].parse().ok() != Some(mount_id) {
             return false;
         }
         let options = fields[5].split(',').collect::<BTreeSet<_>>();
@@ -13659,19 +13724,21 @@ mod tests {
         let mountinfo = concat!(
             "31 22 0:28 / / rw,relatime - ext4 /dev/root rw\n",
             "44 31 0:28 /run/fence/example/resolv.conf /run/systemd/resolve/stub-resolv.conf ro,nosuid,nodev,relatime - ext4 /dev/root rw\n",
+            "45 44 0:28 /source /run/systemd/resolve/stub-resolv.conf rw,relatime - ext4 /dev/root rw\n",
         );
+        let target = SYSTEMD_RESOLVER_TARGETS[0];
+        assert!(mountinfo_has_required_options(mountinfo, target, 44));
         assert!(mountinfo_has_required_options(
-            mountinfo,
-            "/run/systemd/resolve/stub-resolv.conf"
+            &mountinfo.replace(target, HOST_RESOLVER_PATH),
+            HOST_RESOLVER_PATH,
+            44,
         ));
         assert!(!mountinfo_has_required_options(
             mountinfo,
-            "/run/systemd/resolve/resolv.conf"
+            SYSTEMD_RESOLVER_TARGETS[1],
+            44,
         ));
-        assert!(!mountinfo_has_required_options(
-            "44 31 0:28 /source /run/systemd/resolve/stub-resolv.conf rw,relatime - ext4 /dev/root rw\n",
-            "/run/systemd/resolve/stub-resolv.conf"
-        ));
+        assert!(!mountinfo_has_required_options(mountinfo, target, 45));
     }
 
     #[test]
@@ -13685,20 +13752,27 @@ mod tests {
         fs::write(&source, RESOLVER_SOURCE_CONTENTS).unwrap();
         fs::hard_link(&source, &same).unwrap();
         fs::write(&different, RESOLVER_SOURCE_CONTENTS).unwrap();
+        let link = root.join("symlink");
+        std::os::unix::fs::symlink(fs::canonicalize(&source).unwrap(), &link).unwrap();
+        let original = resolver_file_identity(&source).unwrap();
+        assert_eq!(resolver_file_identity(&same), Some(original));
+        assert_ne!(resolver_file_identity(&different), Some(original));
+        assert_eq!(resolver_file_identity(&link), None);
         let missing = root.join("missing");
         for (source, target, expected) in [
             (&source, &same, ResolverMount::Mounted),
             (&source, &different, ResolverMount::NotMounted),
+            (&source, &link, ResolverMount::NotMounted),
             (&source, &missing, ResolverMount::Unknown),
             (&missing, &same, ResolverMount::Unknown),
         ] {
-            assert_eq!(resolver_mount_after_failed_bind(source, target), expected);
+            assert_eq!(resolver_mount_identity(source, target), expected);
         }
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn live_resolver_link_must_reach_the_reviewed_path_even_when_backing_identity_matches() {
+    fn live_resolver_must_reach_the_reviewed_path_even_when_backing_identity_matches() {
         use ResolverLayoutFailure as Failure;
         use std::os::unix::fs::symlink;
         let root = std::env::temp_dir().join(format!(
@@ -13711,16 +13785,16 @@ mod tests {
         let link = root.join("resolv.conf");
         let first = root.join("first");
         let second = root.join("second");
-        assert_eq!(resolver_link_target(&link), Err(Failure::LinkUnavailable));
+        assert_eq!(resolver_target(&link), Err(Failure::LinkUnavailable));
         symlink(&first, &link).unwrap();
-        assert_eq!(resolver_link_target(&link), Err(Failure::TargetUnavailable));
+        assert_eq!(resolver_target(&link), Err(Failure::TargetUnavailable));
         fs::write(&first, RESOLVER_SOURCE_CONTENTS).unwrap();
-        assert_eq!(resolver_link_target(&first), Err(Failure::LinkNotSymlink));
+        assert_eq!(resolver_target(&root), Err(Failure::TargetNotRegularFile));
         assert_eq!(
-            reviewed_resolver_link(&link, &[&second]),
+            reviewed_resolver_path(&link, &[&second]),
             Err(Failure::TargetNotReviewed)
         );
-        let reviewed = reviewed_resolver_link(&link, &[&first, &second]).unwrap();
+        let reviewed = reviewed_resolver_path(&link, &[&first, &second]).unwrap();
         assert_eq!(reviewed, first);
         assert_eq!(verify_live_resolver_target(&link, &reviewed), Ok(()));
 
@@ -13729,7 +13803,7 @@ mod tests {
         symlink(&second, &pending_link).unwrap();
         fs::rename(pending_link, &link).unwrap();
         assert_eq!(
-            resolver_mount_after_failed_bind(&first, &second),
+            resolver_mount_identity(&first, &second),
             ResolverMount::Mounted
         );
         for _ in 0..2 {
@@ -13740,6 +13814,24 @@ mod tests {
                 "unsupported_resolver_layout"
             );
         }
+
+        // A direct file is accepted only at its canonical path, and cannot be
+        // replaced with a symlink even if it points to the very same inode.
+        let direct = reviewed_resolver_path(&first, &[]).unwrap();
+        assert_eq!(direct, first);
+        assert_eq!(verify_live_resolver_target(&first, &direct), Ok(()));
+        let alias = root.join("dir-symlink");
+        symlink(&root, &alias).unwrap();
+        assert_eq!(
+            reviewed_resolver_path(&alias.join("first"), &[&first]),
+            Err(Failure::TargetNotReviewed)
+        );
+        fs::remove_file(&first).unwrap();
+        symlink(&second, &first).unwrap();
+        assert_eq!(
+            verify_live_resolver_target(&first, &direct),
+            Err(Failure::TargetChanged)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -13747,7 +13839,7 @@ mod tests {
     fn repeated_live_resolver_drift_checks_do_not_write_startup_diagnostics_to_stderr() {
         // Isolate stderr from the other parallel tests.
         let drift_test =
-            "live_resolver_link_must_reach_the_reviewed_path_even_when_backing_identity_matches";
+            "live_resolver_must_reach_the_reviewed_path_even_when_backing_identity_matches";
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([drift_test, "--nocapture"])
             .output()
@@ -13781,6 +13873,21 @@ mod tests {
             assert_eq!(
                 validate_resolver_target_metadata(regular, (uid, gid), mode, (991, 992)),
                 Err(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn direct_resolver_file_accepts_only_root_ownership() {
+        let root = (0, 0);
+        assert_eq!(
+            validate_resolver_target_metadata(true, root, 0o644, root),
+            Ok(())
+        );
+        for owner in [(991, 0), (0, 992), (991, 992)] {
+            assert_eq!(
+                validate_resolver_target_metadata(true, owner, 0o644, root),
+                Err(ResolverLayoutFailure::TargetOwnerNotReviewed)
             );
         }
     }

@@ -312,9 +312,12 @@ if [[ "$(systemctl show "$runtime_failure_unit" --property=LoadState --value)" !
   die "Action runtime-failure evidence requires an unused transient service name"
 fi
 host_resolver_identity() {
-  stat --dereference --format='%d:%i' /etc/resolv.conf &&
+  stat --format='%d:%i' /etc/resolv.conf &&
     findmnt --noheadings --target /etc/resolv.conf --output ID
 }
+script/test-action-acceptance prepare-regular-resolver
+# Exercise rollback when the host's regular resolver file is itself a mount.
+sudo --non-interactive mount --bind /etc/resolv.conf /etc/resolv.conf
 resolver_before="$(host_resolver_identity)"
 : >"$state"
 : >"$summary"
@@ -337,7 +340,7 @@ if [[ -e "/run/fence/$runtime_failure_invocation" || -e "/run/fence-launcher/$ru
 fi
 [[ ! -e /run/fence-launcher/.active ]] || die "failed Fence startup retained its provisional host claim"
 resolver_after="$(host_resolver_identity)"
-[[ "$resolver_after" == "$resolver_before" ]] || die "failed Fence startup did not restore the original host resolver"
+[[ "$resolver_after" == "$resolver_before" ]] || die "failed Fence startup did not restore the original regular host resolver"
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
   die "Action runtime-failure evidence unexpectedly created inet fence_v0"
 fi

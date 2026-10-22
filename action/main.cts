@@ -254,7 +254,7 @@ function dnsStartupDiagnosticFromJournal(output: string): string | undefined {
 function resolverLayoutDiagnosticFromJournal(output: string): string | undefined {
   // Match the native ResolverLayoutFailure enum, never observed resolver or process details.
   const reasons = new Set([
-    "link_unavailable", "link_not_symlink", "target_unavailable", "target_not_reviewed",
+    "link_unavailable", "target_unavailable", "target_not_reviewed",
     "target_changed", "target_not_regular_file", "target_owner_not_reviewed",
     "target_permissions_unsafe", "target_writable_by_runner", "directory_unavailable",
     "directory_not_canonical", "directory_owner_not_reviewed", "directory_permissions_unsafe",
