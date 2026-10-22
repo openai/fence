@@ -3,6 +3,12 @@ name: action drift canary
 on:
   schedule:
     - cron: "23 */6 * * *"
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/action-drift-canary.yml
+      - script/lib/protected_finalization.py
+      - script/verify-protected-finalization
   workflow_dispatch:
     inputs:
       action_ref:
@@ -28,13 +34,86 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  canary:
-    name: ${{ matrix.runner }} ${{ matrix.mode }} canary
+  released-block:
+    name: ${{ matrix.runner }} block canary
+    if: inputs.action_ref == '' && (github.event_name == 'schedule' || github.event_name == 'pull_request')
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-latest]
-        mode: [block, audit]
+    timeout-minutes: 5
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # Keep this first, with no inputs, just as a consumer would use the published pin.
+      - name: activate released Fence as the first workflow step
+        uses: openai/fence@e017427978b91977d79a3023842166ab79b5b816 # pin@v0.12.2
+
+      - name: check out repository under Fence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      - name: check protected checkout and policy
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -s README.md
+          curl --disable --noproxy '*' --head --fail --silent --show-error --max-time 10 --output /dev/null https://github.com
+
+          if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
+            echo "::error::passwordless sudo was still available"
+            exit 1
+          fi
+          if curl --disable --noproxy '*' --unix-socket /run/docker.sock --silent --max-time 5 --output /dev/null http://localhost/_ping; then
+            echo "::error::the runner could still reach the Docker socket"
+            exit 1
+          fi
+
+          # A connection failure alone proves nothing. Require Fence to report this exact rejected probe.
+          if timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/443' 2>/dev/null; then
+            echo "::error::a connection outside the policy succeeded"
+            exit 1
+          fi
+          report="/run/fence/fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/report.json"
+          for ((i = 0; i < 15; i++)); do
+            if jq -e 'any(.findings[]; [.remote_address, .protocol, .remote_port, .classification] == ["192.0.2.1", "tcp", 443, "rejected"])' "$report" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Fence did not report rejecting the outside-policy connection"
+          exit 1
+
+  verify-released-block:
+    name: verify first-step canary jobs and final reports
+    needs: released-block
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: verify completed jobs, post hooks, and downloaded reports
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: script/verify-protected-finalization canary
+
+  canary:
+    name: ${{ matrix.runner }} ${{ matrix.mode }} canary
+    # Scheduled block runs above. Dispatch and release candidates retain both diagnostic modes.
+    if: inputs.action_ref != '' || github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-latest]
+        mode: ${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '["audit"]' || '["block", "audit"]') }}
     timeout-minutes: 8
     runs-on: ${{ matrix.runner }}
 

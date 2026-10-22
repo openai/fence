@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -gt 1 ]]; then
-  die "usage: script/verify-protected-finalization [integration|action]"
+  die "usage: script/verify-protected-finalization [integration|action|canary]"
 fi
 job_set="${1:-integration}"
 case "$job_set" in
-  integration|action) ;;
-  *) die "finalization job set must be integration or action" ;;
+  integration|action|canary) ;;
+  *) die "finalization job set must be integration, action, or canary" ;;
 esac
 if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
   die "protected finalization verification runs only in GitHub Actions"
@@ -45,6 +45,7 @@ repository = os.environ["GITHUB_REPOSITORY"]
 run_id = os.environ["GITHUB_RUN_ID"]
 token = os.environ["GITHUB_TOKEN"]
 job_set = os.environ["FENCE_FINALIZATION_JOB_SET"]
+require_report = job_set in {"action", "canary"}
 api_root = f"https://api.github.com/repos/{repository}"
 authorization_marker = b"fence-results-storage-authorization-observed"
 authorization_observed = False
@@ -143,7 +144,10 @@ def action_structured_reports(payload, job_name):
 
 
 def job_metadata():
-    with urllib.request.urlopen(request(f"/actions/runs/{run_id}/jobs?per_page={MAX_JOB_COUNT}"), timeout=15) as response:
+    path = f"/actions/runs/{run_id}"
+    if job_set == "canary":
+        path += f'/attempts/{os.environ["GITHUB_RUN_ATTEMPT"]}'
+    with urllib.request.urlopen(request(f"{path}/jobs?per_page={MAX_JOB_COUNT}"), timeout=15) as response:
         body = response.read(1024 * 1024 + 1)
     if len(body) > 1024 * 1024:
         raise SystemExit("protected finalization job metadata exceeded its fixed bound")
@@ -174,7 +178,7 @@ for name in sorted(jobs):
                 raise SystemExit(f"protected finalization log archive had no nonempty files: {name}")
             if sum(entry.file_size for entry in files) > 16 * 1024 * 1024:
                 raise SystemExit(f"protected finalization log archive expanded past its fixed bound: {name}")
-            if job_set == "action":
+            if require_report:
                 marker_observed = False
                 for entry in files:
                     reports.extend(action_structured_reports(bundle.read(entry), name))
@@ -186,12 +190,14 @@ for name in sorted(jobs):
                 marker_observed = any(authorization_marker in bundle.read(entry) for entry in files)
     else:
         marker_observed = authorization_marker in archive
-        if job_set == "action":
+        if require_report:
             reports = action_structured_reports(archive, name)
-    if job_set == "action" and len(reports) != 1:
+    if require_report and len(reports) != 1:
         raise SystemExit(
             f"protected finalization job must contain exactly one structured report: {name}"
         )
+    if job_set == "canary":
+        print(f"Verified first-step protection through the final job log: {name} (job {job['id']})")
     if job_set == "integration" and name.startswith("protected finalization "):
         authorization_observed = authorization_observed or marker_observed
 

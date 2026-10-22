@@ -729,6 +729,8 @@ jobs:
     if: needs.prepare.outputs.should_release == 'true'
     needs: [prepare, create-candidate]
     permissions:
+      # The reusable workflow declares a read-only job-log verifier; candidate jobs themselves need only contents.
+      actions: read
       contents: read
     uses: ./.github/workflows/action-drift-canary.yml
     with:
