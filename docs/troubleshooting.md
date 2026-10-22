@@ -4,6 +4,8 @@ Start with the Fence job summary. It lists network activity, blocked destination
 
 ## Fence Fails To Start
 
+Read the first error in the Fence setup step, not just the post-job error. Check [open runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+is%3Aopen+in%3Atitle+%22Release+canary%22) for the affected version, what you can do now, and a verified replacement pin when one is available. A green run on a different runner doesn't mean your issue is fixed. Please don't post private job logs.
+
 Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Self-hosted runners, container jobs, and other architectures are not supported.
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.

@@ -159,7 +159,7 @@ All scripts live in `script/` and should use `set -euo pipefail` unless there is
 - `script/test`
   - Validates the release-tool lockfile and manifest before running tests.
   - Validates the test-tool lockfile and manifest before running tests.
-  - Runs the offline Action release-state, protected-finalization, and blocked-event evidence regression suites before Rust tests.
+  - Runs the offline Action release-state, release-canary reporting, protected-finalization, and blocked-event evidence regression suites before Rust tests.
   - Runs `cargo test --frozen` by default.
   - `--coverage`, `--cov`, or `-c` requires `cargo-llvm-cov` from `script/install-test-tools` and `llvm-tools-preview` from `script/prepare-rust`.
   - Coverage mode writes text, JSON, LCOV, and HTML reports under `coverage/`.
@@ -460,6 +460,7 @@ If any version file changes, update docs and verify the corresponding script beh
 - Release publication should use a protected `release` environment restricted to protected `main` with no required reviewer; the reviewed version PR merge is the sole human authorization.
 - Final release assets should be re-downloaded from GitHub Releases, checksum-verified, and attestation-verified.
 - Job permissions should be least-privilege. Keep top-level workflow permissions empty where practical.
+- Only the separate [release-canary reporter](docs/development.md#when-the-release-canary-fails) may write compatibility issues. It records trusted scheduled first attempts, publishes bounded diagnostics rather than raw logs, and never declares recovery from a later green run.
 - It is acceptable for publish/sign/verify jobs to use GitHub API access. Do not claim those jobs are zero-network.
 - Be explicit about CI time tradeoffs. Building `cargo-zigbuild` from committed source on PR runners is slower than downloading a binary or using a runner image, but it removes release-time crates.io/tool availability from the build path.
 

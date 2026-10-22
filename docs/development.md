@@ -36,6 +36,14 @@ Builds and tests must not install or download tools.
 
 The `main` branch does not contain generated Action binaries. Release automation adds the agent and its manifest to a separate signed distribution commit.
 
+## When The Release Canary Fails
+
+The scheduled check opens an issue on the first failure. Aim to give people a useful update the same working day, even if it's just "no safe workaround yet." The issue is a record of what failed, not a claim that every runner is affected. Report a possible security bypass [privately](../SECURITY.md).
+
+Leave the first failure visible. Reproduce the runner condition, show that a safe variation works and an unsafe one is still rejected, then put the [finalized release pin](release-provenance.md#pin-the-published-action) in the issue before closing it. A green run elsewhere isn't that evidence, and publishing a fix doesn't update anyone's pin.
+
+After a month, count every scheduled first attempt, including refusals and missing results. Compare when we first saw the failure, when we gave useful guidance, and when a verified pin was available. Record downstream recovery only if someone volunteers it; these checks don't measure customer availability.
+
 ## Temporary Files
 
 Local builds and tool preparation use `target/tmp` unless `TMPDIR` or `RUNNER_TEMP` is already set.
