@@ -1,5 +1,6 @@
 """Record the first unexplained scheduled release-canary failure; never infer recovery."""
 
+import functools
 import json
 import os
 import re
@@ -27,9 +28,20 @@ GUIDANCE = (
 )
 
 
+@functools.cache
+def log_read_flags():
+    # Newer gh refuses runner logs containing terminal escapes; older gh doesn't have this flag.
+    # Either way we capture the bytes privately and publish only the fixed fields from log_evidence().
+    help_text = subprocess.check_output(["gh", "api", "--help"], stderr=subprocess.DEVNULL, timeout=10)
+    flag = "--allow-escape-sequences"
+    return (flag,) if flag.encode() in help_text else ()
+
+
 def github(path, *args):
     """Bound responses (including job logs); do not print raw errors, signed URLs or log text."""
     cmd = ["gh", "api", "--hostname", "github.com", f"repos/{REPOSITORY}/{path}", *args]
+    if path.endswith("/logs"):
+        cmd.extend(log_read_flags())
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as proc:
         limit = 8 * 1024 * 1024
         data = proc.stdout.read(limit + 1)
@@ -81,8 +93,7 @@ def observe(run_id, api=github):
         job_id = int(job["id"])
         row = {"outcome": outcome(job), "id": job_id}
         try:
-            # Runner logs can contain terminal escapes. Capture bytes privately, then emit only fixed evidence.
-            log = api(f"actions/jobs/{job_id}/logs", "--allow-escape-sequences")
+            log = api(f"actions/jobs/{job_id}/logs")
             row["pin"], row["diagnostics"] = log_evidence(log)
         except RuntimeError:
             pass

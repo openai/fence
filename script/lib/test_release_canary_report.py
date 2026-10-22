@@ -2,9 +2,9 @@
 
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from release_canary_report import DIAGNOSTICS, JOBS, REPOSITORY, SAMPLE, describe, log_evidence, observe, report
+from release_canary_report import DIAGNOSTICS, JOBS, REPOSITORY, SAMPLE, describe, log_evidence, log_read_flags, observe, report
 
 
 PIN = "a" * 40
@@ -26,11 +26,17 @@ def sample(outcome="success", *, run_id=50, overrides=None, jobs=None, log=None)
     api = Mock(side_effect=responses)
     result = observe(run_id, api)
     for job in jobs:
-        api.assert_any_call(f"actions/jobs/{job['id']}/logs", "--allow-escape-sequences")
+        api.assert_any_call(f"actions/jobs/{job['id']}/logs")
     return result
 
 
 class CanaryReport(unittest.TestCase):
+    def test_log_capture_works_with_old_and_new_github_cli(self):
+        flag = "--allow-escape-sequences"
+        for help_text, expected in ((b"--silent", ()), (flag.encode(), (flag,))):
+            with patch("release_canary_report.subprocess.check_output", return_value=help_text):
+                self.assertEqual(log_read_flags.__wrapped__(), expected)
+
     def test_only_fixed_diagnostics_and_full_distribution_pin_leave_the_observer(self):
         hostile = b"\x1b[31mtime ##[warning]Fence host resolver: not public\n"
         pin, messages = log_evidence(LOG + hostile)
