@@ -105,7 +105,7 @@ Run Fence once per job. If setup fails, check the [startup diagnostics](docs/tro
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 
-1. It checks that the runner and bundled agent are supported.
+1. It checks that the runner and bundled agent are supported. You don't need to change `/etc/resolv.conf` if the runner provides it as a regular file instead of a symlink.
 2. It allows required GitHub and runner connections, plus your `allowlist`.
 3. It blocks other outbound connections and turns off passwordless `sudo` and Docker.
 4. It checks that the firewall is active, not just that its rules exist, before reporting readiness and throughout the job.

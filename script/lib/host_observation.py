@@ -130,7 +130,11 @@ SCHEMA4_REVIEWED_RUNNER_GROUPS = frozenset(
 )
 SCHEMA4_REVIEWED_RESOLVER_TARGET = "/run/systemd/resolve/stub-resolv.conf"
 SCHEMA4_REVIEWED_RESOLVER_TARGETS = frozenset(
-    {SCHEMA4_REVIEWED_RESOLVER_TARGET, "/run/systemd/resolve/resolv.conf"}
+    {
+        SCHEMA4_REVIEWED_RESOLVER_TARGET,
+        "/run/systemd/resolve/resolv.conf",
+        "/etc/resolv.conf",
+    }
 )
 AZURE_PLATFORM_AGENT_UNITS = (
     "walinuxagent.service",

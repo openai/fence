@@ -1135,6 +1135,7 @@ expected_action_entries = {
     },
     "azure-cli-block": {
         "lifecycle": "standard",
+        "regular_resolver": "true",
         "mode": "block",
         "invocation_id": "action-azure-cli-block",
         "container_policy": "disable",
@@ -1144,6 +1145,7 @@ expected_action_entries = {
     },
     "azure-cli-audit": {
         "lifecycle": "audit",
+        "regular_resolver": "true",
         "mode": "audit",
         "invocation_id": "action-azure-cli-audit",
         "container_policy": "''",
@@ -1179,6 +1181,7 @@ expected_action_steps = {
     "action": [
         "checkout",
         "install assembled Action bundle",
+        "prepare regular host resolver fixture",
         "observe hosted runner fingerprint candidate",
         "classify bundled Action host compatibility",
         "require bundled Action activation",
@@ -1358,6 +1361,13 @@ action_lifecycle = require_step_contract(
     {"run": 'script/test-action-acceptance "${{ matrix.lifecycle || matrix.scenario }}" "${{ matrix.invocation_id }}"'},
     "Action acceptance native-input lifecycle verification",
 )
+require_step_contract(
+    action_job_blocks["action"],
+    "prepare regular host resolver fixture",
+    ["if", "run"],
+    {"if": "matrix.regular_resolver", "run": "script/test-action-acceptance prepare-regular-resolver"},
+    "Action acceptance regular resolver fixture",
+)
 azure_cli = require_step_contract(
     action_job_blocks["action"],
     "exercise Azure CLI and UUID service activation",
@@ -1381,10 +1391,11 @@ action_lifecycle_env = indented_block(
 require(
     scalar_mapping(action_lifecycle_env, 10)
     == {
+        "FENCE_EXPECT_REGULAR_RESOLVER": "${{ matrix.regular_resolver }}",
         "FENCE_GITHUB_ARTIFACT_ID": "${{ steps.github-artifact-upload.outputs.artifact-id }}",
         "FENCE_GITHUB_ARTIFACT_DIGEST": "${{ steps.github-artifact-upload.outputs.artifact-digest }}",
     },
-    "Action acceptance must verify the actual bounded GitHub artifact identity and SHA-256 digest",
+    "Action acceptance must verify the selected resolver fixture and the bounded GitHub artifact identity and SHA-256 digest",
 )
 require_step_contract(
     action_job_blocks["zero-input"],
