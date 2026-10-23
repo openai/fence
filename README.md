@@ -55,7 +55,7 @@ Add destinations your workflow needs to the `allowlist`:
 
 Bare hostnames default to TCP port `443`. Fence also supports IPv6, custom ports, TCP, UDP, CIDR ranges, and one- or two-level hostname wildcards. An allowlist can contain up to 64 unique entries.
 
-In block mode, Fence can shorten DNS cache lifetimes to match its firewall rules. Allowlist the hostname, not each IP it resolves to.
+In block mode, Fence can shorten DNS cache lifetimes to match its firewall rules. If the policy fills up, Fence refuses new addresses and still removes expired ones. Allowlist the hostname, not each IP it resolves to.
 
 See [allowlist syntax](docs/allowlist.md) for all supported formats.
 
@@ -101,7 +101,7 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 
 ## How It Works 🔧
 
-Run Fence once per job. If setup fails, check the [startup diagnostics](docs/troubleshooting.md#fence-fails-to-start) in the job log; Fence does not copy raw service logs there. Cleanup only removes this launch's unfinished setup. It never removes another launch's protections or undoes the lockdown after Fence reports ready.
+Run Fence once per job. If [setup fails](docs/troubleshooting.md#fence-fails-to-start), start with that error, even if the post-job step also fails. Fence won't guess whether protection started or cleanup succeeded, and it never undoes the lockdown after reporting ready.
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 

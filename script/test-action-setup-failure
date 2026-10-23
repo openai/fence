@@ -330,9 +330,10 @@ if INPUT_CONFIG='{"schema_version":1,"mode":"block","invocation_id":"action-runt
   die "Action setup unexpectedly accepted an unresolvable required hostname"
 fi
 
-grep -q "Fence resident service exited before readiness" "$stderr"
+grep -Fq "::error::Fence could not verify readiness: DNS rules for required hostnames could not be prepared (dns_block_prehydration_failed)" "$stderr"
+grep -q "Fence resident service exited while the Action was waiting for readiness" "$stdout"
 grep -q "Fence resident error code: dns_block_prehydration_failed" "$stdout"
-if grep -q "readiness was not emitted before the timeout" "$stderr"; then
+if grep -q "Fence timed out waiting for readiness" "$stdout"; then
   die "Action runtime failure waited for the full readiness timeout"
 fi
 if [[ -e "/run/fence/$runtime_failure_invocation" || -e "/run/fence-launcher/$runtime_failure_invocation" ]]; then
