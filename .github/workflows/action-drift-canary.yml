@@ -47,7 +47,7 @@ jobs:
     steps:
       # Keep this first, with no inputs, just as a consumer would use the published pin.
       - name: activate released Fence as the first workflow step
-        uses: openai/fence@e017427978b91977d79a3023842166ab79b5b816 # pin@v0.12.2
+        uses: openai/fence@4b2b73844fee38d2c32519ba8f30bd50b839600c # pin@v0.12.3
 
       - name: check out repository under Fence
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
