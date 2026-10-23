@@ -4,6 +4,7 @@ set -euo pipefail
 
 source script/env "$@"
 source "$DIR/script/lib/test-tools.bash"
+source "$DIR/script/lib/staged-tree.bash"
 
 ensure_rust_toolchain
 
@@ -14,8 +15,6 @@ require_cmd curl
 require_cmd tar
 
 test_tools_dir="$DIR/vendor/test-tools"
-cargo_llvm_cov_dir="$test_tools_dir/cargo-llvm-cov"
-manifest="$test_tools_dir/manifest.toml"
 lockfile="$TEST_TOOLS_LOCK"
 
 if [[ ! -f "$lockfile" ]]; then
@@ -39,7 +38,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-remove_generated_path "$test_tools_dir" "test-tool vendor directory"
+staged_test_tools_dir="$tmpdir/vendor/test-tools"
+cargo_llvm_cov_dir="$staged_test_tools_dir/cargo-llvm-cov"
+manifest="$staged_test_tools_dir/manifest.toml"
+backup="$tmpdir/previous-test-tools"
 mkdir -p "$TOOLING_DIR" "$cargo_llvm_cov_dir"
 
 tool_entries="$tmpdir/cargo-llvm-cov-entries.toml"
@@ -77,7 +79,7 @@ while IFS='|' read -r name version url path expected_sha256; do
     die "cargo-llvm-cov license checksum mismatch for $name (expected $expected_sha256, found $actual_sha256)"
   fi
 
-  mv "$tmp_license" "$DIR/$path"
+  mv "$tmp_license" "$tmpdir/$path"
 
   {
     echo "[[cargo_llvm_cov_license]]"
@@ -127,7 +129,7 @@ while IFS='|' read -r platform arch os target version url path expected_sha256; 
     die "cargo-llvm-cov artifact missing executable: $filename"
   fi
 
-  mv "$tmp_artifact" "$DIR/$path"
+  mv "$tmp_artifact" "$tmpdir/$path"
 
   {
     echo "[[cargo_llvm_cov]]"
@@ -161,5 +163,11 @@ fi
   sed '$d' "$tool_entries"
 } > "$manifest"
 
-script/validate-test-tools
+publish_staged_generated_tree \
+  "$staged_test_tools_dir" \
+  "$test_tools_dir" \
+  "$backup" \
+  "test-tool vendor directory" \
+  script/validate-test-tools
+
 echo -e "${GREEN}test tools vendored:${OFF} $test_tools_dir"
