@@ -48,6 +48,10 @@ while IFS='|' read -r name binary version url crate_sha256 crate_lockfile_sha256
     *) die "unexpected update-tool lock entry: $name" ;;
   esac
 
+  if [[ "$binary" != "$name" ]]; then
+    die "${name} binary mismatch (expected ${name}, found ${binary})"
+  fi
+
   version_file="$TOOLING_DIR/${name}-version"
   expected_version="$(read_version_file "$version_file")"
   if [[ "$version" != "$expected_version" ]]; then
