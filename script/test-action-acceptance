@@ -240,6 +240,8 @@ expected = {
     "audit": ("audit", "protected_host_audit_observation", "resident_observation_only", "ready_observation_only", False, "preserved_verified", "preserved_verified"),
 }[scenario]
 mode, status, resident, readiness, protection, sudo_status, container_status = expected
+if mode == "block":
+    expected_workers.insert(-1, {"name": "hostname_refresh", "status": "running"})
 allow_github_artifacts = scenario == "github-artifacts"
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
@@ -528,6 +530,7 @@ if scenario == "audit":
     report, dns = wait_for_audit_probe_evidence(report_path, dns_path)
 else:
     time.sleep(6)
+    expected_workers.insert(-1, {"name": "hostname_refresh", "status": "running"})
     report = json.loads(report_path.read_text(encoding="utf-8"))
     dns = json.loads(dns_path.read_text(encoding="utf-8"))
 docker_routing = sys.argv[5]

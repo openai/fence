@@ -169,11 +169,13 @@ const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
-const REQUIRED_RESIDENT_WORKERS: [&str; 5] = [
+const HOSTNAME_REFRESH_WORKER: &str = "hostname_refresh";
+const REQUIRED_RESIDENT_WORKERS: [&str; 6] = [
     "docker_tcp_dns",
     "docker_udp_dns",
     "host_tcp_dns",
     "host_udp_dns",
+    HOSTNAME_REFRESH_WORKER,
     ATTRIBUTION_WORKER_NAME,
 ];
 
@@ -216,16 +218,24 @@ struct ResidentWorkerSupervisor {
     disconnected_reported: bool,
 }
 
-fn initial_resident_health(docker_available: bool) -> ResidentHealth {
+fn required_resident_workers(
+    mode: Mode,
+    docker_available: bool,
+) -> impl Iterator<Item = &'static str> {
+    REQUIRED_RESIDENT_WORKERS.into_iter().filter(move |&name| {
+        (docker_available || !name.starts_with("docker_"))
+            && (mode == Mode::Block || name != HOSTNAME_REFRESH_WORKER)
+    })
+}
+
+fn initial_resident_health(mode: Mode, docker_available: bool) -> ResidentHealth {
     ResidentHealth {
         status: "starting",
         resident_pid: std::process::id(),
         verification_sequence: 0,
         last_successful_verification_unix_milliseconds: 0,
         verification_interval_seconds: RESIDENT_VERIFICATION_INTERVAL.as_secs(),
-        workers: REQUIRED_RESIDENT_WORKERS
-            .into_iter()
-            .filter(|name| docker_available || !name.starts_with("docker_"))
+        workers: required_resident_workers(mode, docker_available)
             .map(|name| ResidentWorkerHealth {
                 name,
                 status: "starting",
@@ -253,12 +263,10 @@ fn advance_resident_health(
 }
 
 impl ResidentWorkerSupervisor {
-    fn new(events: Receiver<ResidentWorkerEvent>, docker_available: bool) -> Self {
+    fn new(events: Receiver<ResidentWorkerEvent>, mode: Mode, docker_available: bool) -> Self {
         Self {
             events,
-            statuses: REQUIRED_RESIDENT_WORKERS
-                .into_iter()
-                .filter(|worker| docker_available || !worker.starts_with("docker_"))
+            statuses: required_resident_workers(mode, docker_available)
                 .map(|worker| (worker, "starting"))
                 .collect(),
             disconnected_reported: false,
@@ -2221,6 +2229,7 @@ pub struct DnsMediationSession {
     resident_health: Arc<Mutex<ResidentHealth>>,
     supervisor: ResidentWorkerSupervisor,
     attribution: AttributionCoordinator,
+    hostname_refresh: Option<HostnameRefresh>,
     stop_workers: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -2229,6 +2238,7 @@ struct DnsProxyRuntime {
     threads: Vec<JoinHandle<()>>,
     supervisor: ResidentWorkerSupervisor,
     attribution: AttributionCoordinator,
+    hostname_refresh: Option<HostnameRefresh>,
 }
 
 impl DnsMediationSession {
@@ -2254,7 +2264,10 @@ impl DnsMediationSession {
                 .map_err(|error| DnsMediationError::new(error.code, error.message))?,
         );
         let report_path = runtime_directory.join("dns-report.json");
-        let resident_health = Arc::new(Mutex::new(initial_resident_health(mediate_docker)));
+        let resident_health = Arc::new(Mutex::new(initial_resident_health(
+            scope.mode(),
+            mediate_docker,
+        )));
         let stop_workers = Arc::new(AtomicBool::new(false));
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
@@ -2291,6 +2304,7 @@ impl DnsMediationSession {
             mut threads,
             mut supervisor,
             attribution,
+            hostname_refresh,
         } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers), mediate_docker)?;
         if let Err(error) = supervisor.wait_for_startup() {
             shutdown_dns_workers(&stop_workers, &mut threads);
@@ -2324,6 +2338,7 @@ impl DnsMediationSession {
             resident_health,
             supervisor,
             attribution,
+            hostname_refresh,
             stop_workers,
             threads,
         })
@@ -2852,8 +2867,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
 
 struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     _mediation: DnsMediationSession,
-    materialization_requests: Receiver<MaterializationRequest>,
-    pending_materialization_request: Option<MaterializationRequest>,
+    dns_work: BlockDnsWork,
     backend: NativeNftBackend<SystemNftExecutor>,
     lockdown: SystemLockdownControl,
     reader: NflogReader,
@@ -2865,7 +2879,6 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
     scope: DnsBlockRuntimeScope,
-    next_hostname_refresh: BTreeMap<String, Duration>,
     next_verification: Duration,
 }
 
@@ -3068,12 +3081,18 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
         mediation.routing.provisional.committed = true;
         lockdown.commit_no_restore();
-        let next_hostname_refresh =
-            hostname_refresh_schedule(&hostname_policy, &active, Duration::ZERO);
+        let dns_work = BlockDnsWork {
+            materialization_requests,
+            pending_request: None,
+            refresh: mediation
+                .hostname_refresh
+                .take()
+                .expect("block mode supervises hostname refresh"),
+            next_refresh: hostname_refresh_schedule(&hostname_policy, &active, Instant::now()),
+        };
         Ok(Self {
             _mediation: mediation,
-            materialization_requests,
-            pending_materialization_request: None,
+            dns_work,
             backend,
             lockdown,
             reader,
@@ -3085,7 +3104,6 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             evidence,
             findings: FindingCollection::empty(),
             scope,
-            next_hostname_refresh,
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
         })
     }
@@ -3095,7 +3113,6 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         elapsed: Duration,
         finding_timeout: Duration,
     ) -> Result<bool, DnsMediationError> {
-        let poll_started = Instant::now();
         let mut changed = false;
         for failure in self._mediation.drain_worker_failures() {
             let _worker = failure.worker;
@@ -3142,42 +3159,24 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
 
         let mut root_refresh_error = None;
         let mut refresh_materializations = BTreeSet::new();
-        let due_hostname = next_due_hostname_refresh(&self.next_hostname_refresh, elapsed);
-        if let Some(hostname) = due_hostname {
-            let entry = self
-                ._mediation
-                .recorder
-                .hostname_policy
-                .exact_entry(&hostname)
-                .expect("refresh schedule contains only exact policy hostnames")
-                .clone();
-            match prehydrate_exact_hostname(&entry, &self._mediation.recorder.hostname_policy) {
-                Ok(materializations) => {
-                    let refresh_interval = hostname_refresh_interval(&entry, &materializations);
-                    let completed_elapsed = elapsed.saturating_add(poll_started.elapsed());
-                    refresh_materializations.extend(materializations);
-                    self.next_hostname_refresh
-                        .insert(hostname, completed_elapsed.saturating_add(refresh_interval));
-                }
+        let (requests, refresh) = self.dns_work.poll(Instant::now());
+        let refresh_hostname = refresh.map(|(hostname, refresh)| {
+            match refresh {
+                Ok(materializations) => refresh_materializations.extend(materializations),
                 Err(error) => {
                     if matches!(error, PrehydrationError::Transient(_)) {
                         self.evidence.hostname_refresh_warnings =
                             self.evidence.hostname_refresh_warnings.saturating_add(1);
                         self._mediation.recorder.record_hostname_refresh_warning();
                     }
-                    let completed_elapsed = elapsed.saturating_add(poll_started.elapsed());
-                    self.next_hostname_refresh.insert(
-                        hostname,
-                        completed_elapsed.saturating_add(DNS_PROFILE_REFRESH_INTERVAL),
-                    );
                     root_refresh_error = Some(error);
                 }
             };
             changed = true;
-        }
+            hostname
+        });
 
         let refresh_attempted = !refresh_materializations.is_empty();
-        let requests = self.collect_materialization_requests();
         let batch_started = Instant::now();
         let mut authorizations = self
             ._mediation
@@ -3247,10 +3246,24 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         // the owner never waits for that worker to write to the client.
         if update_result.is_ok() {
             complete_materialization_requests(accepted_requests.drain(..), |request| {
-                request.verified_answer_lifetime(&authorizations, &self.active)
+                self.dns_work.observe_committed_answer(
+                    request,
+                    &authorizations,
+                    &self.active,
+                    Instant::now(),
+                )
             });
         }
         drop(authorizations);
+        if let Some(hostname) = refresh_hostname {
+            self.dns_work.schedule_after_refresh(
+                hostname,
+                &self._mediation.recorder.hostname_policy,
+                &self.active,
+                root_refresh_error.is_some(),
+                Instant::now(),
+            );
+        }
 
         if rejected_request_count > 0 {
             for (_, reason) in &rejected_requests {
@@ -3427,30 +3440,6 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         Ok(more_findings_pending)
     }
 
-    fn collect_materialization_requests(&mut self) -> Vec<MaterializationRequest> {
-        let mut requests = Vec::new();
-        if let Some(request) = self.pending_materialization_request.take() {
-            requests.push(request);
-        }
-        while requests.len() < MATERIALIZATION_REQUEST_QUEUE_CAPACITY {
-            match self.materialization_requests.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
-        }
-
-        requests
-    }
-
-    fn wait_for_materialization_or_housekeeping(&mut self, timeout: Duration) {
-        if self.pending_materialization_request.is_some() {
-            return;
-        }
-        if let Ok(request) = self.materialization_requests.recv_timeout(timeout) {
-            self.pending_materialization_request = Some(request);
-        }
-    }
-
     fn record_critical(&mut self, code: &'static str, message: &'static str) {
         self._mediation.mark_resident_critical();
         self.evidence.resident_health = self._mediation.resident_health();
@@ -3560,7 +3549,9 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             let start = Instant::now();
             loop {
                 if !session.poll_once(start.elapsed(), Duration::ZERO)? {
-                    session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+                    session
+                        .dns_work
+                        .wait_for_materialization(RESIDENT_IDLE_INTERVAL);
                 }
             }
         }
@@ -3631,7 +3622,9 @@ pub fn run_selected_profile_runtime_test_service(
     let start = Instant::now();
     loop {
         if !session.poll_once(start.elapsed(), Duration::ZERO)? {
-            session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+            session
+                .dns_work
+                .wait_for_materialization(RESIDENT_IDLE_INTERVAL);
         }
     }
 }
@@ -4128,17 +4121,6 @@ where
     }
 }
 
-fn prehydrate_exact_hostname(
-    entry: &ExactHostnamePolicy,
-    hostname_policy: &RuntimeHostnamePolicy,
-) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
-    prehydrate_exact_hostname_with_query(
-        entry,
-        hostname_policy,
-        query_fixed_upstream_for_prehydration,
-    )
-}
-
 fn prehydrate_exact_hostname_with_query<F>(
     entry: &ExactHostnamePolicy,
     hostname_policy: &RuntimeHostnamePolicy,
@@ -4165,67 +4147,212 @@ where
     Ok(materializations)
 }
 
+type HostnameRefreshResult = Result<Vec<PendingMaterialization>, PrehydrationError>;
+
+struct BlockDnsWork {
+    materialization_requests: Receiver<MaterializationRequest>,
+    pending_request: Option<MaterializationRequest>,
+    refresh: HostnameRefresh,
+    next_refresh: BTreeMap<String, Instant>,
+}
+
+impl BlockDnsWork {
+    fn poll(
+        &mut self,
+        now: Instant,
+    ) -> (
+        Vec<MaterializationRequest>,
+        Option<(String, HostnameRefreshResult)>,
+    ) {
+        // Finish a ready refresh in its own transaction. Leave live requests queued: the
+        // resident's subsequent wait returns immediately for a pending or queued request.
+        if let Some(refresh) = self.refresh.poll(&self.next_refresh, now) {
+            return (Vec::new(), Some(refresh));
+        }
+        let requests = self
+            .pending_request
+            .take()
+            .into_iter()
+            .chain(self.materialization_requests.try_iter())
+            .take(MATERIALIZATION_REQUEST_QUEUE_CAPACITY)
+            .collect();
+        (requests, None)
+    }
+
+    fn schedule_after_refresh(
+        &mut self,
+        hostname: String,
+        policy: &RuntimeHostnamePolicy,
+        active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+        lookup_failed: bool,
+        now: Instant,
+    ) {
+        // Use the earliest remaining verified coverage across both families, including when
+        // the refresh was superseded or could not fit. Never schedule from a rejected answer.
+        let entry = policy
+            .exact_entry(&hostname)
+            .expect("refresh requires an exact policy hostname");
+        let mut interval = hostname_refresh_interval_from_active(entry, active, now);
+        if lookup_failed {
+            interval = interval.min(DNS_PROFILE_REFRESH_INTERVAL);
+        }
+        self.next_refresh.insert(hostname, now + interval);
+    }
+
+    fn observe_committed_answer(
+        &mut self,
+        request: &MaterializationRequest,
+        authorizations: &CnameAuthorizationState,
+        active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+        now: Instant,
+    ) -> Option<VerifiedAnswerLifetime> {
+        let lifetime = request.verified_answer_lifetime(authorizations, active)?;
+        // A shorter user grant can bring the next lookup forward even if the refresh just
+        // finished. A longer one cannot postpone another family's earlier refresh.
+        // Validated answers have at least one address, all of the question family.
+        let grant = &request.response.materializations[0];
+        if !grant.origins.contains(&HostnamePolicyOrigin::Platform)
+            && let Some(due) = self.next_refresh.get_mut(&request.queried_hostname)
+        {
+            let ttl = lifetime.cache_until.saturating_duration_since(now);
+            *due = (*due).min(now + user_hostname_refresh_interval(ttl.as_secs()));
+        }
+        if let Some((hostname, superseded)) = &mut self.refresh.in_flight
+            && *hostname == request.queried_hostname
+        {
+            superseded[usize::from(grant.address.is_ipv6())] = true;
+        }
+        Some(lifetime)
+    }
+
+    fn wait_for_materialization(&mut self, timeout: Duration) {
+        if self.pending_request.is_none() {
+            self.pending_request = self.materialization_requests.recv_timeout(timeout).ok();
+        }
+    }
+}
+
+struct HostnameRefresh {
+    requests: SyncSender<String>,
+    results: Receiver<HostnameRefreshResult>,
+    // At most one lookup, with independent supersession for its A and AAAA answers.
+    in_flight: Option<(String, [bool; 2])>,
+}
+
+impl HostnameRefresh {
+    fn start(
+        policy: RuntimeHostnamePolicy,
+        stop: Arc<AtomicBool>,
+        events: SyncSender<ResidentWorkerEvent>,
+        mut query: impl FnMut(&str, u16) -> Result<Vec<u8>, PrehydrationQueryError> + Send + 'static,
+    ) -> Result<(Self, JoinHandle<()>), DnsMediationError> {
+        let (requests, work) = mpsc::sync_channel::<String>(1);
+        let (completed, results) = mpsc::sync_channel(1);
+        let thread = spawn_supervised_worker(HOSTNAME_REFRESH_WORKER, stop, events, move |stop| {
+            while !stop.load(Ordering::Relaxed) {
+                match work.recv_timeout(RESIDENT_IDLE_INTERVAL) {
+                    Ok(hostname) => {
+                        let entry = policy
+                            .exact_entry(&hostname)
+                            .expect("refresh requires an exact policy hostname");
+                        let result =
+                            prehydrate_exact_hostname_with_query(entry, &policy, &mut query);
+                        if completed.try_send(result).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            Ok(())
+        })?;
+        Ok((
+            Self {
+                requests,
+                results,
+                in_flight: None,
+            },
+            thread,
+        ))
+    }
+
+    fn poll(
+        &mut self,
+        schedule: &BTreeMap<String, Instant>,
+        now: Instant,
+    ) -> Option<(String, HostnameRefreshResult)> {
+        if let Some((hostname, superseded)) = &mut self.in_flight {
+            let result = self.results.try_recv().ok()?;
+            let result = result.map(|mut grants| {
+                grants.retain(|grant| !superseded[usize::from(grant.address.is_ipv6())]);
+                grants
+            });
+            let hostname = std::mem::take(hostname);
+            self.in_flight = None;
+            return Some((hostname, result));
+        }
+
+        // Only the resident issues work, with at most one lookup or unconsumed result.
+        // Worker exit is reported by the same required-worker supervisor as the DNS listeners.
+        if let Some(hostname) = next_due_hostname_refresh(schedule, now)
+            && self.requests.try_send(hostname.clone()).is_ok()
+        {
+            self.in_flight = Some((hostname, [false; 2]));
+        }
+        None
+    }
+}
+
 fn hostname_refresh_schedule(
     hostname_policy: &RuntimeHostnamePolicy,
     active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
-    elapsed: Duration,
-) -> BTreeMap<String, Duration> {
+    now: Instant,
+) -> BTreeMap<String, Instant> {
     hostname_policy
         .exact
         .iter()
         .map(|entry| {
             (
                 entry.hostname.clone(),
-                elapsed + hostname_refresh_interval_from_active(entry, active),
+                now + hostname_refresh_interval_from_active(entry, active, now),
             )
         })
         .collect()
 }
 
-fn next_due_hostname_refresh(
-    schedule: &BTreeMap<String, Duration>,
-    elapsed: Duration,
-) -> Option<String> {
+fn next_due_hostname_refresh(schedule: &BTreeMap<String, Instant>, now: Instant) -> Option<String> {
     schedule
         .iter()
-        .filter(|(_, due)| **due <= elapsed)
+        .filter(|(_, due)| **due <= now)
         .min_by_key(|(_, due)| **due)
         .map(|(hostname, _)| hostname.clone())
-}
-
-fn hostname_refresh_interval(
-    entry: &ExactHostnamePolicy,
-    materializations: &[PendingMaterialization],
-) -> Duration {
-    if entry.origins.contains(&HostnamePolicyOrigin::Platform) {
-        return DNS_PROFILE_REFRESH_INTERVAL;
-    }
-    let minimum_ttl = materializations
-        .iter()
-        .map(|materialization| materialization.ttl_seconds)
-        .min()
-        .unwrap_or(1);
-    user_hostname_refresh_interval(minimum_ttl)
 }
 
 fn hostname_refresh_interval_from_active(
     entry: &ExactHostnamePolicy,
     active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    now: Instant,
 ) -> Duration {
     if entry.origins.contains(&HostnamePolicyOrigin::Platform) {
         return DNS_PROFILE_REFRESH_INTERVAL;
     }
-    let minimum_ttl = active
+    // A short-lived answer can enter its overlap while we wait for the other family.
+    // We cannot tell it from a rotated-out address here. Refresh early until that
+    // grant expires; never let an older, longer-lived address postpone its renewal.
+    let ttl = active
         .values()
-        .filter(|materialization| materialization.source_hostname == entry.hostname)
-        .map(|materialization| materialization.observed_ttl_seconds)
+        .filter(|grant| grant.source_hostname == entry.hostname)
+        .map(|grant| {
+            (grant.expires_at - DNS_MATERIALIZATION_REFRESH_OVERLAP).saturating_duration_since(now)
+        })
         .min()
-        .unwrap_or(1);
-    user_hostname_refresh_interval(minimum_ttl)
+        .unwrap_or_default();
+    user_hostname_refresh_interval(ttl.as_secs())
 }
 
-fn user_hostname_refresh_interval(ttl_seconds: u32) -> Duration {
-    let half_ttl = u64::from(ttl_seconds).div_ceil(2).max(1);
+fn user_hostname_refresh_interval(ttl_seconds: u64) -> Duration {
+    let half_ttl = ttl_seconds.div_ceil(2).max(1);
     Duration::from_secs(half_ttl).min(MAX_USER_HOSTNAME_REFRESH_INTERVAL)
 }
 
@@ -4687,7 +4814,7 @@ fn merge_materializations(
 
 fn complete_materialization_requests(
     requests: impl IntoIterator<Item = MaterializationRequest>,
-    verified_lifetime: impl Fn(&MaterializationRequest) -> Option<VerifiedAnswerLifetime>,
+    mut verified_lifetime: impl FnMut(&MaterializationRequest) -> Option<VerifiedAnswerLifetime>,
 ) {
     for request in requests {
         let completion = verified_lifetime(&request).map_or(
@@ -4939,11 +5066,26 @@ fn start_dns_proxy(
             return Err(error);
         }
     }
+    let mode = recorder.scope.mode();
+    let hostname_refresh = if mode == Mode::Block {
+        let (refresh, thread) = HostnameRefresh::start(
+            recorder.hostname_policy,
+            Arc::clone(&stop),
+            events.clone(),
+            query_fixed_upstream_for_prehydration,
+        )
+        .inspect_err(|_| shutdown_dns_workers(&stop, &mut threads))?;
+        threads.push(thread);
+        Some(refresh)
+    } else {
+        None
+    };
     drop(events);
     Ok(DnsProxyRuntime {
         threads,
-        supervisor: ResidentWorkerSupervisor::new(receiver, docker_available),
+        supervisor: ResidentWorkerSupervisor::new(receiver, mode, docker_available),
         attribution,
+        hostname_refresh,
     })
 }
 
@@ -6716,7 +6858,10 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
-        &initial_resident_health(scope.lockdown_posture() != LockdownPosture::StandardBlock),
+        &initial_resident_health(
+            scope.mode(),
+            scope.lockdown_posture() != LockdownPosture::StandardBlock,
+        ),
     )
 }
 
@@ -7264,6 +7409,7 @@ mod tests {
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
             resident_health: Arc::new(Mutex::new(initial_resident_health(
+                scope.mode(),
                 scope.lockdown_posture() != LockdownPosture::StandardBlock,
             ))),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -7659,6 +7805,7 @@ mod tests {
     fn stage_and_complete_test_request(
         recorder: &ObservationRecorder,
         request: MaterializationRequest,
+        mut dns_work: Option<&mut BlockDnsWork>,
     ) {
         let (failed_completion, failed_result) = mpsc::sync_channel(1);
         let failed_request = MaterializationRequest {
@@ -7728,8 +7875,11 @@ mod tests {
         .unwrap();
         assert!(!authorizations.active.is_empty());
         assert!(!active.is_empty());
-        complete_materialization_requests(accepted, |request| {
-            request.verified_answer_lifetime(&authorizations, &active)
+        complete_materialization_requests(accepted, |request| match &mut dns_work {
+            Some(work) => {
+                work.observe_committed_answer(request, &authorizations, &active, Instant::now())
+            }
+            None => request.verified_answer_lifetime(&authorizations, &active),
         });
     }
 
@@ -8583,7 +8733,7 @@ mod tests {
                 .iter()
                 .all(|materialization| { materialization.origins == [HostnamePolicyOrigin::User] })
         );
-        stage_and_complete_test_request(&recorder, request);
+        stage_and_complete_test_request(&recorder, request, None);
         assert!(matches!(
             caller.join().unwrap(),
             DnsResponseDisposition::LimitAnswerTtls { .. }
@@ -9233,6 +9383,7 @@ mod tests {
 
     #[test]
     fn exact_hostname_refresh_intervals_are_origin_and_ttl_aware() {
+        let now = Instant::now();
         let platform = ExactHostnamePolicy {
             hostname: "github.com".to_owned(),
             origins: vec![HostnamePolicyOrigin::Platform],
@@ -9257,59 +9408,419 @@ mod tests {
             port: 8443,
             origins: vec![HostnamePolicyOrigin::User],
             ttl_seconds,
-            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl_seconds)),
+            expires_at: now + Duration::from_secs(u64::from(ttl_seconds)),
         };
+        let mut active = BTreeMap::new();
+        merge_materializations(&mut active, [materialization(300)], now);
 
         assert_eq!(
-            hostname_refresh_interval(&platform, &[materialization(300)]),
+            hostname_refresh_interval_from_active(&platform, &active, now),
             Duration::from_secs(5)
         );
         assert_eq!(
-            hostname_refresh_interval(&user, &[materialization(300)]),
+            hostname_refresh_interval_from_active(&user, &active, now),
             Duration::from_secs(60)
         );
+        let later = now + Duration::from_secs(291);
         assert_eq!(
-            hostname_refresh_interval(&user, &[materialization(9)]),
+            hostname_refresh_interval_from_active(&user, &active, later),
             Duration::from_secs(5)
         );
-        assert_eq!(user_hostname_refresh_interval(1), Duration::from_secs(1));
+
+        // A new one-second A answer sits behind a slow AAAA query. The old A address
+        // has a long TTL; it must not postpone renewal of the address we just received.
+        let completed = now + Duration::from_secs(2);
+        let new = PendingMaterialization {
+            address: "192.0.2.20".parse().unwrap(),
+            ..materialization(1)
+        };
+        merge_materializations(&mut active, [new], completed);
+        assert_eq!(
+            hostname_refresh_interval_from_active(&user, &active, completed),
+            Duration::from_secs(1)
+        );
+        let after_overlap = completed + DNS_MATERIALIZATION_REFRESH_OVERLAP;
+        merge_materializations(&mut active, [], after_overlap);
+        assert_eq!(
+            hostname_refresh_interval_from_active(&user, &active, after_overlap),
+            MAX_USER_HOSTNAME_REFRESH_INTERVAL,
+        );
     }
 
     #[test]
     fn due_hostname_refreshes_prioritize_deadlines_without_starving_platform_roots() {
+        let now = Instant::now();
+        let sooner = now + Duration::from_secs(1);
+        let later = now + Duration::from_secs(5);
         let mut schedule = BTreeMap::from([
-            ("a.example.com".to_owned(), Duration::from_secs(5)),
-            ("github.com".to_owned(), Duration::from_secs(1)),
-            ("z.example.com".to_owned(), Duration::from_secs(1)),
+            ("a.example.com".to_owned(), later),
+            ("github.com".to_owned(), sooner),
+            ("z.example.com".to_owned(), sooner),
         ]);
 
-        assert_eq!(next_due_hostname_refresh(&schedule, Duration::ZERO), None);
+        assert_eq!(next_due_hostname_refresh(&schedule, now), None);
         assert_eq!(
-            next_due_hostname_refresh(&schedule, Duration::from_secs(1)),
+            next_due_hostname_refresh(&schedule, sooner),
             Some("github.com".to_owned())
         );
         assert_eq!(
-            next_due_hostname_refresh(&schedule, Duration::from_secs(5)),
+            next_due_hostname_refresh(&schedule, later),
             Some("github.com".to_owned())
         );
 
-        schedule.insert("a.example.com".to_owned(), Duration::from_secs(1));
-        schedule.insert("github.com".to_owned(), Duration::from_secs(5));
-        schedule.insert("z.example.com".to_owned(), Duration::from_secs(5));
+        schedule.insert("a.example.com".to_owned(), sooner);
+        schedule.insert("github.com".to_owned(), later);
+        schedule.insert("z.example.com".to_owned(), later);
         assert_eq!(
-            next_due_hostname_refresh(&schedule, Duration::from_secs(5)),
+            next_due_hostname_refresh(&schedule, later),
             Some("a.example.com".to_owned())
         );
 
-        let completed_elapsed = Duration::from_secs(7);
+        let completed = now + Duration::from_secs(7);
         schedule.insert(
             "a.example.com".to_owned(),
-            completed_elapsed.saturating_add(user_hostname_refresh_interval(1)),
+            completed + user_hostname_refresh_interval(1),
         );
         assert_eq!(
-            next_due_hostname_refresh(&schedule, completed_elapsed),
+            next_due_hostname_refresh(&schedule, completed),
             Some("github.com".to_owned())
         );
+    }
+
+    fn in_flight_test_refresh(
+        now: Instant,
+    ) -> (
+        BlockDnsWork,
+        SyncSender<HostnameRefreshResult>,
+        RuntimeHostnamePolicy,
+    ) {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"user-host","allowlist":[{"destination_type":"hostname","destination":"example.com","protocol":"tcp","port":443}]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (_submitter, materialization_requests) = materialization_request_channel();
+        let (requests, lookups) = mpsc::sync_channel(1);
+        let (completed, results) = mpsc::sync_channel(1);
+        let mut work = BlockDnsWork {
+            materialization_requests,
+            pending_request: None,
+            refresh: HostnameRefresh {
+                requests,
+                results,
+                in_flight: None,
+            },
+            next_refresh: BTreeMap::from([("example.com".to_owned(), now)]),
+        };
+        let (requests, refresh) = work.poll(now);
+        assert!(requests.is_empty() && refresh.is_none());
+        assert_eq!(lookups.try_recv().unwrap(), "example.com");
+        (work, completed, policy)
+    }
+
+    fn refresh_test_request(
+        address: IpAddr,
+        ttl: u32,
+        now: Instant,
+        policy: &RuntimeHostnamePolicy,
+    ) -> (MaterializationRequest, Receiver<MaterializationCompletion>) {
+        let (completion, result) = mpsc::sync_channel(1);
+        let request = MaterializationRequest {
+            queried_hostname: "example.com".to_owned(),
+            response: direct_test_validated_response("example.com", address, ttl, now, policy),
+            completion,
+        };
+        (request, result)
+    }
+
+    #[test]
+    fn a_foreground_rotation_rejected_at_capacity_does_not_postpone_refresh() {
+        let now = Instant::now();
+        let (mut work, completed, policy) = in_flight_test_refresh(now);
+        let request =
+            |octet, ttl| refresh_test_request(IpAddr::from([192, 0, 2, octet]), ttl, now, &policy);
+        let current = request(10, 1).0.response.materializations.pop().unwrap();
+        let mut active = BTreeMap::new();
+        let filler = (1..MAX_ACTIVE_MATERIALIZATIONS).map(|i| PendingMaterialization {
+            source_hostname: format!("occupied-{i}.example"),
+            ..current.clone()
+        });
+        merge_materializations(
+            &mut active,
+            std::iter::once(current.clone()).chain(filler),
+            now,
+        );
+
+        // The client arrives while the refresh is in flight, but its new address cannot fit.
+        let (rotation, result) = request(20, 120);
+        work.pending_request = Some(rotation);
+        let (requests, refresh) = work.poll(now);
+        assert_eq!(requests.len(), 1);
+        assert!(refresh.is_none());
+        let mut authorizations = CnameAuthorizationState::default();
+        let (staged, grants, accepted, rejected, _) = stage_materialization_transactions(
+            &authorizations,
+            &policy,
+            BTreeSet::new(),
+            requests,
+            now,
+        );
+        assert!(rejected.is_empty());
+        let mut candidate = active.clone();
+        merge_materializations(&mut candidate, grants, now);
+        let allowances = effective_allowances_with_materializations(&[], &candidate);
+        let at_capacity = materialization_candidate_exceeds_bounds(&candidate, &allowances);
+        assert!(at_capacity);
+        let unchanged = active.clone();
+        assert_eq!(
+            publish_verified_materialization_transaction(
+                true,
+                at_capacity,
+                &mut authorizations,
+                &mut active,
+                staged,
+                unchanged,
+            ),
+            Err(MaterializationRejectionReason::Capacity)
+        );
+        complete_materialization_requests(accepted, |_| None);
+        assert_eq!(
+            result.try_recv().unwrap(),
+            MaterializationCompletion::Failed
+        );
+
+        // Renew the existing address, even if another rotation is already queued. It gets the
+        // very next owner turn, not a combined transaction that rejects the useful renewal too.
+        let renewal = request(10, 9).0.response;
+        let expected_expiry = renewal.valid_until.unwrap() + DNS_MATERIALIZATION_REFRESH_OVERLAP;
+        completed.send(Ok(renewal.materializations)).unwrap();
+        work.pending_request = Some(request(20, 120).0);
+        let (requests, refresh) = work.poll(now);
+        assert!(
+            requests.is_empty(),
+            "a ready refresh must have its own transaction"
+        );
+        let (hostname, grants) = refresh.unwrap();
+        let merge = merge_materializations(&mut active, grants.unwrap(), now);
+        assert!(merge.metadata_changed && !merge.rules_changed);
+        assert_eq!(active[&current.active_key()].expires_at, expected_expiry);
+        work.schedule_after_refresh(hostname, &policy, &active, false, now);
+        assert_eq!(
+            work.next_refresh["example.com"],
+            now + Duration::from_secs(5)
+        );
+        work.wait_for_materialization(Duration::ZERO);
+        let (requests, refresh) = work.poll(now);
+        assert_eq!(requests.len(), 1);
+        assert!(refresh.is_none());
+    }
+
+    #[test]
+    fn committed_answers_supersede_only_their_family_and_keep_the_shorter_refresh_deadline() {
+        let now = Instant::now();
+        let v4 = IpAddr::from([192, 0, 2, 10]);
+        let v6 = "2001:db8::10".parse().unwrap();
+        for (live, other) in [(v4, v6), (v6, v4)] {
+            for (live_ttl, other_ttl) in [(120, 1), (1, 120)] {
+                let (mut work, completed, policy) = in_flight_test_refresh(now);
+                let request = refresh_test_request(live, live_ttl, now, &policy).0;
+                let committed = request.response.materializations[0].clone();
+                let mut active = BTreeMap::new();
+                merge_materializations(&mut active, [committed.clone()], now);
+                let lifetime = work
+                    .observe_committed_answer(
+                        &request,
+                        &CnameAuthorizationState::default(),
+                        &active,
+                        now,
+                    )
+                    .unwrap();
+                assert_eq!(lifetime.cache_until, committed.expires_at);
+
+                let response = |address, ttl| {
+                    direct_test_validated_response("example.com", address, ttl, now, &policy)
+                };
+                let mut background = response(live, 300).materializations;
+                background.extend(response(other, other_ttl).materializations);
+                completed.send(Ok(background)).unwrap();
+                let (_, refresh) = work.poll(now);
+                let (hostname, grants) = refresh.unwrap();
+                let [renewal]: [PendingMaterialization; 1] = grants.unwrap().try_into().unwrap();
+                assert_eq!(renewal.address, other);
+                merge_materializations(&mut active, [renewal], now);
+                assert_eq!(
+                    active[&committed.active_key()].expires_at,
+                    lifetime.covered_until
+                );
+                work.schedule_after_refresh(hostname, &policy, &active, false, now);
+                assert_eq!(
+                    work.next_refresh["example.com"],
+                    now + Duration::from_secs(1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_foreground_grant_brings_forward_even_a_just_completed_refresh() {
+        let now = Instant::now();
+        let address = IpAddr::from([192, 0, 2, 10]);
+        let (mut work, completed, policy) = in_flight_test_refresh(now);
+        let request = |ttl| refresh_test_request(address, ttl, now, &policy).0;
+        completed
+            .send(Ok(request(120).response.materializations))
+            .unwrap();
+        let (_, refresh) = work.poll(now);
+        let (hostname, grants) = refresh.unwrap();
+        let mut active = BTreeMap::new();
+        merge_materializations(&mut active, grants.unwrap(), now);
+        work.schedule_after_refresh(hostname, &policy, &active, false, now);
+        assert_eq!(
+            work.next_refresh["example.com"],
+            now + Duration::from_secs(60)
+        );
+
+        // A nine-second answer spent eight seconds in the queue. Refresh in one second;
+        // neither the scheduling delay nor a subsequent longer grant may restart its TTL.
+        let committed_at = now + Duration::from_secs(8);
+        for ttl in [9, 120] {
+            let request = request(ttl);
+            merge_materializations(
+                &mut active,
+                request.response.materializations.clone(),
+                committed_at,
+            );
+            work.observe_committed_answer(
+                &request,
+                &CnameAuthorizationState::default(),
+                &active,
+                committed_at,
+            )
+            .unwrap();
+            assert_eq!(
+                work.next_refresh["example.com"],
+                committed_at + Duration::from_secs(1)
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_transaction_completes_while_older_hostname_refresh_is_blocked() {
+        const ROOT: &str = "github.com";
+        const TARGET: &str = "edge.example";
+        const ADDRESS: &[u8] = &[192, 0, 2, 10];
+        for (live_hostname, corrupt_refresh) in
+            [(ROOT, false), (ROOT, true), ("api.github.com", false)]
+        {
+            let policy = test_hostname_policy(false);
+            let stop = Arc::new(AtomicBool::new(false));
+            let (events, _events) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+            let (entered, refresh_blocked) = mpsc::sync_channel(0);
+            let (release, resume) = mpsc::sync_channel(0);
+            let (refresh, worker) = HostnameRefresh::start(
+                policy.clone(),
+                stop.clone(),
+                events,
+                move |hostname, qtype| {
+                    assert_eq!(hostname, ROOT);
+                    if qtype == 1 {
+                        return Ok(response_with_cname_and_address(
+                            ROOT, TARGET, 300, 300, ADDRESS,
+                        ));
+                    }
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                    Ok(if corrupt_refresh {
+                        Vec::new()
+                    } else {
+                        response_with_cname_for_type(ROOT, qtype, TARGET, 300)
+                    })
+                },
+            )
+            .unwrap();
+            let (submitter, materialization_requests) = materialization_request_channel();
+            let mut work = BlockDnsWork {
+                materialization_requests,
+                pending_request: None,
+                refresh,
+                next_refresh: BTreeMap::from([(ROOT.to_owned(), Instant::now())]),
+            };
+            work.poll(Instant::now());
+            refresh_blocked.recv().unwrap();
+
+            // Exercise the resident's real wake, poll, staging and completion paths. The
+            // barrier, not a latency assertion, holds the older lookup until the client is done.
+            let (recorder, report_path) =
+                test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
+            let client = recorder.clone();
+            let caller = thread::spawn(move || {
+                client.record_response(
+                    live_hostname,
+                    1,
+                    &response_with_cname_and_address(live_hostname, TARGET, 10, 10, ADDRESS),
+                    None,
+                )
+            });
+            work.wait_for_materialization(RESIDENT_WORKER_START_TIMEOUT);
+            let (requests, refresh) = work.poll(Instant::now());
+            assert!(refresh.is_none());
+            let [request] = requests.try_into().unwrap();
+            let cache_until = request.response.valid_until.unwrap();
+            stage_and_complete_test_request(&recorder, request, Some(&mut work));
+            assert!(
+                matches!(caller.join().unwrap(), DnsResponseDisposition::LimitAnswerTtls { lifetime, .. }
+                if lifetime.cache_until == cache_until && lifetime.covered_until == cache_until)
+            );
+
+            // Stop after publishing the held result so the final poll is deterministic too.
+            stop.store(true, Ordering::Relaxed);
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            let (requests, refresh) = work.poll(Instant::now());
+            assert!(requests.is_empty());
+            let (hostname, refresh) = refresh.unwrap();
+            assert_eq!(hostname, ROOT);
+            if corrupt_refresh {
+                assert!(matches!(refresh, Err(PrehydrationError::Fatal(_))));
+            } else if live_hostname == ROOT {
+                assert!(
+                    refresh.unwrap().is_empty(),
+                    "the older refresh must not lengthen the live grant"
+                );
+            } else {
+                assert!(
+                    !refresh.unwrap().is_empty(),
+                    "an unrelated live answer must not suppress refresh"
+                );
+            }
+            fs::remove_file(report_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn hostname_refresh_worker_exit_is_reported_to_resident_supervision() {
+        let (events, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+        let (refresh, worker) = HostnameRefresh::start(
+            test_hostname_policy(false),
+            Arc::new(AtomicBool::new(false)),
+            events,
+            |_, _| unreachable!("no lookup was requested"),
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ResidentWorkerEvent::Started(HOSTNAME_REFRESH_WORKER)
+        ));
+        drop(refresh.requests);
+        worker.join().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ResidentWorkerEvent::Fatal {
+                worker: HOSTNAME_REFRESH_WORKER,
+                code: "resident_worker_exited",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -9535,7 +10046,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(Mode::Block, false))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: PathBuf::from("unused-test-report.json"),
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
@@ -9733,7 +10244,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert_eq!(evidence.runner_authorized_results_storage.len(), 4);
         assert!(
@@ -9866,7 +10377,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &artifact_policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert!(evidence.allow_github_artifacts);
         assert!(evidence.hostname_policy.allow_github_artifacts);
@@ -10458,7 +10969,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert_eq!(
             evidence.bounded_githubapp_suffix_authorizations.len(),
@@ -10489,7 +11000,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &CnameAuthorizationState::default(),
             &opt_out_policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert!(
             opt_out_evidence
@@ -10568,7 +11079,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert_eq!(
             evidence.bounded_user_wildcard_authorizations.len(),
@@ -14060,7 +14571,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(Mode::Audit, true))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: root.join("missing/report.json"),
             scope: DnsEvidenceScope::ProtectedHostAudit,
@@ -14076,7 +14587,7 @@ mod tests {
     #[test]
     fn resident_worker_supervisor_requires_all_workers_and_reports_fatal_exit() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, true);
         for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
@@ -14106,8 +14617,14 @@ mod tests {
     #[test]
     fn host_only_worker_supervision_omits_only_container_dns_workers() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver, false);
-        for worker in ["host_tcp_dns", "host_udp_dns", ATTRIBUTION_WORKER_NAME] {
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, false);
+        let required = [
+            "host_tcp_dns",
+            "host_udp_dns",
+            HOSTNAME_REFRESH_WORKER,
+            ATTRIBUTION_WORKER_NAME,
+        ];
+        for worker in required {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
         supervisor.wait_for_startup().unwrap();
@@ -14118,10 +14635,10 @@ mod tests {
                 .iter()
                 .map(|worker| worker.name)
                 .collect::<Vec<_>>(),
-            vec!["host_tcp_dns", "host_udp_dns", ATTRIBUTION_WORKER_NAME]
+            required
         );
         assert!(
-            initial_resident_health(false)
+            initial_resident_health(Mode::Block, false)
                 .workers
                 .iter()
                 .all(|worker| !worker.name.starts_with("docker_"))
@@ -14131,7 +14648,7 @@ mod tests {
     #[test]
     fn resident_worker_supervisor_reports_channel_disconnect_once() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, true);
         for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
@@ -14148,7 +14665,7 @@ mod tests {
         for panic_worker in [false, true] {
             let stop = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-            let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
+            let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, true);
             let worker = if panic_worker {
                 ATTRIBUTION_WORKER_NAME
             } else {
@@ -14181,7 +14698,7 @@ mod tests {
 
     #[test]
     fn resident_verification_sequence_and_timestamp_are_bounded() {
-        let mut health = initial_resident_health(true);
+        let mut health = initial_resident_health(Mode::Block, true);
         health.verification_sequence = u64::MAX;
         let workers = health
             .workers
