@@ -6,6 +6,8 @@ Start with the Fence job summary. It lists network activity, blocked destination
 
 Open the Fence setup step and look for `Fence could not verify readiness`. That error names the check the resident reported, when recognized, or says no recognized reason was available. It does not mean protection never started or that cleanup succeeded. Keep the job failed; don't use `continue-on-error` or weaken the policy to get past this check.
 
+If setup says `could not confirm whether the resident started`, Fence doesn't use the service journal to guess why: it could belong to an earlier failed launch. Run Fence only once per job.
+
 Check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22) for the affected version and a verified replacement pin, if available. A green run on a different runner doesn't mean your issue is fixed. Share the Fence version, runner image version, and error code if needed, not private job logs.
 
 Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Self-hosted runners, container jobs, and other architectures are not supported.

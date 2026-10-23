@@ -1308,7 +1308,7 @@ function activeActionMountEvidence(
   if (!path.isAbsolute(target) || path.normalize(target) !== target) {
     fail("Fence active Action mount target is invalid");
   }
-  const unavailable = "Fence active Action mount evidence is unavailable. Check the earlier Fence setup step. " +
+  const unavailable = "Fence active Action mount evidence is unavailable. Check the Fence setup step. " +
     "If it reported ready, the protected mount may have been removed; do not trust this job as protected.";
   let descriptor: number;
   try {

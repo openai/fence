@@ -2,7 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const childProcess = require("node:child_process");
 const log = require("./log.cts");
 const {
   ACTION_RUNTIME_FILES,
@@ -62,9 +62,9 @@ let runtimeDirectoryCreated = false;
 
 class ResidentReadinessError extends Error {}
 
-function emitError(error: unknown): void {
-  if (error instanceof ResidentReadinessError && launcherPaths) {
-    emitServiceDiagnostics(launcherPaths.unit, error.message);
+function emitError(error: unknown, unit: string | undefined): void {
+  if (error instanceof ResidentReadinessError && unit) {
+    emitServiceDiagnostics(unit, error.message);
     return;
   }
   const message = error instanceof Error ? error.message : String(error);
@@ -78,7 +78,7 @@ function run(
   ignoreStdout = false,
   timeout = CHILD_TIMEOUT_MS,
 ): void {
-  const result = spawnSync(executable, args, {
+  const result = childProcess.spawnSync(executable, args, {
     encoding: "utf8",
     env: CHILD_ENV,
     input,
@@ -101,7 +101,7 @@ function capture(
   args: string[],
   timeout = 2 * 1000,
 ): { status: number | null; stdout: string; error: boolean } {
-  const result = spawnSync(executable, args, {
+  const result = childProcess.spawnSync(executable, args, {
     encoding: "utf8",
     env: CHILD_ENV,
     killSignal: "SIGKILL",
@@ -309,6 +309,9 @@ function reportedStartupFailure(output: string): { code: string; reason: string 
   let reason: string;
   let detail: string | undefined;
   switch (code) {
+    case "unsupported_host_fingerprint":
+      reason = "the runner did not meet the required host security checks";
+      break;
     case "dns_proxy_bind_failed":
       reason = "a required DNS listener could not start";
       detail = dnsStartupDiagnosticFromJournal(output);
@@ -324,6 +327,15 @@ function reportedStartupFailure(output: string): { code: string; reason: string 
       reason = "local services and their socket owners could not be verified";
       detail = localControlDiagnosticFromJournal(output, code.slice("local_control_inventory_".length));
       break;
+    case "local_control_inventory_additive_drift":
+      reason = "the runner exposed an unreviewed privileged service, endpoint, or owner";
+      break;
+    case "local_control_inventory_unreviewed_reduction":
+      reason = "an expected local service endpoint or owner was missing";
+      break;
+    case "local_control_inventory_drift":
+      reason = "local services or their owners changed during setup";
+      break;
     case "lockdown_command_timeout":
     case "lockdown_command_output_too_large":
       reason = code === "lockdown_command_timeout" ? "a host verification command timed out" :
@@ -332,6 +344,19 @@ function reportedStartupFailure(output: string): { code: string; reason: string 
       break;
     case "dns_block_prehydration_failed":
       reason = "DNS rules for required hostnames could not be prepared";
+      break;
+    case "resident_worker_start_timeout":
+      reason = "a required background worker did not start in time";
+      break;
+    case "resident_worker_start_failed":
+      reason = "a required background worker could not start";
+      break;
+    case "resident_worker_unhealthy":
+      reason = "a required background worker did not report healthy";
+      break;
+    case "runner_worker_identity_unavailable":
+    case "runner_worker_identity_ambiguous":
+      reason = "the GitHub runner process could not be identified";
       break;
     default:
       return undefined;
@@ -563,6 +588,16 @@ function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
   ];
 }
 
+function launchResidentService(args: string[]): void {
+  serviceLaunchAttempted = true;
+  try {
+    run("/usr/bin/sudo", args);
+  } catch {
+    // The service may have started, but this unit's journal could belong to a previous failed launch.
+    throw new Error("could not confirm whether the resident started. Keep this job failed.");
+  }
+}
+
 function provisionalCleanupPreservationReason(
   status: ReturnType<typeof capture>,
   inspect: (name: "ready.json" | "dns-routing-owned") => { uid: number; mode: number; isFile(): boolean } | undefined,
@@ -763,13 +798,7 @@ function main(): void {
     `args=${serviceArgs.join(" ")}`,
     `child_timeout_ms=${CHILD_TIMEOUT_MS}`,
   ]);
-  serviceLaunchAttempted = true;
-  try {
-    run("/usr/bin/sudo", serviceArgs);
-  } catch {
-    // A failed or timed-out launch does not prove the service never ran.
-    throw new ResidentReadinessError("Fence could not confirm whether the resident service started");
-  }
+  launchResidentService(serviceArgs);
   const report = waitForReady(paths);
   readinessObserved = true;
   log.ready(report);
@@ -781,11 +810,11 @@ if (require.main === module) {
   } catch (error) {
     process.exitCode = 1;
     try {
-      emitError(error);
+      emitError(error, launcherPaths?.unit);
     } finally {
       cleanupLauncherBeforeReadiness();
     }
   }
 }
 
-module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, provisionalCleanupPreservationReason, residentServiceArgs, resolverLayoutDiagnosticFromJournal, run, terminalServiceStatus };
+module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, emitError, fenceErrorCodeFromJournal, launchResidentService, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, provisionalCleanupPreservationReason, residentServiceArgs, resolverLayoutDiagnosticFromJournal, run, terminalServiceStatus };

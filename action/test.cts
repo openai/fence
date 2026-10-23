@@ -49,7 +49,9 @@ const { postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settle
 const {
   dnsStartupDiagnosticFromJournal,
   emitCapturedServiceDiagnostics,
+  emitError,
   fenceErrorCodeFromJournal,
+  launchResidentService,
   localControlDiagnosticFromJournal,
   lockdownCommandDiagnosticFromJournal,
   provisionalCleanupPreservationReason,
@@ -1170,6 +1172,29 @@ test("failed launches permit cleanup only for a stopped resident with no readine
   }
 });
 
+test("an unconfirmed launch does not read or report a previous failure from the same unit", (t: any) => {
+  const paths = runtimePaths("action-previously-failed");
+  const previous = { schema_version: 1, command: "run", status: "error", error: { code: "dns_block_prehydration_failed" } };
+  const calls: string[] = [];
+  t.mock.method(require("node:child_process"), "spawnSync", (executable: string) => {
+    calls.push(executable);
+    if (executable === "/usr/bin/journalctl") return { status: 0, stdout: JSON.stringify(previous) };
+    if (executable === "/usr/bin/systemctl") return { status: 0, stdout: "ActiveState=failed\nSubState=failed\nMainPID=0" };
+    return { status: 1, stderr: "unit already exists: private_fixture_value" };
+  });
+
+  let error = "";
+  const output = captureStdout(() => {
+    error = captureStderr(() => assert.throws(() => launchResidentService(residentServiceArgs(paths)), (failure: unknown) => {
+      emitError(failure, paths.unit);
+      return true;
+    }));
+  });
+  assert.deepEqual(calls, ["/usr/bin/sudo"], "a failed launch cannot identify a journal belonging to this attempt");
+  assert.match(error, /^::error::Fence setup failed: could not confirm whether the resident started/);
+  assert.doesNotMatch(error + output, /private_fixture_value|dns_block_prehydration_failed|Fence resident error code/);
+});
+
 test("setup puts the reported reason and safe next step in the error, without raw service output", () => {
   const sensitive = "private_fixture_value\n::error::injected";
   const status = {
@@ -1206,7 +1231,7 @@ test("setup puts the reported reason and safe next step in the error, without ra
     });
     assert.match(error, /the host DNS resolver did not pass verification: target changed \(unsupported_resolver_layout\)/);
     // Scheduled release-canary reporting also consumes this fixed warning.
-    assert.match(resolverOutput, /::warning::Fence resident error code: unsupported_resolver_layout/);
+    assert.match(resolverOutput, /^::warning::Fence resident error code: unsupported_resolver_layout$/m);
     assert.doesNotMatch(error + resolverOutput, /private_fixture_value|injected|host UDP|FENCE_REPORT_JSON/);
   } finally {
     if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
@@ -1216,7 +1241,9 @@ test("setup puts the reported reason and safe next step in the error, without ra
 
 test("setup explains recognized failures without guessing at missing or unrelated details", () => {
   const status = { status: 0, error: false, stdout: "ActiveState=failed\nSubState=failed\nMainPID=0" };
-  const failure = (code: string) => JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code } });
+  const failure = (code: string) => JSON.stringify({
+    schema_version: 1, command: "run", status: "error", error: { code, message: "private_fixture_value\n::error::injected" },
+  });
   const cases = [
     [failure("dns_proxy_bind_failed"), /a required DNS listener could not start \(dns_proxy_bind_failed\)/],
     [JSON.stringify({ fence_resolver_layout: { reason: "private_fixture_value\n::error::injected" } }) + "\n" +
@@ -1226,6 +1253,11 @@ test("setup explains recognized failures without guessing at missing or unrelate
     [JSON.stringify({ fence_lockdown_command: { executable: "sudo", principal: "runner", code: "lockdown_command_timeout", timeout_ms: 5000 } }) +
       "\n" + failure("lockdown_command_timeout"), /host verification command.*executable=sudo; principal=runner.*timeout_ms=5000/],
     [failure("dns_block_prehydration_failed"), /DNS rules for required hostnames could not be prepared/],
+    ...[
+      "unsupported_host_fingerprint", "local_control_inventory_additive_drift", "local_control_inventory_unreviewed_reduction",
+      "local_control_inventory_drift", "resident_worker_start_timeout", "resident_worker_start_failed", "resident_worker_unhealthy",
+      "runner_worker_identity_unavailable", "runner_worker_identity_ambiguous",
+    ].map((code) => [failure(code), new RegExp("\\(" + code + "\\)\\. Keep this job failed")] as const),
   ] as const;
   for (const [stdout, reason] of cases) {
     const error = captureStderr(() => captureStdout(() =>
@@ -1238,7 +1270,7 @@ test("setup explains recognized failures without guessing at missing or unrelate
   for (const journal of [
     { status: 1, error: false, stdout: failure("dns_proxy_bind_failed") },
     { status: null, error: true, stdout: "private_fixture_value" },
-    { status: 0, error: false, stdout: failure("private_fixture_value") },
+    { status: 0, error: false, stdout: failure("local_control_inventory_private_fixture_value") },
     { status: 0, error: false, stdout: '{"fence_resolver_layout":{"reason":"target_changed"}}\nnot JSON' },
   ]) {
     let error = "";
@@ -1246,7 +1278,7 @@ test("setup explains recognized failures without guessing at missing or unrelate
       error = captureStderr(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
     });
     assert.match(error, /^::error::Fence could not verify readiness: no recognized startup reason was available/);
-    assert.doesNotMatch(error + output, /dns_proxy_bind_failed|private_fixture_value|target changed|FENCE_REPORT_JSON/);
+    assert.doesNotMatch(error + output, /dns_proxy_bind_failed|private_fixture_value|injected|target changed|FENCE_REPORT_JSON/);
   }
 });
 
@@ -1261,7 +1293,7 @@ test("post still fails without the protected mount and points to the setup step"
     },
   });
   assert.equal(post.status, 1);
-  assert.match(post.stderr, /Check the earlier Fence setup step.*reported ready.*protected mount may have been removed/);
+  assert.match(post.stderr, /Check the Fence setup step.*reported ready.*protected mount may have been removed/);
   assert.doesNotMatch(post.stdout, /FENCE_REPORT_JSON|Fence evidence verified/);
 });
 
