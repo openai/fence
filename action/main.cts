@@ -2,7 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
+const childProcess = require("node:child_process");
 const log = require("./log.cts");
 const {
   ACTION_RUNTIME_FILES,
@@ -50,7 +50,6 @@ const SERVICE_STATUS_PROPERTIES = new Map<string, RegExp>([
   ["MainPID", /^[0-9]{1,10}$/],
 ]);
 
-let diagnosticPaths: { unit: string } | undefined;
 let serviceLaunchAttempted = false;
 let launcherPaths: ReturnType<typeof runtimePaths> | undefined;
 let protectedActionPathGuards: string[] = [];
@@ -61,10 +60,15 @@ let launcherMountUncertain = false;
 let launcherDirectoryCreated = false;
 let runtimeDirectoryCreated = false;
 
-function emitError(error: unknown): void {
+class ResidentReadinessError extends Error {}
+
+function emitError(error: unknown, unit: string | undefined): void {
+  if (error instanceof ResidentReadinessError && unit) {
+    emitServiceDiagnostics(unit, error.message);
+    return;
+  }
   const message = error instanceof Error ? error.message : String(error);
   log.error(`Fence setup failed: ${message}`);
-  emitServiceDiagnostics(diagnosticPaths);
 }
 
 function run(
@@ -74,7 +78,7 @@ function run(
   ignoreStdout = false,
   timeout = CHILD_TIMEOUT_MS,
 ): void {
-  const result = spawnSync(executable, args, {
+  const result = childProcess.spawnSync(executable, args, {
     encoding: "utf8",
     env: CHILD_ENV,
     input,
@@ -97,7 +101,7 @@ function capture(
   args: string[],
   timeout = 2 * 1000,
 ): { status: number | null; stdout: string; error: boolean } {
-  const result = spawnSync(executable, args, {
+  const result = childProcess.spawnSync(executable, args, {
     encoding: "utf8",
     env: CHILD_ENV,
     killSignal: "SIGKILL",
@@ -171,7 +175,7 @@ function fenceErrorCodeFromJournal(output: string): string | undefined {
   return undefined;
 }
 
-function localControlDiagnosticFromJournal(output: string): string | undefined {
+function localControlDiagnosticFromJournal(output: string, expectedStatus?: string): string | undefined {
   const unavailableReasons = new Set([
     "cgroup_identity", "ipv4_table", "ipv6_table", "malformed_rows", "proc", "proc_scan",
     "process_fd_readlink", "process_fd_scan", "process_identity", "process_identity_drift",
@@ -191,6 +195,7 @@ function localControlDiagnosticFromJournal(output: string): string | undefined {
       const diagnostic = JSON.parse(line)?.fence_local_control;
       if (
         !diagnostic || !["unavailable", "unstable", "bounds_exceeded"].includes(diagnostic.status) ||
+        (expectedStatus !== undefined && diagnostic.status !== expectedStatus) ||
         !Number.isSafeInteger(diagnostic.attempts) || diagnostic.attempts < 1 ||
         !validReasons(diagnostic.unavailable_inputs, unavailableReasons) ||
         !validReasons(diagnostic.bounds_exceeded, boundReasons)
@@ -205,7 +210,7 @@ function localControlDiagnosticFromJournal(output: string): string | undefined {
   return undefined;
 }
 
-function lockdownCommandDiagnosticFromJournal(output: string): string | undefined {
+function lockdownCommandDiagnosticFromJournal(output: string, expectedCode?: string): string | undefined {
   // Match only the native closed enums. Never render journal text or program arguments.
   const executables = new Set([
     "docker", "id", "mount", "nft", "stat", "sudo", "systemctl", "systemd_run",
@@ -218,9 +223,10 @@ function lockdownCommandDiagnosticFromJournal(output: string): string | undefine
       if (
         !d || !executables.has(d.executable) || !["root", "runner"].includes(d.principal) ||
         !["lockdown_command_timeout", "lockdown_command_output_too_large"].includes(d.code) ||
+        (expectedCode !== undefined && d.code !== expectedCode) ||
         !Number.isSafeInteger(d.timeout_ms) || d.timeout_ms < 0 || d.timeout_ms > 30_000
       ) continue;
-      return `executable=${d.executable}; principal=${d.principal}; code=${d.code}; timeout_ms=${d.timeout_ms}`;
+      return `executable=${d.executable}; principal=${d.principal}; timeout_ms=${d.timeout_ms}`;
     } catch {
       // Ignore unrelated or malformed entries without forwarding them.
     }
@@ -283,21 +289,79 @@ function captureServiceStatus(unit: string): ReturnType<typeof capture> {
   ]);
 }
 
-function emitServiceDiagnostics(paths: { unit: string } | undefined): void {
-  if (!paths || !serviceLaunchAttempted) {
-    return;
-  }
-  const status = captureServiceStatus(paths.unit);
+function emitServiceDiagnostics(unit: string, observation: string): void {
+  const status = captureServiceStatus(unit);
   const journal = capture("/usr/bin/journalctl", [
     "--no-pager",
     "--unit",
-    paths.unit,
+    unit,
     "--lines",
     "20",
     "--output",
     "cat",
   ]);
-  emitCapturedServiceDiagnostics(paths.unit, status, journal);
+  emitCapturedServiceDiagnostics(unit, status, journal);
+  log.info(observation);
+}
+
+function reportedStartupFailure(output: string): { code: string; reason: string } | undefined {
+  const code = fenceErrorCodeFromJournal(output);
+  let reason: string;
+  let detail: string | undefined;
+  switch (code) {
+    case "unsupported_host_fingerprint":
+      reason = "the runner did not meet the required host security checks";
+      break;
+    case "dns_proxy_bind_failed":
+      reason = "a required DNS listener could not start";
+      detail = dnsStartupDiagnosticFromJournal(output);
+      break;
+    case "unsupported_resolver_layout":
+      reason = "the host DNS resolver did not pass verification";
+      detail = resolverLayoutDiagnosticFromJournal(output);
+      break;
+    case "local_control_inventory_unavailable":
+    case "local_control_inventory_unstable":
+    case "local_control_inventory_bounds_exceeded":
+    case "local_control_inventory_incomplete":
+      reason = "local services and their socket owners could not be verified";
+      detail = localControlDiagnosticFromJournal(output, code.slice("local_control_inventory_".length));
+      break;
+    case "local_control_inventory_additive_drift":
+      reason = "the runner exposed an unreviewed privileged service, endpoint, or owner";
+      break;
+    case "local_control_inventory_unreviewed_reduction":
+      reason = "an expected local service endpoint or owner was missing";
+      break;
+    case "local_control_inventory_drift":
+      reason = "local services or their owners changed during setup";
+      break;
+    case "lockdown_command_timeout":
+    case "lockdown_command_output_too_large":
+      reason = code === "lockdown_command_timeout" ? "a host verification command timed out" :
+        "a host verification command exceeded its output limit";
+      detail = lockdownCommandDiagnosticFromJournal(output, code);
+      break;
+    case "dns_block_prehydration_failed":
+      reason = "DNS rules for required hostnames could not be prepared";
+      break;
+    case "resident_worker_start_timeout":
+      reason = "a required background worker did not start in time";
+      break;
+    case "resident_worker_start_failed":
+      reason = "a required background worker could not start";
+      break;
+    case "resident_worker_unhealthy":
+      reason = "a required background worker did not report healthy";
+      break;
+    case "runner_worker_identity_unavailable":
+    case "runner_worker_identity_ambiguous":
+      reason = "the GitHub runner process could not be identified";
+      break;
+    default:
+      return undefined;
+  }
+  return { code, reason: `${reason}${detail ? `: ${detail}` : ""} (${code})` };
 }
 
 function emitCapturedServiceDiagnostics(
@@ -305,39 +369,22 @@ function emitCapturedServiceDiagnostics(
   status: ReturnType<typeof capture>,
   journal: ReturnType<typeof capture>,
 ): void {
+  // Journal diagnostics explain a failed readiness check; they never establish readiness or cleanup.
+  const failure = !journal.error && journal.status === 0 ? reportedStartupFailure(journal.stdout) : undefined;
+  const reason = failure?.reason ?? "no recognized startup reason was available from the resident service";
+  log.error(`Fence could not verify readiness: ${reason}. Keep this job failed. Check runner compatibility issues and verified fixes: ` +
+    "https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22");
+
+  // The release-canary reporter recognizes this fixed warning.
+  if (failure) log.warning(`Fence resident error code: ${failure.code}`);
   const serviceStatus = !status.error && status.status === 0
     ? formatServiceProperties(parseServiceProperties(status.stdout))
     : "";
-  if (serviceStatus) log.warning(`Fence service state for ${unit}: ${serviceStatus}`);
+  if (serviceStatus) log.info(`Fence service state for ${unit}: ${serviceStatus}`);
   log.debugGroup("Fence debug: service diagnostics", [
     `service_status_exit=${status.status ?? "unavailable"}`,
     `journal_exit=${journal.status ?? "unavailable"}`,
   ]);
-  if (journal.error || journal.status !== 0) return;
-  const errorCode = fenceErrorCodeFromJournal(journal.stdout);
-  if (errorCode !== undefined) {
-    log.warning(`Fence resident error code: ${errorCode}`);
-  }
-  const localControlDiagnostic = localControlDiagnosticFromJournal(journal.stdout);
-  if (localControlDiagnostic !== undefined) {
-    log.warning(`Fence local control inspection: ${localControlDiagnostic}`);
-  }
-  const lockdownDiagnostic = lockdownCommandDiagnosticFromJournal(journal.stdout);
-  if (lockdownDiagnostic !== undefined) {
-    log.warning(`Fence host command: ${lockdownDiagnostic}`);
-  }
-  if (errorCode === "dns_proxy_bind_failed") {
-    const dnsDiagnostic = dnsStartupDiagnosticFromJournal(journal.stdout);
-    if (dnsDiagnostic !== undefined) {
-      log.warning(`Fence DNS startup: ${dnsDiagnostic}`);
-    }
-  }
-  if (errorCode === "unsupported_resolver_layout") {
-    const resolverDiagnostic = resolverLayoutDiagnosticFromJournal(journal.stdout);
-    if (resolverDiagnostic !== undefined) {
-      log.warning(`Fence host resolver: ${resolverDiagnostic}`);
-    }
-  }
 }
 
 function sleep(milliseconds: number): void {
@@ -541,6 +588,16 @@ function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
   ];
 }
 
+function launchResidentService(args: string[]): void {
+  serviceLaunchAttempted = true;
+  try {
+    run("/usr/bin/sudo", args);
+  } catch {
+    // The service may have started, but this unit's journal could belong to a previous failed launch.
+    throw new Error("could not confirm whether the resident started. Keep this job failed.");
+  }
+}
+
 function provisionalCleanupPreservationReason(
   status: ReturnType<typeof capture>,
   inspect: (name: "ready.json" | "dns-routing-owned") => { uid: number; mode: number; isFile(): boolean } | undefined,
@@ -670,14 +727,13 @@ function waitForReady(paths: { ready: string; report: string; unit: string }): a
     }
     const service = captureServiceStatus(paths.unit);
     if (!service.error && service.status === 0) {
-      const terminalStatus = terminalServiceStatus(service.stdout);
-      if (terminalStatus !== undefined) {
-        throw new Error(`Fence resident service exited before readiness: ${terminalStatus}`);
+      if (terminalServiceStatus(service.stdout) !== undefined) {
+        throw new ResidentReadinessError("Fence resident service exited while the Action was waiting for readiness");
       }
     }
     sleep(POLL_INTERVAL_MS);
   }
-  throw new Error("Fence readiness was not emitted before the timeout");
+  throw new ResidentReadinessError("Fence timed out waiting for readiness");
 }
 
 function main(): void {
@@ -688,7 +744,6 @@ function main(): void {
   const manifest = sourceRuntime.manifest;
   const config = validateInlineConfig(process.env.INPUT_CONFIG, process.env, nativeInputsFromEnvironment(process.env));
   const paths = runtimePaths(config.invocationId);
-  diagnosticPaths = paths;
   launcherPaths = paths;
   const details = log.configLogDetails(config.raw, config.usingDefault);
 
@@ -743,8 +798,7 @@ function main(): void {
     `args=${serviceArgs.join(" ")}`,
     `child_timeout_ms=${CHILD_TIMEOUT_MS}`,
   ]);
-  serviceLaunchAttempted = true;
-  run("/usr/bin/sudo", serviceArgs);
+  launchResidentService(serviceArgs);
   const report = waitForReady(paths);
   readinessObserved = true;
   log.ready(report);
@@ -754,10 +808,13 @@ if (require.main === module) {
   try {
     main();
   } catch (error) {
-    emitError(error);
-    cleanupLauncherBeforeReadiness();
     process.exitCode = 1;
+    try {
+      emitError(error, launcherPaths?.unit);
+    } finally {
+      cleanupLauncherBeforeReadiness();
+    }
   }
 }
 
-module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, fenceErrorCodeFromJournal, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, provisionalCleanupPreservationReason, residentServiceArgs, resolverLayoutDiagnosticFromJournal, run, terminalServiceStatus };
+module.exports = { dnsStartupDiagnosticFromJournal, emitCapturedServiceDiagnostics, emitError, fenceErrorCodeFromJournal, launchResidentService, localControlDiagnosticFromJournal, lockdownCommandDiagnosticFromJournal, main, provisionalCleanupPreservationReason, residentServiceArgs, resolverLayoutDiagnosticFromJournal, run, terminalServiceStatus };
