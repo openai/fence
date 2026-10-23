@@ -1,0 +1,67 @@
+name: release canary report
+
+on:
+  workflow_run:
+    workflows: [action drift canary]
+    branches: [main]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  observe:
+    # A rerun is not the original sample. Dispatches and release-candidate calls are not samples.
+    if: >-
+      github.repository == 'openai/fence' &&
+      github.ref == 'refs/heads/main' &&
+      github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.path == '.github/workflows/action-drift-canary.yml'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      sample: ${{ steps.observe.outputs.sample }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          # workflow_run's github.sha is on the default branch, not the commit the canary tested.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: summarize the scheduled first attempt
+        id: observe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: python3 -IB script/lib/release_canary_report.py observe "$CANARY_RUN_ID"
+
+  report:
+    needs: observe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Serialize the open-or-comment decision, retaining queued observations.
+    concurrency:
+      group: release-canary-compatibility-issue
+      queue: max
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: script/lib/release_canary_report.py
+          sparse-checkout-cone-mode: false
+
+      - name: record failures and the first later passing sample
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANARY_RUN_ID: ${{ github.event.workflow_run.id }}
+          CANARY_SAMPLE: ${{ needs.observe.outputs.sample }}
+        run: python3 -IB script/lib/release_canary_report.py report "$CANARY_RUN_ID"
