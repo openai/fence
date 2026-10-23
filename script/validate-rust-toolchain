@@ -23,6 +23,17 @@ if [[ ! -f "$rust_lockfile" ]]; then
   die "missing Rust toolchain lockfile: $rust_lockfile"
 fi
 
+require_cmd python3
+hosts_csv="$(rust_dist_csv "${RUST_DIST_HOSTS[@]}")"
+targets_csv="$(rust_dist_csv "${RUST_DIST_TARGETS[@]}")"
+host_components_csv="$(rust_dist_csv "${RUST_DIST_HOST_COMPONENTS[@]}")"
+python3 -B -E "$DIR/script/validate-rust-lock-surface" \
+  "$rust_lockfile" \
+  "$hosts_csv" \
+  "$targets_csv" \
+  "$host_components_csv"
+python3 -B -E "$DIR/script/validate-rust-lock-surface" --self-test
+
 require_cmd_for_online() {
   require_cmd curl
   require_cmd python3
@@ -123,8 +134,6 @@ if [[ "$online" == "true" ]]; then
     die "Rust channel manifest checksum mismatch against ${RUST_TOOLCHAIN_LOCK#$DIR/}"
   fi
 
-  hosts_csv="$(rust_dist_csv "${RUST_DIST_HOSTS[@]}")"
-  targets_csv="$(rust_dist_csv "${RUST_DIST_TARGETS[@]}")"
   if ! diff -u <(rust_dist_artifact_entries "$rust_lockfile" | sort) <(rust_dist_generate_artifact_entries_from_manifest "$manifest_file" "$expected_version" "$hosts_csv" "$targets_csv" | sort); then
     die "Rust artifact locks differ from upstream channel manifest"
   fi
