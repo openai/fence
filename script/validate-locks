@@ -328,9 +328,10 @@ require(
         "acceptance.yml",
         "action-acceptance.yml",
         "action-acceptance-ubuntu-latest.yml",
+        "action-drift-canary.yml",
         "integration.yml",
     },
-    "Pull requests must run the six protected workflows and reviewed ubuntu-latest acceptance",
+    "Pull requests may run only the six protected workflows, ubuntu-latest acceptance, and the path-filtered consumer canary",
 )
 pull_request_sources = {
     name: source
@@ -2474,8 +2475,19 @@ canary_triggers = indented_block(
 require_exact_mapping_keys(
     canary_triggers,
     2,
-    ["schedule", "workflow_dispatch", "workflow_call"],
-    "Action drift canary may run only on schedule, manual dispatch, or reusable call",
+    ["schedule", "pull_request", "workflow_dispatch", "workflow_call"],
+    "Action drift canary triggers must remain narrowly scoped",
+)
+canary_pull_request = indented_block(canary_triggers, "  pull_request:", "Canary pull-request trigger must be unique")
+require(
+    [line.strip() for line in canary_pull_request.splitlines()[1:] if line.strip()]
+    == [
+        "branches: [main]", "paths:",
+        "- .github/workflows/action-drift-canary.yml",
+        "- script/lib/protected_finalization.py",
+        "- script/verify-protected-finalization",
+    ],
+    "Only changes to the released consumer canary or its verifier should trigger a pull-request run",
 )
 canary_schedule = indented_block(
     canary_triggers,
@@ -2580,8 +2592,32 @@ canary_jobs = indented_block(
 require_exact_mapping_keys(
     canary_jobs,
     2,
-    ["canary"],
-    "Action drift canary must contain exactly one canary job",
+    ["released-block", "verify-released-block", "canary"],
+    "Action drift canary must keep the consumer, final-log verifier, and diagnostic jobs separate",
+)
+consumer = indented_block(canary_jobs, "  released-block:", "Released block canary job must be unique")
+consumer_steps = [
+    line.strip() for line in consumer.split("    steps:\n", 1)[1].splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
+]
+require(
+    "permissions:" not in consumer
+    and "if: inputs.action_ref == '' && (github.event_name == 'schedule' || github.event_name == 'pull_request')" in consumer
+    and "runner: [ubuntu-24.04, ubuntu-latest]" in consumer
+    and consumer_steps[0].startswith("- name: ")
+    and re.fullmatch(r"uses: openai/fence@[0-9a-f]{40} # pin@v[0-9]+\.[0-9]+\.[0-9]+", consumer_steps[1])
+    and consumer_steps[2].startswith("- name: ")
+    and consumer_steps[3].split(" #", 1)[0] == f"uses: {checkout_action}"
+    and "persist-credentials: false" in consumer_steps,
+    "Scheduled block must use the zero-input published pin before checkout, with only contents: read",
+)
+verifier = indented_block(canary_jobs, "  verify-released-block:", "Released block verifier job must be unique")
+verifier_permissions = indented_block(verifier, "    permissions:", "Released block verifier permissions must be unique")
+require(
+    scalar_mapping(verifier_permissions, 6) == {"actions": "read", "contents": "read"}
+    and "needs: released-block" in verifier
+    and "run: script/verify-protected-finalization canary" in verifier,
+    "Only the downstream read-only verifier should fetch the completed consumer jobs and logs",
 )
 canary_job = indented_block(
     canary_jobs,
@@ -2591,13 +2627,14 @@ canary_job = indented_block(
 require_exact_mapping_keys(
     canary_job,
     4,
-    ["name", "strategy", "timeout-minutes", "runs-on", "steps"],
+    ["name", "if", "strategy", "timeout-minutes", "runs-on", "steps"],
     "Action drift canary job fields must remain narrowly scoped",
 )
 require(
     scalar_mapping(canary_job, 4)
     == {
         "name": "${{ matrix.runner }} ${{ matrix.mode }} canary",
+        "if": "inputs.action_ref != '' || github.event_name != 'pull_request'",
         "timeout-minutes": "8",
         "runs-on": "${{ matrix.runner }}",
     },
@@ -2633,12 +2670,12 @@ require(
     scalar_mapping(canary_matrix, 8)
     == {
         "runner": "[ubuntu-24.04, ubuntu-latest]",
-        "mode": "[block, audit]",
+        "mode": """${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '["audit"]' || '["block", "audit"]') }}""",
     },
-    "Action drift canary matrix must test both supported labels in block and audit mode",
+    "Action drift canary must retain scheduled audit and test both modes for dispatch and explicit release candidates",
 )
 require(
-    len(re.findall(r"(?m)^\s*runs-on:", canary)) == 1,
+    len(re.findall(r"(?m)^\s*runs-on:", canary_job)) == 1,
     "Action drift canary must source exactly one runs-on field from its reviewed matrix",
 )
 
@@ -2843,12 +2880,12 @@ release_canary_permissions = indented_block(
 require_exact_mapping_keys(
     release_canary_permissions,
     6,
-    ["contents"],
+    ["actions", "contents"],
     "Release drift canary permissions must remain narrowly scoped",
 )
 require(
-    scalar_mapping(release_canary_permissions, 6) == {"contents": "read"},
-    "Release drift canary permissions must remain read-only",
+    scalar_mapping(release_canary_permissions, 6) == {"actions": "read", "contents": "read"},
+    "Release drift canary caller must allow the reusable workflow's read-only permission ceiling",
 )
 release_canary_with = indented_block(
     release_canary,

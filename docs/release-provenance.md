@@ -33,6 +33,8 @@ The tag and `action-release.json` are public before verification finishes. A tag
 
 Use the full distribution commit SHA, not the tag or `main`. The `main` branch does not contain the Action bundle.
 
+After publication, maintainers update the [first-step canary](../.github/workflows/action-drift-canary.yml) in a normal pull request, using the same pin we give users. That tests adopting the release; it doesn't gate publication or require the previous release to keep working.
+
 ## Verify Release Artifacts
 
 `action-release.json` records the source commit, distribution commit, binary checksum, manifest version, and signing workflow. Use it to verify the published pin, not to decide whether the release is ready.
