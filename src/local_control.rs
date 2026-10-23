@@ -2152,17 +2152,24 @@ fn parse_tcp_diag_datagram(
         let length = u32::from_ne_bytes(hdr[..4].try_into().unwrap()) as usize;
         let kind = u16::from_ne_bytes([hdr[4], hdr[5]]);
         let flags = i32::from(u16::from_ne_bytes([hdr[6], hdr[7]]));
-        if flags & libc::NLM_F_DUMP_INTR != 0 {
-            return Err(AcquisitionError::Unavailable);
-        }
-        if flags & libc::NLM_F_MULTI == 0
-            || hdr[8..12] != TCP_DIAG_SEQUENCE.to_ne_bytes()
-            || hdr[12..] != port_id.to_ne_bytes()
-        {
+        if hdr[8..12] != TCP_DIAG_SEQUENCE.to_ne_bytes() || hdr[12..] != port_id.to_ne_bytes() {
             return Err(malformed);
         }
         let payload = bytes.get(16..length).ok_or(malformed)?;
         bytes = bytes.get(length.next_multiple_of(4)..).ok_or(malformed)?;
+        // A kernel error can be a single message, even for a multipart request.
+        // Discard the whole dump; the existing acquisition retry starts a fresh one.
+        if kind == libc::NLMSG_ERROR as u16 && payload.len() < size_of::<libc::nlmsgerr>() {
+            return Err(malformed);
+        }
+        if flags & libc::NLM_F_DUMP_INTR != 0
+            || matches!(i32::from(kind), libc::NLMSG_ERROR | libc::NLMSG_OVERRUN)
+        {
+            return Err(AcquisitionError::Unavailable);
+        }
+        if flags & libc::NLM_F_MULTI == 0 {
+            return Err(malformed);
+        }
         if i32::from(kind) == libc::NLMSG_DONE {
             return if payload == [0; 4] && bytes.is_empty() {
                 Ok(true)
@@ -2171,7 +2178,6 @@ fn parse_tcp_diag_datagram(
             };
         }
         if kind != SOCK_DIAG_BY_FAMILY {
-            // Includes NLMSG_ERROR and NLMSG_OVERRUN: never use preceding rows.
             return Err(AcquisitionError::Unavailable);
         }
         if rows.len() >= MAX_TCP_DIAG_ROWS {
@@ -3302,7 +3308,21 @@ mod tests {
         let mut interrupted = done;
         interrupted[6] |= libc::NLM_F_DUMP_INTR as u8;
         assert_eq!(parse(&interrupted), Err(AcquisitionError::Unavailable));
-        assert!(parse(&header(20, libc::NLMSG_OVERRUN as u16)).is_err());
+        assert_eq!(
+            parse(&header(16, libc::NLMSG_ERROR as u16)),
+            Err(AcquisitionError::Malformed)
+        );
+        for kind in [libc::NLMSG_ERROR, libc::NLMSG_OVERRUN] {
+            let mut error = header(36, kind as u16);
+            error[6..8].fill(0); // Kernel errors need not carry NLM_F_MULTI.
+            error[16..20].copy_from_slice(&(-libc::ENOBUFS).to_ne_bytes());
+            assert_eq!(
+                parse(&[listener.as_slice(), &error].concat()),
+                Err(AcquisitionError::Unavailable)
+            );
+            error[8..12].fill(0); // An error for another request is still malformed.
+            assert_eq!(parse(&error), Err(AcquisitionError::Malformed));
+        }
 
         let mut rows = Vec::new();
         for _ in 0..MAX_TCP_DIAG_ROWS {
