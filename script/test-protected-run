@@ -481,6 +481,8 @@ workers = [
     {"name": "host_udp_dns", "status": "running"},
     {"name": "process_attribution", "status": "running"},
 ]
+if scenario != "audit":
+    workers.insert(-1, {"name": "hostname_refresh", "status": "running"})
 if expected["container_status"] == "disabled_verified":
     require(dns["docker_dns_routing"] == "not_configured_standard_block")
 else:

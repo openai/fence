@@ -185,6 +185,7 @@ expected_workers = [
         "name": "host_udp_dns",
         "status": "failed" if scenario == "worker-failure" else "running",
     },
+    {"name": "hostname_refresh", "status": "running"},
     {"name": "process_attribution", "status": "running"},
 ]
 require(resident["workers"] == expected_workers)

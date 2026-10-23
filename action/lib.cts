@@ -180,16 +180,6 @@ const RUNTIME_EVIDENCE_SCHEMA_VERSION = 5;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
 const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
-const REQUIRED_HOST_RESIDENT_WORKERS = [
-  "host_tcp_dns",
-  "host_udp_dns",
-  "process_attribution",
-];
-const REQUIRED_RESIDENT_WORKERS = [
-  "docker_tcp_dns",
-  "docker_udp_dns",
-  ...REQUIRED_HOST_RESIDENT_WORKERS,
-];
 const RELEASE_TAG = /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_ROOT = "/run/fence";
@@ -1551,6 +1541,7 @@ function validateReport(report: any, failOnCritical = true): any {
     report.resident_health,
     Date.now(),
     !failOnCritical,
+    report.mode,
   );
   const hasCriticalFindings = report.critical_findings.length !== 0;
   const hasCriticalResident = residentHealth.status === "critical";
@@ -1640,7 +1631,9 @@ function validateReady(ready: any, report: any, phase: "setup" | "post" = "setup
     fail("Fence readiness identity does not match the resident report");
   }
   // At post this is the healthy commit, not the latest heartbeat or materialized ruleset.
-  const readyHealth = validateResidentHealth(ready.resident_health, phase === "post" ? "historical" : Date.now());
+  const readyHealth = validateResidentHealth(
+    ready.resident_health, phase === "post" ? "historical" : Date.now(), false, ready.mode,
+  );
   const current = report.resident_health;
   if (
     readyHealth.resident_pid !== current.resident_pid ||
@@ -1676,6 +1669,7 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
     dnsEvidence.resident_health,
     Date.now(),
     report.resident_health.status === "critical",
+    report.mode,
   );
   if (
     dnsHealth.resident_pid !== report.resident_health.resident_pid ||
@@ -1689,9 +1683,9 @@ function validateDnsEvidence(dnsEvidence: any, report: any): any {
     ? routing === "not_configured_standard_block"
     : report.mode === "audit" && routing === "not_present";
   const expectedWorkers = hostOnly
-    ? REQUIRED_HOST_RESIDENT_WORKERS
+    ? requiredResidentWorkers(report.mode, false)
     : !standardBlock && routing === "local_root_resident_mediator"
-    ? REQUIRED_RESIDENT_WORKERS
+    ? requiredResidentWorkers(report.mode, true)
     : undefined;
   if (
     expectedWorkers === undefined ||
@@ -1889,10 +1883,21 @@ function isNonnegativeSafeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 0;
 }
 
+function requiredResidentWorkers(mode: string, dockerDns: boolean): string[] {
+  return [
+    ...(dockerDns ? ["docker_tcp_dns", "docker_udp_dns"] : []),
+    "host_tcp_dns",
+    "host_udp_dns",
+    ...(mode === "block" ? ["hostname_refresh"] : []),
+    "process_attribution",
+  ];
+}
+
 function validateResidentHealth(
   health: any,
   nowMilliseconds: number | "historical" = Date.now(),
   allowCritical = false,
+  mode = "block",
 ): any {
   if (health === null || Array.isArray(health) || typeof health !== "object") {
     fail("Fence report does not contain resident health evidence");
@@ -1943,8 +1948,8 @@ function validateResidentHealth(
   });
   const sorted = JSON.stringify(workers.sort());
   if (
-    sorted !== JSON.stringify(REQUIRED_RESIDENT_WORKERS) &&
-    sorted !== JSON.stringify(REQUIRED_HOST_RESIDENT_WORKERS)
+    sorted !== JSON.stringify(requiredResidentWorkers(mode, true)) &&
+    sorted !== JSON.stringify(requiredResidentWorkers(mode, false))
   ) {
     fail("Fence resident worker set does not match the reviewed runtime");
   }

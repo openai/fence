@@ -59,7 +59,7 @@ const {
   terminalServiceStatus,
 } = require("./main.cts");
 
-function residentHealth(overrides: Record<string, unknown> = {}, dockerDns = false): Record<string, unknown> {
+function residentHealth(overrides: Record<string, unknown> = {}, dockerDns = false, mode = "block"): Record<string, unknown> {
   return {
     status: "healthy",
     resident_pid: 4242,
@@ -73,6 +73,7 @@ function residentHealth(overrides: Record<string, unknown> = {}, dockerDns = fal
       ] : []),
       { name: "host_tcp_dns", status: "running" },
       { name: "host_udp_dns", status: "running" },
+      ...(mode === "block" ? [{ name: "hostname_refresh", status: "running" }] : []),
       { name: "process_attribution", status: "running" },
     ],
     ...overrides,
@@ -118,6 +119,7 @@ const auditReport = {
   protection_available: false,
   sudo_status: "preserved_verified",
   container_status: "preserved_verified",
+  resident_health: residentHealth({}, false, "audit"),
 };
 
 const githubArtifactCompatibilityLimitations = [
@@ -1737,16 +1739,7 @@ test("settles bounded block, degraded-block, and audit evidence", () => {
       protection_available: false,
       container_status: "preserved_unsafe",
     },
-    {
-      ...report,
-      status: "protected_host_audit_observation",
-      mode: "audit",
-      readiness_status: "ready_observation_only",
-      setup_status: "resident_observation_only",
-      protection_available: false,
-      sudo_status: "preserved_verified",
-      container_status: "preserved_verified",
-    },
+    auditReport,
   ];
 
   for (const variant of variants) {
@@ -1853,14 +1846,7 @@ test("rejects audit firewall resets and sampled regressions across counter epoch
     counters: { total_violations: 4, sampled_violations: 3 },
   };
   const initialAudit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     counters: { total_violations: 4, sampled_violations: 3 },
   };
   const invalidSnapshots = [
@@ -2222,18 +2208,10 @@ test("validates stable runtime evidence", () => {
   validateReport(report);
   const dnsEvidence = dnsEvidenceFor(report);
   validateDnsEvidence(dnsEvidence, report);
-  const auditReport = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
-  };
   validateReport(auditReport);
   validateDnsEvidence(dnsEvidenceFor(auditReport), auditReport);
+  assert.throws(() => validateReport({ ...report, resident_health: auditReport.resident_health }), /worker set/);
+  assert.throws(() => validateReport({ ...auditReport, resident_health: report.resident_health }), /worker set/);
   assert.throws(
     () => validateDnsEvidence({ ...dnsEvidence, docker_dns_routing: "not_present" }, report),
     /worker set/,
@@ -2254,7 +2232,7 @@ test("validates stable runtime evidence", () => {
   );
   const dockerHealth = residentHealth({}, true);
   for (const preserved of [auditReport, degradedReport]) {
-    const withDocker = { ...preserved, resident_health: dockerHealth };
+    const withDocker = { ...preserved, resident_health: residentHealth({}, true, preserved.mode) };
     validateDnsEvidence(dnsEvidenceFor(withDocker), withDocker);
   }
   const unexpectedDocker = { ...report, resident_health: dockerHealth };
@@ -2658,6 +2636,7 @@ test("validates fresh resident worker and service identity evidence", () => {
       { name: "docker_udp_dns", status: "running" },
       { name: "host_tcp_dns", status: "running" },
       { name: "host_udp_dns", status: "running" },
+      { name: "hostname_refresh", status: "running" },
       { name: "process_attribution", status: "running" },
     ],
   };
@@ -3213,16 +3192,7 @@ test("reports source-produced sudo and container drift in every runtime mode", (
       protection_available: false,
       container_status: "preserved_unsafe",
     },
-    {
-      ...report,
-      status: "protected_host_audit_observation",
-      mode: "audit",
-      readiness_status: "ready_observation_only",
-      setup_status: "resident_observation_only",
-      protection_available: false,
-      sudo_status: "preserved_verified",
-      container_status: "preserved_verified",
-    },
+    auditReport,
   ];
 
   for (const currentMode of modes) {
@@ -3236,6 +3206,7 @@ test("reports source-produced sudo and container drift in every runtime mode", (
         ...Object.fromEntries(controls.map((control) => [control, "critical_drift"])),
         resident_health: residentHealth(
           { status: "critical" }, currentMode.status === "protected_host_block_degraded",
+          currentMode.mode,
         ),
         critical_findings: controls.map((control, index) => ({
           timestamp: `unix-ms:${index + 1}`,
@@ -3311,14 +3282,9 @@ test("rejects unbounded, inconsistent, and unsupported critical report evidence"
     critical_findings: [finding],
   };
   const audit = {
-    ...critical,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
+    resident_health: residentHealth({ status: "critical" }, false, "audit"),
+    critical_findings: [finding],
   };
 
   for (const invalid of [
@@ -3721,14 +3687,7 @@ test("counts only fixed reasons for unmappable audit findings without changing d
     unparsed_reason: "short_header",
   };
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [
       ...nativeReasons.map((unparsed_reason) => ({ ...unavailable, unparsed_reason })),
       ...hostileReasons.map((unparsed_reason) => ({ ...unavailable, unparsed_reason })),
@@ -3976,13 +3935,7 @@ test("preserves the fixed byte budget by pruning whole network rows explicitly",
 
   const audit = {
     ...currentReport,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [
       ...currentReport.findings.map((finding) => ({ ...finding, mode: "audit", classification: "would_block" })),
       { mode: "audit", classification: "would_block", unparsed_reason: "ipv4_fragment" },
@@ -3999,14 +3952,7 @@ test("preserves the fixed byte budget by pruning whole network rows explicitly",
 
 test("reports missing DNS evidence and unretained observations without inventing hostnames", () => {
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [{
       timestamp: "unix-ms:1",
       mode: "audit",
@@ -4227,14 +4173,7 @@ test("renders degraded and critical summaries without a healthy signal", () => {
 
 test("renders audit would-block findings with DNS-backed allowlist guidance", () => {
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [
       {
         timestamp: "unix-ms:1",
@@ -4356,14 +4295,7 @@ test("renders audit would-block findings with DNS-backed allowlist guidance", ()
 
 test("renders only bounded approved local attribution beside network findings", () => {
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [{
       timestamp: "unix-ms:1",
       mode: "audit",
@@ -4432,14 +4364,7 @@ test("renders only bounded approved local attribution beside network findings", 
 
 test("renders audit IP-only and missing-DNS fallbacks safely", () => {
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [
       {
         timestamp: "unix-ms:1",
@@ -4476,14 +4401,7 @@ test("renders audit IP-only and missing-DNS fallbacks safely", () => {
 
 test("renders audit IP-only findings when DNS evidence excludes non-GitHub names", () => {
   const audit = {
-    ...report,
-    status: "protected_host_audit_observation",
-    mode: "audit",
-    readiness_status: "ready_observation_only",
-    setup_status: "resident_observation_only",
-    protection_available: false,
-    sudo_status: "preserved_verified",
-    container_status: "preserved_verified",
+    ...auditReport,
     findings: [
       {
         timestamp: "unix-ms:1",
@@ -4672,7 +4590,7 @@ test("post distinguishes blocked wildcard DNS requests from audit predictions", 
 
   const requests = 3;
   for (const [modeReport, decision] of [[report, "denied"], [auditReport, "would deny"]] as const) {
-    const currentReport = { ...modeReport, resident_health: residentHealth() };
+    const currentReport = { ...modeReport, resident_health: residentHealth({}, false, modeReport.mode) };
     const dnsEvidence = dnsEvidenceFor(currentReport, {
       bounded_user_wildcard_authorizations_truncated: true,
       user_wildcard_request_rejections: requests,

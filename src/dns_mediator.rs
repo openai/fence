@@ -169,11 +169,13 @@ const DNS_ROUTING_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DOCKER_DAEMON_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_MOUNTINFO_BYTES: u64 = 1024 * 1024;
 const RESIDENT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
-const REQUIRED_RESIDENT_WORKERS: [&str; 5] = [
+const HOSTNAME_REFRESH_WORKER: &str = "hostname_refresh";
+const REQUIRED_RESIDENT_WORKERS: [&str; 6] = [
     "docker_tcp_dns",
     "docker_udp_dns",
     "host_tcp_dns",
     "host_udp_dns",
+    HOSTNAME_REFRESH_WORKER,
     ATTRIBUTION_WORKER_NAME,
 ];
 
@@ -216,16 +218,24 @@ struct ResidentWorkerSupervisor {
     disconnected_reported: bool,
 }
 
-fn initial_resident_health(docker_available: bool) -> ResidentHealth {
+fn required_resident_workers(
+    mode: Mode,
+    docker_available: bool,
+) -> impl Iterator<Item = &'static str> {
+    REQUIRED_RESIDENT_WORKERS.into_iter().filter(move |&name| {
+        (docker_available || !name.starts_with("docker_"))
+            && (mode == Mode::Block || name != HOSTNAME_REFRESH_WORKER)
+    })
+}
+
+fn initial_resident_health(mode: Mode, docker_available: bool) -> ResidentHealth {
     ResidentHealth {
         status: "starting",
         resident_pid: std::process::id(),
         verification_sequence: 0,
         last_successful_verification_unix_milliseconds: 0,
         verification_interval_seconds: RESIDENT_VERIFICATION_INTERVAL.as_secs(),
-        workers: REQUIRED_RESIDENT_WORKERS
-            .into_iter()
-            .filter(|name| docker_available || !name.starts_with("docker_"))
+        workers: required_resident_workers(mode, docker_available)
             .map(|name| ResidentWorkerHealth {
                 name,
                 status: "starting",
@@ -253,12 +263,10 @@ fn advance_resident_health(
 }
 
 impl ResidentWorkerSupervisor {
-    fn new(events: Receiver<ResidentWorkerEvent>, docker_available: bool) -> Self {
+    fn new(events: Receiver<ResidentWorkerEvent>, mode: Mode, docker_available: bool) -> Self {
         Self {
             events,
-            statuses: REQUIRED_RESIDENT_WORKERS
-                .into_iter()
-                .filter(|worker| docker_available || !worker.starts_with("docker_"))
+            statuses: required_resident_workers(mode, docker_available)
                 .map(|worker| (worker, "starting"))
                 .collect(),
             disconnected_reported: false,
@@ -2215,6 +2223,7 @@ pub struct DnsMediationSession {
     resident_health: Arc<Mutex<ResidentHealth>>,
     supervisor: ResidentWorkerSupervisor,
     attribution: AttributionCoordinator,
+    hostname_refresh: Option<HostnameRefresh>,
     stop_workers: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -2223,6 +2232,7 @@ struct DnsProxyRuntime {
     threads: Vec<JoinHandle<()>>,
     supervisor: ResidentWorkerSupervisor,
     attribution: AttributionCoordinator,
+    hostname_refresh: Option<HostnameRefresh>,
 }
 
 impl DnsMediationSession {
@@ -2248,7 +2258,10 @@ impl DnsMediationSession {
                 .map_err(|error| DnsMediationError::new(error.code, error.message))?,
         );
         let report_path = runtime_directory.join("dns-report.json");
-        let resident_health = Arc::new(Mutex::new(initial_resident_health(mediate_docker)));
+        let resident_health = Arc::new(Mutex::new(initial_resident_health(
+            scope.mode(),
+            mediate_docker,
+        )));
         let stop_workers = Arc::new(AtomicBool::new(false));
         let recorder = ObservationRecorder {
             state: Arc::new(Mutex::new(ObservationState::default())),
@@ -2285,6 +2298,7 @@ impl DnsMediationSession {
             mut threads,
             mut supervisor,
             attribution,
+            hostname_refresh,
         } = start_dns_proxy(recorder.clone(), Arc::clone(&stop_workers), mediate_docker)?;
         if let Err(error) = supervisor.wait_for_startup() {
             shutdown_dns_workers(&stop_workers, &mut threads);
@@ -2318,6 +2332,7 @@ impl DnsMediationSession {
             resident_health,
             supervisor,
             attribution,
+            hostname_refresh,
             stop_workers,
             threads,
         })
@@ -2846,8 +2861,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
 
 struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     _mediation: DnsMediationSession,
-    materialization_requests: Receiver<MaterializationRequest>,
-    pending_materialization_request: Option<MaterializationRequest>,
+    dns_work: BlockDnsWork,
     backend: NativeNftBackend<SystemNftExecutor>,
     lockdown: SystemLockdownControl,
     reader: NflogReader,
@@ -2859,7 +2873,6 @@ struct DnsMediatedBlockSession<R: RuntimeDocumentStore> {
     evidence: DnsMediatedBlockEvidence,
     findings: FindingCollection,
     scope: DnsBlockRuntimeScope,
-    next_hostname_refresh: BTreeMap<String, Duration>,
     next_verification: Duration,
 }
 
@@ -3062,12 +3075,18 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
         mediation.routing.provisional.committed = true;
         lockdown.commit_no_restore();
-        let next_hostname_refresh =
-            hostname_refresh_schedule(&hostname_policy, &active, Duration::ZERO);
+        let dns_work = BlockDnsWork {
+            materialization_requests,
+            pending_request: None,
+            refresh: mediation
+                .hostname_refresh
+                .take()
+                .expect("block mode supervises hostname refresh"),
+            next_refresh: hostname_refresh_schedule(&hostname_policy, &active, Duration::ZERO),
+        };
         Ok(Self {
             _mediation: mediation,
-            materialization_requests,
-            pending_materialization_request: None,
+            dns_work,
             backend,
             lockdown,
             reader,
@@ -3079,7 +3098,6 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             evidence,
             findings: FindingCollection::empty(),
             scope,
-            next_hostname_refresh,
             next_verification: RESIDENT_VERIFICATION_INTERVAL,
         })
     }
@@ -3136,34 +3154,19 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
 
         let mut root_refresh_error = None;
         let mut refresh_materializations = BTreeSet::new();
-        let due_hostname = next_due_hostname_refresh(&self.next_hostname_refresh, elapsed);
-        if let Some(hostname) = due_hostname {
-            let entry = self
-                ._mediation
-                .recorder
-                .hostname_policy
-                .exact_entry(&hostname)
-                .expect("refresh schedule contains only exact policy hostnames")
-                .clone();
-            match prehydrate_exact_hostname(&entry, &self._mediation.recorder.hostname_policy) {
-                Ok(materializations) => {
-                    let refresh_interval = hostname_refresh_interval(&entry, &materializations);
-                    let completed_elapsed = elapsed.saturating_add(poll_started.elapsed());
-                    refresh_materializations.extend(materializations);
-                    self.next_hostname_refresh
-                        .insert(hostname, completed_elapsed.saturating_add(refresh_interval));
-                }
+        let (requests, refresh) = self.dns_work.poll(
+            elapsed.saturating_add(poll_started.elapsed()),
+            &self._mediation.recorder.hostname_policy,
+        );
+        if let Some(refresh) = refresh {
+            match refresh {
+                Ok(materializations) => refresh_materializations.extend(materializations),
                 Err(error) => {
                     if matches!(error, PrehydrationError::Transient(_)) {
                         self.evidence.hostname_refresh_warnings =
                             self.evidence.hostname_refresh_warnings.saturating_add(1);
                         self._mediation.recorder.record_hostname_refresh_warning();
                     }
-                    let completed_elapsed = elapsed.saturating_add(poll_started.elapsed());
-                    self.next_hostname_refresh.insert(
-                        hostname,
-                        completed_elapsed.saturating_add(DNS_PROFILE_REFRESH_INTERVAL),
-                    );
                     root_refresh_error = Some(error);
                 }
             };
@@ -3171,7 +3174,6 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         let refresh_attempted = !refresh_materializations.is_empty();
-        let requests = self.collect_materialization_requests();
         let batch_started = Instant::now();
         let mut authorizations = self
             ._mediation
@@ -3416,30 +3418,6 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         Ok(more_findings_pending)
     }
 
-    fn collect_materialization_requests(&mut self) -> Vec<MaterializationRequest> {
-        let mut requests = Vec::new();
-        if let Some(request) = self.pending_materialization_request.take() {
-            requests.push(request);
-        }
-        while requests.len() < MATERIALIZATION_REQUEST_QUEUE_CAPACITY {
-            match self.materialization_requests.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
-        }
-
-        requests
-    }
-
-    fn wait_for_materialization_or_housekeeping(&mut self, timeout: Duration) {
-        if self.pending_materialization_request.is_some() {
-            return;
-        }
-        if let Ok(request) = self.materialization_requests.recv_timeout(timeout) {
-            self.pending_materialization_request = Some(request);
-        }
-    }
-
     fn record_critical(&mut self, code: &'static str, message: &'static str) {
         self._mediation.mark_resident_critical();
         self.evidence.resident_health = self._mediation.resident_health();
@@ -3549,7 +3527,9 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             let start = Instant::now();
             loop {
                 if !session.poll_once(start.elapsed(), Duration::ZERO)? {
-                    session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+                    session
+                        .dns_work
+                        .wait_for_materialization(RESIDENT_IDLE_INTERVAL);
                 }
             }
         }
@@ -3620,7 +3600,9 @@ pub fn run_selected_profile_runtime_test_service(
     let start = Instant::now();
     loop {
         if !session.poll_once(start.elapsed(), Duration::ZERO)? {
-            session.wait_for_materialization_or_housekeeping(RESIDENT_IDLE_INTERVAL);
+            session
+                .dns_work
+                .wait_for_materialization(RESIDENT_IDLE_INTERVAL);
         }
     }
 }
@@ -4117,17 +4099,6 @@ where
     }
 }
 
-fn prehydrate_exact_hostname(
-    entry: &ExactHostnamePolicy,
-    hostname_policy: &RuntimeHostnamePolicy,
-) -> Result<Vec<PendingMaterialization>, PrehydrationError> {
-    prehydrate_exact_hostname_with_query(
-        entry,
-        hostname_policy,
-        query_fixed_upstream_for_prehydration,
-    )
-}
-
 fn prehydrate_exact_hostname_with_query<F>(
     entry: &ExactHostnamePolicy,
     hostname_policy: &RuntimeHostnamePolicy,
@@ -4152,6 +4123,139 @@ where
         )));
     }
     Ok(materializations)
+}
+
+type HostnameRefreshResult = Result<Vec<PendingMaterialization>, PrehydrationError>;
+
+struct BlockDnsWork {
+    materialization_requests: Receiver<MaterializationRequest>,
+    pending_request: Option<MaterializationRequest>,
+    refresh: HostnameRefresh,
+    next_refresh: BTreeMap<String, Duration>,
+}
+
+impl BlockDnsWork {
+    fn poll(
+        &mut self,
+        elapsed: Duration,
+        policy: &RuntimeHostnamePolicy,
+    ) -> (Vec<MaterializationRequest>, Option<HostnameRefreshResult>) {
+        let requests: Vec<_> = self
+            .pending_request
+            .take()
+            .into_iter()
+            .chain(self.materialization_requests.try_iter())
+            .take(MATERIALIZATION_REQUEST_QUEUE_CAPACITY)
+            .collect();
+        let refresh = self
+            .refresh
+            .poll(&mut self.next_refresh, elapsed, policy, &requests);
+        (requests, refresh)
+    }
+
+    fn wait_for_materialization(&mut self, timeout: Duration) {
+        if self.pending_request.is_none() {
+            self.pending_request = self.materialization_requests.recv_timeout(timeout).ok();
+        }
+    }
+}
+
+struct HostnameRefresh {
+    requests: SyncSender<String>,
+    results: Receiver<HostnameRefreshResult>,
+    in_flight: Option<(String, bool)>,
+}
+
+impl HostnameRefresh {
+    fn start(
+        policy: RuntimeHostnamePolicy,
+        stop: Arc<AtomicBool>,
+        events: SyncSender<ResidentWorkerEvent>,
+        mut query: impl FnMut(&str, u16) -> Result<Vec<u8>, PrehydrationQueryError> + Send + 'static,
+    ) -> Result<(Self, JoinHandle<()>), DnsMediationError> {
+        let (requests, work) = mpsc::sync_channel::<String>(1);
+        let (completed, results) = mpsc::sync_channel(1);
+        let thread = spawn_supervised_worker(HOSTNAME_REFRESH_WORKER, stop, events, move |stop| {
+            while !stop.load(Ordering::Relaxed) {
+                match work.recv_timeout(RESIDENT_IDLE_INTERVAL) {
+                    Ok(hostname) => {
+                        let entry = policy
+                            .exact_entry(&hostname)
+                            .expect("refresh requires an exact policy hostname");
+                        let result =
+                            prehydrate_exact_hostname_with_query(entry, &policy, &mut query);
+                        if completed.try_send(result).is_err() {
+                            break;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            Ok(())
+        })?;
+        Ok((
+            Self {
+                requests,
+                results,
+                in_flight: None,
+            },
+            thread,
+        ))
+    }
+
+    fn poll(
+        &mut self,
+        schedule: &mut BTreeMap<String, Duration>,
+        elapsed: Duration,
+        policy: &RuntimeHostnamePolicy,
+        requests: &[MaterializationRequest],
+    ) -> Option<HostnameRefreshResult> {
+        let completed = if let Some((hostname, superseded)) = &mut self.in_flight {
+            let entry = policy
+                .exact_entry(hostname)
+                .expect("refresh requires an exact policy hostname");
+            let next_due = schedule
+                .get_mut(hostname)
+                .expect("in-flight refresh must be scheduled");
+            // A validated foreground response for this root supersedes the whole older lookup,
+            // even if both arrive in this poll. Never suppress an error or restart a grant's TTL.
+            if let Some(interval) = requests
+                .iter()
+                .filter(|request| request.queried_hostname == *hostname)
+                .map(|request| hostname_refresh_interval(entry, &request.response.materializations))
+                .min()
+            {
+                *superseded = true;
+                *next_due = elapsed.saturating_add(interval);
+            }
+            let result = self.results.try_recv().ok()?;
+            let result = if *superseded && result.is_ok() {
+                None
+            } else {
+                let interval = result
+                    .as_ref()
+                    .map_or(DNS_PROFILE_REFRESH_INTERVAL, |materializations| {
+                        hostname_refresh_interval(entry, materializations)
+                    });
+                *next_due = elapsed.saturating_add(interval);
+                Some(result)
+            };
+            self.in_flight = None;
+            result
+        } else {
+            None
+        };
+
+        // Only the resident issues work, with at most one lookup or unconsumed result.
+        // Worker exit is reported by the same required-worker supervisor as the DNS listeners.
+        if let Some(hostname) = next_due_hostname_refresh(schedule, elapsed)
+            && self.requests.try_send(hostname.clone()).is_ok()
+        {
+            self.in_flight = Some((hostname, false));
+        }
+        completed
+    }
 }
 
 fn hostname_refresh_schedule(
@@ -4899,11 +5003,26 @@ fn start_dns_proxy(
             return Err(error);
         }
     }
+    let mode = recorder.scope.mode();
+    let hostname_refresh = if mode == Mode::Block {
+        let (refresh, thread) = HostnameRefresh::start(
+            recorder.hostname_policy,
+            Arc::clone(&stop),
+            events.clone(),
+            query_fixed_upstream_for_prehydration,
+        )
+        .inspect_err(|_| shutdown_dns_workers(&stop, &mut threads))?;
+        threads.push(thread);
+        Some(refresh)
+    } else {
+        None
+    };
     drop(events);
     Ok(DnsProxyRuntime {
         threads,
-        supervisor: ResidentWorkerSupervisor::new(receiver, docker_available),
+        supervisor: ResidentWorkerSupervisor::new(receiver, mode, docker_available),
         attribution,
+        hostname_refresh,
     })
 }
 
@@ -6676,7 +6795,10 @@ fn evidence_from_state(
         scope,
         &CnameAuthorizationState::default(),
         &hostname_policy,
-        &initial_resident_health(scope.lockdown_posture() != LockdownPosture::StandardBlock),
+        &initial_resident_health(
+            scope.mode(),
+            scope.lockdown_posture() != LockdownPosture::StandardBlock,
+        ),
     )
 }
 
@@ -7224,6 +7346,7 @@ mod tests {
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
             resident_health: Arc::new(Mutex::new(initial_resident_health(
+                scope.mode(),
                 scope.lockdown_posture() != LockdownPosture::StandardBlock,
             ))),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -9273,6 +9396,125 @@ mod tests {
     }
 
     #[test]
+    fn foreground_transaction_completes_while_older_hostname_refresh_is_blocked() {
+        const ROOT: &str = "github.com";
+        const TARGET: &str = "edge.example";
+        const ADDRESS: &[u8] = &[192, 0, 2, 10];
+        for (live_hostname, corrupt_refresh) in
+            [(ROOT, false), (ROOT, true), ("api.github.com", false)]
+        {
+            let policy = test_hostname_policy(false);
+            let stop = Arc::new(AtomicBool::new(false));
+            let (events, _events) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+            let (entered, refresh_blocked) = mpsc::sync_channel(0);
+            let (release, resume) = mpsc::sync_channel(0);
+            let (refresh, worker) = HostnameRefresh::start(
+                policy.clone(),
+                stop.clone(),
+                events,
+                move |hostname, qtype| {
+                    assert_eq!(hostname, ROOT);
+                    if qtype == 1 {
+                        return Ok(response_with_cname_and_address(
+                            ROOT, TARGET, 300, 300, ADDRESS,
+                        ));
+                    }
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                    Ok(if corrupt_refresh {
+                        Vec::new()
+                    } else {
+                        response_with_cname_for_type(ROOT, qtype, TARGET, 300)
+                    })
+                },
+            )
+            .unwrap();
+            let (submitter, materialization_requests) = materialization_request_channel();
+            let mut work = BlockDnsWork {
+                materialization_requests,
+                pending_request: None,
+                refresh,
+                next_refresh: BTreeMap::from([(ROOT.to_owned(), Duration::ZERO)]),
+            };
+            let elapsed = Duration::ZERO;
+            work.poll(elapsed, &policy);
+            refresh_blocked.recv().unwrap();
+
+            // Exercise the resident's real wake, poll, staging and completion paths. The
+            // barrier, not a latency assertion, holds the older lookup until the client is done.
+            let (recorder, report_path) =
+                test_recorder(DnsEvidenceScope::ProtectedHostBlock, Some(submitter));
+            let client = recorder.clone();
+            let caller = thread::spawn(move || {
+                client.record_response(
+                    live_hostname,
+                    1,
+                    &response_with_cname_and_address(live_hostname, TARGET, 10, 10, ADDRESS),
+                    None,
+                )
+            });
+            work.wait_for_materialization(RESIDENT_WORKER_START_TIMEOUT);
+            let (requests, refresh) = work.poll(elapsed, &policy);
+            assert!(refresh.is_none());
+            let [request] = requests.try_into().unwrap();
+            let cache_until = request.response.valid_until.unwrap();
+            stage_and_complete_test_request(&recorder, request);
+            assert!(
+                matches!(caller.join().unwrap(), DnsResponseDisposition::LimitAnswerTtls { lifetime, .. }
+                if lifetime.cache_until == cache_until && lifetime.covered_until == cache_until)
+            );
+
+            // Stop after publishing the held result so the final poll is deterministic too.
+            stop.store(true, Ordering::Relaxed);
+            release.send(()).unwrap();
+            worker.join().unwrap();
+            let (requests, refresh) = work.poll(elapsed, &policy);
+            assert!(requests.is_empty());
+            if corrupt_refresh {
+                assert!(matches!(refresh, Some(Err(PrehydrationError::Fatal(_)))));
+            } else if live_hostname == ROOT {
+                assert!(
+                    refresh.is_none(),
+                    "the older refresh must not lengthen the live grant"
+                );
+            } else {
+                assert!(
+                    !refresh.unwrap().unwrap().is_empty(),
+                    "an unrelated live answer must not suppress refresh"
+                );
+            }
+            assert_eq!(work.next_refresh[ROOT], DNS_PROFILE_REFRESH_INTERVAL);
+            fs::remove_file(report_path).unwrap();
+        }
+    }
+
+    #[test]
+    fn hostname_refresh_worker_exit_is_reported_to_resident_supervision() {
+        let (events, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
+        let (refresh, worker) = HostnameRefresh::start(
+            test_hostname_policy(false),
+            Arc::new(AtomicBool::new(false)),
+            events,
+            |_, _| panic!("test refresh panic"),
+        )
+        .unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ResidentWorkerEvent::Started(HOSTNAME_REFRESH_WORKER)
+        ));
+        refresh.requests.try_send("github.com".to_owned()).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            receiver.recv().unwrap(),
+            ResidentWorkerEvent::Fatal {
+                worker: HOSTNAME_REFRESH_WORKER,
+                code: "resident_worker_panicked",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn block_missing_materialization_owner_fails_closed_but_empty_and_audit_answers_forward() {
         let (block, block_report) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
         assert_eq!(
@@ -9495,7 +9737,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(Mode::Block, false))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: PathBuf::from("unused-test-report.json"),
             scope: DnsEvidenceScope::SelectedProfileRuntimeTest,
@@ -9693,7 +9935,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert_eq!(evidence.runner_authorized_results_storage.len(), 4);
         assert!(
@@ -9826,7 +10068,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &artifact_policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert!(evidence.allow_github_artifacts);
         assert!(evidence.hostname_policy.allow_github_artifacts);
@@ -10418,7 +10660,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert_eq!(
             evidence.bounded_githubapp_suffix_authorizations.len(),
@@ -10449,7 +10691,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &CnameAuthorizationState::default(),
             &opt_out_policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert!(
             opt_out_evidence
@@ -10528,7 +10770,7 @@ mod tests {
             DnsEvidenceScope::ProtectedHostBlock,
             &authorizations,
             &policy,
-            &initial_resident_health(true),
+            &initial_resident_health(Mode::Block, false),
         );
         assert_eq!(
             evidence.bounded_user_wildcard_authorizations.len(),
@@ -13932,7 +14174,7 @@ mod tests {
             state: Arc::new(Mutex::new(ObservationState::default())),
             cname_authorizations: Arc::new(Mutex::new(CnameAuthorizationState::default())),
             report_write_failed: Arc::new(AtomicBool::new(false)),
-            resident_health: Arc::new(Mutex::new(initial_resident_health(true))),
+            resident_health: Arc::new(Mutex::new(initial_resident_health(Mode::Audit, true))),
             shutdown: Arc::new(AtomicBool::new(false)),
             report_path: root.join("missing/report.json"),
             scope: DnsEvidenceScope::ProtectedHostAudit,
@@ -13948,7 +14190,7 @@ mod tests {
     #[test]
     fn resident_worker_supervisor_requires_all_workers_and_reports_fatal_exit() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, true);
         for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
@@ -13978,8 +14220,14 @@ mod tests {
     #[test]
     fn host_only_worker_supervision_omits_only_container_dns_workers() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver, false);
-        for worker in ["host_tcp_dns", "host_udp_dns", ATTRIBUTION_WORKER_NAME] {
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, false);
+        let required = [
+            "host_tcp_dns",
+            "host_udp_dns",
+            HOSTNAME_REFRESH_WORKER,
+            ATTRIBUTION_WORKER_NAME,
+        ];
+        for worker in required {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
         supervisor.wait_for_startup().unwrap();
@@ -13990,10 +14238,10 @@ mod tests {
                 .iter()
                 .map(|worker| worker.name)
                 .collect::<Vec<_>>(),
-            vec!["host_tcp_dns", "host_udp_dns", ATTRIBUTION_WORKER_NAME]
+            required
         );
         assert!(
-            initial_resident_health(false)
+            initial_resident_health(Mode::Block, false)
                 .workers
                 .iter()
                 .all(|worker| !worker.name.starts_with("docker_"))
@@ -14003,7 +14251,7 @@ mod tests {
     #[test]
     fn resident_worker_supervisor_reports_channel_disconnect_once() {
         let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-        let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
+        let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, true);
         for worker in REQUIRED_RESIDENT_WORKERS {
             sender.send(ResidentWorkerEvent::Started(worker)).unwrap();
         }
@@ -14020,7 +14268,7 @@ mod tests {
         for panic_worker in [false, true] {
             let stop = Arc::new(AtomicBool::new(false));
             let (sender, receiver) = mpsc::sync_channel(RESIDENT_EVENT_CHANNEL_CAPACITY);
-            let mut supervisor = ResidentWorkerSupervisor::new(receiver, true);
+            let mut supervisor = ResidentWorkerSupervisor::new(receiver, Mode::Block, true);
             let worker = if panic_worker {
                 ATTRIBUTION_WORKER_NAME
             } else {
@@ -14053,7 +14301,7 @@ mod tests {
 
     #[test]
     fn resident_verification_sequence_and_timestamp_are_bounded() {
-        let mut health = initial_resident_health(true);
+        let mut health = initial_resident_health(Mode::Block, true);
         health.verification_sequence = u64::MAX;
         let workers = health
             .workers
