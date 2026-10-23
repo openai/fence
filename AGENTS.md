@@ -30,6 +30,8 @@ Packets to the fixed upstream DNS tuple are dispatched through current-socket po
 
 In host output and forwarding, original-direction UDP packets follow the current destination policy even for established flows; reply-direction packets keep normal connection-state handling. Connection tracking identifies a flow, not the socket that sent it.
 
+Rejecting a DNS answer at the address limit must not postpone expiry. Verify the resulting firewall before recording removals; when the effective rules are unchanged, verify them without replacing the table or resetting its counters.
+
 Production runtime intake accepts only `/run/fence/<invocation-id>/config.json`, requires pinned root-owned directories containing only a root-owned `0600` regular config file before activation, uses no-follow and close-on-exec config opens, and validates that production execution is the root `MainPID` of `fence-<invocation-id>.service`. The public worker composes DNS-mediated network policy, mode-specific lockdown or observation semantics, production readiness, resident verification, and no-restore operation onto those primitives.
 
 ## North-Star Principles
