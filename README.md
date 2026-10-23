@@ -113,7 +113,7 @@ Fence runs before the rest of your job and controls which network destinations t
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
-Fence briefly retries incomplete local service inspections before failing. If startup still fails, check the inspection reason codes in the log; see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
+Fence checks listening services without counting unrelated TCP connections against the inspection limit. It briefly retries incomplete inspections; if startup still fails, check the reason codes in the log and see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
 
 Failed evidence validation may include [bounded, unverified diagnostics](docs/troubleshooting.md#post-job-evidence-validation-fails); the job still fails.
 
