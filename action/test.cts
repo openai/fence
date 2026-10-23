@@ -1170,8 +1170,8 @@ test("failed launches permit cleanup only for a stopped resident with no readine
   }
 });
 
-test("service diagnostics never emit raw command output, even in debug mode", () => {
-  const sensitive = "sensitive_marker";
+test("setup puts the reported reason and safe next step in the error, without raw service output", () => {
+  const sensitive = "private_fixture_value\n::error::injected";
   const status = {
     status: 0, error: false,
     stdout: `LoadState=loaded\nActiveState=failed\nResult=${sensitive}\nEnvironment=${sensitive}`,
@@ -1188,23 +1188,81 @@ test("service diagnostics never emit raw command output, even in debug mode", ()
   const previousDebug = process.env.RUNNER_DEBUG;
   process.env.RUNNER_DEBUG = "1";
   try {
-    const output = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    let error = "";
+    const output = captureStdout(() => {
+      error = captureStderr(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    });
+    assert.match(error, /^::error::Fence could not verify readiness: a required DNS listener could not start/);
+    assert.match(error, /host UDP bind: address already in use/);
+    assert.match(error, /dns_proxy_bind_failed.*Keep this job failed.*runner compatibility issues/);
     assert.match(output, /Fence service state for fence-example\.service: LoadState=loaded; ActiveState=failed/);
     assert.match(output, /Fence debug: service diagnostics/);
     assert.match(output, /Fence resident error code: dns_proxy_bind_failed/);
-    assert.match(output, /Fence DNS startup: host UDP bind: address already in use/);
-    assert.ok(!output.includes(sensitive));
-    assert.doesNotMatch(output, /Fence host resolver:/);
+    assert.doesNotMatch(error + output, /private_fixture_value|injected|target changed|FENCE_REPORT_JSON/);
 
     journal.stdout = journal.stdout.replace("dns_proxy_bind_failed", "unsupported_resolver_layout");
-    const resolverOutput = captureStdout(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
-    assert.match(resolverOutput, /Fence host resolver: target changed/);
-    assert.doesNotMatch(resolverOutput, /Fence DNS startup:/);
-    assert.ok(!resolverOutput.includes(sensitive));
+    const resolverOutput = captureStdout(() => {
+      error = captureStderr(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    });
+    assert.match(error, /the host DNS resolver did not pass verification: target changed \(unsupported_resolver_layout\)/);
+    // Scheduled release-canary reporting also consumes this fixed warning.
+    assert.match(resolverOutput, /::warning::Fence resident error code: unsupported_resolver_layout/);
+    assert.doesNotMatch(error + resolverOutput, /private_fixture_value|injected|host UDP|FENCE_REPORT_JSON/);
   } finally {
     if (previousDebug === undefined) delete process.env.RUNNER_DEBUG;
     else process.env.RUNNER_DEBUG = previousDebug;
   }
+});
+
+test("setup explains recognized failures without guessing at missing or unrelated details", () => {
+  const status = { status: 0, error: false, stdout: "ActiveState=failed\nSubState=failed\nMainPID=0" };
+  const failure = (code: string) => JSON.stringify({ schema_version: 1, command: "run", status: "error", error: { code } });
+  const cases = [
+    [failure("dns_proxy_bind_failed"), /a required DNS listener could not start \(dns_proxy_bind_failed\)/],
+    [JSON.stringify({ fence_resolver_layout: { reason: "private_fixture_value\n::error::injected" } }) + "\n" +
+      failure("unsupported_resolver_layout"), /host DNS resolver did not pass verification \(unsupported_resolver_layout\)/],
+    [JSON.stringify({ fence_local_control: { status: "unavailable", attempts: 3, unavailable_inputs: ["proc"], bounds_exceeded: [] } }) +
+      "\n" + failure("local_control_inventory_unavailable"), /local services and their socket owners.*attempts=3; unavailable=proc/],
+    [JSON.stringify({ fence_lockdown_command: { executable: "sudo", principal: "runner", code: "lockdown_command_timeout", timeout_ms: 5000 } }) +
+      "\n" + failure("lockdown_command_timeout"), /host verification command.*executable=sudo; principal=runner.*timeout_ms=5000/],
+    [failure("dns_block_prehydration_failed"), /DNS rules for required hostnames could not be prepared/],
+  ] as const;
+  for (const [stdout, reason] of cases) {
+    const error = captureStderr(() => captureStdout(() =>
+      emitCapturedServiceDiagnostics("fence-example.service", status, { status: 0, error: false, stdout })));
+    assert.match(error, reason);
+    assert.equal(error.split("::error::").length, 2);
+    assert.doesNotMatch(error, /private_fixture_value|injected|FENCE_REPORT_JSON/);
+  }
+
+  for (const journal of [
+    { status: 1, error: false, stdout: failure("dns_proxy_bind_failed") },
+    { status: null, error: true, stdout: "private_fixture_value" },
+    { status: 0, error: false, stdout: failure("private_fixture_value") },
+    { status: 0, error: false, stdout: '{"fence_resolver_layout":{"reason":"target_changed"}}\nnot JSON' },
+  ]) {
+    let error = "";
+    const output = captureStdout(() => {
+      error = captureStderr(() => emitCapturedServiceDiagnostics("fence-example.service", status, journal));
+    });
+    assert.match(error, /^::error::Fence could not verify readiness: no recognized startup reason was available/);
+    assert.doesNotMatch(error + output, /dns_proxy_bind_failed|private_fixture_value|target changed|FENCE_REPORT_JSON/);
+  }
+});
+
+test("post still fails without the protected mount and points to the setup step", () => {
+  const paths = runtimePaths("action-missing-mount");
+  const post = require("node:child_process").spawnSync(process.execPath, [path.join(__dirname, "post.cts")], {
+    encoding: "utf8",
+    env: {
+      STATE_invocation_id: "action-missing-mount",
+      STATE_report_path: paths.report,
+      STATE_launcher_integrity_path: paths.launcherIntegrity,
+    },
+  });
+  assert.equal(post.status, 1);
+  assert.match(post.stderr, /Check the earlier Fence setup step.*reported ready.*protected mount may have been removed/);
+  assert.doesNotMatch(post.stdout, /FENCE_REPORT_JSON|Fence evidence verified/);
 });
 
 test("local control diagnostics expose only bounded fixed reason codes", () => {
@@ -1245,14 +1303,14 @@ test("host command diagnostics exclude arbitrary data and accept only known prog
     executable: "docker", principal: "runner", code: "lockdown_command_timeout", timeout_ms: 5000,
   };
   const line = (value: unknown) => JSON.stringify({ fence_lockdown_command: value });
-  const expected = "executable=docker; principal=runner; code=lockdown_command_timeout; timeout_ms=5000";
+  const expected = "executable=docker; principal=runner; timeout_ms=5000";
   assert.equal(lockdownCommandDiagnosticFromJournal(`unrelated\n${line(diagnostic)}\n`), expected);
   assert.equal(lockdownCommandDiagnosticFromJournal(line({
     ...diagnostic, message: "::error::secret", path: "/private/example", output: "do_not_print",
   })), expected);
   assert.equal(lockdownCommandDiagnosticFromJournal(line({
     executable: "systemd_run", principal: "root", code: "lockdown_command_output_too_large", timeout_ms: 30000,
-  })), "executable=systemd_run; principal=root; code=lockdown_command_output_too_large; timeout_ms=30000");
+  })), "executable=systemd_run; principal=root; timeout_ms=30000");
   for (const invalid of [
     undefined, null, {},
     ...["/usr/bin/docker", "unknown", "docker\n::error::injected", null, ["sudo"]].map((executable) => ({ ...diagnostic, executable })),
@@ -4852,14 +4910,17 @@ test("reports stale critical evidence without accepting it", (t: any) => {
       status: "critical",
       last_successful_verification_unix_milliseconds: Date.now() - 60_000,
     }),
-    critical_findings: [{ code: "dns_block_network_drift", message: "not for logs" }],
+    critical_findings: [
+      { code: "local_control_inventory_drift", message: "not for logs" },
+      { code: "not_a_recognized_code", message: "not for logs" },
+    ],
   };
   assert.throws(() => validateReport(stale, false), /stale/);
   assert.throws(() => settleResidentReport("unused", "unused", stale), /stale/);
   assert.equal(lines.length, 1);
   assert.match(lines[0], /unverified/);
-  assert.match(lines[0], /dns_block_network_drift/);
-  assert.doesNotMatch(lines[0], /not for logs|FENCE_REPORT_JSON|verified protection/);
+  assert.match(lines[0], /"critical_codes":\["local_control_inventory_drift","unrecognized"\]/);
+  assert.doesNotMatch(lines[0], /not_a_recognized_code|not for logs|FENCE_REPORT_JSON|verified protection/);
   const failure = new Error("original validation failure");
   assert.throws(() => validatePostEvidence(stale, "dns", () => { throw failure; }), (error: unknown) => error === failure);
   t.mock.method(actionLog, "info", () => { throw new Error("logging failed"); });

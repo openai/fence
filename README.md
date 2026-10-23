@@ -101,7 +101,7 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 
 ## How It Works 🔧
 
-Run Fence once per job. If setup fails, check the [startup diagnostics](docs/troubleshooting.md#fence-fails-to-start) in the job log; Fence does not copy raw service logs there. Cleanup only removes this launch's unfinished setup. It never removes another launch's protections or undoes the lockdown after Fence reports ready.
+Run Fence once per job. If you see [`Fence could not verify readiness`](docs/troubleshooting.md#fence-fails-to-start), read that setup error first, even if the post-job step also fails. It shows a recognized reason when available, not raw service logs or a claim that cleanup succeeded. Fence never removes another launch's protections or undoes the lockdown after reporting ready.
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 

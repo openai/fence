@@ -1308,6 +1308,8 @@ function activeActionMountEvidence(
   if (!path.isAbsolute(target) || path.normalize(target) !== target) {
     fail("Fence active Action mount target is invalid");
   }
+  const unavailable = "Fence active Action mount evidence is unavailable. Check the earlier Fence setup step. " +
+    "If it reported ready, the protected mount may have been removed; do not trust this job as protected.";
   let descriptor: number;
   try {
     descriptor = fs.openSync(
@@ -1317,7 +1319,7 @@ function activeActionMountEvidence(
         fs.constants.O_NOFOLLOW,
     );
   } catch {
-    fail("Fence active Action mount evidence is unavailable; setup may not have reached readiness, or the protected mount was removed");
+    fail(unavailable);
   }
   try {
     const mountId = mountIdFromFdInfo(
@@ -1333,7 +1335,7 @@ function activeActionMountEvidence(
       mountId,
     };
   } catch {
-    fail("Fence active Action mount evidence is unavailable; setup may not have reached readiness, or the protected mount was removed");
+    fail(unavailable);
   } finally {
     fs.closeSync(descriptor);
   }
