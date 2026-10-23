@@ -234,6 +234,21 @@ impl<E: NftExecutor> NativeNftBackend<E> {
         verify_owned_state(expected, &observed).map_err(BackendError::from)
     }
 
+    /// Replacing an identical table would reset its packet counters. Verify it instead.
+    pub fn verify_or_replace_owned_state(
+        &mut self,
+        current: &OwnedNftState,
+        proposed: &OwnedNftState,
+        replacement: impl FnOnce() -> String,
+    ) -> Result<(), BackendError> {
+        if proposed != current {
+            let ruleset = replacement();
+            self.preflight(&ruleset)?;
+            self.replace_owned_state(&ruleset)?;
+        }
+        self.verify_owned_state(proposed)
+    }
+
     pub fn total_violation_packets(&self) -> Result<u64, BackendError> {
         let bytes = self
             .executor
@@ -1657,6 +1672,47 @@ mod tests {
         assert_eq!(
             backend.executor.operations.borrow().as_slice(),
             &[NftOperation::ApplyProvisional]
+        );
+    }
+
+    #[test]
+    fn unchanged_rules_are_still_verified_without_resetting_the_packet_counters() {
+        let expected = expected_owned_state(Mode::Block, &allowances());
+        let executor = FakeExecutor::with_responses(vec![
+            Ok(active_state_json(Mode::Block)),
+            Ok(active_state_json(Mode::Audit)),
+        ]);
+        let mut backend = NativeNftBackend::new(executor);
+        let mut verify = || {
+            backend.verify_or_replace_owned_state(&expected, &expected, || {
+                panic!("unexpected replacement")
+            })
+        };
+        verify().unwrap();
+        assert_eq!(verify().unwrap_err().code, "owned_nft_state_mismatch");
+        assert_eq!(
+            *backend.executor.operations.borrow(),
+            vec![NftOperation::ReadOwnedState; 2]
+        );
+
+        let changed = expected_owned_state(Mode::Audit, &allowances());
+        let executor = FakeExecutor::with_responses(vec![
+            Ok(Vec::new()),
+            Ok(Vec::new()),
+            Ok(active_state_json(Mode::Audit)),
+        ]);
+        let mut backend = NativeNftBackend::new(executor);
+        backend.provisional_table = ProvisionalTable::Owned;
+        backend
+            .verify_or_replace_owned_state(&expected, &changed, || "change".into())
+            .unwrap();
+        assert_eq!(
+            *backend.executor.operations.borrow(),
+            [
+                NftOperation::Preflight,
+                NftOperation::ApplyProvisional,
+                NftOperation::ReadOwnedState,
+            ]
         );
     }
 
