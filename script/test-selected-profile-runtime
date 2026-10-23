@@ -446,28 +446,34 @@ from dns_evidence import validate_materialization_rejections
 report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:4])
 scenario = sys.argv[4]
 if scenario == "healthy":
-    # Closed connections exceeded the former 1 MiB whole-table limit. Exercise
-    # real TIME_WAIT sockets without leaving a listener or open connections.
+    former_table_limit = 1024 * 1024
+
+    def time_wait_bytes(destination):
+        with open("/proc/net/tcp", "rb") as table:
+            return sum(len(row) for row in table if row.split()[2:4] == [destination, b"06"])
+
+    # Port reuse varies. Measure our TIME_WAIT rows after each bounded batch,
+    # then close the listener before waiting for two full resident checks.
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         address = listener.getsockname()
+        destination = f"0100007F:{address[1]:04X}".encode("ascii")
         listener.listen()
-        for _ in range(8192):
-            with socket.socket() as client:
-                client.settimeout(2)
-                client.connect(address)
-                peer, _ = listener.accept()
-                with peer:
-                    client.close()
-                    require(peer.recv(1) == b"", "loopback connection did not close")
+        batch_size = 2048
+        for _ in range(0, 16_384, batch_size):
+            for _ in range(batch_size):
+                with socket.socket() as client:
+                    client.settimeout(2)
+                    client.connect(address)
+                    peer, _ = listener.accept()
+                    with peer:
+                        client.close()
+                        require(peer.recv(1) == b"", "loopback connection did not close")
+            if time_wait_bytes(destination) > former_table_limit:
+                break
+        else:
+            raise SystemExit("test TIME_WAIT sockets did not exceed the former TCP table bound")
 
-    def require_tcp_churn():
-        port = f":{address[1]:04X}".encode()
-        with open("/proc/net/tcp", "rb") as table:
-            size = sum(len(row) for row in table if row.split()[2].endswith(port) and row.split()[3] == b"06")
-        require(size > 1024 * 1024, "test TIME_WAIT sockets did not exceed the former TCP table bound")
-
-    require_tcp_churn()
     resident = json.loads(report_path.read_bytes())["resident_health"]
     target_sequence = resident["verification_sequence"] + 2
     deadline = time.monotonic() + 30
@@ -476,7 +482,10 @@ if scenario == "healthy":
         require(time.monotonic() < deadline, "resident verification did not advance under TCP connection churn")
         time.sleep(0.2)
         resident = json.loads(report_path.read_bytes())["resident_health"]
-    require_tcp_churn()
+    require(
+        time_wait_bytes(destination) > former_table_limit,
+        "test TIME_WAIT sockets fell below the former TCP table bound during resident checks",
+    )
 
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))

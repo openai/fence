@@ -3943,15 +3943,26 @@ mod tests {
     #[test]
     fn missing_proc_acquisition_is_stably_unavailable_and_rejected() {
         let root = TestRoot::new();
-        fs::remove_dir_all(&root.0).unwrap();
-        let observation = observe_local_control_inventory(
-            &root.0,
-            &TestSocketAccess::default(),
-            &NoCurrentFenceOwner,
+        let missing_proc = root.0.join("missing-proc");
+        let access = TestSocketAccess::default();
+        let observation = observe_local_control_with(
+            || {
+                collect_private_snapshot(&missing_proc, &access, &NoCurrentFenceOwner, |_, _| {
+                    Ok(Vec::new())
+                })
+            },
+            || {},
         );
         assert_eq!(observation.status, ObservationStatus::Unavailable);
         assert!(observation.stable);
+        assert_eq!(observation.attempts, STABILITY_ATTEMPTS);
         assert_eq!(observation.snapshot.scan_status, ScanStatus::Unavailable);
+        assert!(
+            observation
+                .snapshot
+                .unavailable_inputs
+                .contains(&UnavailableReason::Proc)
+        );
         let accepted = accepted_observation();
         assert_eq!(
             verify_local_control_observation(&accepted.snapshot, &observation)
