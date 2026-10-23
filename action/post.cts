@@ -82,6 +82,7 @@ const FAILURE_CRITICAL_CODES = new Set([
   "dns_udp_listener_failed",
   "local_control_inventory_additive_drift",
   "local_control_inventory_bounds_exceeded",
+  "local_control_inventory_drift",
   "local_control_inventory_incomplete",
   "local_control_inventory_unavailable",
   "local_control_inventory_unreviewed_reduction",

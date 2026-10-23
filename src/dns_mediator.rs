@@ -989,6 +989,12 @@ struct MaterializationMerge {
     expired: u64,
 }
 
+struct MaterializationCandidate {
+    active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    allowances: Vec<EffectiveAllowance>,
+    merge: MaterializationMerge,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ActiveMaterialization {
     source_hostname: String,
@@ -3195,25 +3201,36 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         let accepted_request_count = accepted_requests.len();
         let rejected_request_count = rejected_requests.len();
         let batch_has_work = !materializations.is_empty();
-        let mut proposed = self.active.clone();
-        let merge = merge_materializations(&mut proposed, materializations, transaction_now);
-        let proposed_allowances =
-            effective_allowances_with_materializations(&self.base_allowances, &proposed);
-        let materialization_bound_exceeded =
-            materialization_candidate_exceeds_bounds(&proposed, &proposed_allowances);
-        let ruleset = render_dns_mediated_replacement_ruleset(Mode::Block, &proposed_allowances);
-        let active_ruleset = render_dns_mediated_ruleset(Mode::Block, &proposed_allowances);
-        let expected = expected_dns_mediated_owned_state(Mode::Block, &proposed_allowances);
-        let transaction_requires_verification =
-            materialization_candidate_requires_verification(accepted_request_count, &merge);
-        let verification_succeeded = if materialization_bound_exceeded {
-            false
-        } else if merge.rules_changed {
-            self.backend.preflight(&ruleset).is_ok()
-                && self.backend.replace_owned_state(&ruleset).is_ok()
-                && self.backend.verify_owned_state(&expected).is_ok()
-        } else if transaction_requires_verification {
-            self.backend.verify_owned_state(&expected).is_ok()
+        let (candidate, materialization_bound_exceeded) = bounded_materialization_candidate(
+            &self.active,
+            &self.base_allowances,
+            materializations,
+        );
+        let MaterializationCandidate {
+            active,
+            allowances,
+            merge,
+        } = candidate;
+        let transaction_requires_verification = materialization_candidate_requires_verification(
+            accepted_request_count,
+            materialization_bound_exceeded,
+            &merge,
+        );
+        let verification_succeeded = if transaction_requires_verification {
+            let expected = expected_dns_mediated_owned_state(Mode::Block, &allowances);
+            let verified = self
+                .backend
+                .verify_or_replace_owned_state(&self.expected_state, &expected, || {
+                    render_dns_mediated_replacement_ruleset(Mode::Block, &allowances)
+                })
+                .is_ok();
+            if verified {
+                let ruleset = render_dns_mediated_ruleset(Mode::Block, &allowances);
+                self.evidence.ruleset_hash = sha256_hex(ruleset.as_bytes());
+                self.expected_state = expected;
+                self.evidence.network_verification_status = "verified";
+            }
+            verified
         } else {
             true
         };
@@ -3223,17 +3240,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             &mut authorizations,
             &mut self.active,
             proposed_authorizations,
-            proposed,
+            active,
         );
-        let update_succeeded = update_result.is_ok();
-        if update_succeeded && transaction_requires_verification {
-            self.expected_state = expected;
-            self.evidence.ruleset_hash = sha256_hex(active_ruleset.as_bytes());
-            self.evidence.network_verification_status = "verified";
-        }
         // Snapshot both grants at commit. Completion only wakes the DNS worker;
         // the owner never waits for that worker to write to the client.
-        if update_succeeded {
+        if update_result.is_ok() {
             complete_materialization_requests(accepted_requests.drain(..), |request| {
                 self.dns_work.observe_committed_answer(
                     request,
@@ -3276,7 +3287,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                     self.evidence.hostname_refresh_warnings.saturating_add(1);
                 self._mediation.recorder.record_hostname_refresh_warning();
             }
-            if !materialization_bound_exceeded {
+            if reason == MaterializationRejectionReason::FirewallUpdateFailed {
                 self.evidence.network_verification_status = "critical_dynamic_update_failed";
                 self.record_critical(
                     "dns_block_dynamic_update_failed",
@@ -3289,7 +3300,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 .recorder
                 .record_materialization_batch(batch_started.elapsed());
         }
-        if update_succeeded && (merge.metadata_changed || merge.rules_changed) {
+        if verification_succeeded && (merge.metadata_changed || merge.rules_changed) {
             self.evidence.materialized_allowances = report_materializations(&self.active);
             self.evidence.expired_materializations = self
                 .evidence
@@ -4660,11 +4671,39 @@ fn materialization_candidate_exceeds_bounds(
     active.len() > MAX_ACTIVE_MATERIALIZATIONS || effective_allowances.len() > MAX_EXPANDED_RULES
 }
 
+fn bounded_materialization_candidate(
+    active: &BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
+    base: &[EffectiveAllowance],
+    pending: BTreeSet<PendingMaterialization>,
+) -> (MaterializationCandidate, bool) {
+    let candidate = |pending| {
+        let mut active = active.clone();
+        let merge = merge_materializations(&mut active, pending, Instant::now());
+        let allowances = effective_allowances_with_materializations(base, &active);
+        MaterializationCandidate {
+            active,
+            allowances,
+            merge,
+        }
+    };
+    let proposed = candidate(pending);
+    if !materialization_candidate_exceeds_bounds(&proposed.active, &proposed.allowances) {
+        return (proposed, false);
+    }
+    // Refusing new addresses must not preserve expired ones. Start again from the
+    // committed grants, so no part of an over-capacity answer can be installed.
+    (candidate(BTreeSet::new()), true)
+}
+
 fn materialization_candidate_requires_verification(
     accepted_request_count: usize,
+    materialization_bound_exceeded: bool,
     merge: &MaterializationMerge,
 ) -> bool {
-    accepted_request_count > 0 || merge.rules_changed || merge.metadata_changed
+    accepted_request_count > 0
+        || materialization_bound_exceeded
+        || merge.rules_changed
+        || merge.metadata_changed
 }
 
 fn publish_verified_materialization_transaction(
@@ -4675,13 +4714,14 @@ fn publish_verified_materialization_transaction(
     proposed_authorizations: CnameAuthorizationState,
     proposed_active: BTreeMap<ActiveMaterializationKey, ActiveMaterialization>,
 ) -> Result<(), MaterializationRejectionReason> {
-    if materialization_bound_exceeded {
-        return Err(MaterializationRejectionReason::Capacity);
-    }
     if !verification_succeeded {
         return Err(MaterializationRejectionReason::FirewallUpdateFailed);
     }
+    // At capacity the verified candidate contains only surviving grants.
     *active = proposed_active;
+    if materialization_bound_exceeded {
+        return Err(MaterializationRejectionReason::Capacity);
+    }
     *authorizations = proposed_authorizations;
     Ok(())
 }
@@ -12695,17 +12735,21 @@ mod tests {
             now,
         );
         let (recorder, report_path) = test_recorder(DnsEvidenceScope::ProtectedHostBlock, None);
-        for (bound_exceeded, expected_reason) in [
-            (false, MaterializationRejectionReason::FirewallUpdateFailed),
-            (true, MaterializationRejectionReason::Capacity),
+        for (verified, bound_exceeded, expected_reason) in [
+            (
+                false,
+                false,
+                MaterializationRejectionReason::FirewallUpdateFailed,
+            ),
+            (true, true, MaterializationRejectionReason::Capacity),
         ] {
             let reason = publish_verified_materialization_transaction(
-                false,
+                verified,
                 bound_exceeded,
                 &mut current_authorizations,
                 &mut current_active,
                 proposed_authorizations.clone(),
-                proposed_active.clone(),
+                BTreeMap::new(),
             )
             .unwrap_err();
             assert_eq!(reason, expected_reason);
@@ -12832,6 +12876,77 @@ mod tests {
     }
 
     #[test]
+    fn a_full_policy_still_retires_expired_grants_without_admitting_the_answer() {
+        let now = Instant::now();
+        let pending = |index: usize| PendingMaterialization {
+            source_hostname: "source.example".into(),
+            hostname: format!("target-{index}.example"),
+            address: if index == 0 {
+                "192.0.2.10"
+            } else {
+                "192.0.2.11"
+            }
+            .parse()
+            .unwrap(),
+            protocol: Protocol::Tcp,
+            port: 443,
+            origins: vec![HostnamePolicyOrigin::User],
+            ttl_seconds: 60,
+            expires_at: now + Duration::from_secs(60),
+        };
+        let limit = MAX_ACTIVE_MATERIALIZATIONS;
+        let mut active = BTreeMap::new();
+        merge_materializations(&mut active, (0..limit).map(pending), now);
+
+        // An over-capacity background refresh must verify even when no grants expire.
+        let refresh = BTreeSet::from([pending(limit)]);
+        let (candidate, exceeded) = bounded_materialization_candidate(&active, &[], refresh);
+        assert!(exceeded);
+        assert_eq!(candidate.active, active);
+        assert!(materialization_candidate_requires_verification(
+            0,
+            exceeded,
+            &candidate.merge,
+        ));
+
+        let expired = pending(0).active_key();
+        active.get_mut(&expired).unwrap().expires_at = now;
+        let mut survivors = active.clone();
+        survivors.remove(&expired).unwrap();
+
+        // One grant expires as two arrive. Keep the other grants, not the first new one.
+        let incoming = BTreeSet::from([pending(limit), pending(limit + 1)]);
+        let (candidate, exceeded) = bounded_materialization_candidate(&active, &[], incoming);
+        assert!(exceeded);
+        assert_eq!(candidate.active, survivors);
+        assert_eq!(candidate.merge.expired, 1);
+        assert!(candidate.merge.rules_changed);
+        assert_eq!(candidate.allowances.len(), 1);
+        assert_eq!(candidate.allowances[0].destination, "192.0.2.11");
+
+        let mut authorizations = CnameAuthorizationState::default();
+        let mut staged = authorizations.clone();
+        staged.bounded_user_wildcard.insert("new.example".into());
+        for (verified, reason) in [
+            (false, MaterializationRejectionReason::FirewallUpdateFailed),
+            (true, MaterializationRejectionReason::Capacity),
+        ] {
+            let result = publish_verified_materialization_transaction(
+                verified,
+                exceeded,
+                &mut authorizations,
+                &mut active,
+                staged.clone(),
+                candidate.active.clone(),
+            );
+            assert_eq!(result, Err(reason));
+            assert_eq!(active.contains_key(&expired), !verified);
+            assert!(authorizations.bounded_user_wildcard.is_empty());
+        }
+        assert_eq!(active, survivors);
+    }
+
+    #[test]
     fn refresh_only_metadata_requires_verification_before_publication() {
         let now = Instant::now();
         let idle = MaterializationMerge {
@@ -12839,7 +12954,9 @@ mod tests {
             metadata_changed: false,
             expired: 0,
         };
-        assert!(!materialization_candidate_requires_verification(0, &idle));
+        assert!(!materialization_candidate_requires_verification(
+            0, false, &idle
+        ));
         let pending = |expires_at| PendingMaterialization {
             source_hostname: "github.com".to_owned(),
             hostname: "edge.example".to_owned(),
@@ -12865,7 +12982,18 @@ mod tests {
         );
         assert!(!merge.rules_changed);
         assert!(merge.metadata_changed);
-        assert!(materialization_candidate_requires_verification(0, &merge));
+        assert!(materialization_candidate_requires_verification(
+            0, false, &merge
+        ));
+
+        // An address already allowed by a static entry also needs verification, not a new table.
+        let base = effective_allowances_with_materializations(&[], &current_active);
+        let incoming = BTreeSet::from([pending(now + Duration::from_secs(60))]);
+        let (candidate, exceeded) =
+            bounded_materialization_candidate(&BTreeMap::new(), &base, incoming);
+        assert!(!exceeded);
+        assert!(candidate.merge.rules_changed);
+        assert_eq!(candidate.allowances, base);
 
         let mut current_authorizations = CnameAuthorizationState::default();
         assert_eq!(

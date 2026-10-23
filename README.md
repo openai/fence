@@ -55,7 +55,7 @@ Add destinations your workflow needs to the `allowlist`:
 
 Bare hostnames default to TCP port `443`. Fence also supports IPv6, custom ports, TCP, UDP, CIDR ranges, and one- or two-level hostname wildcards. An allowlist can contain up to 64 unique entries.
 
-Allowlist the hostname, not every IP address it might use. In block mode, Fence refreshes exact hostnames in the background, verifies the firewall rules before returning a new address, and can shorten DNS cache lifetimes to match.
+Allowlist the hostname, not every IP address it might use. In block mode, Fence refreshes exact hostnames in the background, verifies the firewall rules before returning a new address, and can shorten DNS cache lifetimes to match. If the policy fills up, Fence refuses new addresses and still removes expired ones.
 
 See [allowlist syntax](docs/allowlist.md) for all supported formats.
 
@@ -101,7 +101,7 @@ Fence disables Docker by default. If your job needs containers, you can keep it 
 
 ## How It Works 🔧
 
-Run Fence once per job. If setup fails, check the [startup diagnostics](docs/troubleshooting.md#fence-fails-to-start) in the job log; Fence does not copy raw service logs there. Cleanup only removes this launch's unfinished setup. It never removes another launch's protections or undoes the lockdown after Fence reports ready.
+Run Fence once per job. If [setup fails](docs/troubleshooting.md#fence-fails-to-start), start with that error, even if the post-job step also fails. Fence won't guess whether protection started or cleanup succeeded, and it never undoes the lockdown after reporting ready.
 
 Fence runs before the rest of your job and controls which network destinations the runner can reach:
 
@@ -113,7 +113,7 @@ Fence runs before the rest of your job and controls which network destinations t
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
-Fence briefly retries incomplete local service inspections before failing. If startup still fails, check the inspection reason codes in the log; see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
+Fence checks listening services without counting unrelated TCP connections against the inspection limit. It briefly retries incomplete inspections; if startup still fails, check the reason codes in the log and see [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
 
 Failed evidence validation may include [bounded, unverified diagnostics](docs/troubleshooting.md#post-job-evidence-validation-fails); the job still fails.
 
