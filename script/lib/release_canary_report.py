@@ -22,9 +22,9 @@ BOT = '.[] | select(.user.login == "github-actions[bot]" and .pull_request == nu
 GUIDANCE = (
     "If this affects your workflow, keep failing closed. There may be no safe workaround; do not widen "
     "your allowlist, treat audit mode as protection, or post private job logs here.\n\n"
-    "Keep this issue open across passing samples: runner labels can cover different host configurations. "
-    "Close it only when a maintainer confirms the affected runner configuration works with a finalized "
-    "replacement release and records its full Action commit pin here."
+    "Keep this issue open until we can explain the first failure. A passing run on another host isn't proof of a fix. "
+    "For a Fence fix, verify the affected runner configuration and record the full commit pin from the finalized release. "
+    "If only the check or its evidence failed, record what happened and how you verified it; no release is needed."
 )
 
 

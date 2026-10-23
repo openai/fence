@@ -40,7 +40,9 @@ The `main` branch does not contain generated Action binaries. Release automation
 
 The scheduled check opens an issue on the first failure. Aim to give people a useful update the same working day, even if it's just "no safe workaround yet." The issue is a record of what failed, not a claim that every runner is affected. Report a possible security bypass [privately](../SECURITY.md).
 
-Leave the first failure visible. Reproduce the runner condition, show that a safe variation works and an unsafe one is still rejected, then put the [finalized release pin](release-provenance.md#pin-the-published-action) in the issue before closing it. A green run elsewhere isn't that evidence, and publishing a fix doesn't update anyone's pin.
+Keep the issue open until we can explain the first failure. For a Fence fix, reproduce the runner condition, show that a safe variation works and an unsafe one is still rejected, then record the [verified release pin](release-provenance.md#pin-the-published-action). A green run elsewhere isn't that evidence, and publishing a fix doesn't update anyone's pin.
+
+If reporting failed, rerun `release canary report` to recover the original result. If the problem was missing evidence rather than Fence, record what happened and how you verified it; no release is needed.
 
 After a month, count every scheduled first attempt, including refusals and missing results. Compare when we first saw the failure, when we gave useful guidance, and when a verified pin was available. Record downstream recovery only if someone volunteers it; these checks don't measure customer availability.
 
