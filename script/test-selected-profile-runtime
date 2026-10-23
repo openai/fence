@@ -436,13 +436,48 @@ def require(condition, message="evidence validation failed"):
 
 import json
 import pathlib
+import socket
 import sys
+import time
 
 sys.path.insert(0, "script/lib")
 from dns_evidence import validate_materialization_rejections
 
 report_path, dns_path, production_path = (pathlib.Path(item) for item in sys.argv[1:4])
 scenario = sys.argv[4]
+if scenario == "healthy":
+    # Closed connections exceeded the former 1 MiB whole-table limit. Exercise
+    # real TIME_WAIT sockets without leaving a listener or open connections.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        address = listener.getsockname()
+        listener.listen()
+        for _ in range(8192):
+            with socket.socket() as client:
+                client.settimeout(2)
+                client.connect(address)
+                peer, _ = listener.accept()
+                with peer:
+                    client.close()
+                    require(peer.recv(1) == b"", "loopback connection did not close")
+
+    def require_tcp_churn():
+        port = f":{address[1]:04X}".encode()
+        with open("/proc/net/tcp", "rb") as table:
+            size = sum(len(row) for row in table if row.split()[2].endswith(port) and row.split()[3] == b"06")
+        require(size > 1024 * 1024, "test TIME_WAIT sockets did not exceed the former TCP table bound")
+
+    require_tcp_churn()
+    resident = json.loads(report_path.read_bytes())["resident_health"]
+    target_sequence = resident["verification_sequence"] + 2
+    deadline = time.monotonic() + 30
+    while resident["verification_sequence"] < target_sequence:
+        require(resident["status"] == "healthy", "resident failed under TCP connection churn")
+        require(time.monotonic() < deadline, "resident verification did not advance under TCP connection churn")
+        time.sleep(0.2)
+        resident = json.loads(report_path.read_bytes())["resident_health"]
+    require_tcp_churn()
+
 report = json.loads(report_path.read_text(encoding="utf-8"))
 dns = json.loads(dns_path.read_text(encoding="utf-8"))
 require(report["network_verification_status"] == "verified")

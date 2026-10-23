@@ -1,6 +1,7 @@
 use crate::hosted_runner::{
     AcceptedLocalControlInventoryV2, AcceptedLocalControlOwnerV2, UNIX_NAME_HASH_SCHEMA_V1,
 };
+use netlink_sys::{Socket, SocketAddr, constants::NETLINK_SOCK_DIAG};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,12 +9,12 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const MAX_PROCESSES: usize = 2_048;
 pub const MAX_FILE_DESCRIPTORS_PER_PROCESS: usize = 2_048;
@@ -27,12 +28,19 @@ pub const STABILITY_INTERVAL_MILLISECONDS: u64 = 50;
 pub const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-const MAX_PROC_NET_TABLE_BYTES: u64 = 1024 * 1024;
+const MAX_LISTENER_TABLE_BYTES: usize = 1024 * 1024;
 const MAX_PROCESS_FILE_BYTES: u64 = 4_096;
 const UNIX_LISTEN_FLAG: u64 = 0x0001_0000;
 const UNIX_STREAM: u64 = 1;
 const UNIX_SEQPACKET: u64 = 5;
+// Linux UAPI: linux/sock_diag.h and linux/inet_diag.h.
+const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const TCP_LISTEN_STATE: u8 = 0x0a;
+const MAX_TCP_DIAG_DATAGRAM_BYTES: usize = 32 * 1024;
+// Includes non-root listeners: a root process can hold a non-root socket.
+const MAX_TCP_DIAG_ROWS: usize = 4096;
+// Each family dump uses a new socket with exactly one request.
+const TCP_DIAG_SEQUENCE: u32 = 1;
 const UNREVIEWED_EXECUTABLE_PATH: &str = "unreviewed_executable_path";
 const UNREVIEWED_CGROUP: &str = "unreviewed_cgroup";
 // SHA-256 in the existing fence-unix-name-v1 domain for /run/uuidd/request.
@@ -1282,7 +1290,7 @@ pub fn observe_local_control_inventory(
     current_fence: &dyn CurrentFenceOwner,
 ) -> LocalControlObservation {
     let observed = observe_local_control_with(
-        || collect_private_snapshot(proc_root, socket_access, current_fence),
+        || collect_private_snapshot(proc_root, socket_access, current_fence, read_tcp_listeners),
         || thread::sleep(Duration::from_millis(STABILITY_INTERVAL_MILLISECONDS)),
     );
     if let Some(diagnostic) = local_control_failure_diagnostic(&observed) {
@@ -1361,10 +1369,15 @@ fn collect_private_snapshot(
     proc_root: &Path,
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
+    tcp_listeners: impl Fn(
+        InternetAddressFamily,
+        Instant,
+    ) -> Result<Vec<ParsedTcpListener>, AcquisitionError>,
 ) -> PrivateSnapshot {
+    let mut bounds = BTreeSet::new();
     let mut unavailable = BTreeSet::new();
     let mut malformed_row_count = 0_u64;
-    let mut unix = match read_bounded(&proc_root.join("net/unix"), MAX_PROC_NET_TABLE_BYTES)
+    let mut unix = match read_bounded(&proc_root.join("net/unix"), MAX_LISTENER_TABLE_BYTES as u64)
         .and_then(|contents| parse_unix_table(&contents))
     {
         Ok(parsed) => {
@@ -1376,33 +1389,24 @@ fn collect_private_snapshot(
             Vec::new()
         }
     };
-    let tcp = match read_bounded(&proc_root.join("net/tcp"), MAX_PROC_NET_TABLE_BYTES)
-        .and_then(|contents| parse_tcp_table(&contents, InternetAddressFamily::Ipv4))
-    {
-        Ok(parsed) => {
-            malformed_row_count = malformed_row_count.saturating_add(parsed.malformed_rows);
-            parsed.rows
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut all_tcp = Vec::new();
+    for (family, reason) in [
+        (InternetAddressFamily::Ipv4, UnavailableReason::Ipv4Table),
+        (InternetAddressFamily::Ipv6, UnavailableReason::Ipv6Table),
+    ] {
+        match tcp_listeners(family, deadline) {
+            Ok(rows) => all_tcp.extend(rows),
+            Err(AcquisitionError::TooLarge) => {
+                bounds.insert(BoundReason::TcpListeners);
+            }
+            Err(error) => {
+                malformed_row_count += u64::from(error == AcquisitionError::Malformed);
+                unavailable.insert(reason);
+            }
         }
-        Err(_) => {
-            unavailable.insert(UnavailableReason::Ipv4Table);
-            Vec::new()
-        }
-    };
-    let tcp6 = match read_bounded(&proc_root.join("net/tcp6"), MAX_PROC_NET_TABLE_BYTES)
-        .and_then(|contents| parse_tcp_table(&contents, InternetAddressFamily::Ipv6))
-    {
-        Ok(parsed) => {
-            malformed_row_count = malformed_row_count.saturating_add(parsed.malformed_rows);
-            parsed.rows
-        }
-        Err(_) => {
-            unavailable.insert(UnavailableReason::Ipv6Table);
-            Vec::new()
-        }
-    };
+    }
 
-    let mut all_tcp = tcp;
-    all_tcp.extend(tcp6);
     let mut seen_inodes = BTreeSet::new();
     unix.retain(|listener| {
         if listener.inode == 0 || !seen_inodes.insert(listener.inode) {
@@ -1427,7 +1431,7 @@ fn collect_private_snapshot(
         .collect::<BTreeSet<_>>();
     let scan = scan_processes(proc_root, &relevant_inodes);
     unavailable.extend(scan.unavailable_inputs.iter().copied());
-    let mut bounds = scan.bounds_exceeded.clone();
+    bounds.extend(scan.bounds_exceeded);
 
     let mut unresolved_unix_listener_count = 0_u64;
     let mut inaccessible_root_filesystem_listener_count = 0_u64;
@@ -2076,160 +2080,148 @@ fn acquisition_io(error: std::io::Error) -> AcquisitionError {
     }
 }
 
-fn parse_tcp_table(
-    contents: &[u8],
+// Request TCP_LISTEN in the kernel: unrelated connections (including TIME_WAIT)
+// must not consume the listener budget, and a partial dump must never be used.
+fn read_tcp_listeners(
     family: InternetAddressFamily,
-) -> Result<ParsedTable<ParsedTcpListener>, AcquisitionError> {
-    let text = std::str::from_utf8(contents).map_err(|_| AcquisitionError::Malformed)?;
-    let mut lines = text.lines();
-    let header = lines.next().ok_or(AcquisitionError::Malformed)?;
-    let expected = match family {
-        InternetAddressFamily::Ipv4 => [
-            "sl",
-            "local_address",
-            "rem_address",
-            "st",
-            "tx_queue",
-            "rx_queue",
-            "tr",
-            "tm->when",
-            "retrnsmt",
-            "uid",
-            "timeout",
-            "inode",
-        ],
-        InternetAddressFamily::Ipv6 => [
-            "sl",
-            "local_address",
-            "remote_address",
-            "st",
-            "tx_queue",
-            "rx_queue",
-            "tr",
-            "tm->when",
-            "retrnsmt",
-            "uid",
-            "timeout",
-            "inode",
-        ],
-    };
-    if header.split_ascii_whitespace().collect::<Vec<_>>() != expected {
-        return Err(AcquisitionError::Malformed);
+    deadline: Instant,
+) -> Result<Vec<ParsedTcpListener>, AcquisitionError> {
+    let mut socket = Socket::new(NETLINK_SOCK_DIAG).map_err(acquisition_io)?;
+    let port_id = socket.bind_auto().map_err(acquisition_io)?.port_number();
+    let kernel = SocketAddr::new(0, 0);
+
+    // nlmsghdr followed by inet_diag_req_v2: all addresses, ports and owners.
+    let mut request = [0_u8; 72];
+    let length = request.len() as u32;
+    request[..4].copy_from_slice(&length.to_ne_bytes());
+    request[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    let flags = (libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16;
+    request[6..8].copy_from_slice(&flags.to_ne_bytes());
+    request[8..12].copy_from_slice(&TCP_DIAG_SEQUENCE.to_ne_bytes());
+    request[12..16].copy_from_slice(&port_id.to_ne_bytes());
+    request[16] = family.diag_family();
+    request[17] = libc::IPPROTO_TCP as u8;
+    request[20..24].copy_from_slice(&(1_u32 << TCP_LISTEN_STATE).to_ne_bytes());
+    request[64..].fill(0xff); // INET_DIAG_NOCOOKIE
+    let sent = socket
+        .send_to(&request, &kernel, libc::MSG_DONTWAIT)
+        .map_err(acquisition_io)?;
+    if sent != request.len() {
+        return Err(AcquisitionError::Unavailable);
     }
+
     let mut rows = Vec::new();
-    let mut malformed_rows = 0_u64;
-    for line in lines.filter(|line| !line.trim().is_empty()) {
-        match parse_tcp_row(line, family) {
-            Ok(Some(row)) => rows.push(row),
-            Ok(None) => {}
-            Err(_) => malformed_rows = malformed_rows.saturating_add(1),
+    let mut buffer = [0_u8; MAX_TCP_DIAG_DATAGRAM_BYTES];
+    let mut remaining = MAX_LISTENER_TABLE_BYTES;
+    while Instant::now() < deadline {
+        // MSG_TRUNC returns the actual datagram length even if it did not fit.
+        let flags = libc::MSG_DONTWAIT | libc::MSG_TRUNC;
+        let (length, sender) = match socket.recv_from(&mut buffer.as_mut_slice(), flags) {
+            Ok(datagram) => datagram,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return Err(AcquisitionError::Unavailable),
+        };
+        if sender != kernel {
+            return Err(AcquisitionError::Malformed);
+        }
+        let bytes = buffer.get(..length).ok_or(AcquisitionError::TooLarge)?;
+        remaining = remaining
+            .checked_sub(length)
+            .ok_or(AcquisitionError::TooLarge)?;
+        if parse_tcp_diag_datagram(bytes, family, port_id, &mut rows)? {
+            return Ok(rows);
         }
     }
-    Ok(ParsedTable {
-        rows,
-        malformed_rows,
+    Err(AcquisitionError::Unavailable)
+}
+
+// Return true only for a successful NLMSG_DONE at the end of the datagram.
+fn parse_tcp_diag_datagram(
+    mut bytes: &[u8],
+    family: InternetAddressFamily,
+    port_id: u32,
+    rows: &mut Vec<ParsedTcpListener>,
+) -> Result<bool, AcquisitionError> {
+    let malformed = AcquisitionError::Malformed;
+    loop {
+        let hdr = bytes.first_chunk::<16>().ok_or(malformed)?;
+        let length = u32::from_ne_bytes(hdr[..4].try_into().unwrap()) as usize;
+        let kind = u16::from_ne_bytes([hdr[4], hdr[5]]);
+        let flags = i32::from(u16::from_ne_bytes([hdr[6], hdr[7]]));
+        if flags & libc::NLM_F_DUMP_INTR != 0 {
+            return Err(AcquisitionError::Unavailable);
+        }
+        if flags & libc::NLM_F_MULTI == 0
+            || hdr[8..12] != TCP_DIAG_SEQUENCE.to_ne_bytes()
+            || hdr[12..] != port_id.to_ne_bytes()
+        {
+            return Err(malformed);
+        }
+        let payload = bytes.get(16..length).ok_or(malformed)?;
+        bytes = bytes.get(length.next_multiple_of(4)..).ok_or(malformed)?;
+        if i32::from(kind) == libc::NLMSG_DONE {
+            return if payload == [0; 4] && bytes.is_empty() {
+                Ok(true)
+            } else {
+                Err(malformed)
+            };
+        }
+        if kind != SOCK_DIAG_BY_FAMILY {
+            // Includes NLMSG_ERROR and NLMSG_OVERRUN: never use preceding rows.
+            return Err(AcquisitionError::Unavailable);
+        }
+        if rows.len() >= MAX_TCP_DIAG_ROWS {
+            return Err(AcquisitionError::TooLarge);
+        }
+        rows.push(parse_diag_listener(payload, family)?);
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+    }
+}
+
+fn parse_diag_listener(
+    payload: &[u8],
+    family: InternetAddressFamily,
+) -> Result<ParsedTcpListener, AcquisitionError> {
+    // inet_diag_msg; ignore optional attributes following the fixed fields.
+    let msg = payload
+        .first_chunk::<72>()
+        .ok_or(AcquisitionError::Malformed)?;
+    if msg[0] != family.diag_family() || msg[1] != TCP_LISTEN_STATE {
+        return Err(AcquisitionError::Malformed);
+    }
+    let address: IpAddr = match family {
+        InternetAddressFamily::Ipv4 => Ipv4Addr::new(msg[8], msg[9], msg[10], msg[11]).into(),
+        InternetAddressFamily::Ipv6 => {
+            Ipv6Addr::from(<[u8; 16]>::try_from(&msg[8..24]).unwrap()).into()
+        }
+    };
+    Ok(ParsedTcpListener {
+        family,
+        bind_class: if address.is_unspecified() {
+            BindClass::Wildcard
+        } else if address.is_loopback() {
+            BindClass::Loopback
+        } else {
+            BindClass::OtherLocal
+        },
+        port: u16::from_be_bytes([msg[4], msg[5]]),
+        socket_uid: u32::from_ne_bytes(msg[64..68].try_into().unwrap()),
+        inode: u64::from(u32::from_ne_bytes(msg[68..72].try_into().unwrap())),
     })
 }
 
-fn parse_tcp_row(
-    line: &str,
-    family: InternetAddressFamily,
-) -> Result<Option<ParsedTcpListener>, AcquisitionError> {
-    let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
-    if fields.len() < 10 || !fields[0].ends_with(':') {
-        return Err(AcquisitionError::Malformed);
-    }
-    parse_bounded_decimal(&fields[0][..fields[0].len() - 1], 10)?;
-    let (address, port) = parse_proc_endpoint(fields[1], family)?;
-    parse_proc_endpoint(fields[2], family)?;
-    let state =
-        u8::try_from(parse_bounded_hex(fields[3], 2)?).map_err(|_| AcquisitionError::Malformed)?;
-    parse_hex_pair(fields[4], 8, 8)?;
-    parse_hex_pair(fields[5], 2, 8)?;
-    parse_bounded_hex(fields[6], 8)?;
-    let socket_uid = u32::try_from(parse_bounded_decimal(fields[7], 20)?)
-        .map_err(|_| AcquisitionError::Malformed)?;
-    parse_bounded_decimal(fields[8], 20)?;
-    let inode = parse_bounded_decimal(fields[9], 20)?;
-    if state != TCP_LISTEN_STATE {
-        return Ok(None);
-    }
-    Ok(Some(ParsedTcpListener {
-        inode,
-        socket_uid,
-        family,
-        bind_class: bind_class(address),
-        port,
-    }))
-}
-
-fn parse_hex_pair(
-    value: &str,
-    left_maximum: usize,
-    right_maximum: usize,
-) -> Result<(), AcquisitionError> {
-    let (left, right) = value.split_once(':').ok_or(AcquisitionError::Malformed)?;
-    parse_bounded_hex(left, left_maximum)?;
-    parse_bounded_hex(right, right_maximum)?;
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ParsedAddress {
-    Ipv4(Ipv4Addr),
-    Ipv6(Ipv6Addr),
-}
-
-fn parse_proc_endpoint(
-    value: &str,
-    family: InternetAddressFamily,
-) -> Result<(ParsedAddress, u16), AcquisitionError> {
-    let (address, port) = value.split_once(':').ok_or(AcquisitionError::Malformed)?;
-    let port =
-        u16::try_from(parse_bounded_hex(port, 4)?).map_err(|_| AcquisitionError::Malformed)?;
-    let bytes = decode_hex(address)?;
-    match family {
-        InternetAddressFamily::Ipv4 if bytes.len() == 4 => {
-            let mut octets = [0_u8; 4];
-            for (index, byte) in bytes.into_iter().rev().enumerate() {
-                octets[index] = byte;
-            }
-            Ok((ParsedAddress::Ipv4(Ipv4Addr::from(octets)), port))
+impl InternetAddressFamily {
+    fn diag_family(self) -> u8 {
+        match self {
+            Self::Ipv4 => libc::AF_INET as u8,
+            Self::Ipv6 => libc::AF_INET6 as u8,
         }
-        InternetAddressFamily::Ipv6 if bytes.len() == 16 => {
-            let mut octets = [0_u8; 16];
-            for (source, destination) in bytes.chunks_exact(4).zip(octets.chunks_exact_mut(4)) {
-                for (index, byte) in source.iter().rev().enumerate() {
-                    destination[index] = *byte;
-                }
-            }
-            Ok((ParsedAddress::Ipv6(Ipv6Addr::from(octets)), port))
-        }
-        _ => Err(AcquisitionError::Malformed),
-    }
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, AcquisitionError> {
-    if !value.len().is_multiple_of(2) {
-        return Err(AcquisitionError::Malformed);
-    }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let pair = std::str::from_utf8(pair).map_err(|_| AcquisitionError::Malformed)?;
-            u8::from_str_radix(pair, 16).map_err(|_| AcquisitionError::Malformed)
-        })
-        .collect()
-}
-
-fn bind_class(address: ParsedAddress) -> BindClass {
-    match address {
-        ParsedAddress::Ipv4(address) if address.is_unspecified() => BindClass::Wildcard,
-        ParsedAddress::Ipv6(address) if address.is_unspecified() => BindClass::Wildcard,
-        ParsedAddress::Ipv4(address) if address.is_loopback() => BindClass::Loopback,
-        ParsedAddress::Ipv6(address) if address.is_loopback() => BindClass::Loopback,
-        ParsedAddress::Ipv4(_) | ParsedAddress::Ipv6(_) => BindClass::OtherLocal,
     }
 }
 
@@ -3217,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn parsers_preserve_complete_unix_names_and_count_malformed_rows() {
+    fn unix_table_preserves_complete_names_and_counts_malformed_rows() {
         let mut unix = b"Num RefCount Protocol Flags Type St Inode Path\n".to_vec();
         unix.extend_from_slice(b"0: 2 0 00010000 0001 01 42 @root-control\n1: malformed\n");
         let parsed = parse_unix_table(&unix).unwrap();
@@ -3228,18 +3220,101 @@ mod tests {
             parsed.rows[0].name_sha256,
             "94e42880b01c85d2d11cccb5c2846e5863baf3d2a7a032443dedbb2e2d97473c"
         );
+    }
 
-        let tcp = b"sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n\
-0: 00000000:0016 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 43\n\
-1: malformed\n";
-        let parsed = parse_tcp_table(tcp, InternetAddressFamily::Ipv4).unwrap();
-        assert_eq!(parsed.malformed_rows, 1);
-        assert_eq!(parsed.rows[0].port, 22);
-        assert_eq!(parsed.rows[0].bind_class, BindClass::Wildcard);
+    #[test]
+    fn kernel_tcp_dumps_include_listeners_but_not_their_established_connections() {
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
 
-        let tcp6 = b"sl local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n";
-        assert!(parse_tcp_table(tcp6, InternetAddressFamily::Ipv6).is_ok());
-        assert!(parse_tcp_table(tcp, InternetAddressFamily::Ipv6).is_err());
+        for (family, address) in [
+            (
+                InternetAddressFamily::Ipv4,
+                IpAddr::from(Ipv4Addr::LOCALHOST),
+            ),
+            (
+                InternetAddressFamily::Ipv6,
+                IpAddr::from(Ipv6Addr::LOCALHOST),
+            ),
+        ] {
+            let listener = TcpListener::bind((address, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = TcpStream::connect(address).unwrap();
+            let (server, _) = listener.accept().unwrap();
+
+            let socket = |fd| fs::metadata(format!("/proc/self/fd/{fd}")).unwrap();
+            let expected = socket(listener.as_raw_fd());
+            let rows = read_tcp_listeners(family, Instant::now() + Duration::from_secs(1)).unwrap();
+            assert!(rows.contains(&ParsedTcpListener {
+                inode: expected.ino(),
+                socket_uid: expected.uid(),
+                family,
+                bind_class: BindClass::Loopback,
+                port: address.port(),
+            }));
+            for inode in [
+                socket(client.as_raw_fd()).ino(),
+                socket(server.as_raw_fd()).ino(),
+            ] {
+                assert!(!rows.iter().any(|row| row.inode == inode));
+            }
+        }
+    }
+
+    #[test]
+    fn tcp_diag_requires_complete_matching_uninterrupted_multipart_dump() {
+        let family = InternetAddressFamily::Ipv4;
+        let port_id = 42_u32;
+        let header = |length: u32, kind: u16| {
+            let mut bytes = vec![0; length as usize];
+            bytes[..4].copy_from_slice(&length.to_ne_bytes());
+            bytes[4..6].copy_from_slice(&kind.to_ne_bytes());
+            bytes[6..8].copy_from_slice(&(libc::NLM_F_MULTI as u16).to_ne_bytes());
+            bytes[8..12].copy_from_slice(&TCP_DIAG_SEQUENCE.to_ne_bytes());
+            bytes[12..16].copy_from_slice(&port_id.to_ne_bytes());
+            bytes
+        };
+        let mut listener = header(88, SOCK_DIAG_BY_FAMILY);
+        listener[16] = family.diag_family();
+        listener[17] = TCP_LISTEN_STATE;
+        let done = header(20, libc::NLMSG_DONE as u16);
+        let parse = |bytes: &[u8]| parse_tcp_diag_datagram(bytes, family, port_id, &mut Vec::new());
+        assert_eq!(parse(&listener), Ok(false));
+        assert_eq!(parse(&[listener.as_slice(), &done].concat()), Ok(true));
+        assert_eq!(parse(&done), Ok(true)); // no listeners is also a complete dump
+
+        for invalid in [
+            &done[..15],
+            &done[..19],
+            &[done.as_slice(), &listener].concat(),
+        ] {
+            assert_eq!(parse(invalid), Err(AcquisitionError::Malformed));
+        }
+        // Invalid length, flags, sequence, port ID, address family or TCP state.
+        for (offset, byte) in [(0, 0), (6, 0), (8, 0), (12, 0), (16, 0), (17, 1)] {
+            let mut invalid = listener.clone();
+            invalid[offset] = byte;
+            assert_eq!(parse(&invalid), Err(AcquisitionError::Malformed));
+        }
+        let mut failed = done.clone();
+        failed[16] = 1;
+        assert!(parse(&failed).is_err());
+        let mut interrupted = done;
+        interrupted[6] |= libc::NLM_F_DUMP_INTR as u8;
+        assert_eq!(parse(&interrupted), Err(AcquisitionError::Unavailable));
+        assert!(parse(&header(20, libc::NLMSG_OVERRUN as u16)).is_err());
+
+        let mut rows = Vec::new();
+        for _ in 0..MAX_TCP_DIAG_ROWS {
+            assert_eq!(
+                parse_tcp_diag_datagram(&listener, family, port_id, &mut rows),
+                Ok(false)
+            );
+        }
+        assert_eq!(
+            parse_tcp_diag_datagram(&listener, family, port_id, &mut rows),
+            Err(AcquisitionError::TooLarge)
+        );
     }
 
     #[test]
@@ -3702,16 +3777,6 @@ mod tests {
     fn root_file_ownership_fallback_is_retained_but_incomplete_without_process_owners() {
         let root = TestRoot::new();
         fs::write(
-            root.0.join("net/tcp"),
-            b"sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
-        )
-        .unwrap();
-        fs::write(
-            root.0.join("net/tcp6"),
-            b"sl local_address remote_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
-        )
-        .unwrap();
-        fs::write(
             root.0.join("net/unix"),
             b"Num RefCount Protocol Flags Type St Inode Path\n\
 0: 2 0 00010000 0001 01 42 /run/root-owned.sock\n",
@@ -3723,7 +3788,13 @@ mod tests {
                 FilesystemSocketAccess::Reachable { owner_uid: 0 },
             )]),
         };
-        let private = collect_private_snapshot(&root.0, &access, &NoCurrentFenceOwner);
+        let private =
+            collect_private_snapshot(
+                &root.0,
+                &access,
+                &NoCurrentFenceOwner,
+                |_, _| Ok(Vec::new()),
+            );
         assert_eq!(private.unix_listeners.len(), 1);
         assert!(!private.unix_listeners[0].ownership_complete);
         let public = public_snapshot(private);
