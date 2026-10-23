@@ -3212,8 +3212,11 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             allowances,
             merge,
         } = candidate;
-        let transaction_requires_verification =
-            materialization_candidate_requires_verification(accepted_request_count, &merge);
+        let transaction_requires_verification = materialization_candidate_requires_verification(
+            accepted_request_count,
+            materialization_bound_exceeded,
+            &merge,
+        );
         let verification_succeeded = if transaction_requires_verification {
             let expected = expected_dns_mediated_owned_state(Mode::Block, &allowances);
             let verified = self
@@ -4567,9 +4570,13 @@ fn bounded_materialization_candidate(
 
 fn materialization_candidate_requires_verification(
     accepted_request_count: usize,
+    materialization_bound_exceeded: bool,
     merge: &MaterializationMerge,
 ) -> bool {
-    accepted_request_count > 0 || merge.rules_changed || merge.metadata_changed
+    accepted_request_count > 0
+        || materialization_bound_exceeded
+        || merge.rules_changed
+        || merge.metadata_changed
 }
 
 fn publish_verified_materialization_transaction(
@@ -12379,6 +12386,18 @@ mod tests {
         let limit = MAX_ACTIVE_MATERIALIZATIONS;
         let mut active = BTreeMap::new();
         merge_materializations(&mut active, (0..limit).map(pending), now);
+
+        // An over-capacity background refresh must verify even when no grants expire.
+        let refresh = BTreeSet::from([pending(limit)]);
+        let (candidate, exceeded) = bounded_materialization_candidate(&active, &[], refresh);
+        assert!(exceeded);
+        assert_eq!(candidate.active, active);
+        assert!(materialization_candidate_requires_verification(
+            0,
+            exceeded,
+            &candidate.merge,
+        ));
+
         let expired = pending(0).active_key();
         active.get_mut(&expired).unwrap().expires_at = now;
         let mut survivors = active.clone();
@@ -12424,7 +12443,9 @@ mod tests {
             metadata_changed: false,
             expired: 0,
         };
-        assert!(!materialization_candidate_requires_verification(0, &idle));
+        assert!(!materialization_candidate_requires_verification(
+            0, false, &idle
+        ));
         let pending = |expires_at| PendingMaterialization {
             source_hostname: "github.com".to_owned(),
             hostname: "edge.example".to_owned(),
@@ -12450,7 +12471,9 @@ mod tests {
         );
         assert!(!merge.rules_changed);
         assert!(merge.metadata_changed);
-        assert!(materialization_candidate_requires_verification(0, &merge));
+        assert!(materialization_candidate_requires_verification(
+            0, false, &merge
+        ));
 
         // An address already allowed by a static entry also needs verification, not a new table.
         let base = effective_allowances_with_materializations(&[], &current_active);
