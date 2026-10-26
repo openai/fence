@@ -14,7 +14,7 @@ Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ub
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.
 
-`local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries acquisition failures within a fixed limit and still requires a complete, stable inventory in both audit and block mode. The setup error can include the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
+`local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries read failures within a fixed limit. At startup, it can also retry if the only missing detail is who owns a known socket. It won't accept an unexpected owner or start with incomplete checks, even in audit mode. The setup error can include the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
 
 `dns_proxy_bind_failed` means Fence could not start a required DNS listener. For example, `docker UDP bind: address unavailable` means the required Docker address was not available. If only the error code is shown, the specific listener and reason aren't known. Changing the allowlist will not fix this error.
 
