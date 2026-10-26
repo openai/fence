@@ -45,7 +45,7 @@ const {
   validateResidentUnitStatus,
 } = require("./lib.cts");
 const actionLog = require("./log.cts");
-const { postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport } = require("./post.cts");
+const { postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport, verifyFinalEvidence } = require("./post.cts");
 const {
   dnsStartupDiagnosticFromJournal,
   emitCapturedServiceDiagnostics,
@@ -1319,7 +1319,7 @@ test("local control diagnostics expose only bounded fixed reason codes", () => {
   for (const invalid of [
     undefined, null, {}, { ...diagnostic, status: "stable" },
     { ...diagnostic, status: "unavailable\n::error::injected" },
-    ...[0, -1, 1.5, "2", null, Number.MAX_SAFE_INTEGER + 1].map((attempts) => ({ ...diagnostic, attempts })),
+    ...[0, -1, 1.5, 4, "2", null, Number.MAX_SAFE_INTEGER + 1].map((attempts) => ({ ...diagnostic, attempts })),
     ...[null, "proc", ["proc", "proc"], ["unknown"], ["proc\u0000"], ["::error::secret"],
       ["ghp_do_not_print"], ["/private/process"], Array(100).fill("proc")]
       .map((unavailable_inputs) => ({ ...diagnostic, unavailable_inputs })),
@@ -4853,7 +4853,7 @@ test("bounds fixed privileged child command execution", () => {
 
 test("reports stale critical evidence without accepting it", (t: any) => {
   const lines: string[] = [];
-  t.mock.method(actionLog, "info", (line: string) => lines.push(line));
+  const info = t.mock.method(actionLog, "info", (line: string) => lines.push(line));
   const stale = {
     ...report,
     resident_health: residentHealth({
@@ -4873,8 +4873,125 @@ test("reports stale critical evidence without accepting it", (t: any) => {
   assert.doesNotMatch(lines[0], /not_a_recognized_code|not for logs|FENCE_REPORT_JSON|verified protection/);
   const failure = new Error("original validation failure");
   assert.throws(() => validatePostEvidence(stale, "dns", () => { throw failure; }), (error: unknown) => error === failure);
-  t.mock.method(actionLog, "info", () => { throw new Error("logging failed"); });
+  info.mock.mockImplementation(() => { throw new Error("logging failed"); });
   assert.throws(() => validatePostEvidence(stale, "resident", () => { throw failure; }), (error: unknown) => error === failure);
+});
+
+for (const base of [report, auditReport]) {
+  test(`${base.mode} post explains the first failed local-control scan on both sides of the freshness limit`, (t: any) => {
+    const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-failed-scan-"));
+    const paths = {
+      ready: path.join(temporary, "ready.json"), report: path.join(temporary, "report.json"),
+      dnsReport: path.join(temporary, "dns-report.json"),
+    };
+    const previousSummary = process.env.GITHUB_STEP_SUMMARY;
+    process.env.GITHUB_STEP_SUMMARY = path.join(temporary, "summary");
+    fs.writeFileSync(process.env.GITHUB_STEP_SUMMARY, "");
+    t.after(() => {
+      if (previousSummary === undefined) delete process.env.GITHUB_STEP_SUMMARY;
+      else process.env.GITHUB_STEP_SUMMARY = previousSummary;
+      fs.rmSync(temporary, { recursive: true, force: true });
+    });
+
+    let now = 1_000_000;
+    t.mock.method(Date, "now", () => now);
+    const health = residentHealth({ last_successful_verification_unix_milliseconds: now - 20_000 }, false, base.mode);
+    const healthy = { ...base, resident_health: health };
+    writeRootOwnedTestReadiness(t, paths.ready, healthy);
+    fs.writeFileSync(paths.dnsReport, JSON.stringify(dnsEvidenceFor(healthy)));
+    assert.doesNotMatch(captureStdout(() => verifyFinalEvidence(healthy, paths)), /Fence failure diagnostic/);
+    const scan = { status: "unavailable", attempts: 3, unavailable_inputs: ["proc_scan", "socket_ownership"], bounds_exceeded: [] };
+    const critical = {
+      ...base,
+      resident_health: { ...health, status: "critical" },
+      counters: { total_violations: 0, sampled_violations: 0 },
+      critical_findings: [{ code: "local_control_inventory_unavailable", message: "Local control inventory was unavailable." }],
+    };
+    const withScan = {
+      ...critical,
+      first_failed_local_control_scan: {
+        ...scan, process_name: "fixture_worker_sentinel", process_path: "/example/fixture_binary_sentinel",
+        journal: "fixture_journal_first\n::error::fixture_journal_second",
+      },
+    };
+    const rawDetails = /fixture_worker_sentinel|fixture_binary_sentinel|fixture_journal_first|fixture_journal_second/;
+    const dns = dnsEvidenceFor(critical, { first_failed_local_control_scan: scan });
+    fs.writeFileSync(paths.dnsReport, JSON.stringify(dns));
+    const settle = (value: any = withScan) => settleResidentReport(paths.report, "unused", value, { verifyService: () => {} });
+    const criticalError = { message: "Fence report contains critical resident findings" };
+    const staleError = { message: "Fence resident health evidence is stale or has an invalid timestamp" };
+    const fresh = captureStdout(() => assert.throws(() => verifyFinalEvidence(settle(), paths), criticalError));
+    const records = fresh.split("\n").filter((line) => line.startsWith("FENCE_REPORT_JSON="));
+    assert.deepEqual(records, [structuredReportLine(critical, dns)]);
+    assert.match(records[0], /"result":"critical"/);
+    const prefix = "Fence failure diagnostic (unverified): ";
+    assert.ok(fresh.indexOf(records[0]) < fresh.indexOf(prefix));
+    for (const value of [critical, { ...critical, first_failed_local_control_scan: { ...scan, attempts: 4 } }]) {
+      const fallback = captureStdout(() => {
+        assert.throws(() => verifyFinalEvidence(settle(value), paths), criticalError);
+        now += 1;
+        assert.throws(() => settle(value), staleError);
+        now -= 1;
+      });
+      assert.doesNotMatch(fallback, /first_failed_local_control_scan/);
+    }
+    fs.unlinkSync(paths.ready);
+    const missingReady = captureStdout(() => assert.throws(() => verifyFinalEvidence(settle(), paths), /readiness commit marker/));
+    const staleDns = captureStdout(() => {
+      const settled = settle();
+      now += 1;
+      assert.throws(() => verifyFinalEvidence(settled, paths), /stale/);
+    });
+    const stale = captureStdout(() => assert.throws(settle, staleError));
+    for (const [output, sources] of [
+      [fresh, ["resident"]], [stale, ["resident"]], [missingReady, ["resident"]], [staleDns, ["dns", "resident"]],
+    ] as const) {
+      const diagnostics = output.split("\n").filter((line) => line.startsWith(prefix)).map((line) => JSON.parse(line.slice(prefix.length)));
+      assert.deepEqual(diagnostics.map((d) => d.source), sources);
+      assert.deepEqual(diagnostics.find((d) => d.source === "resident").first_failed_local_control_scan, scan);
+      assert.equal(diagnostics.find((d) => d.source === "dns")?.first_failed_local_control_scan, undefined);
+      assert.doesNotMatch(output, rawDetails);
+      assert.doesNotMatch(output, /Fence evidence verified/);
+    }
+    assert.doesNotMatch(fs.readFileSync(process.env.GITHUB_STEP_SUMMARY, "utf8"), rawDetails);
+    assert.doesNotMatch(stale + staleDns + missingReady, /FENCE_REPORT_JSON/);
+    const readError = new Error("original evidence read failure");
+    t.mock.method(fs, "existsSync", () => { throw readError; });
+    t.mock.method(actionLog, "info", () => { throw new Error("logging failed"); });
+    assert.throws(() => verifyFinalEvidence(withScan, paths), (error: unknown) => error === readError);
+  });
+}
+
+test("projects only bounded scan fields from a matching or truncated critical resident report", () => {
+  const scan = { status: "stable", attempts: 1, unavailable_inputs: [], bounds_exceeded: [] };
+  const unrelated = { code: "dns_block_sudo_drift" };
+  const evidence = {
+    resident_health: { status: "critical" },
+    critical_findings: [{ code: "local_control_inventory_drift" }],
+    first_failed_local_control_scan: scan,
+  };
+  const detail = (value: any, source = "resident") => JSON.parse(postFailureDiagnostic(value, source).split(": ")[1]).first_failed_local_control_scan;
+  assert.deepEqual(detail(evidence), scan);
+  for (const status of ["unavailable", "unstable"]) {
+    const mixed = { ...scan, status, unavailable_inputs: ["proc_scan"], bounds_exceeded: ["processes"] };
+    assert.deepEqual(detail({ ...evidence, first_failed_local_control_scan: mixed }), mixed);
+  }
+  const full = Array(MAX_CRITICAL_FINDINGS).fill(unrelated);
+  assert.deepEqual(detail({ ...evidence, critical_findings: full, critical_findings_truncated: true }), scan);
+  assert.deepEqual(detail({ ...evidence, critical_findings: [...full.slice(1), ...evidence.critical_findings] }), scan);
+  for (const value of [
+    { ...evidence, resident_health: { status: "healthy" } },
+    { ...evidence, critical_findings: full },
+    { ...evidence, critical_findings: [unrelated], critical_findings_truncated: true },
+    ...[undefined, null, {}, { ...scan, status: "private" }, { ...scan, attempts: 4 },
+      { ...scan, unavailable_inputs: ["proc"] }, { ...scan, status: "unavailable" }, { ...scan, status: "bounds_exceeded" },
+      { ...scan, status: "bounds_exceeded", unavailable_inputs: ["proc"], bounds_exceeded: ["processes"] },
+      { ...scan, status: "unavailable", unavailable_inputs: ["/private/path"] },
+      { ...scan, status: "unavailable", unavailable_inputs: ["proc", "proc"] },
+      { ...scan, status: "bounds_exceeded", bounds_exceeded: ["::error::injected"] },
+    ].map((first_failed_local_control_scan) => ({ ...evidence, first_failed_local_control_scan })),
+  ]) assert.equal(detail(value), undefined);
+  assert.equal(detail(evidence, "dns"), undefined);
 });
 
 test("bounds failure diagnostics and excludes arbitrary evidence", () => {

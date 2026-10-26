@@ -78,6 +78,8 @@ If active Action mount evidence is missing, check the earlier Fence setup step f
 
 A `Fence failure diagnostic (unverified)` line shows the evidence source, reported resident status, verification sequence, heartbeat age, and at most five recognized critical codes. Unknown values are omitted or marked unavailable; unknown codes appear as `unrecognized`. These details help explain rejected evidence and do not prove that protection remained healthy.
 
+If Fence couldn't verify the runner's local services after setup, look for `first_failed_local_control_scan`. It shows how many attempts Fence made and which part of the scan it couldn't complete or which limit it hit. A `stable` scan means the samples matched each other; they can still differ from the approved state. Changing the network allowlist won't help.
+
 A stale heartbeat can follow an earlier critical finding because failed verification does not advance the last successful timestamp. Check the diagnostic codes before treating staleness as a timing issue. Missing or unreadable evidence may leave only the original error. Fence still fails the job and leaves its controls in place.
 
 ## The Agent Cannot Run Directly

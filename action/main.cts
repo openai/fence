@@ -12,6 +12,7 @@ const {
   actionRuntimeDigest,
   actionRuntimeFileDigests,
   launcherIntegrityDocument,
+  localControlScanDiagnostic,
   nativeInputsFromEnvironment,
   readJsonBounded,
   readReady,
@@ -176,30 +177,12 @@ function fenceErrorCodeFromJournal(output: string): string | undefined {
 }
 
 function localControlDiagnosticFromJournal(output: string, expectedStatus?: string): string | undefined {
-  const unavailableReasons = new Set([
-    "cgroup_identity", "ipv4_table", "ipv6_table", "malformed_rows", "proc", "proc_scan",
-    "process_fd_readlink", "process_fd_scan", "process_identity", "process_identity_drift",
-    "socket_ownership", "unix_reachability", "unix_table",
-  ]);
-  const boundReasons = new Set([
-    "container_processes", "fds_per_process", "processes", "socket_owners",
-    "tcp_listeners", "total_fds", "unix_listeners",
-  ]);
-  const validReasons = (values: unknown, allowed: Set<string>): values is string[] =>
-    Array.isArray(values) && values.length <= allowed.size &&
-    values.every((value) => typeof value === "string" && allowed.has(value)) &&
-    new Set(values).size === values.length;
   for (const line of output.split(/\r?\n/).reverse()) {
     if (line.length === 0 || line.length > 4096) continue;
     try {
-      const diagnostic = JSON.parse(line)?.fence_local_control;
-      if (
-        !diagnostic || !["unavailable", "unstable", "bounds_exceeded"].includes(diagnostic.status) ||
-        (expectedStatus !== undefined && diagnostic.status !== expectedStatus) ||
-        !Number.isSafeInteger(diagnostic.attempts) || diagnostic.attempts < 1 ||
-        !validReasons(diagnostic.unavailable_inputs, unavailableReasons) ||
-        !validReasons(diagnostic.bounds_exceeded, boundReasons)
-      ) continue;
+      const diagnostic = localControlScanDiagnostic(JSON.parse(line)?.fence_local_control);
+      if (!diagnostic || diagnostic.status === "stable" ||
+        (expectedStatus !== undefined && diagnostic.status !== expectedStatus)) continue;
       return `status=${diagnostic.status}; attempts=${diagnostic.attempts}; ` +
         `unavailable=${diagnostic.unavailable_inputs.join(",") || "none"}; ` +
         `bounds=${diagnostic.bounds_exceeded.join(",") || "none"}`;

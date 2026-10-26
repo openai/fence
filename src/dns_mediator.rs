@@ -20,11 +20,11 @@ use crate::lifecycle::{
     validate_production_service_context, validate_test_service_context,
 };
 use crate::local_control::{
-    CurrentFenceOwner, LocalControlObservation, LocalControlSnapshot, MissingOwnerRetry,
-    NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner, SOCKET_PROBE_TIMEOUT,
-    SystemUnixSocketAccess, accepted_local_control_snapshot, observe_local_control_inventory,
-    verify_local_control_observation, verify_no_additive_local_control_since,
-    verify_reviewed_local_control_snapshot,
+    CurrentFenceOwner, LocalControlObservation, LocalControlScanDiagnostic, LocalControlSnapshot,
+    MissingOwnerRetry, NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner,
+    SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess, accepted_local_control_snapshot,
+    observe_local_control_inventory, verify_local_control_observation,
+    verify_no_additive_local_control_since, verify_reviewed_local_control_snapshot,
 };
 use crate::lockdown::{
     DockerCheck, LockdownControl, LockdownPosture, SystemLockdownControl,
@@ -705,6 +705,8 @@ pub struct DnsMediatedBlockEvidence {
     pub findings_truncated: bool,
     pub critical_findings: Vec<CriticalFinding>,
     pub critical_findings_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_failed_local_control_scan: Option<LocalControlScanDiagnostic>,
     pub resident_health: ResidentHealth,
     pub protection_available: bool,
     pub limitations: Vec<&'static str>,
@@ -768,6 +770,8 @@ pub struct DnsMediatedAuditEvidence {
     pub findings_truncated: bool,
     pub critical_findings: Vec<CriticalFinding>,
     pub critical_findings_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_failed_local_control_scan: Option<LocalControlScanDiagnostic>,
     pub resident_health: ResidentHealth,
     pub protection_available: bool,
     pub limitations: Vec<&'static str>,
@@ -2369,18 +2373,22 @@ impl DnsMediationSession {
         self.attribution.drain()
     }
 
+    fn observe_local_control(&self, retry: MissingOwnerRetry<'_>) -> LocalControlObservation {
+        observe_local_control(&self.routing.executables, &self.fence_owner, retry)
+    }
+
     fn verify_before_readiness(
         &self,
         baseline: &LocalControlSnapshot,
     ) -> Result<ResidentHealth, DnsMediationError> {
-        let verified =
-            verify_pinned_local_control(self, baseline, MissingOwnerRetry::Baseline(baseline))
-                .map_err(local_control_error)
-                .and_then(|()| {
-                    self.routing
-                        .verify_active_resolver_mount()
-                        .inspect_err(DnsMediationError::report_resolver_startup_failure)
-                });
+        let observed = self.observe_local_control(MissingOwnerRetry::Baseline(baseline));
+        let verified = verify_local_control_observation(baseline, &observed)
+            .map_err(local_control_error)
+            .and_then(|()| {
+                self.routing
+                    .verify_active_resolver_mount()
+                    .inspect_err(DnsMediationError::report_resolver_startup_failure)
+            });
         self.recorder
             .publish_initial_verified_health(verified, self.supervisor.worker_health())
     }
@@ -2521,11 +2529,7 @@ fn establish_local_control_baseline(
             MissingOwnerRetry::Baseline(initial)
         }
     };
-    let observed = observe_local_control(
-        &mediation.routing.executables,
-        &mediation.fence_owner,
-        retry,
-    );
+    let observed = mediation.observe_local_control(retry);
     match posture {
         LockdownPosture::StandardBlock => {
             verify_no_additive_local_control_since(&accepted_inventory, initial, &observed)
@@ -2536,19 +2540,6 @@ fn establish_local_control_baseline(
     }
     .map_err(local_control_error)?;
     Ok(observed.snapshot)
-}
-
-fn verify_pinned_local_control(
-    mediation: &DnsMediationSession,
-    baseline: &LocalControlSnapshot,
-    retry: MissingOwnerRetry<'_>,
-) -> Result<(), crate::local_control::LocalControlVerificationError> {
-    let observed = observe_local_control(
-        &mediation.routing.executables,
-        &mediation.fence_owner,
-        retry,
-    );
-    verify_local_control_observation(baseline, &observed)
 }
 
 struct DnsMediatedAuditSession<R: RuntimeDocumentStore> {
@@ -2814,10 +2805,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                     "measured container availability drifted after observation readiness",
                 );
             }
-            if let Err(error) = verify_pinned_local_control(
-                &self._mediation,
+            let observed = self
+                ._mediation
+                .observe_local_control(MissingOwnerRetry::Never);
+            if let Err(error) = observed.verify_resident_baseline(
                 &self.local_control_baseline,
-                MissingOwnerRetry::Never,
+                &mut self.evidence.first_failed_local_control_scan,
             ) {
                 verification_succeeded = false;
                 self.record_critical(error.code, error.message);
@@ -3408,10 +3401,12 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 }
                 LockdownPosture::Audit => unreachable!("block sessions cannot use audit posture"),
             }
-            if let Err(error) = verify_pinned_local_control(
-                &self._mediation,
+            let observed = self
+                ._mediation
+                .observe_local_control(MissingOwnerRetry::Never);
+            if let Err(error) = observed.verify_resident_baseline(
                 &self.local_control_baseline,
-                MissingOwnerRetry::Never,
+                &mut self.evidence.first_failed_local_control_scan,
             ) {
                 verification_succeeded = false;
                 self.record_critical(error.code, error.message);
@@ -3703,6 +3698,7 @@ fn initial_dns_block_evidence(
         findings_truncated: false,
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
+        first_failed_local_control_scan: None,
         resident_health,
         protection_available: scope.protection_available(),
         limitations: scope.limitations(
@@ -3744,6 +3740,7 @@ fn initial_dns_audit_evidence(
         findings_truncated: false,
         critical_findings: Vec::new(),
         critical_findings_truncated: false,
+        first_failed_local_control_scan: None,
         resident_health,
         protection_available: false,
         limitations: protected_audit_limitations(plan.runtime_hostname_policy.has_user_wildcards()),

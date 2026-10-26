@@ -180,6 +180,17 @@ const RUNTIME_EVIDENCE_SCHEMA_VERSION = 5;
 const RESIDENT_EVIDENCE_MAX_AGE_MILLISECONDS = 20 * 1000;
 const RESIDENT_EVIDENCE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 1000;
 const RESIDENT_VERIFICATION_INTERVAL_SECONDS = 5;
+// Match the native local-control scan budget and closed diagnostic enums.
+const LOCAL_CONTROL_SCAN_ATTEMPTS = 3;
+const LOCAL_CONTROL_UNAVAILABLE_INPUTS = new Set([
+  "cgroup_identity", "ipv4_table", "ipv6_table", "malformed_rows", "proc", "proc_scan",
+  "process_fd_readlink", "process_fd_scan", "process_identity", "process_identity_drift",
+  "socket_ownership", "unix_reachability", "unix_table",
+]);
+const LOCAL_CONTROL_BOUNDS = new Set([
+  "container_processes", "fds_per_process", "processes", "socket_owners",
+  "tcp_listeners", "total_fds", "unix_listeners",
+]);
 const RELEASE_TAG = /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)))*)?$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_ROOT = "/run/fence";
@@ -1493,6 +1504,25 @@ function validateGithubArtifactCompatibilityEvidence(evidence: any, description:
   ) {
     fail(`Fence ${description} contains an unexpected GitHub artifact compatibility policy`);
   }
+}
+
+function localControlScanDiagnostic(value: any) {
+  const validReasons = (values: unknown, allowed: Set<string>): values is string[] =>
+    Array.isArray(values) && values.length <= allowed.size &&
+    values.every((reason) => typeof reason === "string" && allowed.has(reason)) &&
+    new Set(values).size === values.length;
+  if (
+    !value || !Number.isSafeInteger(value.attempts) || value.attempts < 1 || value.attempts > LOCAL_CONTROL_SCAN_ATTEMPTS ||
+    !validReasons(value.unavailable_inputs, LOCAL_CONTROL_UNAVAILABLE_INPUTS) ||
+    !validReasons(value.bounds_exceeded, LOCAL_CONTROL_BOUNDS)
+  ) return undefined;
+  // An unstable pair keeps the final sample's reasons. A matching pair has one fixed status.
+  const pairedStatus = value.unavailable_inputs.length ? "unavailable" : value.bounds_exceeded.length ? "bounds_exceeded" : "stable";
+  if (value.status !== "unstable" && value.status !== pairedStatus) return undefined;
+  return {
+    status: value.status, attempts: value.attempts,
+    unavailable_inputs: [...value.unavailable_inputs], bounds_exceeded: [...value.bounds_exceeded],
+  };
 }
 
 function rejectCriticalFindings(findings: readonly unknown[]): void {
@@ -3102,6 +3132,7 @@ module.exports = {
   readReady,
   readLauncherIntegrity,
   launcherIntegrityDocument,
+  localControlScanDiagnostic,
   rejectCriticalFindings,
   registeredActionPathGuardPaths,
   resultsStorageWarnings,
