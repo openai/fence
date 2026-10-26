@@ -511,8 +511,27 @@ pub(crate) fn verify_no_additive_local_control_since(
     observed: &LocalControlObservation,
 ) -> Result<(), LocalControlVerificationError> {
     verify_reviewed_local_control_snapshot(accepted, observed)?;
-    let snapshot = &observed.snapshot;
+    if !lockdown_removals_match(
+        accepted_inventory,
+        accepted,
+        &observed.snapshot,
+        Owners::Required,
+    ) {
+        return Err(verification_error(
+            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed),
+            "local_control_inventory_unreviewed_reduction",
+            "local control inventory lost a non-container endpoint or owner",
+        ));
+    }
+    Ok(())
+}
 
+fn lockdown_removals_match(
+    accepted_inventory: &AcceptedLocalControlInventoryV2,
+    accepted: &LocalControlSnapshot,
+    snapshot: &LocalControlSnapshot,
+    owners: Owners,
+) -> bool {
     let reviewed_containers = &accepted.root_container_processes;
     let mut accepted_unix_projection =
         non_container_unix_projection(&accepted.unix_listeners, reviewed_containers);
@@ -534,21 +553,13 @@ pub(crate) fn verify_no_additive_local_control_since(
             });
         !removable || remains || reviewed_container_owner_remains
     });
-    if non_container_tcp_projection(&snapshot.tcp_listeners, reviewed_containers)
-        != non_container_tcp_projection(&accepted.tcp_listeners, reviewed_containers)
-        || !unix_listener_snapshots_match(
-            &accepted_unix_projection,
-            &non_container_unix_projection(&snapshot.unix_listeners, reviewed_containers),
-        )
-    {
-        return Err(verification_error(
-            LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Removed),
-            "local_control_inventory_unreviewed_reduction",
-            "local control inventory lost a non-container endpoint or owner",
-        ));
-    }
-
-    Ok(())
+    owners.tcp_match(
+        &non_container_tcp_projection(&accepted.tcp_listeners, reviewed_containers),
+        &non_container_tcp_projection(&snapshot.tcp_listeners, reviewed_containers),
+    ) && owners.unix_match(
+        &accepted_unix_projection,
+        &non_container_unix_projection(&snapshot.unix_listeners, reviewed_containers),
+    )
 }
 
 pub(crate) fn verify_reviewed_local_control_observation(
@@ -559,18 +570,12 @@ pub(crate) fn verify_reviewed_local_control_observation(
     verify_reviewed_local_control_snapshot(&accepted, observed)
 }
 
-fn verify_reviewed_local_control_snapshot(
+pub(crate) fn verify_reviewed_local_control_snapshot(
     accepted: &LocalControlSnapshot,
     observed: &LocalControlObservation,
 ) -> Result<(), LocalControlVerificationError> {
     verify_complete_local_control_observation(observed)?;
-    let snapshot = &observed.snapshot;
-    if !root_container_processes_are_subset(
-        &snapshot.root_container_processes,
-        &accepted.root_container_processes,
-    ) || !tcp_listeners_are_subset(&snapshot.tcp_listeners, &accepted.tcp_listeners)
-        || !unix_listeners_are_subset(&snapshot.unix_listeners, &accepted.unix_listeners)
-    {
+    if !reviewed_inventory_subset(accepted, &observed.snapshot, Owners::Required) {
         return Err(verification_error(
             LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added),
             "local_control_inventory_additive_drift",
@@ -578,6 +583,18 @@ fn verify_reviewed_local_control_snapshot(
         ));
     }
     Ok(())
+}
+
+fn reviewed_inventory_subset(
+    accepted: &LocalControlSnapshot,
+    observed: &LocalControlSnapshot,
+    owners: Owners,
+) -> bool {
+    root_container_processes_are_subset(
+        &observed.root_container_processes,
+        &accepted.root_container_processes,
+    ) && tcp_listeners_are_subset(&observed.tcp_listeners, &accepted.tcp_listeners, owners)
+        && unix_listeners_are_subset(&observed.unix_listeners, &accepted.unix_listeners, owners)
 }
 
 fn non_container_tcp_projection(
@@ -647,16 +664,22 @@ fn root_container_processes_are_subset(
         <= MAX_CONTAINER_PROCESSES as u64
 }
 
-fn tcp_listeners_are_subset(observed: &[TcpListener], accepted: &[TcpListener]) -> bool {
+fn tcp_listeners_are_subset(
+    observed: &[TcpListener],
+    accepted: &[TcpListener],
+    owners: Owners,
+) -> bool {
     if contains_duplicate_tcp_key(accepted)
         || contains_duplicate_tcp_key(observed)
         || observed.iter().any(|item| {
             item.instances == 0
-                || item.owners.is_empty()
-                || !item.ownership_complete
                 || !accepted.iter().any(|expected| {
                     same_tcp_key(item, expected)
-                        && owners_are_subset(&item.owners, &expected.owners)
+                        && owners.match_subset(
+                            item.ownership_complete,
+                            &item.owners,
+                            &expected.owners,
+                        )
                 })
         })
     {
@@ -670,18 +693,23 @@ fn tcp_listeners_are_subset(observed: &[TcpListener], accepted: &[TcpListener]) 
         <= MAX_TCP_LISTENERS as u64
 }
 
-fn unix_listeners_are_subset(observed: &[UnixListener], accepted: &[UnixListener]) -> bool {
+fn unix_listeners_are_subset(
+    observed: &[UnixListener],
+    accepted: &[UnixListener],
+    owners: Owners,
+) -> bool {
     if contains_duplicate_unix_key(accepted)
         || contains_duplicate_unix_key(observed)
         || observed.iter().any(|item| {
             item.instances == 0
-                || item.owners.is_empty()
                 || !item.runner_reachable
-                || !item.ownership_complete
                 || !accepted.iter().any(|expected| {
                     same_unix_key(item, expected)
-                        && (owners_are_subset(&item.owners, &expected.owners)
-                            || reviewed_uuidd_transition(expected, item))
+                        && (owners.match_subset(
+                            item.ownership_complete,
+                            &item.owners,
+                            &expected.owners,
+                        ) || reviewed_uuidd_transition(expected, item))
                 })
         })
     {
@@ -732,12 +760,48 @@ fn reviewed_uuidd_transition(before: &UnixListener, after: &UnixListener) -> boo
         && reviewed_uuidd_listener(after)
 }
 
-fn unix_listener_snapshots_match(accepted: &[UnixListener], observed: &[UnixListener]) -> bool {
-    accepted.len() == observed.len()
-        && accepted
-            .iter()
-            .zip(observed)
-            .all(|(before, after)| before == after || reviewed_uuidd_transition(before, after))
+#[derive(Clone, Copy)]
+enum Owners {
+    Required,
+    ForRetryOnly,
+}
+
+impl Owners {
+    fn missing(self, complete: bool, owners: &[LocalControlOwner]) -> bool {
+        matches!(self, Self::ForRetryOnly) && !complete && owners.is_empty()
+    }
+
+    fn match_subset(
+        self,
+        complete: bool,
+        observed: &[LocalControlOwner],
+        expected: &[LocalControlOwner],
+    ) -> bool {
+        self.missing(complete, observed)
+            || complete && !observed.is_empty() && owners_are_subset(observed, expected)
+    }
+
+    fn tcp_match(self, accepted: &[TcpListener], observed: &[TcpListener]) -> bool {
+        accepted.len() == observed.len()
+            && accepted.iter().zip(observed).all(|(a, b)| {
+                a == b
+                    || self.missing(b.ownership_complete, &b.owners)
+                        && same_tcp_key(a, b)
+                        && a.instances == b.instances
+            })
+    }
+
+    fn unix_match(self, accepted: &[UnixListener], observed: &[UnixListener]) -> bool {
+        accepted.len() == observed.len()
+            && accepted.iter().zip(observed).all(|(a, b)| {
+                a == b
+                    || reviewed_uuidd_transition(a, b)
+                    || self.missing(b.ownership_complete, &b.owners)
+                        && same_unix_key(a, b)
+                        && a.runner_reachable == b.runner_reachable
+                        && a.instances == b.instances
+            })
+    }
 }
 
 fn owners_are_subset(observed: &[LocalControlOwner], accepted: &[LocalControlOwner]) -> bool {
@@ -1054,7 +1118,7 @@ fn local_control_snapshots_match(
         && accepted.reachability_complete == observed.reachability_complete
         && accepted.ownership_complete == observed.ownership_complete
         && accepted.root_container_processes == observed.root_container_processes
-        && unix_listener_snapshots_match(&accepted.unix_listeners, &observed.unix_listeners)
+        && Owners::Required.unix_match(&accepted.unix_listeners, &observed.unix_listeners)
         && accepted.tcp_listeners == observed.tcp_listeners
 }
 
@@ -1284,14 +1348,16 @@ enum AcquisitionError {
     TooLarge,
 }
 
-pub fn observe_local_control_inventory(
+pub(crate) fn observe_local_control_inventory(
     proc_root: &Path,
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
+    retry: MissingOwnerRetry<'_>,
 ) -> LocalControlObservation {
     let observed = observe_local_control_with(
         || collect_private_snapshot(proc_root, socket_access, current_fence, read_tcp_listeners),
         || thread::sleep(Duration::from_millis(STABILITY_INTERVAL_MILLISECONDS)),
+        retry,
     );
     if let Some(diagnostic) = local_control_failure_diagnostic(&observed) {
         let _ = writeln!(std::io::stderr().lock(), "{diagnostic}");
@@ -1314,7 +1380,61 @@ fn local_control_failure_diagnostic(
     })
 }
 
-fn observe_local_control_with<C, S>(mut capture: C, mut sleep: S) -> LocalControlObservation
+// Each startup check may resample an ownerless listener only if the rest of that
+// same check would pass. This predicate never marks a snapshot complete.
+#[derive(Clone, Copy)]
+pub(crate) enum MissingOwnerRetry<'a> {
+    Never,
+    Reviewed(&'a LocalControlSnapshot),
+    NoContainers(&'a LocalControlSnapshot),
+    Baseline(&'a LocalControlSnapshot),
+    AfterLockdown(
+        &'a AcceptedLocalControlInventoryV2,
+        &'a LocalControlSnapshot,
+    ),
+}
+
+impl MissingOwnerRetry<'_> {
+    fn permits(self, snapshot: &LocalControlSnapshot) -> bool {
+        let owners = Owners::ForRetryOnly;
+        if matches!(self, Self::Never)
+            || snapshot.unavailable_inputs != [UnavailableReason::SocketOwnership]
+            || !(snapshot
+                .tcp_listeners
+                .iter()
+                .any(|s| owners.missing(s.ownership_complete, &s.owners))
+                || snapshot
+                    .unix_listeners
+                    .iter()
+                    .any(|s| owners.missing(s.ownership_complete, &s.owners)))
+        {
+            return false;
+        }
+        match self {
+            Self::Never => false,
+            Self::Reviewed(expected) => reviewed_inventory_subset(expected, snapshot, owners),
+            Self::NoContainers(expected) => {
+                snapshot.root_container_processes.is_empty()
+                    && reviewed_inventory_subset(expected, snapshot, owners)
+            }
+            Self::AfterLockdown(policy, initial) => {
+                reviewed_inventory_subset(initial, snapshot, owners)
+                    && lockdown_removals_match(policy, initial, snapshot, owners)
+            }
+            Self::Baseline(expected) => {
+                snapshot.root_container_processes == expected.root_container_processes
+                    && owners.tcp_match(&expected.tcp_listeners, &snapshot.tcp_listeners)
+                    && owners.unix_match(&expected.unix_listeners, &snapshot.unix_listeners)
+            }
+        }
+    }
+}
+
+fn observe_local_control_with<C, S>(
+    mut capture: C,
+    mut sleep: S,
+    retry: MissingOwnerRetry<'_>,
+) -> LocalControlObservation
 where
     C: FnMut() -> PrivateSnapshot,
     S: FnMut(),
@@ -1332,16 +1452,16 @@ where
                 ScanStatus::BoundsExceeded => ObservationStatus::BoundsExceeded,
                 ScanStatus::Unavailable => ObservationStatus::Unavailable,
             };
-            // Matching acquisition failures are not a complete inventory. Use the
-            // remaining attempts, without retrying malformed rows or over-budget scans.
+            // Resample, never accept, an incomplete pair. Keep the original scan budget.
             if status == ObservationStatus::Unavailable
                 && attempt < STABILITY_ATTEMPTS
                 && snapshot.bounds_exceeded.is_empty()
                 && snapshot.malformed_row_count == 0
-                && snapshot
+                && (snapshot
                     .unavailable_inputs
                     .iter()
                     .any(|reason| reason.is_acquisition())
+                    || retry.permits(&snapshot))
             {
                 continue;
             }
@@ -3432,10 +3552,171 @@ mod tests {
     fn observe_samples(
         samples: impl IntoIterator<Item = PrivateSnapshot>,
     ) -> LocalControlObservation {
+        observe_samples_with(samples, MissingOwnerRetry::Never)
+    }
+
+    fn observe_samples_with(
+        samples: impl IntoIterator<Item = PrivateSnapshot>,
+        retry: MissingOwnerRetry<'_>,
+    ) -> LocalControlObservation {
         let mut samples = samples.into_iter();
-        let observed = observe_local_control_with(|| samples.next().unwrap(), || {});
+        let observed = observe_local_control_with(|| samples.next().unwrap(), || {}, retry);
         assert!(samples.next().is_none(), "unused inventory retry samples");
         observed
+    }
+
+    fn owned_listeners() -> PrivateSnapshot {
+        let owners = vec![private_owner(0, true, &[1])];
+        PrivateSnapshot {
+            tcp_listeners: vec![PrivateTcpListener {
+                socket_inode: 10,
+                socket_uid: 0,
+                family: InternetAddressFamily::Ipv4,
+                bind_class: BindClass::Wildcard,
+                port: 22,
+                owners: owners.clone(),
+                ownership_complete: true,
+            }],
+            unix_listeners: vec![PrivateUnixListener {
+                socket_inode: 11,
+                socket_type: UnixSocketType::Stream,
+                name_kind: UnixNameKind::Filesystem,
+                name_sha256: unix_name_sha256(b"/run/uuidd/request"),
+                owners,
+                ownership_complete: true,
+            }],
+            ..empty_private()
+        }
+    }
+
+    fn without_tcp_owner(mut snapshot: PrivateSnapshot) -> PrivateSnapshot {
+        snapshot.tcp_listeners[0].owners.clear();
+        snapshot.tcp_listeners[0].ownership_complete = false;
+        snapshot
+    }
+
+    fn without_unix_owner(mut snapshot: PrivateSnapshot) -> PrivateSnapshot {
+        snapshot.unix_listeners[0].owners.clear();
+        snapshot.unix_listeners[0].ownership_complete = false;
+        snapshot
+    }
+
+    #[test]
+    fn startup_can_recover_missing_owners_but_resident_checks_fail_immediately() {
+        let policy = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let reviewed = accepted_local_control_snapshot(&policy).unwrap();
+        let owned = owned_listeners();
+        let baseline = public_snapshot(owned.clone());
+        let mut before_lockdown = baseline.clone();
+        before_lockdown.root_container_processes = reviewed.root_container_processes.clone();
+
+        for missing in [
+            without_tcp_owner(owned.clone()),
+            without_unix_owner(owned.clone()),
+        ] {
+            let observed = observe_samples([missing.clone(), missing.clone()]);
+            assert_eq!(observed.attempts, 1);
+            assert!(verify_local_control_observation(&baseline, &observed).is_err());
+            for retry in [
+                MissingOwnerRetry::Reviewed(&reviewed),
+                MissingOwnerRetry::NoContainers(&reviewed),
+                MissingOwnerRetry::Baseline(&baseline),
+                MissingOwnerRetry::AfterLockdown(&policy, &before_lockdown),
+            ] {
+                let observed = observe_samples_with(
+                    [
+                        missing.clone(),
+                        missing.clone(),
+                        owned.clone(),
+                        owned.clone(),
+                    ],
+                    retry,
+                );
+                assert_eq!(observed.attempts, 2);
+                verify_local_control_observation(&baseline, &observed).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn startup_requires_a_complete_matching_pair_within_the_existing_budget() {
+        let owned = owned_listeners();
+        let baseline = public_snapshot(owned.clone());
+        let missing = without_tcp_owner(owned.clone());
+        for (second, status) in [
+            (missing.clone(), ObservationStatus::Unavailable),
+            (owned, ObservationStatus::Unstable),
+        ] {
+            let samples = (0..STABILITY_ATTEMPTS).flat_map(|_| [missing.clone(), second.clone()]);
+            let observed = observe_samples_with(samples, MissingOwnerRetry::Baseline(&baseline));
+            assert_eq!(observed.status, status);
+            assert_eq!(observed.attempts, STABILITY_ATTEMPTS);
+            assert!(verify_local_control_observation(&baseline, &observed).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_owner_retries_cannot_hide_other_inventory_failures() {
+        let owned = owned_listeners();
+        let baseline = public_snapshot(owned.clone());
+        let policy = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let reviewed = accepted_local_control_snapshot(&policy).unwrap();
+        let reject = |snapshot: PrivateSnapshot, retry| {
+            let observed = observe_samples_with([snapshot.clone(), snapshot], retry);
+            assert_eq!(observed.attempts, 1);
+            assert!(verify_complete_local_control_observation(&observed).is_err());
+        };
+        let retries = [
+            MissingOwnerRetry::Reviewed(&reviewed),
+            MissingOwnerRetry::NoContainers(&reviewed),
+            MissingOwnerRetry::Baseline(&baseline),
+            MissingOwnerRetry::AfterLockdown(&policy, &baseline),
+        ];
+        let missing = without_unix_owner(owned.clone());
+        // These containers are reviewed, but their presence contradicts an absence check.
+        let mut running = public_snapshot(missing.clone());
+        running.root_container_processes = reviewed.root_container_processes.clone();
+        assert!(MissingOwnerRetry::Reviewed(&reviewed).permits(&running));
+        assert!(!MissingOwnerRetry::NoContainers(&reviewed).permits(&running));
+
+        for snapshot in [owned, missing.clone()] {
+            let mut partial = snapshot.clone();
+            partial.tcp_listeners[0].ownership_complete = false; // Nonempty owners.
+            let mut unreviewed = snapshot;
+            unreviewed.tcp_listeners[0].owners = vec![private_owner(0, false, &[1])];
+            for invalid in [partial, unreviewed] {
+                for retry in retries {
+                    reject(invalid.clone(), retry);
+                }
+            }
+        }
+        let mut wrong_owner = missing.clone();
+        wrong_owner.tcp_listeners[0].owners = vec![private_owner(1001, true, &[1])];
+        let mut wrong_endpoint = missing.clone();
+        wrong_endpoint.unix_listeners[0].name_sha256 = unix_name_sha256(b"/run/other.sock");
+        let mut unresolved = missing.clone();
+        unresolved.unresolved_unix_listener_count = 1;
+        let mut malformed = missing.clone();
+        malformed.malformed_row_count = 1;
+        let mut bounded = missing.clone();
+        bounded.bounds_exceeded.insert(BoundReason::Processes);
+        for invalid in [wrong_owner, wrong_endpoint, unresolved, malformed, bounded] {
+            for retry in retries {
+                reject(invalid.clone(), retry);
+            }
+        }
+        // Removing a non-container listener is not a valid lockdown reduction.
+        let mut removed = missing;
+        removed.tcp_listeners.clear();
+        reject(removed.clone(), MissingOwnerRetry::Baseline(&baseline));
+        reject(
+            removed,
+            MissingOwnerRetry::AfterLockdown(&policy, &baseline),
+        );
     }
 
     #[test]
@@ -3600,6 +3881,7 @@ mod tests {
         let observation = observe_local_control_with(
             || samples.borrow_mut().next().unwrap(),
             || sleeps.set(sleeps.get() + 1),
+            MissingOwnerRetry::Never,
         );
         assert_eq!(observation.status, ObservationStatus::Stable);
         assert_eq!(observation.attempts, 1);
@@ -3700,6 +3982,7 @@ mod tests {
                     }
                 },
                 || {},
+                MissingOwnerRetry::Never,
             );
             assert_eq!(observation.status, ObservationStatus::Unstable);
             assert!(!observation.stable);
@@ -3737,7 +4020,8 @@ mod tests {
             reachable.security_relevant_stability_key()
         );
         let accepted = public_snapshot(excluded);
-        let observation = observe_local_control_with(|| reachable.clone(), || {});
+        let observation =
+            observe_local_control_with(|| reachable.clone(), || {}, MissingOwnerRetry::Never);
         assert_eq!(observation.status, ObservationStatus::Stable);
         assert_eq!(
             verify_local_control_observation(&accepted, &observation)
@@ -3972,6 +4256,7 @@ mod tests {
                 })
             },
             || {},
+            MissingOwnerRetry::Never,
         );
         assert_eq!(observation.status, ObservationStatus::Unavailable);
         assert!(observation.stable);

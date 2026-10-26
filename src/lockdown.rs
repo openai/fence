@@ -4,9 +4,10 @@ use crate::hosted_runner::{
 };
 use crate::lifecycle::validate_test_service_context;
 use crate::local_control::{
-    NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner, SOCKET_PROBE_TIMEOUT,
-    SystemUnixSocketAccess, observe_local_control_inventory,
-    verify_reviewed_local_control_observation,
+    MissingOwnerRetry, NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner,
+    SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess, accepted_local_control_snapshot,
+    observe_local_control_inventory, verify_reviewed_local_control_observation,
+    verify_reviewed_local_control_snapshot,
 };
 use crate::runtime::{RuntimeError, TestRuntimeStore};
 use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
@@ -374,6 +375,21 @@ enum SudoRollbackState {
     CommittedNoRestore,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DockerCheck {
+    Startup,
+    Resident,
+}
+
+impl SudoRollbackState {
+    fn docker_check(&self) -> DockerCheck {
+        match self {
+            Self::CommittedNoRestore => DockerCheck::Resident,
+            Self::Unchanged | Self::RollbackAvailable(_) => DockerCheck::Startup,
+        }
+    }
+}
+
 pub struct SystemLockdownControl {
     executables: Arc<TrustedExecutableSet>,
     sudo_rollback: SudoRollbackState,
@@ -400,7 +416,10 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        self.sudo_source_pins = Some(verify_host_capabilities(executables)?);
+        self.sudo_source_pins = Some(verify_host_capabilities(
+            executables,
+            self.sudo_rollback.docker_check(),
+        )?);
         Ok(())
     }
 
@@ -434,7 +453,7 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        if runner_docker_available(executables)? {
+        if runner_docker_available(executables, self.sudo_rollback.docker_check())? {
             Ok(())
         } else {
             Err(LockdownError::new(
@@ -486,7 +505,7 @@ impl LockdownControl for SystemLockdownControl {
     }
 
     fn disable_containers(&mut self) -> Result<(), LockdownError> {
-        if !runner_docker_available(&self.executables)? {
+        if !runner_docker_available(&self.executables, self.sudo_rollback.docker_check())? {
             return Ok(());
         }
         self.containers_masked = true;
@@ -551,7 +570,7 @@ impl LockdownControl for SystemLockdownControl {
                 false
             }
         } else {
-            runner_docker_available(executables)?
+            runner_docker_available(executables, self.sudo_rollback.docker_check())?
         };
         if docker_available {
             return Err(LockdownError::new(
@@ -760,8 +779,12 @@ fn verify_test_local_control_inventory(
             runner_path_writable(executables, path, timeout).ok()
         }
     });
-    let observed =
-        observe_local_control_inventory(Path::new("/proc"), &socket_access, &NoCurrentFenceOwner);
+    let observed = observe_local_control_inventory(
+        Path::new("/proc"),
+        &socket_access,
+        &NoCurrentFenceOwner,
+        MissingOwnerRetry::Never,
+    );
     verify_reviewed_local_control_observation(
         &hosted_runner_fingerprint_requirement()
             .accepted
@@ -975,6 +998,7 @@ fn verify_runner_identity(
 
 fn verify_host_capabilities(
     executables: &TrustedExecutableSet,
+    check: DockerCheck,
 ) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
     let accepted = hosted_runner_fingerprint_requirement().accepted;
     verify_host_identity(&accepted)?;
@@ -982,7 +1006,7 @@ fn verify_host_capabilities(
         .verify_all()
         .map_err(|_| unsupported_fingerprint())?;
     verify_runner_identity(executables, &accepted)?;
-    let docker_available = runner_docker_available(executables)?;
+    let docker_available = runner_docker_available(executables, check)?;
     if docker_available {
         let workloads = runner_docker_ps(executables)?;
         if !workloads.status.success() || !workloads.stdout.is_empty() {
@@ -1729,6 +1753,7 @@ fn runner_docker_ps(executables: &TrustedExecutableSet) -> Result<Output, Lockdo
 
 pub(crate) fn runner_docker_available(
     executables: &TrustedExecutableSet,
+    check: DockerCheck,
 ) -> Result<bool, LockdownError> {
     if executables.contains(TrustedExecutable::Docker) {
         let output = runner_docker_ps(executables)?;
@@ -1739,12 +1764,13 @@ pub(crate) fn runner_docker_available(
             return Err(unsupported_fingerprint());
         }
     }
-    verify_container_runtime_unavailable(executables)?;
+    verify_container_runtime_unavailable(executables, check)?;
     Ok(false)
 }
 
 fn verify_container_runtime_unavailable(
     executables: &TrustedExecutableSet,
+    check: DockerCheck,
 ) -> Result<(), LockdownError> {
     for unit in CONTAINER_UNITS {
         let state = observe_unit(executables, unit)?;
@@ -1768,15 +1794,20 @@ fn verify_container_runtime_unavailable(
     });
     let fence_owner = PinnedCurrentFenceOwner::capture(Path::new("/proc"))
         .map_err(|error| LockdownError::new(error.code, error.message))?;
-    let observed =
-        observe_local_control_inventory(Path::new("/proc"), &socket_access, &fence_owner);
-    verify_reviewed_local_control_observation(
+    let accepted = accepted_local_control_snapshot(
         &hosted_runner_fingerprint_requirement()
             .accepted
             .local_control_inventory,
-        &observed,
     )
     .map_err(|error| LockdownError::new(error.code, error.message))?;
+    let retry = match check {
+        DockerCheck::Startup => MissingOwnerRetry::NoContainers(&accepted),
+        DockerCheck::Resident => MissingOwnerRetry::Never,
+    };
+    let observed =
+        observe_local_control_inventory(Path::new("/proc"), &socket_access, &fence_owner, retry);
+    verify_reviewed_local_control_snapshot(&accepted, &observed)
+        .map_err(|error| LockdownError::new(error.code, error.message))?;
     if !observed.snapshot.root_container_processes.is_empty() {
         return Err(LockdownError::new(
             "container_lockdown_failed",
@@ -2735,6 +2766,18 @@ mod tests {
             SudoRollbackState::RollbackAvailable(_)
         ));
         assert!(!containers_masked);
+    }
+
+    #[test]
+    fn docker_checks_switch_to_resident_at_commit_with_or_without_sudo_changes() {
+        for mut state in [
+            SudoRollbackState::Unchanged,
+            SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]),
+        ] {
+            assert!(matches!(state.docker_check(), DockerCheck::Startup));
+            commit_no_restore_state(&mut state);
+            assert!(matches!(state.docker_check(), DockerCheck::Resident));
+        }
     }
 
     #[test]
