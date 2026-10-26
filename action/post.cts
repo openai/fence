@@ -10,6 +10,7 @@ const {
   actionRuntimeFileDigests,
   correlateFindingsToDns,
   findingAttributionDebugLines,
+  localControlScanDiagnostic,
   materializationRejectionReasons,
   materializationRequestRejections,
   materializationEvidenceCounter,
@@ -94,8 +95,9 @@ const FAILURE_CRITICAL_CODES = new Set([
 ]);
 
 type EvidenceSource = "resident" | "dns";
+type PostEvidencePaths = { ready: string; report: string; dnsReport: string };
 
-function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date.now()): string {
+function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date.now(), scanOnly = false): string | undefined {
   const health = evidence?.resident_health;
   const verifiedAt = health?.last_successful_verification_unix_milliseconds;
   const sequence = health?.verification_sequence;
@@ -105,6 +107,13 @@ function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date
   const findings = Array.isArray(evidence?.critical_findings) && evidence.critical_findings.length <= MAX_CRITICAL_FINDINGS
     ? evidence.critical_findings
     : null;
+  // A full, truncated list need not retain the finding for the first failed scan.
+  const scan = source === "resident" && health?.status === "critical" && findings && (
+    findings.some((finding: any) =>
+      FAILURE_CRITICAL_CODES.has(finding?.code) && finding.code.startsWith("local_control_inventory_")) ||
+    (findings.length === MAX_CRITICAL_FINDINGS && evidence.critical_findings_truncated === true)
+  ) ? localControlScanDiagnostic(evidence.first_failed_local_control_scan) : undefined;
+  if (scanOnly && !scan) return undefined;
   return `Fence failure diagnostic (unverified): ${JSON.stringify({
     source,
     reported_resident_status: ["healthy", "critical", "starting"].includes(health?.status) ? health.status : "unavailable",
@@ -116,18 +125,24 @@ function postFailureDiagnostic(evidence: any, source: EvidenceSource, now = Date
     critical_codes_omitted: findings === null ? null : Math.max(0, findings.length - MAX_STRUCTURED_CRITICAL_CODES),
     critical_findings_truncated: typeof evidence?.critical_findings_truncated === "boolean"
       ? evidence.critical_findings_truncated : null,
+    first_failed_local_control_scan: scan,
   })}`;
+}
+
+function emitPostFailureDiagnostic(evidence: any, source: EvidenceSource, scanOnly = false): void {
+  try {
+    const diagnostic = postFailureDiagnostic(evidence, source, Date.now(), scanOnly);
+    if (diagnostic) log.info(diagnostic);
+  } catch {
+    // Diagnostics must never replace the original validation failure.
+  }
 }
 
 function validatePostEvidence(evidence: any, source: EvidenceSource, validate: (value: any) => any): any {
   try {
     return validate(evidence);
   } catch (error) {
-    try {
-      log.info(postFailureDiagnostic(evidence, source));
-    } catch {
-      // Diagnostics must never replace the original validation failure.
-    }
+    emitPostFailureDiagnostic(evidence, source);
     throw error;
   }
 }
@@ -309,18 +324,27 @@ function main(): void {
   validateBundle(MANIFEST, BINARY);
   const initialReport = readJsonBounded(reportPath, MAX_REPORT_BYTES, "Fence report");
   const report = settleResidentReport(reportPath, paths.unit, initialReport);
-  let dnsEvidence;
-  const effectiveDnsReportPath = dnsReportPath || paths.dnsReport;
-  if (fs.existsSync(effectiveDnsReportPath)) {
-    dnsEvidence = validatePostEvidence(
-      readJsonBounded(effectiveDnsReportPath, MAX_REPORT_BYTES, "Fence DNS report"),
-      "dns",
-      (value: any) => validateDnsEvidence(value, report),
-    );
-  } else if (report.mode === "block") {
-    throw new Error("Fence block-mode DNS evidence is missing");
+  verifyFinalEvidence(report, paths);
+}
+
+function verifyFinalEvidence(report: any, paths: PostEvidencePaths): void {
+  try {
+    let dnsEvidence;
+    if (fs.existsSync(paths.dnsReport)) {
+      dnsEvidence = validatePostEvidence(
+        readJsonBounded(paths.dnsReport, MAX_REPORT_BYTES, "Fence DNS report"),
+        "dns",
+        (value: any) => validateDnsEvidence(value, report),
+      );
+    } else if (report.mode === "block") {
+      throw new Error("Fence block-mode DNS evidence is missing");
+    }
+    publishPostEvidence(report, dnsEvidence, paths);
+  } catch (error) {
+    // The settled resident may have a scan to explain even when a later evidence check failed first.
+    emitPostFailureDiagnostic(report, "resident", true);
+    throw error;
   }
-  publishPostEvidence(report, dnsEvidence, paths);
 }
 
 function writeJobSummary(filePath: string, report: any, dnsEvidence: any): void {
@@ -340,7 +364,7 @@ function writeJobSummary(filePath: string, report: any, dnsEvidence: any): void 
   }
 }
 
-function publishPostEvidence(report: any, dnsEvidence: any, paths: { ready: string; report: string; dnsReport: string }): void {
+function publishPostEvidence(report: any, dnsEvidence: any, paths: PostEvidencePaths): void {
   // The report is published before the ready marker. It cannot by itself certify that setup committed.
   validateReady(readReady(paths.ready), report, "post");
   const networkReport = renderNetworkReport(report, dnsEvidence);
@@ -447,4 +471,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { main, postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport };
+module.exports = { main, postFailureDiagnostic, publishPostEvidence, validatePostEvidence, settleResidentReport, verifyFinalEvidence };

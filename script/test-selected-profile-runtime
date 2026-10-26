@@ -95,7 +95,8 @@ sudo /usr/bin/systemd-run \
   "${scenario_environment[@]}" \
   "${test_binaries[0]}" --ignored --exact selected_profile_runtime_worker --nocapture
 
-python3 -E - "$report" "$dns_report" "$ready" "$production_ready" "$scenario" <<'PY'
+first_scan_observation="$(
+  python3 -E - "$report" "$dns_report" "$ready" "$production_ready" "$scenario" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -275,10 +276,21 @@ if scenario == "worker-failure":
     require(any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]))
 elif scenario == "local-control-drift":
     require(any(item["code"] == "local_control_inventory_unavailable" for item in report["critical_findings"]))
+    while not report_path.with_name("test-listener-closed").is_file():
+        require(time.monotonic() < deadline, "test listener did not confirm closure")
+        time.sleep(0.1)
+    scan = report["first_failed_local_control_scan"]
+    attempts = scan.get("attempts")
+    require(type(attempts) is int and 1 <= attempts <= 3)
+    require(scan == {"status": "unavailable", "attempts": attempts, "unavailable_inputs": ["socket_ownership"], "bounds_exceeded": []})
+    print(json.dumps([scan, report_path.stat().st_mtime_ns, resident["verification_sequence"]]))
 else:
     require(report["critical_findings"] == [])
+if scenario != "local-control-drift":
+    require("first_failed_local_control_scan" not in report)
 require(not production_path.exists())
 PY
+)"
 
 # Unrelated traffic and a syntactically valid results-storage request from the
 # workflow process must be refused locally.
@@ -425,7 +437,7 @@ if docker ps --quiet >/dev/null 2>&1; then
 fi
 
 sleep 6
-python3 -E - "$report" "$dns_report" "$production_ready" "$scenario" <<'PY'
+python3 -E - "$report" "$dns_report" "$production_ready" "$scenario" "$first_scan_observation" <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -499,10 +511,14 @@ if scenario == "worker-failure":
     require(any(item["code"] == "resident_worker_test_failure" for item in report["critical_findings"]))
     require(any(item["status"] == "failed" for item in report["resident_health"]["workers"]))
 elif scenario == "local-control-drift":
+    first_scan, first_report_mtime, first_sequence = json.loads(sys.argv[5])
     require(report["resident_health"]["status"] == "critical")
-    require(report["resident_health"]["verification_sequence"] == 1)
+    require(report["resident_health"]["verification_sequence"] == first_sequence)
     require(any(item["code"] == "local_control_inventory_unavailable" for item in report["critical_findings"]))
     require(all(item["status"] == "running" for item in report["resident_health"]["workers"]))
+    require(report_path.stat().st_mtime_ns != first_report_mtime, "resident did not republish its report")
+    require(report["first_failed_local_control_scan"] == first_scan,
+            "first failed scan changed after the unexpected listener closed")
 else:
     require(report["critical_findings"] == [])
     require(report["resident_health"]["status"] == "healthy")

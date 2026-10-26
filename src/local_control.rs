@@ -273,6 +273,35 @@ pub struct LocalControlObservation {
     pub snapshot: LocalControlSnapshot,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub(crate) struct LocalControlScanDiagnostic {
+    status: ObservationStatus,
+    attempts: u32,
+    unavailable_inputs: Vec<UnavailableReason>,
+    bounds_exceeded: Vec<BoundReason>,
+}
+
+impl LocalControlObservation {
+    fn diagnostic(&self) -> LocalControlScanDiagnostic {
+        LocalControlScanDiagnostic {
+            status: self.status,
+            attempts: self.attempts,
+            unavailable_inputs: self.snapshot.unavailable_inputs.clone(),
+            bounds_exceeded: self.snapshot.bounds_exceeded.clone(),
+        }
+    }
+
+    pub(crate) fn verify_resident_baseline(
+        &self,
+        baseline: &LocalControlSnapshot,
+        first_failed_scan: &mut Option<LocalControlScanDiagnostic>,
+    ) -> Result<(), LocalControlVerificationError> {
+        verify_local_control_observation(baseline, self).inspect_err(|_| {
+            first_failed_scan.get_or_insert_with(|| self.diagnostic());
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum FilesystemSocketAccess {
     Reachable { owner_uid: u32 },
@@ -1383,16 +1412,8 @@ pub(crate) fn observe_local_control_inventory(
 fn local_control_failure_diagnostic(
     observed: &LocalControlObservation,
 ) -> Option<serde_json::Value> {
-    (observed.status != ObservationStatus::Stable).then(|| {
-        serde_json::json!({
-            "fence_local_control": {
-                "status": observed.status,
-                "attempts": observed.attempts,
-                "unavailable_inputs": observed.snapshot.unavailable_inputs,
-                "bounds_exceeded": observed.snapshot.bounds_exceeded,
-            }
-        })
-    })
+    (observed.status != ObservationStatus::Stable)
+        .then(|| serde_json::json!({ "fence_local_control": observed.diagnostic() }))
 }
 
 // Each startup check may resample an ownerless listener only if the rest of that
@@ -3787,6 +3808,63 @@ mod tests {
     }
 
     #[test]
+    fn resident_keeps_only_the_first_failed_scan() {
+        let baseline = &public_snapshot(owned_listeners());
+        let mut transient = owned_listeners();
+        transient.tcp_listeners.clear();
+        let healthy = observe_samples([
+            owned_listeners(),
+            transient,
+            owned_listeners(),
+            owned_listeners(),
+        ]);
+        assert_eq!(healthy.attempts, 2);
+        let missing = without_tcp_owner(owned_listeners());
+        let unavailable = observe_samples([missing.clone(), missing]);
+        let drift = observe_samples([empty_private(), empty_private()]);
+
+        for (first, later, code, diagnostic) in [
+            (
+                &unavailable,
+                &drift,
+                "local_control_inventory_unavailable",
+                serde_json::json!({"status": "unavailable", "attempts": 1,
+                    "unavailable_inputs": ["socket_ownership"], "bounds_exceeded": []}),
+            ),
+            (
+                &drift,
+                &unavailable,
+                "local_control_inventory_drift",
+                serde_json::json!({"status": "stable", "attempts": 1,
+                    "unavailable_inputs": [], "bounds_exceeded": []}),
+            ),
+        ] {
+            let mut retained = None;
+            healthy
+                .verify_resident_baseline(baseline, &mut retained)
+                .unwrap();
+            assert!(retained.is_none());
+            assert_eq!(
+                first
+                    .verify_resident_baseline(baseline, &mut retained)
+                    .unwrap_err()
+                    .code,
+                code
+            );
+            assert_eq!(serde_json::to_value(&retained).unwrap(), diagnostic);
+            healthy
+                .verify_resident_baseline(baseline, &mut retained)
+                .unwrap();
+            assert!(
+                later
+                    .verify_resident_baseline(baseline, &mut retained)
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(retained).unwrap(), diagnostic);
+        }
+    }
+
+    #[test]
     fn persistent_acquisition_failures_remain_unavailable() {
         let observed = observe_samples(std::iter::repeat_n(
             PrivateSnapshot::unavailable(UnavailableReason::ProcessFdScan),
@@ -3794,14 +3872,21 @@ mod tests {
         ));
         assert_eq!(observed.status, ObservationStatus::Unavailable);
         assert_eq!(observed.attempts, STABILITY_ATTEMPTS);
+        let mut first_failed_scan = None;
         assert_eq!(
-            verify_complete_local_control_observation(&observed)
+            observed
+                .verify_resident_baseline(&public_snapshot(empty_private()), &mut first_failed_scan)
                 .unwrap_err()
                 .code,
             "local_control_inventory_unavailable"
         );
+        let journal = local_control_failure_diagnostic(&observed).unwrap();
         assert_eq!(
-            local_control_failure_diagnostic(&observed).unwrap(),
+            serde_json::to_value(first_failed_scan).unwrap(),
+            journal["fence_local_control"]
+        );
+        assert_eq!(
+            journal,
             serde_json::json!({"fence_local_control": {
                 "status": "unavailable", "attempts": STABILITY_ATTEMPTS,
                 "unavailable_inputs": ["process_fd_scan", "socket_ownership"],

@@ -152,10 +152,8 @@ if /usr/bin/mv -- "$path_guard" "$moved_guard" 2>/dev/null; then
 fi
 echo "registered_action_path_rename=denied"
 
-sudo --non-interactive /usr/sbin/nft delete table inet fence_v0
-sleep 7
-
-python3 -E - "$report" <<'PY'
+first_scan="$(
+  sudo --non-interactive /usr/bin/python3 -I -B - <<'PY'
 import sys
 
 if sys.flags.optimize != 0:
@@ -167,15 +165,69 @@ def require(condition, message="evidence validation failed"):
 
 import json
 import pathlib
-import sys
+import socket
+import subprocess
+import time
 
-report = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+directory = pathlib.Path("/run/fence/action-tamper")
+report_path = directory / "report.json"
+ready = json.loads((directory / "ready.json").read_bytes())
+require(ready["status"] == "ready_observation_only" and ready["resident_health"]["status"] == "healthy")
+
+# Start both probes just after a healthy heartbeat so the fresh post-hook check
+# measures these failures, not time spent on the preceding path-guard tests.
+report = json.loads(report_path.read_bytes())
+sequence = report["resident_health"]["verification_sequence"]
+deadline = time.monotonic() + 15
+while True:
+    require(report["resident_health"]["status"] == "healthy" and "first_failed_local_control_scan" not in report)
+    if report["resident_health"]["verification_sequence"] > sequence:
+        break
+    require(time.monotonic() < deadline, "resident did not publish a healthy heartbeat before tampering")
+    time.sleep(0.1)
+    report = json.loads(report_path.read_bytes())
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    subprocess.run(["/usr/sbin/nft", "delete", "table", "inet", "fence_v0"], check=True, timeout=5)
+    deadline = time.monotonic() + 15
+    while True:
+        report = json.loads(report_path.read_bytes())
+        if "first_failed_local_control_scan" in report and report["network_verification_status"] == "critical_drift":
+            break
+        require(time.monotonic() < deadline, "resident did not report both the listener and the removed firewall")
+        time.sleep(0.1)
 require(report["status"] == "protected_host_audit_observation")
 require(report["readiness_status"] == "ready_observation_only")
 require(report["network_verification_status"] == "critical_drift")
+require(report["resident_health"]["status"] == "critical")
 require(report["critical_findings_truncated"] is False)
 require(any(item["code"] == "dns_audit_network_drift" for item in report["critical_findings"]))
+require(any(item["code"] == "local_control_inventory_unavailable" for item in report["critical_findings"]))
+scan = report["first_failed_local_control_scan"]
+attempts = scan.get("attempts")
+require(type(attempts) is int and 1 <= attempts <= 3)
+require(scan == {"status": "unavailable", "attempts": attempts, "unavailable_inputs": ["socket_ownership"], "bounds_exceeded": []})
+print(json.dumps(scan))
 PY
+)"
+
+require_listener_diagnostic() {
+  python3 -E - "$post_stdout" "$first_scan" <<'PY'
+import json
+import pathlib
+import sys
+
+with pathlib.Path(sys.argv[1]).open("rb") as stream:
+    output = stream.read(256 * 1024 + 1)
+prefix = b"Fence failure diagnostic (unverified): "
+records = [json.loads(line[len(prefix):]) for line in output.splitlines() if line.startswith(prefix)]
+resident = [record for record in records if record.get("source") == "resident"]
+if len(output) > 256 * 1024 or len(resident) != 1 or resident[0].get("first_failed_local_control_scan") != json.loads(sys.argv[2]):
+    raise SystemExit("Action post hook did not preserve the first failed listener scan")
+PY
+}
 
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
   die "Action tamper evidence unexpectedly restored inet fence_v0"
@@ -190,6 +242,7 @@ if STATE_invocation_id="$invocation" \
   die "Action post hook unexpectedly accepted critical resident drift"
 fi
 grep -q "Fence report contains critical resident findings" "$post_stderr"
+require_listener_diagnostic
 
 python3 -E - "$post_stdout" <<'PY'
 import json
@@ -269,21 +322,25 @@ PY
 
 # Critical health never advances its successful heartbeat. Wait only until it
 # crosses the freshness limit, with a separate monotonic test deadline.
-python3 -E - "$report" <<'PYWAIT'
+python3 -E - "$report" "$first_scan" <<'PYWAIT'
 import json
 import pathlib
 import sys
 import time
 
 report_path = pathlib.Path(sys.argv[1])
+first_scan = json.loads(sys.argv[2])
+initial_mtime = report_path.stat().st_mtime_ns
 deadline = time.monotonic() + 25
 while time.monotonic() < deadline:
     evidence = json.loads(report_path.read_text(encoding="utf-8"))
     health = evidence["resident_health"]
     if health["status"] != "critical":
         raise SystemExit("Tamper evidence lost critical resident status")
+    if evidence.get("first_failed_local_control_scan") != first_scan:
+        raise SystemExit("First failed scan changed after the unexpected listener closed")
     age = time.time() * 1000 - health["last_successful_verification_unix_milliseconds"]
-    if age > 21_000:
+    if age > 21_000 and report_path.stat().st_mtime_ns != initial_mtime:
         break
     time.sleep(0.1)
 else:
@@ -299,6 +356,7 @@ if STATE_invocation_id="$invocation" \
 fi
 grep -q "Fence resident health evidence is stale or has an invalid timestamp" "$post_stderr"
 grep -q 'Fence failure diagnostic (unverified): .*"reported_resident_status":"critical".*dns_audit_network_drift' "$post_stdout"
+require_listener_diagnostic
 if grep -q 'FENCE_REPORT_JSON=\|Fence evidence verified' "$post_stdout"; then
   die "Stale critical evidence produced a verified report"
 fi
