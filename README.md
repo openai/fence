@@ -113,7 +113,7 @@ Fence runs before the rest of your job and controls which network destinations t
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
-Fence checks listening services without counting unrelated TCP connections against the inspection limit. At startup, it can check again if a socket has no visible owner. If it still can't verify ownership, it stops. See [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
+Fence checks listening services without counting unrelated TCP connections against the inspection limit. At startup, it can check again if a known socket has no visible owner. If it still can't verify ownership, it stops. See [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
 
 Failed evidence validation may include [bounded, unverified diagnostics](docs/troubleshooting.md#post-job-evidence-validation-fails); the job still fails.
 

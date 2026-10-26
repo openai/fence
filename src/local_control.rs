@@ -1,5 +1,6 @@
 use crate::hosted_runner::{
-    AcceptedLocalControlInventoryV2, AcceptedLocalControlOwnerV2, UNIX_NAME_HASH_SCHEMA_V1,
+    AcceptedLocalControlInventoryV2, AcceptedLocalControlOwnerV2, AcceptedSocketV2,
+    UNIX_NAME_HASH_SCHEMA_V1,
 };
 use netlink_sys::{Socket, SocketAddr, constants::NETLINK_SOCK_DIAG};
 use serde::Serialize;
@@ -221,6 +222,20 @@ pub struct LocalControlSnapshot {
     pub root_container_processes: Vec<RootContainerProcess>,
     pub unix_listeners: Vec<UnixListener>,
     pub tcp_listeners: Vec<TcpListener>,
+}
+
+impl LocalControlSnapshot {
+    pub(crate) fn without_container_controls(mut self, sockets: &[AcceptedSocketV2]) -> Self {
+        self.root_container_processes.clear();
+        // Systemd can hold a reachable control socket before the daemon starts.
+        for socket in sockets {
+            let name = unix_name_sha256(socket.path.as_bytes());
+            self.unix_listeners.retain(|listener| {
+                listener.name_kind != UnixNameKind::Filesystem || listener.name_sha256 != name
+            });
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
@@ -1386,7 +1401,6 @@ fn local_control_failure_diagnostic(
 pub(crate) enum MissingOwnerRetry<'a> {
     Never,
     Reviewed(&'a LocalControlSnapshot),
-    NoContainers(&'a LocalControlSnapshot),
     Baseline(&'a LocalControlSnapshot),
     AfterLockdown(
         &'a AcceptedLocalControlInventoryV2,
@@ -1397,26 +1411,21 @@ pub(crate) enum MissingOwnerRetry<'a> {
 impl MissingOwnerRetry<'_> {
     fn permits(self, snapshot: &LocalControlSnapshot) -> bool {
         let owners = Owners::ForRetryOnly;
-        if matches!(self, Self::Never)
-            || snapshot.unavailable_inputs != [UnavailableReason::SocketOwnership]
-            || !(snapshot
-                .tcp_listeners
-                .iter()
-                .any(|s| owners.missing(s.ownership_complete, &s.owners))
-                || snapshot
-                    .unix_listeners
+        let missing_owner_only = || {
+            snapshot.unavailable_inputs == [UnavailableReason::SocketOwnership]
+                && (snapshot
+                    .tcp_listeners
                     .iter()
-                    .any(|s| owners.missing(s.ownership_complete, &s.owners)))
-        {
-            return false;
-        }
+                    .any(|s| owners.missing(s.ownership_complete, &s.owners))
+                    || snapshot
+                        .unix_listeners
+                        .iter()
+                        .any(|s| owners.missing(s.ownership_complete, &s.owners)))
+        };
         match self {
             Self::Never => false,
+            _ if !missing_owner_only() => false,
             Self::Reviewed(expected) => reviewed_inventory_subset(expected, snapshot, owners),
-            Self::NoContainers(expected) => {
-                snapshot.root_container_processes.is_empty()
-                    && reviewed_inventory_subset(expected, snapshot, owners)
-            }
             Self::AfterLockdown(policy, initial) => {
                 reviewed_inventory_subset(initial, snapshot, owners)
                     && lockdown_removals_match(policy, initial, snapshot, owners)
@@ -3603,10 +3612,12 @@ mod tests {
 
     #[test]
     fn startup_can_recover_missing_owners_but_resident_checks_fail_immediately() {
-        let policy = crate::hosted_runner::hosted_runner_fingerprint_requirement()
-            .accepted
-            .local_control_inventory;
+        let host = crate::hosted_runner::hosted_runner_fingerprint_requirement().accepted;
+        let policy = host.local_control_inventory;
         let reviewed = accepted_local_control_snapshot(&policy).unwrap();
+        let container_free = reviewed
+            .clone()
+            .without_container_controls(&host.container_sockets);
         let owned = owned_listeners();
         let baseline = public_snapshot(owned.clone());
         let mut before_lockdown = baseline.clone();
@@ -3621,7 +3632,7 @@ mod tests {
             assert!(verify_local_control_observation(&baseline, &observed).is_err());
             for retry in [
                 MissingOwnerRetry::Reviewed(&reviewed),
-                MissingOwnerRetry::NoContainers(&reviewed),
+                MissingOwnerRetry::Reviewed(&container_free),
                 MissingOwnerRetry::Baseline(&baseline),
                 MissingOwnerRetry::AfterLockdown(&policy, &before_lockdown),
             ] {
@@ -3661,10 +3672,12 @@ mod tests {
     fn missing_owner_retries_cannot_hide_other_inventory_failures() {
         let owned = owned_listeners();
         let baseline = public_snapshot(owned.clone());
-        let policy = crate::hosted_runner::hosted_runner_fingerprint_requirement()
-            .accepted
-            .local_control_inventory;
+        let host = crate::hosted_runner::hosted_runner_fingerprint_requirement().accepted;
+        let policy = host.local_control_inventory;
         let reviewed = accepted_local_control_snapshot(&policy).unwrap();
+        let container_free = reviewed
+            .clone()
+            .without_container_controls(&host.container_sockets);
         let reject = |snapshot: PrivateSnapshot, retry| {
             let observed = observe_samples_with([snapshot.clone(), snapshot], retry);
             assert_eq!(observed.attempts, 1);
@@ -3672,7 +3685,7 @@ mod tests {
         };
         let retries = [
             MissingOwnerRetry::Reviewed(&reviewed),
-            MissingOwnerRetry::NoContainers(&reviewed),
+            MissingOwnerRetry::Reviewed(&container_free),
             MissingOwnerRetry::Baseline(&baseline),
             MissingOwnerRetry::AfterLockdown(&policy, &baseline),
         ];
@@ -3681,7 +3694,7 @@ mod tests {
         let mut running = public_snapshot(missing.clone());
         running.root_container_processes = reviewed.root_container_processes.clone();
         assert!(MissingOwnerRetry::Reviewed(&reviewed).permits(&running));
-        assert!(!MissingOwnerRetry::NoContainers(&reviewed).permits(&running));
+        assert!(!MissingOwnerRetry::Reviewed(&container_free).permits(&running));
 
         for snapshot in [owned, missing.clone()] {
             let mut partial = snapshot.clone();
@@ -3717,6 +3730,46 @@ mod tests {
             removed,
             MissingOwnerRetry::AfterLockdown(&policy, &baseline),
         );
+    }
+
+    #[test]
+    fn container_absence_rejects_a_reachable_docker_socket_even_without_a_daemon() {
+        let host = crate::hosted_runner::hosted_runner_fingerprint_requirement().accepted;
+        let reviewed = accepted_local_control_snapshot(&host.local_control_inventory).unwrap();
+        let container_free = reviewed
+            .clone()
+            .without_container_controls(&host.container_sockets);
+        let absence = MissingOwnerRetry::Reviewed(&container_free);
+        let owned = owned_listeners();
+        let mut with_docker = owned.clone();
+        let mut socket = with_docker.unix_listeners[0].clone(); // systemd-owned
+        socket.socket_inode += 1;
+        socket.name_sha256 = unix_name_sha256(b"/run/docker.sock");
+        with_docker.unix_listeners.push(socket);
+
+        let mixed = without_tcp_owner(with_docker.clone());
+        assert!(MissingOwnerRetry::Reviewed(&reviewed).permits(&public_snapshot(mixed.clone())));
+        let observed = observe_samples_with([mixed.clone(), mixed], absence);
+        assert_eq!(observed.attempts, 1);
+        assert_eq!(observed.status, ObservationStatus::Unavailable);
+
+        let mut wrong_owner = owned.clone();
+        wrong_owner.tcp_listeners[0].owners = vec![private_owner(1001, true, &[1])];
+        let missing = without_tcp_owner(owned);
+        for invalid in [with_docker, wrong_owner] {
+            let observed = observe_samples_with(
+                [missing.clone(), missing.clone(), invalid.clone(), invalid],
+                absence,
+            );
+            assert_eq!(observed.attempts, 2);
+            assert_eq!(observed.status, ObservationStatus::Stable);
+            assert_eq!(
+                verify_reviewed_local_control_snapshot(&container_free, &observed)
+                    .unwrap_err()
+                    .kind,
+                LocalControlVerificationErrorKind::Drift(LocalControlDriftKind::Added)
+            );
+        }
     }
 
     #[test]

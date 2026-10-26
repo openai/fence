@@ -1794,14 +1794,14 @@ fn verify_container_runtime_unavailable(
     });
     let fence_owner = PinnedCurrentFenceOwner::capture(Path::new("/proc"))
         .map_err(|error| LockdownError::new(error.code, error.message))?;
-    let accepted = accepted_local_control_snapshot(
-        &hosted_runner_fingerprint_requirement()
-            .accepted
-            .local_control_inventory,
-    )
-    .map_err(|error| LockdownError::new(error.code, error.message))?;
+    let host = hosted_runner_fingerprint_requirement().accepted;
+    let mut accepted = accepted_local_control_snapshot(&host.local_control_inventory)
+        .map_err(|error| LockdownError::new(error.code, error.message))?;
     let retry = match check {
-        DockerCheck::Startup => MissingOwnerRetry::NoContainers(&accepted),
+        DockerCheck::Startup => {
+            accepted = accepted.without_container_controls(&host.container_sockets);
+            MissingOwnerRetry::Reviewed(&accepted)
+        }
         DockerCheck::Resident => MissingOwnerRetry::Never,
     };
     let observed =
