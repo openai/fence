@@ -4,8 +4,8 @@ set -euo pipefail
 
 source script/env "$@"
 
-if [[ $# -ne 0 ]]; then
-  die "usage: script/observe-hosted-runner"
+if [[ $# -gt 1 ]]; then
+  die "usage: script/observe-hosted-runner [runner-label]"
 fi
 
 require_cmd sudo
@@ -36,7 +36,7 @@ fi
 sudo --non-interactive /usr/bin/python3 -B -E - \
   "$runner_principal" \
   "$observation_path" \
-  "$DIR/script/lib/host_observation.py" <<'PY'
+  "$DIR/script/lib/host_observation.py" "${1:-}" <<'PY'
 import grp
 import hashlib
 import importlib.util
@@ -692,6 +692,16 @@ try:
             os_identity[key.lower()] = value.strip().strip('"')[:64]
 except (FileNotFoundError, OSError, UnicodeDecodeError, ValueError):
     pass
+
+if sys.argv[4]:
+    version = os_identity["version_id"]
+    if (
+        os_identity["id"] != "ubuntu"
+        or not helper.supported_ubuntu_lts_version(version)
+        or platform.machine() != "x86_64"
+        or sys.argv[4] not in ("ubuntu-latest", f"ubuntu-{version}")
+    ):
+        fail("observed host differs from the requested Ubuntu runner label")
 
 result = {
     "schema_version": 4,

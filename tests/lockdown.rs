@@ -5,6 +5,7 @@ use fence::lockdown::{
 };
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
+use std::process::Command;
 
 #[test]
 #[ignore = "executed as a transient systemd service on a disposable hosted runner"]
@@ -14,11 +15,19 @@ fn lockdown_service_worker() {
     }
     let scenario = std::env::var("FENCE_LOCKDOWN_SCENARIO").unwrap();
     if scenario == "acl-reject" {
-        let error = run_lockdown_acl_rejection_test_service(
-            &std::env::var("FENCE_LOCKDOWN_UNIT").unwrap(),
-            &PathBuf::from(std::env::var_os("FENCE_LOCKDOWN_ACL_FIXTURE").unwrap()),
-        )
-        .unwrap_err();
+        let unit = std::env::var("FENCE_LOCKDOWN_UNIT").unwrap();
+        let fixture = PathBuf::from(std::env::var_os("FENCE_LOCKDOWN_ACL_FIXTURE").unwrap());
+        run_lockdown_acl_rejection_test_service(&unit, &fixture)
+            .expect("runner search should be denied before adding the ACL");
+        assert!(
+            Command::new("/usr/bin/setfacl")
+                .args(["--modify", "user:runner:--x"])
+                .arg(&fixture)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = run_lockdown_acl_rejection_test_service(&unit, &fixture).unwrap_err();
         assert_eq!(error.code, "unsupported_host_fingerprint");
         return;
     }

@@ -892,7 +892,7 @@ fn sanitize_executable_basename(value: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::os::unix::fs::symlink;
@@ -1531,8 +1531,8 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn attributes_only_unique_runner_owned_worker_descendant_dns_sockets() {
+    pub(crate) fn runner_owned_workflow_dns_client()
+    -> (PathBuf, TrustedRunnerWorker, DnsClientSocket) {
         let root = root();
         write_trusted_process(&root, 100, 1001, 1, RUNNER_LISTENER_BASENAME, 10, None);
         write_trusted_process(&root, 200, 1001, 100, RUNNER_WORKER_BASENAME, 20, None);
@@ -1545,6 +1545,12 @@ mod tests {
         };
         write_dns_client_socket(&root, udp, 801, true);
         write_trusted_process(&root, 300, 1001, 200, "node", 30, Some(801));
+        (root, worker, udp)
+    }
+
+    #[test]
+    fn attributes_only_unique_runner_owned_worker_descendant_dns_sockets() {
+        let (root, worker, udp) = runner_owned_workflow_dns_client();
         assert_eq!(
             worker.classify_dns_client(udp).unwrap(),
             DnsCallerProvenance::RunnerOwnedWorkflow

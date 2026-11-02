@@ -57,9 +57,13 @@ report="$runtime_root/$invocation/report.json"
 
 test_environment=()
 acl_fixture=""
-if [[ "${REQUIRE_UBUNTU26_ROLLBACK:-false}" == "true" ]]; then
-  [[ "$scenario" == "rollback" ]] || die "socket rollback evidence requires an injected failure"
+rollback_version=""
+if [[ "$scenario" == "rollback" ]]; then
+  rollback_version="$(python3 -E -c 'import platform; print(platform.freedesktop_os_release()["VERSION_ID"])')"
+fi
+if [[ "$rollback_version" == "26.04" ]]; then
   original_sockets="$(python3 -E script/lib/ubuntu26_socket_evidence.py rollback)"
+  [[ "$original_sockets" =~ ^[0-9a-f]{64}$ ]] || die "missing socket identity evidence before rollback"
   for provider in /usr/bin/sudo /usr/bin/sudo.ws; do
     "$provider" --non-interactive --reset-timestamp /usr/bin/true >/dev/null
   done
@@ -73,10 +77,6 @@ if [[ "$scenario" == "acl-reject" ]]; then
   done
   acl_fixture="/run/fence-lockdown-acl-fixture-$suffix"
   sudo /usr/bin/install --directory --owner=root --group=root --mode=0750 "$acl_fixture"
-  sudo /usr/bin/setfacl --modify user:runner:--x "$acl_fixture"
-  if [[ "$(sudo /usr/bin/stat --format=%a:%U:%G "$acl_fixture")" != "750:root:root" ]]; then
-    die "ACL rejection fixture metadata changed unexpectedly"
-  fi
   test_environment+=("--setenv=FENCE_LOCKDOWN_ACL_FIXTURE=$acl_fixture")
 fi
 
@@ -150,7 +150,7 @@ elif scenario == "rollback":
     require(rollback_error_code == "none", f"rollback error: {rollback_error_code}")
 PY
 
-if [[ "${REQUIRE_UBUNTU26_ROLLBACK:-false}" == "true" ]]; then
+if [[ "$rollback_version" == "26.04" ]]; then
   restored_sockets="$(python3 -E script/lib/ubuntu26_socket_evidence.py rollback)"
   [[ "$restored_sockets" == "$original_sockets" ]] || die "socket rollback did not restore the original inodes, mounts and permissions"
   for provider in /usr/bin/sudo /usr/bin/sudo.ws; do
@@ -159,6 +159,9 @@ if [[ "${REQUIRE_UBUNTU26_ROLLBACK:-false}" == "true" ]]; then
 fi
 
 if [[ -n "$acl_fixture" ]]; then
+  if [[ ! -x "$acl_fixture" || "$(sudo /usr/bin/stat --format=%a:%U:%G "$acl_fixture")" != "750:root:root" ]]; then
+    die "ACL rejection fixture must be searchable by the workflow user with unchanged root-owned mode"
+  fi
   sudo /usr/bin/rmdir "$acl_fixture"
 fi
 

@@ -10756,6 +10756,50 @@ mod tests {
     }
 
     #[test]
+    fn artifact_aaaa_query_cannot_reuse_attribution_from_an_allowed_a_query() {
+        let config = parse_and_normalize(
+            br#"{"schema_version":1,"mode":"block","invocation_id":"artifact-dns","allow_github_artifacts":true,"allowlist":[]}"#,
+        )
+        .unwrap();
+        let policy = crate::hostname_policy::build_runtime_hostname_policy(&config);
+        let (mut recorder, report_path) =
+            test_recorder_with_policy(DnsEvidenceScope::ProtectedHostBlock, None, policy);
+        let (root, worker, socket) = crate::attribution::tests::runner_owned_workflow_dns_client();
+        recorder.trusted_runner_worker = Some(Arc::new(worker));
+        let mut client = DnsQueryClient {
+            listener_kind: DnsListenerKind::Host,
+            socket,
+        };
+        let hostname = "productionresultssa10.blob.core.windows.net";
+        let a = query(hostname, 1);
+        assert_eq!(
+            query_for_upstream(&recorder, &a, parse_dns_question(&a).as_ref(), Some(client))
+                .unwrap(),
+            DnsQueryDispatch::Forward(a, None),
+        );
+
+        // The second question has the same hostname but no matching client socket.
+        client.socket.peer.set_port(socket.peer.port() + 1);
+        let aaaa = query(hostname, 28);
+        assert_eq!(
+            query_for_upstream(
+                &recorder,
+                &aaaa,
+                parse_dns_question(&aaaa).as_ref(),
+                Some(client)
+            )
+            .unwrap(),
+            DnsQueryDispatch::RetryableFailure(Some("outside_policy")),
+        );
+        let state = recorder.state.lock().unwrap();
+        assert_eq!(state.results_storage_authorization_count, 1);
+        assert_eq!(state.results_storage_request_rejections, 1);
+        assert_eq!(state.results_storage_attribution_failures, 1);
+        fs::remove_dir_all(root).unwrap();
+        let _ = fs::remove_file(report_path);
+    }
+
+    #[test]
     fn trusted_results_storage_capacity_rejection_is_retryable() {
         assert_eq!(
             query_authorization(false, true, DnsQueryProvenance::TrustedRunnerWorker,),
