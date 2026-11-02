@@ -3105,6 +3105,7 @@ function summaryLines(report: any, dnsEvidence: any = undefined): string[] {
 
 module.exports = {
   ACTION_RUNTIME_FILES,
+  LOCAL_CONTROL_SCAN_ATTEMPTS,
   MAX_CRITICAL_FINDINGS,
   MAX_STRUCTURED_CRITICAL_CODES,
   MAX_REPORT_BYTES,

@@ -36,6 +36,38 @@ if [[ -e /run/fence/Action_Invalid || -e /run/fence/action-invalid ]]; then
   die "Action setup-failure evidence requires no preexisting invalid runtime directory"
 fi
 
+# A container-free host checks socket owners during its initial Docker absence proof.
+ownership_check=initial_host
+if [[ -x /usr/bin/docker ]] && timeout 5 /usr/bin/docker ps --quiet >/dev/null 2>&1; then
+  ownership_check=initial_inventory
+fi
+
+coproc OWNERSHIP_FIXTURE { exec /usr/bin/sudo --non-interactive /usr/bin/python3 -I -S -u -c '
+import select, socket, sys
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    print("ready")
+    if not select.select([sys.stdin], [], [], 60)[0]:
+        sys.exit("listener release timed out")
+    sys.stdin.readline()
+'; }
+ownership_pid=$OWNERSHIP_FIXTURE_PID
+IFS= read -r -t 10 -u "${OWNERSHIP_FIXTURE[0]}" fixture_state && [[ "$fixture_state" == ready ]] ||
+  die "Action setup-failure listener did not start"
+
+ownership_invocation=action-startup-ownership
+ownership_exit=0
+INPUT_INVOCATION_ID="$ownership_invocation" GITHUB_STATE="$temporary_directory/ownership-state" \
+  GITHUB_STEP_SUMMARY="$summary" node action/main.cts >"$stdout" 2>"$stderr" || ownership_exit=$?
+printf '\n' >&"${OWNERSHIP_FIXTURE[1]}"
+wait "$ownership_pid"
+[[ "$ownership_exit" == 1 && ! -e "/run/fence/$ownership_invocation/ready.json" ]] ||
+  die "Action setup unexpectedly accepted an unreviewed socket owner"
+grep -Fq "Fence resident service exited while the Action was waiting for readiness" "$stdout"
+grep -Eq "^::error::Fence could not verify readiness: .*unavailable=socket_ownership; bounds=none; startup_check=$ownership_check; ownership_detail=([a-z_]+,)*identity_not_reviewed(,[a-z_]+)* \(local_control_inventory_unavailable\)" "$stderr" ||
+  die "Action setup did not report the unreviewed owner in the expected startup check"
+
 if INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"Action_Invalid","allowlist":[]}' \
   GITHUB_STATE="$state" \
   GITHUB_STEP_SUMMARY="$summary" \

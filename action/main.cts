@@ -6,6 +6,7 @@ const childProcess = require("node:child_process");
 const log = require("./log.cts");
 const {
   ACTION_RUNTIME_FILES,
+  LOCAL_CONTROL_SCAN_ATTEMPTS,
   MAX_REPORT_BYTES,
   activeActionMountEvidence,
   actionPathGuardIdentities,
@@ -176,16 +177,39 @@ function fenceErrorCodeFromJournal(output: string): string | undefined {
   return undefined;
 }
 
+const STARTUP_OWNERSHIP_CHECKS = new Set([
+  "initial_host", "initial_inventory", "setup_host", "container_disable", "container_verification",
+  "post_lockdown_baseline", "final_readiness", "docker_dns", "container_availability",
+]);
+const OWNERSHIP_DETAILS = new Set([
+  "no_owner_observed", "observed_ownership_incomplete", "identity_not_reviewed", "retry_inventory_mismatch",
+]);
+
 function localControlDiagnosticFromJournal(output: string, expectedStatus?: string): string | undefined {
   for (const line of output.split(/\r?\n/).reverse()) {
     if (line.length === 0 || line.length > 4096) continue;
     try {
-      const diagnostic = localControlScanDiagnostic(JSON.parse(line)?.fence_local_control);
+      const record = JSON.parse(line)?.fence_local_control;
+      const diagnostic = localControlScanDiagnostic(record);
       if (!diagnostic || diagnostic.status === "stable" ||
         (expectedStatus !== undefined && diagnostic.status !== expectedStatus)) continue;
-      return `status=${diagnostic.status}; attempts=${diagnostic.attempts}; ` +
+      const summary = `status=${diagnostic.status}; attempts=${diagnostic.attempts}; ` +
         `unavailable=${diagnostic.unavailable_inputs.join(",") || "none"}; ` +
         `bounds=${diagnostic.bounds_exceeded.join(",") || "none"}`;
+      const { startup_check, ownership_detail } = record;
+      if (
+        diagnostic.status === "unavailable" && diagnostic.unavailable_inputs.length === 1 &&
+        diagnostic.unavailable_inputs[0] === "socket_ownership" && diagnostic.bounds_exceeded.length === 0 &&
+        STARTUP_OWNERSHIP_CHECKS.has(startup_check) && Array.isArray(ownership_detail) &&
+        ownership_detail.length > 0 && ownership_detail.length <= OWNERSHIP_DETAILS.size &&
+        ownership_detail.every((reason) => OWNERSHIP_DETAILS.has(reason)) &&
+        new Set(ownership_detail).size === ownership_detail.length &&
+        ownership_detail.includes("retry_inventory_mismatch") ===
+          (ownership_detail.includes("no_owner_observed") && diagnostic.attempts < LOCAL_CONTROL_SCAN_ATTEMPTS)
+      ) {
+        return `${summary}; startup_check=${startup_check}; ownership_detail=${ownership_detail.join(",")}`;
+      }
+      return summary;
     } catch {
       // Ignore other journal messages and never forward their contents.
     }
