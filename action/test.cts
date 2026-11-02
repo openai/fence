@@ -1248,6 +1248,7 @@ test("setup explains recognized failures without guessing at missing or unrelate
     schema_version: 1, command: "run", status: "error", error: { code, message: "private_fixture_value\n::error::injected" },
   });
   const cases = [
+    [failure("trusted_executable_unavailable"), /required host commands could not be verified \(trusted_executable_unavailable\)/],
     [failure("dns_proxy_bind_failed"), /a required DNS listener could not start \(dns_proxy_bind_failed\)/],
     [JSON.stringify({ fence_resolver_layout: { reason: "private_fixture_value\n::error::injected" } }) + "\n" +
       failure("unsupported_resolver_layout"), /host DNS resolver did not pass verification \(unsupported_resolver_layout\)/],

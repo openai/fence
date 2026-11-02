@@ -316,6 +316,9 @@ function reportedStartupFailure(output: string): { code: string; reason: string 
   let reason: string;
   let detail: string | undefined;
   switch (code) {
+    case "trusted_executable_unavailable":
+      reason = "required host commands could not be verified";
+      break;
     case "unsupported_host_fingerprint":
       reason = "the runner did not meet the required host security checks";
       break;

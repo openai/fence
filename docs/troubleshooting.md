@@ -10,7 +10,7 @@ If setup says `could not confirm whether the resident started`, Fence doesn't us
 
 Check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22) for the affected version and a verified replacement pin, if available. A green run on a different runner doesn't mean your issue is fixed. Share the Fence version, runner image version, and error code if needed, not private job logs.
 
-Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04` or `ubuntu-latest`. Self-hosted runners, container jobs, and other architectures are not supported.
+Check that the job runs on a GitHub-hosted x64 runner with `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest`. Self-hosted runners, container jobs, and other architectures are not supported.
 
 Run Fence first. Checkout, setup actions, and other commands can change the runner before Fence checks it.
 

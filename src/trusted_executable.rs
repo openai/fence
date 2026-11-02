@@ -1,5 +1,8 @@
+mod ubuntu26;
+
 use crate::hosted_runner::{
-    AcceptedTrustedExecutableV2, hosted_runner_fingerprint_requirement, reviewed_ubuntu_os_release,
+    AcceptedPermissionAncestorV2, AcceptedTrustedExecutableV2,
+    hosted_runner_fingerprint_requirement, reviewed_ubuntu_version,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -22,10 +25,22 @@ const PROC_SELF_STAT_PATH: &str = "/proc/self/stat";
 const MAX_PROC_SELF_STAT_BYTES: u64 = 4 * 1024;
 const MAX_HOST_IDENTITY_FILE_BYTES: u64 = 256 * 1024;
 const REVIEWED_HOST_ANCESTORS: [&str; 2] = ["/etc", "/usr"];
+// Private provider entry points retain the logical sudo, visudo and test diagnostics.
+const UBUNTU26_HELPERS: [(TrustedExecutable, &str); 3] = [
+    (TrustedExecutable::ClassicSudo, "4755"),
+    (TrustedExecutable::ClassicVisudo, "0755"),
+    (TrustedExecutable::GnuTest, "0755"),
+];
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TrustedExecutable {
+    #[serde(rename = "sudo")]
+    ClassicSudo,
+    #[serde(rename = "visudo")]
+    ClassicVisudo,
+    #[serde(rename = "test")]
+    GnuTest,
     Docker,
     Id,
     Mount,
@@ -58,6 +73,9 @@ impl TrustedExecutable {
 
     pub(crate) const fn path(self) -> &'static str {
         match self {
+            Self::ClassicSudo => "/usr/bin/sudo.ws",
+            Self::ClassicVisudo => "/usr/sbin/visudo.ws",
+            Self::GnuTest => "/usr/bin/gnutest",
             Self::Docker => "/usr/bin/docker",
             Self::Id => "/usr/bin/id",
             Self::Mount => "/usr/bin/mount",
@@ -218,15 +236,27 @@ impl PinnedExecutable {
         if !path.is_absolute() || fs::canonicalize(path).ok().as_deref() != Some(path) {
             return Err(TrustedExecutableError::unavailable());
         }
+        let before =
+            fs::symlink_metadata(path).map_err(|_| TrustedExecutableError::unavailable())?;
+        validate_metadata(
+            &before,
+            expected_uid,
+            expected_gid,
+            expected_mode,
+            TrustedExecutableError::unavailable,
+        )?;
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|_| TrustedExecutableError::unavailable())?;
         validate_retained_descriptor(file.as_raw_fd())?;
         let metadata = file
             .metadata()
             .map_err(|_| TrustedExecutableError::unavailable())?;
+        if before.dev() != metadata.dev() || before.ino() != metadata.ino() {
+            return Err(TrustedExecutableError::unavailable());
+        }
         validate_metadata(
             &metadata,
             expected_uid,
@@ -279,10 +309,10 @@ impl PinnedExecutable {
         OsString::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
     }
 
-    fn command(&self) -> Result<Command, TrustedExecutableError> {
+    fn command(&self, logical_path: &str) -> Result<Command, TrustedExecutableError> {
         self.verify_path()?;
         let mut command = Command::new(self.descriptor_path());
-        command.arg0(&self.path);
+        command.arg0(logical_path);
         Ok(command)
     }
 }
@@ -307,22 +337,17 @@ fn validate_metadata(
 #[derive(Debug)]
 pub(crate) struct TrustedExecutableSet {
     executables: BTreeMap<TrustedExecutable, PinnedExecutable>,
+    ubuntu26: Option<ubuntu26::Layout>,
 }
 
 impl TrustedExecutableSet {
     pub(crate) fn capture_reviewed_hosted() -> Result<Self, TrustedExecutableError> {
-        normalize_reviewed_host_ancestors()?;
+        let is_ubuntu26 = normalize_reviewed_host_ancestors()?;
         let specs = reviewed_hosted_specs()?;
-        Self::capture(&specs)
-    }
-
-    pub(crate) fn capture(specs: &[TrustedExecutableSpec]) -> Result<Self, TrustedExecutableError> {
-        if !specs_are_complete(specs) {
-            return Err(TrustedExecutableError::unavailable());
-        }
         let standard_descriptor_reservations = reserve_standard_descriptors()?;
+        let ubuntu26 = is_ubuntu26.then(ubuntu26::Layout::capture).transpose()?;
         let mut executables = BTreeMap::new();
-        for spec in specs {
+        for spec in &specs {
             if spec.executable == TrustedExecutable::Docker
                 && matches!(
                     fs::symlink_metadata(spec.canonical_path),
@@ -331,16 +356,84 @@ impl TrustedExecutableSet {
             {
                 continue;
             }
-            let pinned = PinnedExecutable::capture(
-                Path::new(spec.canonical_path),
-                ROOT_UID,
-                ROOT_GID,
-                spec.mode,
-            )?;
+            let target = if is_ubuntu26 {
+                ubuntu26::target(spec.executable)
+            } else {
+                spec.canonical_path
+            };
+            if is_ubuntu26
+                && fs::canonicalize(spec.canonical_path).ok().as_deref() != Some(Path::new(target))
+            {
+                return Err(TrustedExecutableError::unavailable());
+            }
+            let pinned =
+                PinnedExecutable::capture(Path::new(target), ROOT_UID, ROOT_GID, spec.mode)?;
             executables.insert(spec.executable, pinned);
         }
+        if is_ubuntu26 {
+            for (tool, mode) in UBUNTU26_HELPERS {
+                let mode = u32::from_str_radix(mode, 8)
+                    .map_err(|_| TrustedExecutableError::unavailable())?;
+                executables.insert(
+                    tool,
+                    PinnedExecutable::capture(Path::new(tool.path()), ROOT_UID, ROOT_GID, mode)?,
+                );
+            }
+        }
         drop(standard_descriptor_reservations);
-        Ok(Self { executables })
+        let set = Self {
+            executables,
+            ubuntu26,
+        };
+        set.verify_all()
+            .map_err(|_| TrustedExecutableError::unavailable())?;
+        Ok(set)
+    }
+
+    pub(crate) fn reviewed_access_layout(
+        &self,
+    ) -> (
+        Vec<AcceptedTrustedExecutableV2>,
+        Vec<AcceptedPermissionAncestorV2>,
+    ) {
+        let accepted = hosted_runner_fingerprint_requirement().accepted;
+        let mut paths = accepted.trusted_executables;
+        let mut directories = accepted.permission_ancestor_directories;
+        if self.ubuntu26.is_some() {
+            for path in &mut paths {
+                if let Some(tool) = TrustedExecutable::from_path(path.path) {
+                    path.path = ubuntu26::target(tool);
+                    path.canonical_target = path.path;
+                }
+            }
+            paths.extend(
+                UBUNTU26_HELPERS.map(|(tool, mode)| AcceptedTrustedExecutableV2 {
+                    path: tool.path(),
+                    canonical_target: tool.path(),
+                    mode,
+                }),
+            );
+            directories.extend(ubuntu26::EXTRA_DIRECTORIES.iter().map(|&path| {
+                AcceptedPermissionAncestorV2 {
+                    path,
+                    canonical_target: path,
+                    mode: "0755",
+                    runner_searchable: true,
+                }
+            }));
+        }
+        (paths, directories)
+    }
+
+    fn verify_layout(&self) -> Result<(), TrustedExecutableError> {
+        if self
+            .ubuntu26
+            .as_ref()
+            .is_some_and(|layout| !layout.matches())
+        {
+            return Err(TrustedExecutableError::drift());
+        }
+        Ok(())
     }
 
     pub(crate) fn contains(&self, executable: TrustedExecutable) -> bool {
@@ -366,6 +459,7 @@ impl TrustedExecutableSet {
     }
 
     pub(crate) fn verify_all(&self) -> Result<(), TrustedExecutableError> {
+        self.verify_layout()?;
         for executable in self.executables.values() {
             executable.verify_path()?;
         }
@@ -376,7 +470,8 @@ impl TrustedExecutableSet {
         &self,
         executable: TrustedExecutable,
     ) -> Result<Command, TrustedExecutableError> {
-        self.get(executable)?.command()
+        self.verify_layout()?;
+        self.get(executable)?.command(executable.path())
     }
 
     pub(crate) fn runner_command(
@@ -395,15 +490,29 @@ impl TrustedExecutableSet {
         process_stat: &str,
     ) -> Result<Command, TrustedExecutableError> {
         require_no_controlling_terminal(process_stat)?;
-        let sudo = self.get(TrustedExecutable::Sudo)?;
-        let target = self.get(executable)?;
-        sudo.verify_path()?;
+        self.verify_layout()?;
+        // sudo-rs canonicalizes /proc/self/fd to the supervising process before
+        // switching credentials. Keep the target descriptor in the child by
+        // using the independently pinned classic sudo for this transition.
+        let sudo = if self.ubuntu26.is_some() {
+            TrustedExecutable::ClassicSudo
+        } else {
+            TrustedExecutable::Sudo
+        };
+        // The multicall test binary selects its applet using argv[0]. A target
+        // invoked through fd 0 needs the standalone GNU implementation.
+        let target = if self.ubuntu26.is_some() && executable == TrustedExecutable::Test {
+            TrustedExecutable::GnuTest
+        } else {
+            executable
+        };
+        let target = self.get(target)?;
         target.verify_path()?;
         let target_file = target
             .file
             .try_clone()
             .map_err(|_| TrustedExecutableError::drift())?;
-        let mut command = sudo.command()?;
+        let mut command = self.get(sudo)?.command(TrustedExecutable::Sudo.path())?;
         // The retained descriptors remain close-on-exec. A short-lived clone is
         // deliberately mapped to the child's standard input so sudo can execute
         // the captured target through /proc without inheriting an ambient fd.
@@ -447,7 +556,7 @@ struct ReviewedHostDirectory {
     metadata: fs::Metadata,
 }
 
-fn normalize_reviewed_host_ancestors() -> Result<(), TrustedExecutableError> {
+fn normalize_reviewed_host_ancestors() -> Result<bool, TrustedExecutableError> {
     if std::env::consts::ARCH != "x86_64"
         || fs::metadata("/proc/self")
             .map_err(|_| TrustedExecutableError::unavailable())?
@@ -469,7 +578,7 @@ fn normalize_reviewed_host_ancestors() -> Result<(), TrustedExecutableError> {
     let usr = open_reviewed_directory(REVIEWED_HOST_ANCESTORS[1])?;
     let (passwd_descriptor, passwd) = read_reviewed_host_file(&etc.descriptor, "passwd")?;
     let runner = reviewed_runner_identity(&passwd)?;
-    verify_reviewed_host_image(&usr.descriptor)?;
+    let is_ubuntu26 = verify_reviewed_host_image(&usr.descriptor)?;
 
     for ancestor in [&etc, &usr] {
         validate_repairable_ancestor(ancestor, runner)?;
@@ -497,7 +606,10 @@ fn normalize_reviewed_host_ancestors() -> Result<(), TrustedExecutableError> {
     {
         return Err(TrustedExecutableError::unavailable());
     }
-    verify_reviewed_host_image(&usr.descriptor)
+    if verify_reviewed_host_image(&usr.descriptor)? != is_ubuntu26 {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    Ok(is_ubuntu26)
 }
 
 fn open_reviewed_directory(
@@ -614,7 +726,7 @@ fn reviewed_account_identity(
     Ok((uid, gid))
 }
 
-fn verify_reviewed_host_image(usr: &File) -> Result<(), TrustedExecutableError> {
+fn verify_reviewed_host_image(usr: &File) -> Result<bool, TrustedExecutableError> {
     let path = format!("/proc/self/fd/{}/lib", usr.as_raw_fd());
     let lib = OpenOptions::new()
         .read(true)
@@ -638,16 +750,15 @@ fn verify_reviewed_host_image(usr: &File) -> Result<(), TrustedExecutableError> 
         return Err(TrustedExecutableError::unavailable());
     }
     let (_, contents) = read_reviewed_host_file(&lib, "os-release")?;
-    if !reviewed_host_os_release(&contents) {
-        return Err(TrustedExecutableError::unavailable());
-    }
-    Ok(())
+    reviewed_host_os_release(&contents)
+        .map(|version| version == "26.04")
+        .ok_or_else(TrustedExecutableError::unavailable)
 }
 
-fn reviewed_host_os_release(contents: &[u8]) -> bool {
+fn reviewed_host_os_release(contents: &[u8]) -> Option<&str> {
     std::str::from_utf8(contents)
         .ok()
-        .is_some_and(reviewed_ubuntu_os_release)
+        .and_then(reviewed_ubuntu_version)
 }
 
 fn validate_repairable_ancestor(
@@ -756,7 +867,7 @@ mod tests {
     const TEST_EXECUTABLE_MODE: u32 = 0o755;
     static TEST_DIRECTORY_INDEX: AtomicUsize = AtomicUsize::new(0);
 
-    fn test_directory() -> PathBuf {
+    pub(super) fn test_directory() -> PathBuf {
         let index = TEST_DIRECTORY_INDEX.fetch_add(1, Ordering::Relaxed);
         let root = PathBuf::from(format!(
             "target/tmp/trusted-executable-unit-{}-{index}",
@@ -860,7 +971,7 @@ mod tests {
             b"ID=ubuntu\nVERSION_ID=\"26.04\"\n".as_slice(),
             b"ID=ubuntu\nVERSION_ID=24.04\n".as_slice(),
         ] {
-            assert!(reviewed_host_os_release(supported));
+            assert!(reviewed_host_os_release(supported).is_some());
         }
         for unsupported in [
             b"ID=debian\nVERSION_ID=\"24.04\"\n".as_slice(),
@@ -868,7 +979,7 @@ mod tests {
             b"ID=ubuntu\nVERSION_ID=\"42.04\"\n".as_slice(),
             b"ID=ubuntu\n".as_slice(),
         ] {
-            assert!(!reviewed_host_os_release(unsupported));
+            assert!(reviewed_host_os_release(unsupported).is_none());
         }
     }
 
@@ -1056,7 +1167,10 @@ mod tests {
             TrustedExecutable::Test,
             capture_test_executable(&target, TEST_EXECUTABLE_MODE),
         );
-        let set = TrustedExecutableSet { executables };
+        let set = TrustedExecutableSet {
+            executables,
+            ubuntu26: None,
+        };
 
         let command = set
             .runner_command_with_process_stat(

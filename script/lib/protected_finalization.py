@@ -8,6 +8,7 @@ import unittest
 import urllib.error
 from unittest import mock
 
+from release_canary_report import SCHEDULED_RUNNERS
 from dns_evidence import (
     MATERIALIZATION_REJECTION_REASONS,
     MAX_SAFE_INTEGER,
@@ -24,10 +25,18 @@ ACTION_ZERO_INPUT_BURST_ACTIVATION = "activate bundled Fence agent with strict d
 ACTION_ZERO_INPUT_BURST_DESTINATIONS = ("192.0.2.1", "192.0.2.2")
 CANARY_ACTIVATION = "activate released Fence as the first workflow step"
 CANARY_CHECKOUT = "check out repository under Fence"
-CANARY_STEPS = (
-    "Set up job", CANARY_ACTIVATION, CANARY_CHECKOUT, "check protected checkout and policy",
-    f"Post {CANARY_CHECKOUT}", f"Post {CANARY_ACTIVATION}", "Complete job",
-)
+BLOCK_CANARY_JOBS = {f"{runner} block canary" for runner in SCHEDULED_RUNNERS}
+AUDIT_CANARY_JOBS = {f"{runner} first-step audit canary" for runner in SCHEDULED_RUNNERS}
+
+
+def canary_steps(job):
+    probe = "check protected checkout and audit observation" if job in AUDIT_CANARY_JOBS else "check protected checkout and policy"
+    return (
+        "Set up job", CANARY_ACTIVATION, CANARY_CHECKOUT, probe,
+        f"Post {CANARY_CHECKOUT}", f"Post {CANARY_ACTIVATION}", "Complete job",
+    )
+
+
 EXPECTED_FINALIZATION_STEPS = {
     "integration": {
         "protected finalization quiet-1": "run quiet packaged trusted-launcher block",
@@ -40,7 +49,7 @@ EXPECTED_FINALIZATION_STEPS = {
         "action finalization quiet-2": "activate bundled Fence agent without post-ready warming",
         "action finalization quiet-3": "activate bundled Fence agent without post-ready warming",
     },
-    "canary": {f"{runner} block canary": CANARY_ACTIVATION for runner in ("ubuntu-24.04", "ubuntu-latest")},
+    "canary": dict.fromkeys(sorted(BLOCK_CANARY_JOBS | AUDIT_CANARY_JOBS), CANARY_ACTIVATION),
 }
 STRUCTURED_REPORT_FIELDS = {
     "schema_version", "mode", "result", "controls", "network", "warnings",
@@ -53,6 +62,13 @@ PROTECTED_CONTROLS = {
     "protection_available": True,
     "readiness": "ready",
     "resident_health": "healthy",
+}
+AUDIT_CONTROLS = {
+    **PROTECTED_CONTROLS,
+    "sudo": "preserved_verified",
+    "containers": "preserved_verified",
+    "protection_available": False,
+    "readiness": "ready_observation_only",
 }
 QUIET_WARNINGS = {
     "critical_findings": 0,
@@ -108,9 +124,10 @@ def validate_action_finalization_report(report, job_name):
         raise ValueError("protected finalization structured report schema was invalid")
     if type(report["schema_version"]) is not int or report["schema_version"] != 1:
         raise ValueError("protected finalization structured report version was invalid")
-    if report["mode"] != "block":
-        raise ValueError("protected finalization structured report was not block evidence")
-    if not _exact_fields(report["controls"], PROTECTED_CONTROLS):
+    audit = job_name in AUDIT_CANARY_JOBS
+    if report["mode"] != ("audit" if audit else "block"):
+        raise ValueError("protected finalization structured report mode did not match the job")
+    if not _exact_fields(report["controls"], AUDIT_CONTROLS if audit else PROTECTED_CONTROLS):
         raise ValueError("protected finalization structured report controls were invalid")
     network = report["network"]
     if not isinstance(network, list) or len(network) > 20 or any(not isinstance(row, dict) for row in network):
@@ -125,7 +142,12 @@ def validate_action_finalization_report(report, job_name):
     if job_name == ACTION_ZERO_INPUT_BURST_JOB:
         return validate_action_zero_input_burst_report(report)
     if canary:
-        require_blocked_connection(network, "192.0.2.1", "tcp")
+        if audit:
+            require_connection(network, "192.0.2.10", "udp", "would_block")
+            if "ip 192.0.2.10 udp 443" not in suggestions:
+                raise ValueError("first-step audit did not recommend its observed probe")
+        else:
+            require_connection(network, "192.0.2.1", "tcp", "blocked")
         # This is DNS authorization; checkout and curl separately prove the allowed connection worked.
         if not any(row.get("destination_kind") == "hostname" and row.get("destination") == "github.com"
                    and row.get("decision") == "allowed" for row in network):
@@ -144,7 +166,7 @@ def validate_action_finalization_report(report, job_name):
     }
     if not _exact_fields(warnings, expected_warnings):
         raise ValueError(f"{label} report contained other warnings")
-    if not _exact_fields(omissions, QUIET_OMISSIONS) or suggestions:
+    if not _exact_fields(omissions, QUIET_OMISSIONS) or (suggestions and not audit):
         raise ValueError(f"{label} report omitted evidence or suggested an allowlist")
     if report["result"] != ("warning" if total else "healthy"):
         raise ValueError(f"{label} report result did not match its DNS refusals")
@@ -364,7 +386,7 @@ def validate_finalization_jobs(document, job_set, *, pending=None):
             # A short job or a successful post hook alone cannot prove Fence was the first user step.
             if not steps:
                 _defer_metadata(MetadataPending(f"first-step canary step metadata was empty: {name}"), pending)
-            elif tuple(step.get("name") for step in steps) != CANARY_STEPS:
+            elif tuple(step.get("name") for step in steps) != canary_steps(name):
                 raise ValueError(f"first-step canary activation step, checkout, probes or post hooks were out of order: {name}")
         if not steps:
             continue
@@ -493,19 +515,19 @@ def validate_action_zero_input_burst_report(report):
         raise ValueError("blocked-burst report did not contain bounded network evidence")
 
     for destination in ACTION_ZERO_INPUT_BURST_DESTINATIONS:
-        require_blocked_connection(network, destination, "udp")
+        require_connection(network, destination, "udp", "blocked")
     return report
 
 
-def require_blocked_connection(network, destination, protocol):
+def require_connection(network, destination, protocol, decision):
     rows = [
         row for row in network
         if isinstance(row, dict) and row.get("destination_kind") == "ip"
-        and row.get("destination") == destination and row.get("decision") == "blocked"
+        and row.get("destination") == destination and row.get("decision") == decision
         and type(row.get("count")) is int and row["count"] > 0
     ]
     if len(rows) != 1:
-        raise ValueError(f"blocked destination was missing or duplicated: {destination}")
+        raise ValueError(f"{decision} destination was missing or duplicated: {destination}")
     activities = rows[0].get("activities")
     if not isinstance(activities, list) or sum(
         isinstance(activity, dict) and activity.get("kind") == "connection_attempt"
@@ -514,7 +536,7 @@ def require_blocked_connection(network, destination, protocol):
         and type(activity.get("count")) is int and activity["count"] > 0
         for activity in activities
     ) != 1:
-        raise ValueError(f"blocked {protocol.upper()} evidence was invalid: {destination}")
+        raise ValueError(f"{decision} {protocol.upper()} evidence was invalid: {destination}")
 
 
 class ProtectedFinalizationTests(unittest.TestCase):
@@ -550,9 +572,9 @@ class ProtectedFinalizationTests(unittest.TestCase):
             steps = [activation, post]
             if job_set == "canary":
                 middle = {"started_at": activation["completed_at"], "completed_at": post["started_at"]}
-                steps = [dict(activation, name=CANARY_STEPS[0], completed_at=activation["started_at"]), activation]
-                steps.extend(dict(activation, name=step, **middle) for step in CANARY_STEPS[2:-2])
-                steps.extend((post, dict(post, name=CANARY_STEPS[-1], started_at=post["completed_at"])))
+                steps = [dict(activation, name=canary_steps(name)[0], completed_at=activation["started_at"]), activation]
+                steps.extend(dict(activation, name=step, **middle) for step in canary_steps(name)[2:-2])
+                steps.extend((post, dict(post, name=canary_steps(name)[-1], started_at=post["completed_at"])))
             jobs.append(
                 {
                     "id": job_id,
@@ -1100,7 +1122,7 @@ class ProtectedFinalizationTests(unittest.TestCase):
             self.assertIs(validate_action_finalization_report(report, name), report)
 
     def test_first_step_canary_requires_its_actual_allowed_and_blocked_evidence(self):
-        name = next(iter(EXPECTED_FINALIZATION_STEPS["canary"]))
+        name = next(iter(BLOCK_CANARY_JOBS))
         report = self.action_quiet_report()
         allowed = {"destination_kind": "hostname", "destination": "github.com", "decision": "allowed"}
         blocked = self.action_burst_report()["network"][0]
@@ -1111,6 +1133,26 @@ class ProtectedFinalizationTests(unittest.TestCase):
             report["network"] = unrelated
             with self.subTest(network=unrelated), self.assertRaises(ValueError):
                 validate_action_finalization_report(report, name)
+
+    def test_audit_job_cannot_reuse_block_probe_steps(self):
+        jobs = self.document("canary", setup_seconds=0)
+        audit = next(job for job in jobs["jobs"] if job["name"] in AUDIT_CANARY_JOBS)
+        audit["steps"][3]["name"] = "check protected checkout and policy"
+        with self.assertRaisesRegex(ValueError, "out of order"):
+            validate_finalization_jobs(jobs, "canary")
+
+    def test_first_step_audit_requires_observation_only_and_the_real_probe(self):
+        name = next(iter(AUDIT_CANARY_JOBS))
+        report = self.action_quiet_report()
+        probe = dict(self.action_burst_report()["network"][0], destination="192.0.2.10", decision="would_block")
+        allowed = {"destination_kind": "hostname", "destination": "github.com", "decision": "allowed"}
+        report.update(mode="audit", controls=AUDIT_CONTROLS.copy(), network=[allowed, probe],
+                      suggested_allowlist=["ip 192.0.2.10 udp 443"])
+        self.assertIs(validate_action_finalization_report(report, name), report)
+        for changes in (dict(mode="block"), dict(controls=PROTECTED_CONTROLS), dict(network=[allowed]),
+                        dict(network=[allowed, dict(probe, decision="blocked")]), dict(suggested_allowlist=[])):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_action_finalization_report(dict(report, **changes), name)
 
     def test_full_blocked_burst_report_still_requires_burst_evidence(self):
         report = self.action_quiet_report()

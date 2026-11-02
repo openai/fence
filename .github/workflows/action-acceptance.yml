@@ -45,6 +45,7 @@ jobs:
       source_candidate: ${{ steps.candidate.outputs.source_candidate }}
       artifact_name: ${{ steps.candidate.outputs.artifact_name }}
       acceptance_runner: ${{ steps.candidate.outputs.acceptance_runner }}
+      compatibility_runners: ${{ steps.candidate.outputs.compatibility_runners }}
 
     steps:
       - name: select candidate
@@ -73,24 +74,28 @@ jobs:
               ;;
           esac
           case "$acceptance_runner" in
-            ubuntu-24.04) ;;
-            ubuntu-latest)
-              if [[ "$GITHUB_REF" != "refs/heads/main" ]] &&
-                [[ "$GITHUB_EVENT_NAME" != "pull_request" ||
-                   ! "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ ||
-                   "$PULL_REQUEST_BASE_REF" != "main" ||
-                   "$PULL_REQUEST_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ||
-                   "$action_ref" != "$GITHUB_SHA" ||
-                   "$candidate_kind" != "source" ]]; then
-                echo "ubuntu-latest acceptance requires main or its same-repository pull request" >&2
-                exit 1
-              fi
-              ;;
+            ubuntu-24.04|ubuntu-26.04|ubuntu-latest) ;;
             *)
-              echo "acceptance_runner must be ubuntu-24.04 or ubuntu-latest" >&2
+              echo "acceptance_runner must be a reviewed Ubuntu x64 label" >&2
               exit 1
               ;;
           esac
+          compatibility_runners=$(printf '["%s"]' "$acceptance_runner")
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]] ||
+            [[ "$GITHUB_EVENT_NAME" == "pull_request" &&
+               "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ &&
+               "$PULL_REQUEST_BASE_REF" == "main" &&
+               "$PULL_REQUEST_HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" &&
+               "$action_ref" == "$GITHUB_SHA" &&
+               "$candidate_kind" == "source" ]]; then
+            if [[ "$acceptance_runner" == "ubuntu-24.04" ]]; then
+              compatibility_runners='["ubuntu-24.04","ubuntu-26.04","ubuntu-latest"]'
+            fi
+          elif [[ "$acceptance_runner" != "ubuntu-24.04" ]]; then
+            echo "Additional runner labels require main or its same-repository source pull request" >&2
+            exit 1
+          fi
+          echo "compatibility_runners=$compatibility_runners" >> "$GITHUB_OUTPUT"
           echo "action_ref=$action_ref" >> "$GITHUB_OUTPUT"
           echo "source_candidate=$source_candidate" >> "$GITHUB_OUTPUT"
           echo "artifact_name=action-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
@@ -297,10 +302,14 @@ jobs:
         run: script/test-action-acceptance "${{ matrix.lifecycle || matrix.scenario }}" "${{ matrix.invocation_id }}"
 
   zero-input:
-    name: action zero-input standard
+    name: action zero-input standard${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
     needs: prepare-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}
     timeout-minutes: 8
-    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: checkout
@@ -321,6 +330,8 @@ jobs:
 
       - name: classify bundled Action host compatibility
         id: bundle-host
+        env:
+          FENCE_ACCEPTANCE_RUNNER: ${{ matrix.runner }}
         run: script/classify-action-bundle-host
 
       - name: require bundled Action activation
@@ -340,10 +351,14 @@ jobs:
         run: script/test-action-acceptance standard "fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
   nested-layout:
-    name: action nested registered path
+    name: action nested registered path${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
     needs: prepare-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}
     timeout-minutes: 8
-    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: checkout into nested Action path
@@ -366,6 +381,8 @@ jobs:
 
       - name: classify bundled Action host compatibility
         id: bundle-host
+        env:
+          FENCE_ACCEPTANCE_RUNNER: ${{ matrix.runner }}
         working-directory: target/action-layout/owner/project/revision
         run: script/classify-action-bundle-host
 

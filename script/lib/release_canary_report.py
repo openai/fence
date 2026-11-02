@@ -10,7 +10,9 @@ import sys
 
 REPOSITORY = "openai/fence"
 URL = f"https://github.com/{REPOSITORY}"
-JOBS = [f"{runner} {mode} canary" for runner in ("ubuntu-24.04", "ubuntu-latest") for mode in ("block", "audit")]
+# Extend the released first-step lanes when promoting the first compatible immutable pin.
+SCHEDULED_RUNNERS = ("ubuntu-24.04", "ubuntu-latest")
+JOBS = [f"{runner} {mode} canary" for runner in SCHEDULED_RUNNERS for mode in ("block", "audit", "first-step audit")]
 OUTCOMES = {"success", "failure", "cancelled", "timed_out", "skipped", "neutral", "startup_failure", "unknown", "missing"}
 DIAGNOSTICS = (
     "Fence resident error code: unsupported_resolver_layout",

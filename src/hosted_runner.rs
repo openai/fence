@@ -23,6 +23,11 @@ pub(crate) fn reviewed_ubuntu_lts_version(version: &str) -> bool {
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn reviewed_ubuntu_os_release(contents: &str) -> bool {
+    reviewed_ubuntu_version(contents).is_some()
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn reviewed_ubuntu_version(contents: &str) -> Option<&str> {
     let mut id = None;
     let mut version = None;
     for line in contents.lines() {
@@ -33,28 +38,23 @@ pub(crate) fn reviewed_ubuntu_os_release(contents: &str) -> bool {
             continue;
         }
         let value = if value.starts_with('"') {
-            let Some(value) = value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-            else {
-                return false;
-            };
+            let value = value.strip_prefix('"')?.strip_suffix('"')?;
             if value.contains('"') {
-                return false;
+                return None;
             }
             value
         } else {
             if value.contains('"') {
-                return false;
+                return None;
             }
             value
         };
         let selected = if key == "ID" { &mut id } else { &mut version };
         if selected.replace(value).is_some() {
-            return false;
+            return None;
         }
     }
-    id == Some("ubuntu") && version.is_some_and(reviewed_ubuntu_lts_version)
+    version.filter(|version| id == Some("ubuntu") && reviewed_ubuntu_lts_version(version))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
