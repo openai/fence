@@ -27,7 +27,7 @@ jobs:
       - run: script/test
 ```
 
-Copy the full commit SHA and version comment from the [latest verified release](https://github.com/openai/fence/releases/latest). Fence supports GitHub-hosted x64 runners on `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest`. If Fence stops working on an unchanged workflow, check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22).
+Copy the full commit SHA and version comment from the [latest verified release](https://github.com/openai/fence/releases/latest). Fence supports GitHub-hosted x64 runners on `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest`. For `ubuntu-26.04`, choose a release whose block and audit checks passed on that label. If Fence stops working on an unchanged workflow, check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22).
 
 By default, Fence:
 

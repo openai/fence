@@ -28,6 +28,21 @@ pub(crate) struct ControlSocket {
     owners: Owners,
 }
 
+impl ControlSocket {
+    pub(crate) fn requires_block_seal(&self) -> bool {
+        // Nonroot multipath commands are restricted by peer UID. This networkd hook
+        // only answers from local DHCP leases; the separate management API is sealed.
+        !matches!(
+            (self.path, self.owners),
+            ("/run/multipathd.socket", Owners::Multipath)
+                | (
+                    "/run/systemd/resolve.hook/io.systemd.Network",
+                    Owners::Network
+                )
+        )
+    }
+}
+
 pub(crate) const CONTROL_SOCKETS: &[ControlSocket] = &[
     ControlSocket {
         path: "/run/multipathd.socket",
@@ -105,7 +120,21 @@ pub(crate) fn extend_inventory(
     accepted: &mut AcceptedLocalControlInventoryV2,
     network_uid: u32,
     resolver_uid: u32,
+    messagebus_uid: u32,
 ) {
+    accepted.ubuntu26 = true;
+    // Both LTS images expose the system bus. Ubuntu chooses its service UID at installation.
+    for socket in &mut accepted.unix_listeners {
+        if socket.name_sha256 == super::SYSTEM_BUS_NAME_SHA256 {
+            socket.owners = vec![
+                SYSTEMD_OWNER,
+                super::AcceptedLocalControlOwnerV2 {
+                    uid: messagebus_uid,
+                    ..super::DBUS_OWNER
+                },
+            ];
+        }
+    }
     for entry in CONTROL_SOCKETS {
         let owners = match entry.owners {
             Owners::Manager => vec![SYSTEMD_OWNER],
@@ -173,6 +202,40 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[test]
+    fn only_the_two_read_only_path_and_service_pairs_remain_reachable() {
+        let unsealed: std::collections::BTreeSet<_> = CONTROL_SOCKETS
+            .iter()
+            .filter(|entry| !entry.requires_block_seal())
+            .map(|entry| entry.path)
+            .collect();
+        assert_eq!(
+            unsealed,
+            [
+                "/run/multipathd.socket",
+                "/run/systemd/resolve.hook/io.systemd.Network"
+            ]
+            .into()
+        );
+        for (path, owners) in [
+            ("/run/multipathd.socket", Owners::Manager),
+            (
+                "/run/systemd/resolve.hook/io.systemd.Network",
+                Owners::Resolver,
+            ),
+            ("/run/systemd/netif/io.systemd.Network", Owners::Network),
+        ] {
+            assert!(
+                ControlSocket {
+                    path,
+                    name_sha256: "",
+                    owners
+                }
+                .requires_block_seal()
+            );
+        }
+    }
+
+    #[test]
     fn each_reviewed_path_has_its_own_digest_and_exact_service_owners() {
         let network = AcceptedLocalControlOwnerV2 {
             uid: 507,
@@ -233,7 +296,7 @@ mod tests {
             .accepted
             .local_control_inventory;
         let baseline = accepted.unix_listeners.clone();
-        extend_inventory(&mut accepted, 507, 508);
+        extend_inventory(&mut accepted, 507, 508, super::super::DBUS_OWNER.uid);
         let added = accepted
             .unix_listeners
             .strip_prefix(baseline.as_slice())
@@ -293,7 +356,7 @@ mod tests {
             accepted.tcp_listeners.push(other.clone());
             expected.push(other);
         }
-        extend_inventory(&mut accepted, 507, 508);
+        extend_inventory(&mut accepted, 507, 508, super::super::DBUS_OWNER.uid);
         assert_eq!(accepted.tcp_listeners, expected);
     }
 }

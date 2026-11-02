@@ -210,11 +210,15 @@ pub struct TcpListener {
     pub instances: u32,
 }
 
+type EndpointPins = BTreeMap<PublicEndpointKey, BTreeMap<u64, BTreeSet<ProcessPin>>>;
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct LocalControlSnapshot {
     // Kept in memory only. Synthetic reference inventories have no host pins.
     #[serde(skip)]
-    ubuntu26_pins: BTreeMap<PublicEndpointKey, BTreeSet<(u64, ProcessPin)>>,
+    ubuntu26_pins: EndpointPins,
+    #[serde(skip)]
+    ubuntu26: bool,
     pub scan_status: ScanStatus,
     pub bounds_exceeded: Vec<BoundReason>,
     pub unavailable_inputs: Vec<UnavailableReason>,
@@ -233,7 +237,7 @@ impl LocalControlSnapshot {
         let sealed = |digest: &str| {
             ubuntu26::CONTROL_SOCKETS
                 .iter()
-                .any(|entry| entry.name_sha256 == digest)
+                .any(|entry| entry.name_sha256 == digest && entry.requires_block_seal())
         };
         self.unix_listeners
             .retain(|socket| !sealed(&socket.name_sha256));
@@ -617,7 +621,7 @@ fn lockdown_removals_match(
     snapshot: &LocalControlSnapshot,
     owners: Owners,
 ) -> bool {
-    if accepted.ubuntu26_pins != snapshot.ubuntu26_pins {
+    if !owners.pins_match(&accepted.ubuntu26_pins, &snapshot.ubuntu26_pins) {
         return false;
     }
     let reviewed_containers = &accepted.root_container_processes;
@@ -682,7 +686,12 @@ fn reviewed_inventory_subset(
         &observed.root_container_processes,
         &accepted.root_container_processes,
     ) && tcp_listeners_are_subset(&observed.tcp_listeners, &accepted.tcp_listeners, owners)
-        && unix_listeners_are_subset(&observed.unix_listeners, &accepted.unix_listeners, owners)
+        && unix_listeners_are_subset(
+            &observed.unix_listeners,
+            &accepted.unix_listeners,
+            owners,
+            accepted.ubuntu26,
+        )
 }
 
 fn non_container_tcp_projection(
@@ -798,6 +807,7 @@ fn unix_listeners_are_subset(
     observed: &[UnixListener],
     accepted: &[UnixListener],
     owners: Owners,
+    ubuntu26: bool,
 ) -> bool {
     if contains_duplicate_unix_key(accepted)
         || contains_duplicate_unix_key(observed)
@@ -806,9 +816,11 @@ fn unix_listeners_are_subset(
                 || !item.runner_reachable
                 || !accepted.iter().any(|expected| {
                     same_unix_key(item, expected)
-                        && if ubuntu26::CONTROL_SOCKETS
-                            .iter()
-                            .any(|entry| entry.name_sha256 == expected.name_sha256)
+                        && if (ubuntu26
+                            && expected.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256)
+                            || ubuntu26::CONTROL_SOCKETS
+                                .iter()
+                                .any(|entry| entry.name_sha256 == expected.name_sha256)
                         {
                             item.instances == 1
                                 && owners.match_exact(
@@ -880,6 +892,21 @@ enum Owners {
 }
 
 impl Owners {
+    fn pins_match(self, expected: &EndpointPins, observed: &EndpointPins) -> bool {
+        if expected == observed {
+            return true;
+        }
+        // Startup may retry a wholly ownerless listener, but its kernel socket must
+        // still be the same. Every other listener keeps its exact process pins.
+        matches!(self, Self::ForRetryOnly)
+            && expected.keys().eq(observed.keys())
+            && expected.iter().all(|(key, sockets)| {
+                let current = &observed[key];
+                sockets == current
+                    || sockets.keys().eq(current.keys()) && current.values().all(BTreeSet::is_empty)
+            })
+    }
+
     fn missing(self, complete: bool, owners: &[LocalControlOwner]) -> bool {
         matches!(self, Self::ForRetryOnly) && !complete && owners.is_empty()
     }
@@ -1135,6 +1162,7 @@ pub fn accepted_local_control_snapshot(
         return Err(invalid_accepted_fingerprint());
     }
     Ok(LocalControlSnapshot {
+        ubuntu26: accepted.ubuntu26,
         ubuntu26_pins: BTreeMap::new(),
         scan_status: ScanStatus::WithinBounds,
         bounds_exceeded: Vec::new(),
@@ -1394,6 +1422,7 @@ struct ExcludedUnixListener {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PrivateSnapshot {
+    ubuntu26: bool,
     bounds_exceeded: BTreeSet<BoundReason>,
     unavailable_inputs: BTreeSet<UnavailableReason>,
     malformed_row_count: u64,
@@ -1431,6 +1460,7 @@ impl PrivateSnapshot {
 
     fn unavailable(reason: UnavailableReason) -> Self {
         Self {
+            ubuntu26: false,
             bounds_exceeded: BTreeSet::new(),
             unavailable_inputs: BTreeSet::from([reason]),
             malformed_row_count: 0,
@@ -1606,7 +1636,8 @@ impl MissingOwnerRetry<'_> {
                     && lockdown_removals_match(policy, initial, snapshot, owners)
             }
             Self::Baseline(expected) => {
-                snapshot.root_container_processes == expected.root_container_processes
+                owners.pins_match(&expected.ubuntu26_pins, &snapshot.ubuntu26_pins)
+                    && snapshot.root_container_processes == expected.root_container_processes
                     && owners.tcp_match(&expected.tcp_listeners, &snapshot.tcp_listeners)
                     && owners.unix_match(&expected.unix_listeners, &snapshot.unix_listeners)
             }
@@ -1896,6 +1927,7 @@ fn collect_private_snapshot(
     }
 
     PrivateSnapshot {
+        ubuntu26,
         bounds_exceeded: bounds,
         unavailable_inputs: unavailable,
         malformed_row_count,
@@ -2291,7 +2323,8 @@ fn observe_process(
     if ubuntu26 {
         let candidate = matches!(
             executable_bytes,
-            b"/usr/lib/systemd/systemd"
+            b"/usr/bin/dbus-daemon"
+                | b"/usr/lib/systemd/systemd"
                 | b"/usr/lib/systemd/systemd-journald"
                 | b"/usr/lib/systemd/systemd-resolved"
                 | b"/usr/lib/systemd/systemd-networkd"
@@ -2844,20 +2877,22 @@ fn excluded_unix_sort(
         ))
 }
 
-fn private_endpoint_pins(
-    snapshot: &PrivateSnapshot,
-) -> BTreeMap<PublicEndpointKey, BTreeSet<(u64, ProcessPin)>> {
-    let mut pins = BTreeMap::<_, BTreeSet<_>>::new();
+fn private_endpoint_pins(snapshot: &PrivateSnapshot) -> EndpointPins {
+    let mut pins = EndpointPins::new();
+    if !snapshot.ubuntu26 {
+        return pins;
+    }
     let mut add = |key, inode, owners: &[PrivateOwner]| {
-        let pins = pins.entry(key).or_default();
+        let socket = pins.entry(key).or_default().entry(inode).or_default();
         for owner in owners {
-            pins.extend(owner.process_pins.iter().map(|pin| (inode, pin.clone())));
+            socket.extend(owner.process_pins.iter().cloned());
         }
     };
     for socket in &snapshot.unix_listeners {
-        if ubuntu26::CONTROL_SOCKETS
-            .iter()
-            .any(|entry| entry.name_sha256 == socket.name_sha256)
+        if socket.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256
+            || ubuntu26::CONTROL_SOCKETS
+                .iter()
+                .any(|entry| entry.name_sha256 == socket.name_sha256)
         {
             add(
                 PublicEndpointKey::Unix(
@@ -2871,11 +2906,7 @@ fn private_endpoint_pins(
         }
     }
     for socket in &snapshot.tcp_listeners {
-        if socket
-            .owners
-            .iter()
-            .any(|owner| owner.key.canonical_executable == ubuntu26::SSHD_PATH)
-        {
+        if socket.bind_class == BindClass::Wildcard && socket.port == 22 {
             add(
                 PublicEndpointKey::Tcp(socket.family, socket.bind_class, socket.port),
                 socket.socket_inode,
@@ -2933,6 +2964,7 @@ fn public_snapshot(private: PrivateSnapshot) -> LocalControlSnapshot {
     };
     LocalControlSnapshot {
         ubuntu26_pins,
+        ubuntu26: private.ubuntu26,
         scan_status,
         bounds_exceeded: private.bounds_exceeded.into_iter().collect(),
         unavailable_inputs: unavailable_inputs.into_iter().collect(),
@@ -3526,6 +3558,7 @@ mod tests {
             interval_milliseconds: 50,
             limits: LocalControlLimits::reviewed(),
             snapshot: LocalControlSnapshot {
+                ubuntu26: false,
                 ubuntu26_pins: BTreeMap::new(),
                 scan_status: ScanStatus::WithinBounds,
                 bounds_exceeded: Vec::new(),
@@ -3588,6 +3621,7 @@ mod tests {
 
     fn empty_private() -> PrivateSnapshot {
         PrivateSnapshot {
+            ubuntu26: false,
             bounds_exceeded: BTreeSet::new(),
             unavailable_inputs: BTreeSet::new(),
             malformed_row_count: 0,
@@ -3634,7 +3668,7 @@ mod tests {
             .accepted
             .local_control_inventory;
         let previous = accepted_local_control_snapshot(&inventory).unwrap();
-        ubuntu26::extend_inventory(&mut inventory, 998, 997);
+        ubuntu26::extend_inventory(&mut inventory, 998, 997, 995);
         let expected = accepted_local_control_snapshot(&inventory).unwrap();
         let mut actual = expected.clone();
         assert!(reviewed_inventory_subset(
@@ -3695,11 +3729,64 @@ mod tests {
     }
 
     #[test]
+    fn ubuntu26_system_bus_requires_the_exact_named_account_and_service() {
+        let mut inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let legacy = accepted_local_control_snapshot(&inventory).unwrap();
+        ubuntu26::extend_inventory(&mut inventory, 998, 997, 995);
+        let expected = accepted_local_control_snapshot(&inventory).unwrap();
+        let mut actual = expected.clone();
+        let bus = |row: &&mut UnixListener| {
+            row.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256
+        };
+        let daemon = &mut actual.unix_listeners.iter_mut().find(bus).unwrap().owners[1];
+        assert_eq!(daemon.uid, 995);
+        daemon.uid = 101;
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::ForRetryOnly
+        ));
+        let daemon = &mut actual.unix_listeners.iter_mut().find(bus).unwrap().owners[1];
+        daemon.uid = 995;
+        daemon.unified_cgroup = "/system.slice/other.service".into();
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        actual = expected.clone();
+        actual
+            .unix_listeners
+            .iter_mut()
+            .find(bus)
+            .unwrap()
+            .owners
+            .remove(0);
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        assert_eq!(
+            legacy
+                .unix_listeners
+                .iter()
+                .find(|row| row.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256)
+                .unwrap()
+                .owners[1]
+                .uid,
+            101
+        );
+    }
+
+    #[test]
     fn new_root_services_are_reviewed_only_on_their_packaged_endpoint() {
         let mut inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
             .accepted
             .local_control_inventory;
-        ubuntu26::extend_inventory(&mut inventory, 998, 997);
+        ubuntu26::extend_inventory(&mut inventory, 998, 997, 995);
         let expected = accepted_local_control_snapshot(&inventory).unwrap();
         let mut login = expected
             .unix_listeners
@@ -3736,6 +3823,7 @@ mod tests {
     #[test]
     fn ubuntu26_pins_survive_only_the_exact_sealed_socket_projection() {
         let mut private = empty_private();
+        private.ubuntu26 = true;
         let mut sshd = private_owner(0, true, &[10]);
         sshd.key.executable_basename = "sshd".into();
         sshd.key.canonical_executable = ubuntu26::SSHD_PATH.into();
@@ -3757,20 +3845,50 @@ mod tests {
             ownership_complete: true,
             owners: vec![private_owner(0, true, &[1])],
         });
+        for (inode, path) in [
+            (457, "/run/multipathd.socket"),
+            (458, "/run/systemd/resolve.hook/io.systemd.Network"),
+        ] {
+            private.unix_listeners.push(PrivateUnixListener {
+                socket_inode: inode,
+                socket_type: UnixSocketType::Stream,
+                name_kind: UnixNameKind::Filesystem,
+                name_sha256: unix_name_sha256(path.as_bytes()),
+                ownership_complete: true,
+                owners: vec![private_owner(0, true, &[1])],
+            });
+        }
         let initial = public_snapshot(private.clone());
         let projected = initial.clone().without_sealed_ubuntu26_sockets();
-        assert_eq!(initial.ubuntu26_pins.len(), 2);
-        assert_eq!(projected.ubuntu26_pins.len(), 1);
+        assert_eq!(initial.ubuntu26_pins.len(), 4);
+        assert_eq!(projected.ubuntu26_pins.len(), 3);
         assert!(
             !serde_json::to_string(&initial)
                 .unwrap()
                 .contains("ubuntu26_pins")
         );
-        private.unix_listeners.clear();
+        private.unix_listeners.remove(0);
         assert!(local_control_snapshots_match(
             &projected,
             &public_snapshot(private.clone())
         ));
+        for index in 0..private.unix_listeners.len() {
+            let mut replaced = private.clone();
+            replaced.unix_listeners[index].socket_inode += 100;
+            assert!(!local_control_snapshots_match(
+                &projected,
+                &public_snapshot(replaced)
+            ));
+            let mut changed_owner = private.clone();
+            let pins = &mut changed_owner.unix_listeners[index].owners[0].process_pins;
+            let mut pin = pins.pop_first().unwrap();
+            pin.start_time_ticks += 1;
+            pins.insert(pin);
+            assert!(!local_control_snapshots_match(
+                &projected,
+                &public_snapshot(changed_owner)
+            ));
+        }
         private.tcp_listeners[0].socket_inode += 1;
         assert!(!local_control_snapshots_match(
             &projected,
@@ -4076,6 +4194,42 @@ mod tests {
         snapshot.unix_listeners[0].owners.clear();
         snapshot.unix_listeners[0].ownership_complete = false;
         snapshot
+    }
+
+    #[test]
+    fn ubuntu26_missing_owner_retry_preserves_the_socket_and_other_owner_pins() {
+        let mut private = owned_listeners();
+        private.ubuntu26 = true;
+        private.unix_listeners[0].name_sha256 = ubuntu26::LOGIN_SOCKET_SHA256.into();
+        let baseline = public_snapshot(private.clone());
+        let policy = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let retries = [
+            MissingOwnerRetry::Baseline(&baseline),
+            MissingOwnerRetry::AfterLockdown(&policy, &baseline),
+        ];
+        for retry in retries {
+            for missing in [
+                without_tcp_owner(private.clone()),
+                without_unix_owner(private.clone()),
+            ] {
+                assert!(retry.permits(&public_snapshot(missing.clone())));
+                let mut reused = missing.clone();
+                reused.tcp_listeners[0].socket_inode += 1;
+                assert!(!retry.permits(&public_snapshot(reused)));
+                let mut drift = missing;
+                let owners = if drift.tcp_listeners[0].owners.is_empty() {
+                    &mut drift.unix_listeners[0].owners
+                } else {
+                    &mut drift.tcp_listeners[0].owners
+                };
+                let mut pin = owners[0].process_pins.pop_first().unwrap();
+                pin.start_time_ticks += 1;
+                owners[0].process_pins.insert(pin);
+                assert!(!retry.permits(&public_snapshot(drift)));
+            }
+        }
     }
 
     #[test]

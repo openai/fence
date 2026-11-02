@@ -54,7 +54,7 @@ mod tests {
         for executable in
             TrustedExecutable::ALL
                 .into_iter()
-                .chain([ClassicSudo, ClassicVisudo, GnuTest])
+                .chain([ClassicSudo, ClassicVisudo, GnuTest, Getfacl])
         {
             let expected = redirected.iter().find(|(tool, _)| *tool == executable);
             assert_eq!(

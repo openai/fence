@@ -1259,6 +1259,8 @@ test("setup explains recognized failures without guessing at missing or unrelate
       startup_check: "initial_host", ownership_detail: ["observed_ownership_incomplete"], path: "private_fixture_value",
     } }) + "\n" + failure("local_control_inventory_unavailable"),
       /startup_check=initial_host; ownership_detail=observed_ownership_incomplete \(local_control_inventory_unavailable\)\. Keep this job failed/],
+    [JSON.stringify({ fence_lockdown_command: { executable: "getfacl", principal: "root", code: "lockdown_command_timeout", timeout_ms: 5000 } }) +
+      "\n" + failure("lockdown_command_timeout"), /host verification command.*executable=getfacl; principal=root.*timeout_ms=5000/],
     [JSON.stringify({ fence_lockdown_command: { executable: "sudo", principal: "runner", code: "lockdown_command_timeout", timeout_ms: 5000 } }) +
       "\n" + failure("lockdown_command_timeout"), /host verification command.*executable=sudo; principal=runner.*timeout_ms=5000/],
     [failure("dns_block_prehydration_failed"), /DNS rules for required hostnames could not be prepared/],

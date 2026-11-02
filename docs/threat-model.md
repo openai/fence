@@ -25,7 +25,7 @@ Fence covers:
 
 This threat model assumes:
 
-- Fence runs before checkout, setup, or other untrusted workflow steps.
+- Fence runs before checkout, setup, or other untrusted workflow steps. On Ubuntu 26.04 this ordering also prevents earlier workflow code from retaining a connection to a privileged Unix socket before block mode restricts new connections.
 - The runner is an ephemeral GitHub-hosted x64 job using `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest` and meets Fence's runner security requirements.
 - The hosted image and privileged platform processes have not replaced a trusted executable before Fence captures it. Fence verifies executable identity after capture; it does not authenticate earlier file contents.
 - Later workflow steps can run arbitrary commands as the unprivileged `runner` user and may have access to credentials or sensitive source code.

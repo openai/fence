@@ -2540,7 +2540,7 @@ fn establish_local_control_baseline(
     mediation: &DnsMediationSession,
     posture: LockdownPosture,
     initial: &LocalControlSnapshot,
-    block26_isolation_verified: bool,
+    lockdown: Option<&SystemLockdownControl>,
 ) -> Result<LocalControlSnapshot, DnsMediationError> {
     let accepted_inventory = mediation
         .routing
@@ -2549,17 +2549,17 @@ fn establish_local_control_baseline(
         .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     let projected;
     let initial = if posture != LockdownPosture::Audit
-        && mediation
-            .routing
-            .executables
-            .contains(TrustedExecutable::ClassicSudo)
+        && mediation.routing.executables.uses_ubuntu26_layout()
     {
-        if !block26_isolation_verified {
-            return Err(DnsMediationError::new(
-                "local_control_inventory_incomplete",
-                "host control socket isolation was not verified",
-            ));
-        }
+        lockdown
+            .ok_or_else(|| {
+                DnsMediationError::new(
+                    "local_control_inventory_incomplete",
+                    "host control sockets were not restricted",
+                )
+            })?
+            .verify_socket_seals()
+            .map_err(lockdown_error)?;
         projected = initial.clone().without_sealed_ubuntu26_sockets();
         &projected
     } else {
@@ -2575,14 +2575,13 @@ fn establish_local_control_baseline(
     };
     let observed = mediation.observe_local_control(retry, Some(StartupCheck::PostLockdownBaseline));
     if posture != LockdownPosture::Audit
-        && mediation
-            .routing
-            .executables
-            .contains(TrustedExecutable::ClassicSudo)
+        && mediation.routing.executables.uses_ubuntu26_layout()
         && observed.snapshot.unix_listeners.iter().any(|listener| {
             crate::hosted_runner::ubuntu26::CONTROL_SOCKETS
                 .iter()
-                .any(|entry| entry.name_sha256 == listener.name_sha256)
+                .any(|entry| {
+                    entry.name_sha256 == listener.name_sha256 && entry.requires_block_seal()
+                })
         })
     {
         return Err(DnsMediationError::new(
@@ -2690,7 +2689,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 &mediation,
                 LockdownPosture::Audit,
                 initial_local_control,
-                false,
+                None,
             )
         })();
         let local_control_baseline = match setup_result {
@@ -3087,7 +3086,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 &mediation,
                 scope.lockdown_posture(),
                 initial_local_control,
-                false,
+                Some(&lockdown),
             )
         })();
         let local_control_baseline = match setup_result {
@@ -3124,7 +3123,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
+        evidence.resident_health = match lockdown
+            .verify_socket_seals()
+            .map_err(lockdown_error)
+            .and_then(|()| mediation.verify_before_readiness(&local_control_baseline))
         {
             Ok(health) => health,
             Err(error) => {

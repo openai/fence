@@ -220,7 +220,7 @@ function localControlDiagnosticFromJournal(output: string, expectedStatus?: stri
 function lockdownCommandDiagnosticFromJournal(output: string, expectedCode?: string): string | undefined {
   // Match only the native closed enums. Never render journal text or program arguments.
   const executables = new Set([
-    "docker", "id", "mount", "nft", "stat", "sudo", "systemctl", "systemd_run",
+    "docker", "getfacl", "id", "mount", "nft", "stat", "sudo", "systemctl", "systemd_run",
     "test", "true", "umount", "visudo",
   ]);
   for (const line of output.split(/\r?\n/).reverse()) {

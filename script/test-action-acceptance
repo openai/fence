@@ -201,15 +201,10 @@ def require(condition, message="evidence validation failed"):
     if not condition:
         raise SystemExit(message)
 
-import errno
 import json
 import os
 import pathlib
-import platform
-import pwd
 import re
-import socket
-import stat
 import sys
 import time
 
@@ -245,30 +240,10 @@ expected = {
     "audit": ("audit", "protected_host_audit_observation", "resident_observation_only", "ready_observation_only", False, "preserved_verified", "preserved_verified"),
 }[scenario]
 mode, status, resident, readiness, protection, sudo_status, container_status = expected
-if platform.freedesktop_os_release().get("VERSION_ID") == "26.04":
-    runner_uid = pwd.getpwnam("runner").pw_uid
-    require(os.geteuid() == runner_uid != 0, "socket checks must run as the workflow user")
-    for service, path in (
-        ("SSH", "/run/ssh-unix-local/socket"),
-        ("DNS", "/run/systemd/resolve/io.systemd.Resolve"),
-        ("authorization", "/run/polkit/agent-helper.socket"),
-    ):
-        try:
-            metadata = os.lstat(path)
-        except OSError:
-            raise SystemExit(f"could not inspect the {service} socket") from None
-        require(stat.S_ISSOCK(metadata.st_mode) and metadata.st_uid != runner_uid,
-                f"unexpected {service} socket identity")
-        if mode == "audit":
-            require(os.access(path, os.R_OK | os.W_OK, effective_ids=True),
-                    f"audit did not preserve workflow access to the {service} socket")
-            continue
-        require(stat.S_IMODE(metadata.st_mode) == 0o600,
-                f"block did not restrict the {service} socket permissions")
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-            client.settimeout(1)
-            require(client.connect_ex(path) == errno.EACCES,
-                    f"block did not deny workflow connection to the {service} socket")
+sys.path.insert(0, "script/lib")
+from ubuntu26_socket_evidence import check_sockets
+
+check_sockets(mode)
 if mode == "block":
     expected_workers.insert(-1, {"name": "hostname_refresh", "status": "running"})
 allow_github_artifacts = scenario == "github-artifacts"

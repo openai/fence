@@ -1915,11 +1915,12 @@ for job_name in integration_target_jobs:
         f"Integration {job_name} fields must remain narrowly scoped",
     )
     job_fields = scalar_mapping(job, 4)
+    expected_runner = "${{ matrix.runner }}" if job_name == "lockdown" else "ubuntu-24.04"
     require(
         job_fields.get("needs") == "preflight"
         and job_fields.get("timeout-minutes") == expected_target_timeouts[job_name]
-        and job_fields.get("runs-on") == "ubuntu-24.04",
-        f"Integration {job_name} must depend on preflight and remain bounded on fixed ubuntu-24.04",
+        and job_fields.get("runs-on") == expected_runner,
+        f"Integration {job_name} must depend on preflight and use its fixed runner selection and timeout",
     )
     strategy = indented_block(
         job,
@@ -1984,10 +1985,16 @@ lockdown = indented_block(
     "  lockdown:",
     "Integration lockdown job must be unique",
 )
-require(
-    "scenario: [acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]" in lockdown,
-    "Integration lockdown matrix must retain six isolated scenarios",
-)
+lockdown_matrix = indented_block(lockdown, "      matrix:", "Integration lockdown matrix must be unique")
+require_exact_mapping_keys(lockdown_matrix, 8, ["scenario", "runner", "include"], "Unexpected lockdown matrix dimensions")
+require(scalar_mapping(lockdown_matrix, 8) == {
+    "scenario": "[acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]",
+    "runner": "[ubuntu-24.04]",
+}, "Integration lockdown must retain the six Ubuntu 24.04 scenarios")
+extra_lockdown = indented_block(lockdown_matrix, "        include:", "Integration lockdown matrix include must be unique")
+require([line.strip() for line in extra_lockdown.splitlines() if line.strip()] == [
+    "include:", "- scenario: rollback", "runner: ubuntu-26.04", "label_suffix: ' (ubuntu-26.04)'",
+], "Ubuntu 26.04 must add only the lockdown rollback scenario")
 require_step_contract(
     lockdown,
     "test resident lifecycle evidence",
@@ -1998,13 +2005,16 @@ require_step_contract(
     },
     "Integration standard namespace evidence",
 )
-require_step_contract(
+lockdown_evidence = require_step_contract(
     lockdown,
     "test lockdown evidence",
-    ["run"],
+    ["env", "run"],
     {"run": 'script/test-lockdown "${{ matrix.scenario }}"'},
     "Integration terminal lockdown evidence",
 )
+lockdown_env = indented_block(lockdown_evidence, "        env:", "Lockdown evidence environment must be unique")
+require(scalar_mapping(lockdown_env, 10) == {"REQUIRE_UBUNTU26_ROLLBACK": "${{ matrix.runner == 'ubuntu-26.04' }}"},
+        "The Ubuntu 26.04 rollback must verify original host sockets and both sudo providers")
 require(
     lockdown.count("run: script/test-privileged") == 1
     and lockdown.count('run: script/test-lockdown "${{ matrix.scenario }}"') == 1

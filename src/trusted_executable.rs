@@ -26,10 +26,11 @@ const MAX_PROC_SELF_STAT_BYTES: u64 = 4 * 1024;
 const MAX_HOST_IDENTITY_FILE_BYTES: u64 = 256 * 1024;
 const REVIEWED_HOST_ANCESTORS: [&str; 2] = ["/etc", "/usr"];
 // Private provider entry points retain the logical sudo, visudo and test diagnostics.
-const UBUNTU26_HELPERS: [(TrustedExecutable, &str); 3] = [
+const UBUNTU26_HELPERS: [(TrustedExecutable, &str); 4] = [
     (TrustedExecutable::ClassicSudo, "4755"),
     (TrustedExecutable::ClassicVisudo, "0755"),
     (TrustedExecutable::GnuTest, "0755"),
+    (TrustedExecutable::Getfacl, "0755"),
 ];
 
 #[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -41,6 +42,7 @@ pub(crate) enum TrustedExecutable {
     ClassicVisudo,
     #[serde(rename = "test")]
     GnuTest,
+    Getfacl,
     Docker,
     Id,
     Mount,
@@ -76,6 +78,7 @@ impl TrustedExecutable {
             Self::ClassicSudo => "/usr/bin/sudo.ws",
             Self::ClassicVisudo => "/usr/sbin/visudo.ws",
             Self::GnuTest => "/usr/bin/gnutest",
+            Self::Getfacl => "/usr/bin/getfacl",
             Self::Docker => "/usr/bin/docker",
             Self::Id => "/usr/bin/id",
             Self::Mount => "/usr/bin/mount",
@@ -436,6 +439,10 @@ impl TrustedExecutableSet {
         Ok(())
     }
 
+    pub(crate) fn uses_ubuntu26_layout(&self) -> bool {
+        self.ubuntu26.is_some()
+    }
+
     pub(crate) fn contains(&self, executable: TrustedExecutable) -> bool {
         self.executables.contains_key(&executable)
     }
@@ -458,17 +465,27 @@ impl TrustedExecutableSet {
             .local_control_inventory;
         if self.ubuntu26.is_some() {
             let passwd = self.reviewed_passwd()?;
-            // Account parsing rejects aliases and UID zero. Neither service may be the runner.
+            // Account parsing rejects aliases and UID zero, including an alias of the runner.
             reviewed_account_identity(&passwd, RUNNER_PRINCIPAL)?;
-            let (network_uid, _) = reviewed_account_identity(&passwd, "systemd-network")?;
-            let (resolver_uid, _) = reviewed_account_identity(&passwd, RESOLVER_PRINCIPAL)?;
-            if network_uid >= 1000 || resolver_uid >= 1000 {
+            let (network_uid, network_gid) = reviewed_account_identity(&passwd, "systemd-network")?;
+            let (resolver_uid, resolver_gid) =
+                reviewed_account_identity(&passwd, RESOLVER_PRINCIPAL)?;
+            // The reviewed socket owner and group use the service's own numeric identity.
+            if network_uid != network_gid || resolver_uid != resolver_gid {
+                return Err(TrustedExecutableError::unavailable());
+            }
+            let (messagebus_uid, _) = reviewed_account_identity(&passwd, "messagebus")?;
+            if [network_uid, resolver_uid, messagebus_uid]
+                .iter()
+                .any(|uid| *uid >= 1000)
+            {
                 return Err(TrustedExecutableError::unavailable());
             }
             crate::hosted_runner::ubuntu26::extend_inventory(
                 &mut accepted,
                 network_uid,
                 resolver_uid,
+                messagebus_uid,
             );
         }
         Ok(accepted)

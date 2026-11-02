@@ -1,3 +1,5 @@
+mod socket_seals;
+
 use crate::hosted_runner::{
     AcceptedHostedRunnerFactsV3, AcceptedPermissionAncestorV2, AcceptedTrustedExecutableV2,
     hosted_runner_fingerprint_requirement, reviewed_ubuntu_os_release,
@@ -397,6 +399,7 @@ pub struct SystemLockdownControl {
     sudo_source_pins: Option<Vec<SudoPolicySourcePin>>,
     removed_sudo_source_names: Vec<String>,
     containers_masked: bool,
+    socket_seals: socket_seals::SocketSeals,
 }
 
 impl SystemLockdownControl {
@@ -407,6 +410,7 @@ impl SystemLockdownControl {
             sudo_source_pins: None,
             removed_sudo_source_names: Vec::new(),
             containers_masked: false,
+            socket_seals: socket_seals::SocketSeals::default(),
         }
     }
 
@@ -469,6 +473,9 @@ impl LockdownControl for SystemLockdownControl {
             ));
         }
         self.verify_sudo_baseline()?;
+        if self.executables.uses_ubuntu26_layout() {
+            self.socket_seals.restrict(&self.executables)?;
+        }
         let source_pins = self
             .sudo_source_pins
             .as_ref()
@@ -535,6 +542,7 @@ impl LockdownControl for SystemLockdownControl {
     }
 
     fn verify_sudo_disabled(&mut self) -> Result<(), LockdownError> {
+        self.verify_socket_seals()?;
         let executables = &self.executables;
         executables
             .verify_all()
@@ -599,7 +607,12 @@ impl LockdownControl for SystemLockdownControl {
     fn rollback_pre_ready(&mut self) -> Result<bool, LockdownError> {
         let executables = Arc::clone(&self.executables);
         let sudo_executables = Arc::clone(&executables);
-        rollback_pre_ready_components(
+        let socket_result = if matches!(self.sudo_rollback, SudoRollbackState::CommittedNoRestore) {
+            Ok(false)
+        } else {
+            self.socket_seals.rollback(&executables)
+        };
+        let capability_result = rollback_pre_ready_components(
             &mut self.sudo_rollback,
             &mut self.containers_masked,
             move |sources| {
@@ -609,11 +622,26 @@ impl LockdownControl for SystemLockdownControl {
                 Ok(())
             },
             move || restore_container_controls(&executables),
-        )
+        );
+        match (socket_result, capability_result) {
+            (Ok(sockets), Ok(capabilities)) => Ok(sockets || capabilities),
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+            (Err(_), Err(_)) => Err(LockdownError::new(
+                "lockdown_rollback_failed",
+                "failed to restore multiple provisional host controls",
+            )),
+        }
     }
 }
 
 impl SystemLockdownControl {
+    pub(crate) fn verify_socket_seals(&self) -> Result<(), LockdownError> {
+        if self.executables.uses_ubuntu26_layout() {
+            self.socket_seals.verify(&self.executables)?;
+        }
+        Ok(())
+    }
+
     fn verify_sudo_baseline(&self) -> Result<(), LockdownError> {
         let expected = self
             .sudo_source_pins
