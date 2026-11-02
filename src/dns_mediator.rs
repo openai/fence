@@ -22,7 +22,7 @@ use crate::lifecycle::{
 use crate::local_control::{
     CurrentFenceOwner, LocalControlObservation, LocalControlScanDiagnostic, LocalControlSnapshot,
     MissingOwnerRetry, NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner,
-    SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess, accepted_local_control_snapshot,
+    SOCKET_PROBE_TIMEOUT, StartupCheck, SystemUnixSocketAccess, accepted_local_control_snapshot,
     observe_local_control_inventory, verify_local_control_observation,
     verify_no_additive_local_control_since, verify_reviewed_local_control_snapshot,
 };
@@ -2257,8 +2257,11 @@ impl DnsMediationSession {
     ) -> Result<Self, DnsMediationError> {
         let docker_dns = if scope.lockdown_posture() == LockdownPosture::StandardBlock {
             DockerDns::DisabledByPolicy
-        } else if runner_docker_available(&executables, DockerCheck::Startup)
-            .map_err(lockdown_error)?
+        } else if runner_docker_available(
+            &executables,
+            DockerCheck::Startup(StartupCheck::DockerDns),
+        )
+        .map_err(lockdown_error)?
         {
             DockerDns::Mediated
         } else {
@@ -2373,15 +2376,27 @@ impl DnsMediationSession {
         self.attribution.drain()
     }
 
-    fn observe_local_control(&self, retry: MissingOwnerRetry<'_>) -> LocalControlObservation {
-        observe_local_control(&self.routing.executables, &self.fence_owner, retry)
+    fn observe_local_control(
+        &self,
+        retry: MissingOwnerRetry<'_>,
+        startup_check: Option<StartupCheck>,
+    ) -> LocalControlObservation {
+        observe_local_control(
+            &self.routing.executables,
+            &self.fence_owner,
+            retry,
+            startup_check,
+        )
     }
 
     fn verify_before_readiness(
         &self,
         baseline: &LocalControlSnapshot,
     ) -> Result<ResidentHealth, DnsMediationError> {
-        let observed = self.observe_local_control(MissingOwnerRetry::Baseline(baseline));
+        let observed = self.observe_local_control(
+            MissingOwnerRetry::Baseline(baseline),
+            Some(StartupCheck::FinalReadiness),
+        );
         let verified = verify_local_control_observation(baseline, &observed)
             .map_err(local_control_error)
             .and_then(|()| {
@@ -2483,6 +2498,7 @@ fn observe_local_control(
     executables: &TrustedExecutableSet,
     current_fence: &dyn CurrentFenceOwner,
     retry: MissingOwnerRetry<'_>,
+    startup_check: Option<StartupCheck>,
 ) -> LocalControlObservation {
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
     let socket_access = SystemUnixSocketAccess::new(|path: &std::ffi::OsStr| {
@@ -2494,7 +2510,13 @@ fn observe_local_control(
             runner_path_writable(executables, path, timeout).ok()
         }
     });
-    observe_local_control_inventory(Path::new("/proc"), &socket_access, current_fence, retry)
+    observe_local_control_inventory(
+        Path::new("/proc"),
+        &socket_access,
+        current_fence,
+        retry,
+        startup_check,
+    )
 }
 
 fn verify_pre_activation_local_control(
@@ -2508,6 +2530,7 @@ fn verify_pre_activation_local_control(
         executables,
         &NoCurrentFenceOwner,
         MissingOwnerRetry::Reviewed(&expected),
+        Some(StartupCheck::InitialInventory),
     );
     verify_reviewed_local_control_snapshot(&expected, &observed).map_err(local_control_error)?;
     Ok(observed.snapshot)
@@ -2529,7 +2552,7 @@ fn establish_local_control_baseline(
             MissingOwnerRetry::Baseline(initial)
         }
     };
-    let observed = mediation.observe_local_control(retry);
+    let observed = mediation.observe_local_control(retry, Some(StartupCheck::PostLockdownBaseline));
     match posture {
         LockdownPosture::StandardBlock => {
             verify_no_additive_local_control_since(&accepted_inventory, initial, &observed)
@@ -2807,7 +2830,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             }
             let observed = self
                 ._mediation
-                .observe_local_control(MissingOwnerRetry::Never);
+                .observe_local_control(MissingOwnerRetry::Never, None);
             if let Err(error) = observed.verify_resident_baseline(
                 &self.local_control_baseline,
                 &mut self.evidence.first_failed_local_control_scan,
@@ -3403,7 +3426,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             }
             let observed = self
                 ._mediation
-                .observe_local_control(MissingOwnerRetry::Never);
+                .observe_local_control(MissingOwnerRetry::Never, None);
             if let Err(error) = observed.verify_resident_baseline(
                 &self.local_control_baseline,
                 &mut self.evidence.first_failed_local_control_scan,
@@ -3518,7 +3541,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
     let hostname_policy = plan.runtime_hostname_policy.clone();
     let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
     fingerprint
-        .verify_supported_host()
+        .verify_supported_host_at(StartupCheck::InitialHost)
         .map_err(lockdown_error)?;
     let initial_local_control = verify_pre_activation_local_control(&executables)?;
 
@@ -3620,7 +3643,7 @@ pub fn run_selected_profile_runtime_test_service(
     }
     let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
     fingerprint
-        .verify_supported_host()
+        .verify_supported_host_at(StartupCheck::InitialHost)
         .map_err(lockdown_error)?;
     let initial_local_control = verify_pre_activation_local_control(&executables)?;
     let runtime =

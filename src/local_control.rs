@@ -281,6 +281,29 @@ pub(crate) struct LocalControlScanDiagnostic {
     bounds_exceeded: Vec<BoundReason>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum StartupCheck {
+    InitialHost,
+    InitialInventory,
+    SetupHost,
+    ContainerDisable,
+    ContainerVerification,
+    PostLockdownBaseline,
+    FinalReadiness,
+    DockerDns,
+    ContainerAvailability,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnershipDetail {
+    NoOwnerObserved,
+    ObservedOwnershipIncomplete,
+    IdentityNotReviewed,
+    RetryInventoryMismatch,
+}
+
 impl LocalControlObservation {
     fn diagnostic(&self) -> LocalControlScanDiagnostic {
         LocalControlScanDiagnostic {
@@ -1397,13 +1420,14 @@ pub(crate) fn observe_local_control_inventory(
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
     retry: MissingOwnerRetry<'_>,
+    startup_check: Option<StartupCheck>,
 ) -> LocalControlObservation {
     let observed = observe_local_control_with(
         || collect_private_snapshot(proc_root, socket_access, current_fence, read_tcp_listeners),
         || thread::sleep(Duration::from_millis(STABILITY_INTERVAL_MILLISECONDS)),
         retry,
     );
-    if let Some(diagnostic) = local_control_failure_diagnostic(&observed) {
+    if let Some(diagnostic) = local_control_failure_diagnostic(&observed, retry, startup_check) {
         let _ = writeln!(std::io::stderr().lock(), "{diagnostic}");
     }
     observed
@@ -1411,9 +1435,69 @@ pub(crate) fn observe_local_control_inventory(
 
 fn local_control_failure_diagnostic(
     observed: &LocalControlObservation,
+    retry: MissingOwnerRetry<'_>,
+    startup_check: Option<StartupCheck>,
 ) -> Option<serde_json::Value> {
-    (observed.status != ObservationStatus::Stable)
-        .then(|| serde_json::json!({ "fence_local_control": observed.diagnostic() }))
+    if observed.status == ObservationStatus::Stable {
+        return None;
+    }
+    let mut diagnostic = serde_json::json!(observed.diagnostic());
+    let snapshot = &observed.snapshot;
+    if let Some(check) = startup_check
+        && observed.status == ObservationStatus::Unavailable
+        && snapshot.unavailable_inputs == [UnavailableReason::SocketOwnership]
+        && snapshot.bounds_exceeded.is_empty()
+    {
+        // The last attempt returns without evaluating the retry inventory.
+        let evaluated_retry = if observed.attempts < STABILITY_ATTEMPTS {
+            retry
+        } else {
+            MissingOwnerRetry::Never
+        };
+        diagnostic["startup_check"] = serde_json::json!(check);
+        diagnostic["ownership_detail"] =
+            serde_json::json!(ownership_detail(snapshot, evaluated_retry));
+    }
+    Some(serde_json::json!({ "fence_local_control": diagnostic }))
+}
+
+fn ownership_detail(
+    snapshot: &LocalControlSnapshot,
+    retry: MissingOwnerRetry<'_>,
+) -> BTreeSet<OwnershipDetail> {
+    let mut detail = BTreeSet::new();
+    let unix = snapshot
+        .unix_listeners
+        .iter()
+        .map(|s| (s.ownership_complete, &s.owners));
+    let tcp = snapshot
+        .tcp_listeners
+        .iter()
+        .map(|s| (s.ownership_complete, &s.owners));
+    for (complete, owners) in unix.chain(tcp) {
+        if !complete {
+            detail.insert(if owners.is_empty() {
+                OwnershipDetail::NoOwnerObserved
+            } else {
+                OwnershipDetail::ObservedOwnershipIncomplete
+            });
+        }
+    }
+    if !identities_reviewed(
+        &snapshot.root_container_processes,
+        &snapshot.unix_listeners,
+        &snapshot.tcp_listeners,
+    ) {
+        detail.insert(OwnershipDetail::IdentityNotReviewed);
+    }
+    // The same ownerless listener can match one startup inventory and contradict another.
+    if detail.contains(&OwnershipDetail::NoOwnerObserved)
+        && !matches!(retry, MissingOwnerRetry::Never)
+        && !retry.permits(snapshot)
+    {
+        detail.insert(OwnershipDetail::RetryInventoryMismatch);
+    }
+    detail
 }
 
 // Each startup check may resample an ownerless listener only if the rest of that
@@ -2660,22 +2744,12 @@ fn public_snapshot(private: PrivateSnapshot) -> LocalControlSnapshot {
     if !reachability_complete {
         unavailable_inputs.insert(UnavailableReason::UnixReachability);
     }
-    let identities_reviewed = root_container_processes
-        .iter()
-        .all(root_container_identity_reviewed)
-        && unix_listeners.iter().all(|listener| {
-            listener.owners.iter().all(owner_identity_reviewed) || reviewed_uuidd_listener(listener)
-        })
-        && tcp_listeners
-            .iter()
-            .flat_map(|listener| &listener.owners)
-            .all(owner_identity_reviewed);
     let ownership_failure = unavailable_inputs
         .iter()
         .any(|reason| reason.is_acquisition() || *reason == UnavailableReason::MalformedRows);
     let ownership_complete = reachability_complete
         && !ownership_failure
-        && identities_reviewed
+        && identities_reviewed(&root_container_processes, &unix_listeners, &tcp_listeners)
         && unix_listeners
             .iter()
             .all(|listener| listener.ownership_complete)
@@ -2863,6 +2937,23 @@ fn owner_identity_reviewed(owner: &LocalControlOwner) -> bool {
         && reviewed_cgroup(&owner.unified_cgroup)
 }
 
+fn identities_reviewed(
+    root_container_processes: &[RootContainerProcess],
+    unix_listeners: &[UnixListener],
+    tcp_listeners: &[TcpListener],
+) -> bool {
+    root_container_processes
+        .iter()
+        .all(root_container_identity_reviewed)
+        && unix_listeners.iter().all(|listener| {
+            listener.owners.iter().all(owner_identity_reviewed) || reviewed_uuidd_listener(listener)
+        })
+        && tcp_listeners
+            .iter()
+            .flat_map(|listener| &listener.owners)
+            .all(owner_identity_reviewed)
+}
+
 fn root_container_identity_reviewed(process: &RootContainerProcess) -> bool {
     REVIEWED_EXECUTABLE_PATHS.contains(&process.canonical_executable.as_str())
         && reviewed_cgroup(&process.unified_cgroup)
@@ -3018,15 +3109,19 @@ mod tests {
             owners: vec![systemd, uuidd.clone()],
             ownership_complete: true,
         });
-        assert_eq!(
-            public_snapshot(private.clone()).scan_status,
-            ScanStatus::WithinBounds
-        );
+        let reviewed = public_snapshot(private.clone());
+        assert_eq!(reviewed.scan_status, ScanStatus::WithinBounds);
+        assert!(ownership_detail(&reviewed, MissingOwnerRetry::Never).is_empty());
         private.unix_listeners[0].name_sha256 = unix_name_sha256(b"/run/other/request");
+        let unreviewed = public_snapshot(private.clone());
         assert!(
-            public_snapshot(private.clone())
+            unreviewed
                 .unavailable_inputs
                 .contains(&UnavailableReason::SocketOwnership)
+        );
+        assert_eq!(
+            ownership_detail(&unreviewed, MissingOwnerRetry::Never),
+            BTreeSet::from([OwnershipDetail::IdentityNotReviewed])
         );
         private.unix_listeners.clear();
         private.tcp_listeners.push(PrivateTcpListener {
@@ -3682,11 +3777,51 @@ mod tests {
             (owned, ObservationStatus::Unstable),
         ] {
             let samples = (0..STABILITY_ATTEMPTS).flat_map(|_| [missing.clone(), second.clone()]);
-            let observed = observe_samples_with(samples, MissingOwnerRetry::Baseline(&baseline));
+            let retry = MissingOwnerRetry::Baseline(&baseline);
+            let observed = observe_samples_with(samples, retry);
             assert_eq!(observed.status, status);
             assert_eq!(observed.attempts, STABILITY_ATTEMPTS);
             assert!(verify_local_control_observation(&baseline, &observed).is_err());
+            let journal = local_control_failure_diagnostic(
+                &observed,
+                retry,
+                Some(StartupCheck::FinalReadiness),
+            )
+            .unwrap();
+            let diagnostic = &journal["fence_local_control"];
+            if status == ObservationStatus::Unavailable {
+                assert_eq!(
+                    diagnostic["ownership_detail"],
+                    serde_json::json!(["no_owner_observed"])
+                );
+            } else {
+                assert!(diagnostic.get("ownership_detail").is_none());
+                assert!(diagnostic.get("startup_check").is_none());
+            }
         }
+    }
+
+    #[test]
+    fn final_ownerless_pair_does_not_report_an_unevaluated_retry_mismatch() {
+        let owned = owned_listeners();
+        let baseline = public_snapshot(owned.clone());
+        let retry = MissingOwnerRetry::Baseline(&baseline);
+        let missing = without_tcp_owner(owned);
+        let mut mismatch = missing.clone();
+        mismatch.tcp_listeners[0].port += 1;
+        assert!(!retry.permits(&public_snapshot(mismatch.clone())));
+        let samples = (1..STABILITY_ATTEMPTS)
+            .flat_map(|_| [missing.clone(), missing.clone()])
+            .chain([mismatch.clone(), mismatch]);
+        let observed = observe_samples_with(samples, retry);
+        assert_eq!(observed.attempts, STABILITY_ATTEMPTS);
+        let journal =
+            local_control_failure_diagnostic(&observed, retry, Some(StartupCheck::FinalReadiness))
+                .unwrap();
+        assert_eq!(
+            journal["fence_local_control"]["ownership_detail"],
+            serde_json::json!(["no_owner_observed"])
+        );
     }
 
     #[test]
@@ -3703,6 +3838,24 @@ mod tests {
             let observed = observe_samples_with([snapshot.clone(), snapshot], retry);
             assert_eq!(observed.attempts, 1);
             assert!(verify_complete_local_control_observation(&observed).is_err());
+            if !observed.snapshot.bounds_exceeded.is_empty() {
+                let journal = local_control_failure_diagnostic(
+                    &observed,
+                    retry,
+                    Some(StartupCheck::SetupHost),
+                )
+                .unwrap();
+                assert!(
+                    journal["fence_local_control"]
+                        .get("startup_check")
+                        .is_none()
+                );
+                assert!(
+                    journal["fence_local_control"]
+                        .get("ownership_detail")
+                        .is_none()
+                );
+            }
         };
         let retries = [
             MissingOwnerRetry::Reviewed(&reviewed),
@@ -3716,6 +3869,17 @@ mod tests {
         running.root_container_processes = reviewed.root_container_processes.clone();
         assert!(MissingOwnerRetry::Reviewed(&reviewed).permits(&running));
         assert!(!MissingOwnerRetry::Reviewed(&container_free).permits(&running));
+        assert_eq!(
+            ownership_detail(&running, MissingOwnerRetry::Reviewed(&reviewed)),
+            BTreeSet::from([OwnershipDetail::NoOwnerObserved])
+        );
+        assert_eq!(
+            ownership_detail(&running, MissingOwnerRetry::Reviewed(&container_free)),
+            BTreeSet::from([
+                OwnershipDetail::NoOwnerObserved,
+                OwnershipDetail::RetryInventoryMismatch
+            ])
+        );
 
         for snapshot in [owned, missing.clone()] {
             let mut partial = snapshot.clone();
@@ -3803,7 +3967,10 @@ mod tests {
             assert_eq!(observed.status, ObservationStatus::Stable);
             assert_eq!(observed.attempts, failed_attempts + 1);
             verify_local_control_observation(&public_snapshot(empty_private()), &observed).unwrap();
-            assert!(local_control_failure_diagnostic(&observed).is_none());
+            assert!(
+                local_control_failure_diagnostic(&observed, MissingOwnerRetry::Never, None)
+                    .is_none()
+            );
         }
     }
 
@@ -3880,7 +4047,12 @@ mod tests {
                 .code,
             "local_control_inventory_unavailable"
         );
-        let journal = local_control_failure_diagnostic(&observed).unwrap();
+        let journal = local_control_failure_diagnostic(
+            &observed,
+            MissingOwnerRetry::Never,
+            Some(StartupCheck::InitialInventory),
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_value(first_failed_scan).unwrap(),
             journal["fence_local_control"]
@@ -3958,11 +4130,13 @@ mod tests {
 
     #[test]
     fn failure_diagnostics_omit_inventory_details() {
-        let mut private = empty_private();
+        let baseline = public_snapshot(owned_listeners());
+        let retry = MissingOwnerRetry::Baseline(&baseline);
+        let mut private = without_unix_owner(owned_listeners());
         let mut owner = private_owner(0, false, &[10]);
         owner.key.executable_basename = "private-process".into();
         owner.key.canonical_executable = "/private/executable".into();
-        private.tcp_listeners.push(PrivateTcpListener {
+        private.tcp_listeners[0] = PrivateTcpListener {
             socket_inode: 43,
             socket_uid: 0,
             family: InternetAddressFamily::Ipv4,
@@ -3970,16 +4144,34 @@ mod tests {
             port: 8443,
             owners: vec![owner],
             ownership_complete: false,
-        });
-        let observed = observe_samples([private.clone(), private]);
+        };
+        let observed = observe_samples_with([private.clone(), private], retry);
+        assert_eq!(observed.attempts, 1);
         assert_eq!(
-            local_control_failure_diagnostic(&observed).unwrap(),
+            local_control_failure_diagnostic(&observed, retry, None).unwrap(),
             serde_json::json!({
                 "fence_local_control": {
                     "status": "unavailable", "attempts": 1,
                     "unavailable_inputs": ["socket_ownership"], "bounds_exceeded": [],
                 }
             })
+        );
+        assert_eq!(
+            local_control_failure_diagnostic(
+                &observed,
+                retry,
+                Some(StartupCheck::InitialInventory)
+            )
+            .unwrap(),
+            serde_json::json!({"fence_local_control": {
+                "status": "unavailable", "attempts": 1, "unavailable_inputs": ["socket_ownership"],
+                "bounds_exceeded": [], "startup_check": "initial_inventory",
+                "ownership_detail": ["no_owner_observed", "observed_ownership_incomplete", "identity_not_reviewed", "retry_inventory_mismatch"],
+            }})
+        );
+        assert!(
+            !ownership_detail(&observed.snapshot, MissingOwnerRetry::Never)
+                .contains(&OwnershipDetail::RetryInventoryMismatch)
         );
     }
 

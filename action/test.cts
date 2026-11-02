@@ -8,6 +8,7 @@ const path = require("node:path");
 const test = require("node:test");
 const {
   ACTION_RUNTIME_FILES,
+  LOCAL_CONTROL_SCAN_ATTEMPTS,
   MAX_CRITICAL_FINDINGS,
   MAX_STRUCTURED_CRITICAL_CODES,
   MAX_STRUCTURED_REPORT_BYTES,
@@ -1252,6 +1253,11 @@ test("setup explains recognized failures without guessing at missing or unrelate
       failure("unsupported_resolver_layout"), /host DNS resolver did not pass verification \(unsupported_resolver_layout\)/],
     [JSON.stringify({ fence_local_control: { status: "unavailable", attempts: 3, unavailable_inputs: ["proc"], bounds_exceeded: [] } }) +
       "\n" + failure("local_control_inventory_unavailable"), /local services and their socket owners.*attempts=3; unavailable=proc/],
+    [JSON.stringify({ fence_local_control: {
+      status: "unavailable", attempts: 1, unavailable_inputs: ["socket_ownership"], bounds_exceeded: [],
+      startup_check: "initial_host", ownership_detail: ["observed_ownership_incomplete"], path: "private_fixture_value",
+    } }) + "\n" + failure("local_control_inventory_unavailable"),
+      /startup_check=initial_host; ownership_detail=observed_ownership_incomplete \(local_control_inventory_unavailable\)\. Keep this job failed/],
     [JSON.stringify({ fence_lockdown_command: { executable: "sudo", principal: "runner", code: "lockdown_command_timeout", timeout_ms: 5000 } }) +
       "\n" + failure("lockdown_command_timeout"), /host verification command.*executable=sudo; principal=runner.*timeout_ms=5000/],
     [failure("dns_block_prehydration_failed"), /DNS rules for required hostnames could not be prepared/],
@@ -1330,6 +1336,37 @@ test("local control diagnostics expose only bounded fixed reason codes", () => {
   }
   assert.equal(localControlDiagnosticFromJournal(`${line(diagnostic)}\nnot JSON`), expected);
   assert.equal(localControlDiagnosticFromJournal(line({ ...diagnostic, extra: "x".repeat(4096) })), undefined);
+});
+
+test("startup socket ownership details require a recognized check and compatible reasons", () => {
+  const scan = { status: "unavailable", attempts: 1, unavailable_inputs: ["socket_ownership"], bounds_exceeded: [] };
+  const summary = "status=unavailable; attempts=1; unavailable=socket_ownership; bounds=none";
+  const context = { startup_check: "post_lockdown_baseline", ownership_detail: ["no_owner_observed", "retry_inventory_mismatch"] };
+  const line = (fields: object) => JSON.stringify({ fence_local_control: { ...scan, ...fields } });
+  assert.equal(localControlDiagnosticFromJournal(line(context)),
+    summary + "; startup_check=post_lockdown_baseline; ownership_detail=no_owner_observed,retry_inventory_mismatch");
+  assert.equal(localControlDiagnosticFromJournal(line({
+    startup_check: "final_readiness", ownership_detail: ["observed_ownership_incomplete", "identity_not_reviewed"],
+  })), summary + "; startup_check=final_readiness; ownership_detail=observed_ownership_incomplete,identity_not_reviewed");
+  const exhausted = { attempts: LOCAL_CONTROL_SCAN_ATTEMPTS };
+  const exhaustedSummary = localControlDiagnosticFromJournal(line(exhausted));
+  assert.equal(localControlDiagnosticFromJournal(line({ ...context, ...exhausted })), exhaustedSummary);
+  assert.equal(localControlDiagnosticFromJournal(line({ ...context, ...exhausted, ownership_detail: ["no_owner_observed"] })),
+    exhaustedSummary + "; startup_check=post_lockdown_baseline; ownership_detail=no_owner_observed");
+  for (const fields of [
+    {}, { startup_check: context.startup_check }, { ownership_detail: context.ownership_detail },
+    { ...context, startup_check: "initial_host\n::error::injected" },
+    ...[[], null, "no_owner_observed", ["identity_not_reviewed", "identity_not_reviewed"],
+      ["no_owner_observed", "/private/process"], ["no_owner_observed"], ["retry_inventory_mismatch"]]
+      .map((ownership_detail) => ({ ...context, ownership_detail })),
+  ]) {
+    assert.equal(localControlDiagnosticFromJournal(line(context) + "\n" + line(fields)), summary);
+  }
+  for (const otherScan of [
+    { status: "unstable" }, { unavailable_inputs: ["proc", "socket_ownership"] }, { bounds_exceeded: ["total_fds"] },
+  ]) {
+    assert.equal(localControlDiagnosticFromJournal(line({ ...otherScan, ...context })), localControlDiagnosticFromJournal(line(otherScan)));
+  }
 });
 
 test("host command diagnostics exclude arbitrary data and accept only known programs, principals and bounds", () => {

@@ -5,7 +5,7 @@ use crate::hosted_runner::{
 use crate::lifecycle::validate_test_service_context;
 use crate::local_control::{
     MissingOwnerRetry, NoCurrentFenceOwner, OBSERVATION_TIMEOUT, PinnedCurrentFenceOwner,
-    SOCKET_PROBE_TIMEOUT, SystemUnixSocketAccess, accepted_local_control_snapshot,
+    SOCKET_PROBE_TIMEOUT, StartupCheck, SystemUnixSocketAccess, accepted_local_control_snapshot,
     observe_local_control_inventory, verify_reviewed_local_control_observation,
     verify_reviewed_local_control_snapshot,
 };
@@ -377,15 +377,15 @@ enum SudoRollbackState {
 
 #[derive(Clone, Copy)]
 pub(crate) enum DockerCheck {
-    Startup,
+    Startup(StartupCheck),
     Resident,
 }
 
 impl SudoRollbackState {
-    fn docker_check(&self) -> DockerCheck {
+    fn docker_check(&self, startup_check: StartupCheck) -> DockerCheck {
         match self {
             Self::CommittedNoRestore => DockerCheck::Resident,
-            Self::Unchanged | Self::RollbackAvailable(_) => DockerCheck::Startup,
+            Self::Unchanged | Self::RollbackAvailable(_) => DockerCheck::Startup(startup_check),
         }
     }
 }
@@ -408,19 +408,26 @@ impl SystemLockdownControl {
             containers_masked: false,
         }
     }
-}
 
-impl LockdownControl for SystemLockdownControl {
-    fn verify_supported_host(&mut self) -> Result<(), LockdownError> {
+    pub(crate) fn verify_supported_host_at(
+        &mut self,
+        startup_check: StartupCheck,
+    ) -> Result<(), LockdownError> {
         let executables = &self.executables;
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
         self.sudo_source_pins = Some(verify_host_capabilities(
             executables,
-            self.sudo_rollback.docker_check(),
+            self.sudo_rollback.docker_check(startup_check),
         )?);
         Ok(())
+    }
+}
+
+impl LockdownControl for SystemLockdownControl {
+    fn verify_supported_host(&mut self) -> Result<(), LockdownError> {
+        self.verify_supported_host_at(StartupCheck::SetupHost)
     }
 
     fn verify_sudo_available(&mut self) -> Result<(), LockdownError> {
@@ -453,7 +460,11 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        if runner_docker_available(executables, self.sudo_rollback.docker_check())? {
+        if runner_docker_available(
+            executables,
+            self.sudo_rollback
+                .docker_check(StartupCheck::ContainerAvailability),
+        )? {
             Ok(())
         } else {
             Err(LockdownError::new(
@@ -505,7 +516,11 @@ impl LockdownControl for SystemLockdownControl {
     }
 
     fn disable_containers(&mut self) -> Result<(), LockdownError> {
-        if !runner_docker_available(&self.executables, self.sudo_rollback.docker_check())? {
+        if !runner_docker_available(
+            &self.executables,
+            self.sudo_rollback
+                .docker_check(StartupCheck::ContainerDisable),
+        )? {
             return Ok(());
         }
         self.containers_masked = true;
@@ -570,7 +585,11 @@ impl LockdownControl for SystemLockdownControl {
                 false
             }
         } else {
-            runner_docker_available(executables, self.sudo_rollback.docker_check())?
+            runner_docker_available(
+                executables,
+                self.sudo_rollback
+                    .docker_check(StartupCheck::ContainerVerification),
+            )?
         };
         if docker_available {
             return Err(LockdownError::new(
@@ -784,6 +803,7 @@ fn verify_test_local_control_inventory(
         &socket_access,
         &NoCurrentFenceOwner,
         MissingOwnerRetry::Never,
+        None,
     );
     verify_reviewed_local_control_observation(
         &hosted_runner_fingerprint_requirement()
@@ -1797,15 +1817,20 @@ fn verify_container_runtime_unavailable(
     let host = hosted_runner_fingerprint_requirement().accepted;
     let mut accepted = accepted_local_control_snapshot(&host.local_control_inventory)
         .map_err(|error| LockdownError::new(error.code, error.message))?;
-    let retry = match check {
-        DockerCheck::Startup => {
+    let (retry, startup_check) = match check {
+        DockerCheck::Startup(check) => {
             accepted = accepted.without_container_controls(&host.container_sockets);
-            MissingOwnerRetry::Reviewed(&accepted)
+            (MissingOwnerRetry::Reviewed(&accepted), Some(check))
         }
-        DockerCheck::Resident => MissingOwnerRetry::Never,
+        DockerCheck::Resident => (MissingOwnerRetry::Never, None),
     };
-    let observed =
-        observe_local_control_inventory(Path::new("/proc"), &socket_access, &fence_owner, retry);
+    let observed = observe_local_control_inventory(
+        Path::new("/proc"),
+        &socket_access,
+        &fence_owner,
+        retry,
+        startup_check,
+    );
     verify_reviewed_local_control_snapshot(&accepted, &observed)
         .map_err(|error| LockdownError::new(error.code, error.message))?;
     if !observed.snapshot.root_container_processes.is_empty() {
@@ -2774,9 +2799,15 @@ mod tests {
             SudoRollbackState::Unchanged,
             SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]),
         ] {
-            assert!(matches!(state.docker_check(), DockerCheck::Startup));
+            assert!(matches!(
+                state.docker_check(StartupCheck::InitialHost),
+                DockerCheck::Startup(StartupCheck::InitialHost)
+            ));
             commit_no_restore_state(&mut state);
-            assert!(matches!(state.docker_check(), DockerCheck::Resident));
+            assert!(matches!(
+                state.docker_check(StartupCheck::ContainerVerification),
+                DockerCheck::Resident
+            ));
         }
     }
 

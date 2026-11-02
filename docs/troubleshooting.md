@@ -16,6 +16,15 @@ Run Fence first. Checkout, setup actions, and other commands can change the runn
 
 `local_control_inventory_unavailable` means Fence could not fully inspect local services and their socket owners. Fence retries read failures within a fixed limit. At startup, it can also retry if the only missing detail is who owns a known socket. It won't accept an unexpected owner or start with incomplete checks, even in audit mode. The setup error can include the scan status, attempt count, and fixed reason codes, without process names or paths. An allowlist change will not fix this error.
 
+When the samples match, socket ownership is the only unavailable input, and the scan stays within its bounds, `startup_check` names the check that stopped setup. The `ownership_detail` field can include more than one reason.
+
+- `no_owner_observed` means Fence found a listener but could not identify any owner.
+- `observed_ownership_incomplete` means Fence found at least one owner but could not verify ownership completely.
+- `identity_not_reviewed` means a listener owner or root container process did not match a reviewed identity.
+- `retry_inventory_mismatch` means that even after allowing for the missing owner, the inventory did not match what that startup check permits.
+
+These fields omit socket and process identifiers.
+
 `dns_proxy_bind_failed` means Fence could not start a required DNS listener. For example, `docker UDP bind: address unavailable` means the required Docker address was not available. If only the error code is shown, the specific listener and reason aren't known. Changing the allowlist will not fix this error.
 
 `unsupported_resolver_layout` means Fence could not verify `/etc/resolv.conf`. It can be a root-owned regular file or a symlink to a supported systemd-resolved file; you don't need to convert one to the other. The setup error can name the failed check, never observed paths, ownership, permissions, or process IDs. Changing the allowlist will not help.
