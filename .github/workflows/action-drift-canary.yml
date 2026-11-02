@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/action-drift-canary.yml
       - script/lib/protected_finalization.py
+      - script/lib/release_canary_report.py
       - script/verify-protected-finalization
   workflow_dispatch:
     inputs:
@@ -40,14 +41,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-latest]
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-latest]
     timeout-minutes: 5
     runs-on: ${{ matrix.runner }}
 
     steps:
       # Keep this first, with no inputs, just as a consumer would use the published pin.
       - name: activate released Fence as the first workflow step
-        uses: openai/fence@5b321754a58bfe91ea704500baee8eb4defe1613 # pin@v0.12.6
+        uses: openai/fence@9d10445098284f8e8bbf67495fc8c2eaa34c28c5 # pin@v0.12.7
 
       - name: check out repository under Fence
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
@@ -92,13 +93,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-latest]
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-latest]
     timeout-minutes: 5
     runs-on: ${{ matrix.runner }}
 
     steps:
       - name: activate released Fence as the first workflow step
-        uses: openai/fence@5b321754a58bfe91ea704500baee8eb4defe1613 # pin@v0.12.6
+        uses: openai/fence@9d10445098284f8e8bbf67495fc8c2eaa34c28c5 # pin@v0.12.7
         with:
           mode: audit
 
@@ -158,7 +159,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '["ubuntu-24.04","ubuntu-latest"]' || '["ubuntu-24.04","ubuntu-26.04","ubuntu-latest"]') }}
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-latest]
         mode: ${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '["audit"]' || '["block", "audit"]') }}
     timeout-minutes: 8
     runs-on: ${{ matrix.runner }}
