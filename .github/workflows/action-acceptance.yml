@@ -176,20 +176,21 @@ jobs:
           if-no-files-found: error
 
   action:
-    name: action ${{ matrix.scenario }}
+    name: action ${{ matrix.scenario.name }}${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
     needs: prepare-candidate
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - scenario: standard-opt-out
+        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}
+        scenario:
+          - name: standard-opt-out
             mode: block
             invocation_id: action-standard-opt-out
             container_policy: disable
             disable_broad_github_domains: 'true'
             allow_github_artifacts: 'false'
             allowlist: ''
-          - scenario: wildcard-docker
+          - name: wildcard-docker
             mode: block
             invocation_id: action-wildcard-docker
             container_policy: unsafe_preserve
@@ -197,14 +198,14 @@ jobs:
             allow_github_artifacts: 'false'
             allowlist: |
               *.docker.io
-          - scenario: github-artifacts
+          - name: github-artifacts
             mode: block
             invocation_id: action-github-artifacts
             container_policy: disable
             disable_broad_github_domains: 'false'
             allow_github_artifacts: 'true'
             allowlist: ''
-          - scenario: azure-cli-block
+          - name: azure-cli-block
             lifecycle: standard
             regular_resolver: true
             mode: block
@@ -213,7 +214,7 @@ jobs:
             disable_broad_github_domains: 'false'
             allow_github_artifacts: 'false'
             allowlist: ''
-          - scenario: azure-cli-audit
+          - name: azure-cli-audit
             lifecycle: audit
             regular_resolver: true
             mode: audit
@@ -223,7 +224,7 @@ jobs:
             allow_github_artifacts: 'false'
             allowlist: ''
     timeout-minutes: 8
-    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: checkout
@@ -240,7 +241,7 @@ jobs:
           path: action
 
       - name: prepare regular host resolver fixture
-        if: matrix.regular_resolver
+        if: matrix.scenario.regular_resolver
         run: script/test-action-acceptance prepare-regular-resolver
 
       - name: observe hosted runner fingerprint candidate
@@ -248,6 +249,8 @@ jobs:
 
       - name: classify bundled Action host compatibility
         id: bundle-host
+        env:
+          FENCE_ACCEPTANCE_RUNNER: ${{ matrix.runner }}
         run: script/classify-action-bundle-host
 
       - name: require bundled Action activation
@@ -263,21 +266,21 @@ jobs:
       - name: activate bundled Fence agent
         uses: ./
         with:
-          mode: ${{ matrix.mode }}
-          invocation_id: ${{ matrix.invocation_id }}
-          container_policy: ${{ matrix.container_policy }}
-          disable_broad_github_domains: ${{ matrix.disable_broad_github_domains }}
-          allow_github_artifacts: ${{ matrix.allow_github_artifacts }}
-          allowlist: ${{ matrix.allowlist }}
+          mode: ${{ matrix.scenario.mode }}
+          invocation_id: ${{ matrix.scenario.invocation_id }}
+          container_policy: ${{ matrix.scenario.container_policy }}
+          disable_broad_github_domains: ${{ matrix.scenario.disable_broad_github_domains }}
+          allow_github_artifacts: ${{ matrix.scenario.allow_github_artifacts }}
+          allowlist: ${{ matrix.scenario.allowlist }}
 
       - name: exercise Azure CLI and UUID service activation
-        if: ${{ matrix.scenario == 'azure-cli-block' || matrix.scenario == 'azure-cli-audit' }}
+        if: ${{ matrix.scenario.name == 'azure-cli-block' || matrix.scenario.name == 'azure-cli-audit' }}
         run: |
           az version
           systemctl is-active --quiet uuidd.service
 
       - name: create bounded GitHub artifact fixture
-        if: ${{ matrix.scenario == 'github-artifacts' }}
+        if: ${{ matrix.scenario.name == 'github-artifacts' }}
         env:
           FENCE_ARTIFACT_FIXTURE: ${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt
         run: |
@@ -286,20 +289,20 @@ jobs:
 
       - name: upload bounded GitHub artifact under Fence
         id: github-artifact-upload
-        if: ${{ matrix.scenario == 'github-artifacts' }}
+        if: ${{ matrix.scenario.name == 'github-artifacts' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # pin@v7.0.1
         with:
-          name: fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.prepare-candidate.outputs.acceptance_runner }}
+          name: fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
           path: ${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt
           retention-days: 1
           if-no-files-found: error
 
       - name: verify Action lifecycle
         env:
-          FENCE_EXPECT_REGULAR_RESOLVER: ${{ matrix.regular_resolver }}
+          FENCE_EXPECT_REGULAR_RESOLVER: ${{ matrix.scenario.regular_resolver }}
           FENCE_GITHUB_ARTIFACT_ID: ${{ steps.github-artifact-upload.outputs.artifact-id }}
           FENCE_GITHUB_ARTIFACT_DIGEST: ${{ steps.github-artifact-upload.outputs.artifact-digest }}
-        run: script/test-action-acceptance "${{ matrix.lifecycle || matrix.scenario }}" "${{ matrix.invocation_id }}"
+        run: script/test-action-acceptance "${{ matrix.scenario.lifecycle || matrix.scenario.name }}" "${{ matrix.scenario.invocation_id }}"
 
   zero-input:
     name: action zero-input standard${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
@@ -408,36 +411,14 @@ jobs:
         run: script/test-action-acceptance audit action-nested-layout
 
   setup-failure:
-    name: action setup failure evidence
+    name: action setup failure evidence${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
     needs: prepare-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}
     timeout-minutes: 5
-    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
-
-    steps:
-      - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
-        with:
-          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
-          persist-credentials: false
-
-      - name: install assembled Action bundle
-        if: needs.prepare-candidate.outputs.source_candidate == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
-        with:
-          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
-          path: action
-
-      - name: observe hosted runner fingerprint candidate
-        run: script/observe-hosted-runner
-
-      - name: reject invalid setup before mutation
-        run: script/test-action-setup-failure
-
-  tamper:
-    name: action registered-path and post-ready tamper evidence
-    needs: prepare-candidate
-    timeout-minutes: 5
-    runs-on: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: checkout
@@ -458,6 +439,54 @@ jobs:
 
       - name: classify bundled Action host compatibility
         id: bundle-host
+        env:
+          FENCE_ACCEPTANCE_RUNNER: ${{ matrix.runner }}
+        run: script/classify-action-bundle-host
+
+      - name: require bundled Action activation
+        env:
+          RUN_BUNDLE: ${{ steps.bundle-host.outputs.run_bundle }}
+          CLASSIFICATION: ${{ steps.bundle-host.outputs.classification }}
+        run: |
+          if [[ "$RUN_BUNDLE" != "true" || "$CLASSIFICATION" != "bundle_compatible" ]]; then
+            echo "::error::bundled Action host classification did not authorize activation"
+            exit 1
+          fi
+
+      - name: reject invalid setup before mutation
+        run: script/test-action-setup-failure
+
+  tamper:
+    name: action registered-path and post-ready tamper evidence${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
+    needs: prepare-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}
+    timeout-minutes: 5
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          ref: ${{ needs.prepare-candidate.outputs.action_ref }}
+          persist-credentials: false
+
+      - name: install assembled Action bundle
+        if: needs.prepare-candidate.outputs.source_candidate == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # pin@8.0.1
+        with:
+          name: ${{ needs.prepare-candidate.outputs.artifact_name }}
+          path: action
+
+      - name: observe hosted runner fingerprint candidate
+        run: script/observe-hosted-runner
+
+      - name: classify bundled Action host compatibility
+        id: bundle-host
+        env:
+          FENCE_ACCEPTANCE_RUNNER: ${{ matrix.runner }}
         run: script/classify-action-bundle-host
 
       - name: require bundled Action activation
@@ -502,6 +531,8 @@ jobs:
 
       - name: classify bundled Action host compatibility
         id: bundle-host
+        env:
+          FENCE_ACCEPTANCE_RUNNER: ${{ needs.prepare-candidate.outputs.acceptance_runner }}
         run: script/classify-action-bundle-host
 
       - name: require bundled Action activation

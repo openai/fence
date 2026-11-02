@@ -327,11 +327,10 @@ require(
         "build.yml",
         "acceptance.yml",
         "action-acceptance.yml",
-        "action-acceptance-ubuntu-latest.yml",
         "action-drift-canary.yml",
         "integration.yml",
     },
-    "Pull requests may run only the six protected workflows, ubuntu-latest acceptance, and the path-filtered consumer canary",
+    "Pull requests may run only the six protected workflows and the path-filtered consumer canary",
 )
 pull_request_sources = {
     name: source
@@ -842,19 +841,19 @@ require(
 )
 
 jobs = indented_block(workflow, "jobs:", "Action acceptance jobs contract must be unique")
-target_jobs = [
-    "action",
-    "zero-input",
-    "nested-layout",
-    "setup-failure",
-    "tamper",
-    "action-finalization",
-]
+target_jobs = {
+    "action": "action ${{ matrix.scenario.name }}",
+    "zero-input": "action zero-input standard",
+    "nested-layout": "action nested registered path",
+    "setup-failure": "action setup failure evidence",
+    "tamper": "action registered-path and post-ready tamper evidence",
+    "action-finalization": "action finalization ${{ matrix.replica }}",
+}
 support_jobs = ["prepare-candidate", "acceptance"]
 require_exact_mapping_keys(
     jobs,
     2,
-    target_jobs + support_jobs,
+    list(target_jobs) + support_jobs,
     "Action acceptance must retain six target job definitions and two fixed support jobs",
 )
 
@@ -1044,36 +1043,37 @@ require(
 )
 
 validated_runner = "${{ needs.prepare-candidate.outputs.acceptance_runner }}"
-target_job_keys = {
-    "action": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
-    "zero-input": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
-    "nested-layout": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
-    "setup-failure": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
-    "tamper": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
-    "action-finalization": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
+matrix_runner = "${{ matrix.runner }}"
+runner_axis = "${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}"
+runner_suffix = "${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}"
+action_job_blocks = {
+    job_name: indented_block(jobs, f"  {job_name}:", f"Action acceptance {job_name} job must be unique")
+    for job_name in target_jobs
 }
-for job_name in target_jobs:
-    job = indented_block(
-        jobs,
-        f"  {job_name}:",
-        f"Action acceptance {job_name} job must be unique",
-    )
+for job_name, job in action_job_blocks.items():
     require_exact_mapping_keys(
-        job,
-        4,
-        target_job_keys[job_name],
+        job, 4, ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
         f"Action acceptance {job_name} fields must remain narrowly scoped",
     )
-    compatibility_job = job_name in {"zero-input", "nested-layout"}
-    if compatibility_job:
-        require(
-            "    strategy:\n      fail-fast: false\n      matrix:\n        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}\n" in job,
-            "Compatibility jobs must test each prepared runner label independently",
-        )
+    quiet = job_name == "action-finalization"
+    fields = scalar_mapping(job, 4)
     require(
-        scalar_mapping(job, 4).get("needs") == "prepare-candidate"
-        and scalar_mapping(job, 4).get("runs-on") == ("${{ matrix.runner }}" if compatibility_job else validated_runner),
-        f"Action acceptance {job_name} must depend on preparation and use only the validated runner output",
+        fields.get("name") == target_jobs[job_name] + ("" if quiet else runner_suffix)
+        and fields.get("needs") == "prepare-candidate"
+        and fields.get("runs-on") == (validated_runner if quiet else matrix_runner),
+        f"Action acceptance {job_name} must use the prepared runner and preserve its primary job name",
+    )
+    strategy = indented_block(job, "    strategy:", f"Action acceptance {job_name} strategy must be unique")
+    require_exact_mapping_keys(strategy, 6, ["fail-fast", "matrix"], f"Unexpected {job_name} strategy fields")
+    require(scalar_mapping(strategy, 6) == {"fail-fast": "false"}, "Action acceptance must collect all matrix results")
+    matrix = indented_block(strategy, "      matrix:", f"Action acceptance {job_name} matrix must be unique")
+    dimensions = ["replica"] if quiet else ["runner"]
+    if job_name == "action":
+        dimensions.append("scenario")
+    require_exact_mapping_keys(matrix, 8, dimensions, f"Unexpected {job_name} acceptance matrix dimensions")
+    require(
+        scalar_mapping(matrix, 8) == ({"replica": "[quiet-1, quiet-2, quiet-3]"} if quiet else {"runner": runner_axis}),
+        f"Action acceptance {job_name} must run every reviewed matrix combination",
     )
 for job_name in support_jobs:
     job = indented_block(
@@ -1091,29 +1091,11 @@ require(
     ),
     "Action acceptance must not interpolate the raw runner input into runs-on",
 )
-require(
-    workflow.count(f"runs-on: {validated_runner}") == len(target_jobs) - 2
-    and workflow.count("runs-on: ${{ matrix.runner }}") == 2
-    and workflow.count("runs-on: ubuntu-24.04") == len(support_jobs),
-    "Action acceptance runner routing must remain complete and exclusive",
-)
-action_job = indented_block(
-    jobs,
-    "  action:",
-    "Action acceptance matrix job must be unique",
-)
-action_strategy = indented_block(
-    action_job,
-    "    strategy:",
-    "Action acceptance matrix strategy must be unique",
-)
-require(
-    scalar_mapping(action_strategy, 6).get("fail-fast") == "false",
-    "Action acceptance matrix must not hide sibling evidence",
-)
+action_matrix = indented_block(action_job_blocks["action"], "      matrix:", "Action acceptance matrix must be unique")
+action_scenarios = indented_block(action_matrix, "        scenario:", "Action acceptance scenarios must be unique")
 action_entries = re.findall(
-    r"(?ms)^          - scenario: ([^\n]+)\n(.*?)(?=^          - scenario:|\Z)",
-    action_strategy,
+    r"(?ms)^          - name: ([^\n]+)\n(.*?)(?=^          - name:|\Z)",
+    action_scenarios,
 )
 expected_action_entries = {
     "standard-opt-out": {
@@ -1176,14 +1158,6 @@ require(
     "Action acceptance wildcard-Docker allowlist must remain exact",
 )
 
-action_job_blocks = {
-    job_name: indented_block(
-        jobs,
-        f"  {job_name}:",
-        f"Action acceptance {job_name} job must be unique",
-    )
-    for job_name in target_jobs
-}
 expected_action_steps = {
     "action": [
         "checkout",
@@ -1220,6 +1194,8 @@ expected_action_steps = {
         "checkout",
         "install assembled Action bundle",
         "observe hosted runner fingerprint candidate",
+        "classify bundled Action host compatibility",
+        "require bundled Action activation",
         "reject invalid setup before mutation",
     ],
     "tamper": [
@@ -1309,9 +1285,7 @@ for job_name, job in action_job_blocks.items():
         f"Action acceptance {job_name} host observation",
     )
 
-for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-finalization"]:
-    job = action_job_blocks[job_name]
-    classifier_keys = ["id", "run"]
+    classifier_keys = ["id", "env", "run"]
     classifier_scalars = {
         "id": "bundle-host",
         "run": "script/classify-action-bundle-host",
@@ -1319,13 +1293,10 @@ for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-fina
     guard_keys = ["env", "run"]
     guard_scalars = {"run": "|"}
     if job_name == "nested-layout":
-        classifier_keys = ["id", "working-directory", "run"]
+        classifier_keys = ["id", "env", "working-directory", "run"]
         classifier_scalars["working-directory"] = "target/action-layout/owner/project/revision"
         guard_keys = ["working-directory", "env", "run"]
         guard_scalars["working-directory"] = "target/action-layout/owner/project/revision"
-    compatibility_job = job_name in {"zero-input", "nested-layout"}
-    if compatibility_job:
-        classifier_keys.insert(1, "env")
     classifier = require_step_contract(
         job,
         "classify bundled Action host compatibility",
@@ -1333,12 +1304,11 @@ for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-fina
         classifier_scalars,
         f"Action acceptance {job_name} host classifier",
     )
-    if compatibility_job:
-        require(
-            scalar_mapping(indented_block(classifier, "        env:", "Expected runner label missing"), 10)
-            == {"FENCE_ACCEPTANCE_RUNNER": "${{ matrix.runner }}"},
-            "Fixed-label compatibility evidence must verify the actual observed release",
-        )
+    require(
+        scalar_mapping(indented_block(classifier, "        env:", "Expected runner label missing"), 10)
+        == {"FENCE_ACCEPTANCE_RUNNER": validated_runner if job_name == "action-finalization" else matrix_runner},
+        "Fixed-label compatibility evidence must verify the actual observed release",
+    )
     guard = require_step_contract(
         job,
         "require bundled Action activation",
@@ -1374,14 +1344,14 @@ action_lifecycle = require_step_contract(
     action_job_blocks["action"],
     "verify Action lifecycle",
     ["env", "run"],
-    {"run": 'script/test-action-acceptance "${{ matrix.lifecycle || matrix.scenario }}" "${{ matrix.invocation_id }}"'},
+    {"run": 'script/test-action-acceptance "${{ matrix.scenario.lifecycle || matrix.scenario.name }}" "${{ matrix.scenario.invocation_id }}"'},
     "Action acceptance native-input lifecycle verification",
 )
 require_step_contract(
     action_job_blocks["action"],
     "prepare regular host resolver fixture",
     ["if", "run"],
-    {"if": "matrix.regular_resolver", "run": "script/test-action-acceptance prepare-regular-resolver"},
+    {"if": "matrix.scenario.regular_resolver", "run": "script/test-action-acceptance prepare-regular-resolver"},
     "Action acceptance regular resolver fixture",
 )
 azure_cli = require_step_contract(
@@ -1389,7 +1359,7 @@ azure_cli = require_step_contract(
     "exercise Azure CLI and UUID service activation",
     ["if", "run"],
     {
-        "if": "${{ matrix.scenario == 'azure-cli-block' || matrix.scenario == 'azure-cli-audit' }}",
+        "if": "${{ matrix.scenario.name == 'azure-cli-block' || matrix.scenario.name == 'azure-cli-audit' }}",
         "run": "|",
     },
     "Action acceptance Azure CLI exercise",
@@ -1407,7 +1377,7 @@ action_lifecycle_env = indented_block(
 require(
     scalar_mapping(action_lifecycle_env, 10)
     == {
-        "FENCE_EXPECT_REGULAR_RESOLVER": "${{ matrix.regular_resolver }}",
+        "FENCE_EXPECT_REGULAR_RESOLVER": "${{ matrix.scenario.regular_resolver }}",
         "FENCE_GITHUB_ARTIFACT_ID": "${{ steps.github-artifact-upload.outputs.artifact-id }}",
         "FENCE_GITHUB_ARTIFACT_DIGEST": "${{ steps.github-artifact-upload.outputs.artifact-digest }}",
     },
@@ -1459,12 +1429,12 @@ native_activation_with = indented_block(
 require(
     scalar_mapping(native_activation_with, 10)
     == {
-        "mode": "${{ matrix.mode }}",
-        "invocation_id": "${{ matrix.invocation_id }}",
-        "container_policy": "${{ matrix.container_policy }}",
-        "disable_broad_github_domains": "${{ matrix.disable_broad_github_domains }}",
-        "allow_github_artifacts": "${{ matrix.allow_github_artifacts }}",
-        "allowlist": "${{ matrix.allowlist }}",
+        "mode": "${{ matrix.scenario.mode }}",
+        "invocation_id": "${{ matrix.scenario.invocation_id }}",
+        "container_policy": "${{ matrix.scenario.container_policy }}",
+        "disable_broad_github_domains": "${{ matrix.scenario.disable_broad_github_domains }}",
+        "allow_github_artifacts": "${{ matrix.scenario.allow_github_artifacts }}",
+        "allowlist": "${{ matrix.scenario.allowlist }}",
     },
     "Action acceptance native-input activation must exercise every reviewed matrix field",
 )
@@ -1472,7 +1442,7 @@ artifact_fixture = require_step_contract(
     action_job_blocks["action"],
     "create bounded GitHub artifact fixture",
     ["if", "env", "run"],
-    {"if": "${{ matrix.scenario == 'github-artifacts' }}", "run": "|"},
+    {"if": "${{ matrix.scenario.name == 'github-artifacts' }}", "run": "|"},
     "Action acceptance GitHub artifact compatibility fixture",
 )
 artifact_fixture_env = indented_block(
@@ -1504,7 +1474,7 @@ artifact_upload = require_step_contract(
     ["id", "if", "uses", "with"],
     {
         "id": "github-artifact-upload",
-        "if": "${{ matrix.scenario == 'github-artifacts' }}",
+        "if": "${{ matrix.scenario.name == 'github-artifacts' }}",
         "uses": "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     },
     "Action acceptance GitHub artifact compatibility upload",
@@ -1517,7 +1487,7 @@ artifact_upload_with = indented_block(
 require(
     scalar_mapping(artifact_upload_with, 10)
     == {
-        "name": "fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.prepare-candidate.outputs.acceptance_runner }}",
+        "name": "fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}",
         "path": "${{ runner.temp }}/fence-github-artifact-${{ github.run_id }}-${{ github.run_attempt }}.txt",
         "retention-days": "1",
         "if-no-files-found": "error",
@@ -1566,16 +1536,9 @@ require(
     "Action acceptance finalization replicas must use distinct strict invocations",
 )
 
-finalization = indented_block(
-    jobs,
-    "  action-finalization:",
-    "Action acceptance finalization matrix must be unique",
-)
 require(
-    "replica: [quiet-1, quiet-2, quiet-3]" in finalization
-    and "fail-fast: false" in finalization
-    and scalar_mapping(finalization, 4).get("timeout-minutes") == "8",
-    "Action acceptance must retain three non-cancelling finalization replicas with an eight-minute setup budget",
+    scalar_mapping(action_job_blocks["action-finalization"], 4).get("timeout-minutes") == "8",
+    "Action acceptance finalization must retain its eight-minute setup budget",
 )
 
 require_exact_mapping_keys(
@@ -1902,6 +1865,10 @@ expected_integration_steps = {
         "run quiet packaged trusted-launcher block",
     ],
 }
+integration_runner_matrices = {
+    "lockdown": ("[acl-reject, rollback]", ["audit", "local-control-reject", "standard", "unsafe-preserve"]),
+    "selected-profile-runtime": ("[local-control-drift, worker-failure]", ["healthy"]),
+}
 for job_name in integration_target_jobs:
     job = indented_block(
         integration_jobs,
@@ -1915,7 +1882,8 @@ for job_name in integration_target_jobs:
         f"Integration {job_name} fields must remain narrowly scoped",
     )
     job_fields = scalar_mapping(job, 4)
-    expected_runner = "${{ matrix.runner }}" if job_name == "lockdown" else "ubuntu-24.04"
+    runner_matrix = job_name in integration_runner_matrices
+    expected_runner = "${{ matrix.runner }}" if runner_matrix else "ubuntu-24.04"
     require(
         job_fields.get("needs") == "preflight"
         and job_fields.get("timeout-minutes") == expected_target_timeouts[job_name]
@@ -1937,6 +1905,20 @@ for job_name in integration_target_jobs:
         scalar_mapping(strategy, 6).get("fail-fast") == "false",
         f"Integration {job_name} must not hide sibling evidence",
     )
+    if runner_matrix:
+        scenarios, baseline_cases = integration_runner_matrices[job_name]
+        matrix = indented_block(strategy, "      matrix:", f"Integration {job_name} matrix must be unique")
+        require_exact_mapping_keys(matrix, 8, ["scenario", "runner", "include"], f"Unexpected {job_name} matrix dimensions")
+        require(scalar_mapping(matrix, 8) == {
+            "scenario": scenarios,
+            "runner": "[ubuntu-24.04, ubuntu-26.04, ubuntu-latest]",
+        }, f"Integration {job_name} must exercise the failure paths on each supported runner label")
+        cases = indented_block(matrix, "        include:", f"Integration {job_name} include must be unique")
+        expected_cases = ["include:"]
+        for scenario in baseline_cases:
+            expected_cases.extend([f"- scenario: {scenario}", "runner: ubuntu-24.04"])
+        require([line.strip() for line in cases.splitlines() if line.strip()] == expected_cases,
+                f"Integration {job_name} must retain the other fixed Ubuntu 24.04 cases")
     require(
         re.findall(r"(?m)^      - name: ([^\n]+)$", job)
         == expected_integration_steps[job_name],
@@ -1962,7 +1944,7 @@ for job_name in integration_target_jobs:
         job,
         "observe hosted runner fingerprint candidate",
         ["run"],
-        {"run": "script/observe-hosted-runner"},
+        {"run": 'script/observe-hosted-runner "${{ matrix.runner }}"' if runner_matrix else "script/observe-hosted-runner"},
         f"Integration {job_name} host observation",
     )
     require_step_contract(
@@ -1985,16 +1967,6 @@ lockdown = indented_block(
     "  lockdown:",
     "Integration lockdown job must be unique",
 )
-lockdown_matrix = indented_block(lockdown, "      matrix:", "Integration lockdown matrix must be unique")
-require_exact_mapping_keys(lockdown_matrix, 8, ["scenario", "runner", "include"], "Unexpected lockdown matrix dimensions")
-require(scalar_mapping(lockdown_matrix, 8) == {
-    "scenario": "[acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]",
-    "runner": "[ubuntu-24.04]",
-}, "Integration lockdown must retain the six Ubuntu 24.04 scenarios")
-extra_lockdown = indented_block(lockdown_matrix, "        include:", "Integration lockdown matrix include must be unique")
-require([line.strip() for line in extra_lockdown.splitlines() if line.strip()] == [
-    "include:", "- scenario: rollback", "runner: ubuntu-26.04", "label_suffix: ' (ubuntu-26.04)'",
-], "Ubuntu 26.04 must add only the lockdown rollback scenario")
 require_step_contract(
     lockdown,
     "test resident lifecycle evidence",
@@ -2005,16 +1977,13 @@ require_step_contract(
     },
     "Integration standard namespace evidence",
 )
-lockdown_evidence = require_step_contract(
+require_step_contract(
     lockdown,
     "test lockdown evidence",
-    ["env", "run"],
+    ["run"],
     {"run": 'script/test-lockdown "${{ matrix.scenario }}"'},
     "Integration terminal lockdown evidence",
 )
-lockdown_env = indented_block(lockdown_evidence, "        env:", "Lockdown evidence environment must be unique")
-require(scalar_mapping(lockdown_env, 10) == {"REQUIRE_UBUNTU26_ROLLBACK": "${{ matrix.runner == 'ubuntu-26.04' }}"},
-        "The Ubuntu 26.04 rollback must verify original host sockets and both sudo providers")
 require(
     lockdown.count("run: script/test-privileged") == 1
     and lockdown.count('run: script/test-lockdown "${{ matrix.scenario }}"') == 1
@@ -2027,10 +1996,6 @@ selected_profile = indented_block(
     integration_jobs,
     "  selected-profile-runtime:",
     "Integration selected-profile matrix must be unique",
-)
-require(
-    "scenario: [healthy, local-control-drift, worker-failure]" in selected_profile,
-    "Integration selected-profile matrix must retain all three health cases",
 )
 selected_profile_run = require_step_contract(
     selected_profile,
@@ -2281,8 +2246,8 @@ nightly_triggers = indented_block(
 require_exact_mapping_keys(
     nightly_triggers,
     2,
-    ["schedule", "workflow_dispatch", "pull_request"],
-    "Ubuntu-latest acceptance may run only on schedule, manual dispatch, or reviewed pull requests",
+    ["schedule", "workflow_dispatch"],
+    "Nightly ubuntu-latest acceptance may run only on schedule or manual dispatch",
 )
 nightly_schedule = indented_block(
     nightly_triggers,
@@ -2315,26 +2280,6 @@ require(
     ),
     "Nightly ubuntu-latest manual dispatch must not accept inputs",
 )
-nightly_pull_request = indented_block(
-    nightly_triggers,
-    "  pull_request:",
-    "Ubuntu-latest acceptance pull-request trigger must be unique",
-)
-require_exact_mapping_keys(
-    nightly_pull_request,
-    4,
-    ["branches"],
-    "Ubuntu-latest acceptance pull-request trigger may contain only its reviewed branch filter",
-)
-require(
-    re.findall(
-        r"(?m)^      - ([^#\n]+?)(?:[ \t]+#.*)?[ \t]*$",
-        nightly_pull_request,
-    )
-    == ["main"],
-    "Ubuntu-latest acceptance pull requests must target main",
-)
-
 nightly_permissions_block = indented_block(
     nightly,
     "permissions:",
@@ -2366,10 +2311,10 @@ nightly_concurrency = scalar_mapping(nightly_concurrency_block, 2)
 require(
     nightly_concurrency
     == {
-        "group": "nightly-ubuntu-latest-${{ github.event.pull_request.number || 'main' }}",
+        "group": "nightly-ubuntu-latest",
         "cancel-in-progress": "false",
     },
-    "Ubuntu-latest acceptance concurrency must isolate pull requests without cancelling protected jobs",
+    "Nightly ubuntu-latest acceptance must serialize protected jobs without cancelling them",
 )
 
 nightly_jobs = indented_block(
@@ -2391,17 +2336,16 @@ nightly_job = indented_block(
 require_exact_mapping_keys(
     nightly_job,
     4,
-    ["name", "if", "uses", "with"],
-    "Ubuntu-latest caller may contain only its name, trusted-source condition, reusable call, and reviewed inputs",
+    ["name", "uses", "with"],
+    "Nightly ubuntu-latest caller may contain only its name, reusable call, and reviewed inputs",
 )
 require(
     scalar_mapping(nightly_job, 4)
     == {
         "name": "ubuntu-latest action acceptance",
-        "if": "${{ github.event_name != 'pull_request' || (github.event.pull_request.base.ref == 'main' && github.event.pull_request.head.repo.full_name == github.repository) }}",
         "uses": "./.github/workflows/action-acceptance.yml",
     },
-    "Ubuntu-latest acceptance must reject fork pull requests before its local reusable-workflow call",
+    "Nightly ubuntu-latest acceptance must run the local reusable workflow",
 )
 nightly_with = indented_block(
     nightly_job,

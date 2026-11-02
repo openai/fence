@@ -992,10 +992,13 @@ class ClassificationTests(unittest.TestCase):
 
     def test_fixed_label_requires_its_actual_image(self):
         observation, support, transitions = fixture()
-        for label in ("ubuntu-24.04", "ubuntu-latest"):
-            self.assertTrue(classify(observation, support, transitions, label)["run_bundle"])
-        with self.assertRaisesRegex(ClassificationError, "differs from the requested runner label"):
-            classify(observation, support, transitions, "ubuntu-26.04")
+        for version, mismatched_label in (("24.04", "ubuntu-26.04"), ("26.04", "ubuntu-24.04")):
+            with self.subTest(version=version):
+                observation["host"]["os_version_id"] = version
+                for label in (f"ubuntu-{version}", "ubuntu-latest"):
+                    self.assertTrue(classify(observation, support, transitions, label)["run_bundle"])
+                with self.assertRaisesRegex(ClassificationError, "differs from the requested runner label"):
+                    classify(observation, support, transitions, mismatched_label)
 
     def test_reviewed_resolver_targets_and_service_owners_may_change(self):
         observation, support, transitions = fixture()
