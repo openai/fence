@@ -233,6 +233,14 @@ DERIVED_UNAVAILABLE_REASONS = {
 
 UNREVIEWED_EXECUTABLE_PATH = "unreviewed_executable_path"
 UNREVIEWED_CGROUP = "unreviewed_cgroup"
+UBUNTU26_ROOT_SERVICES = {
+    "/usr/lib/systemd/systemd-logind": "/system.slice/systemd-logind.service",
+    "/usr/sbin/sshd": "/system.slice/ssh.service",
+}
+UBUNTU26_SERVICE_PATHS_BY_DIGEST = {
+    hashlib.sha256(b"fence-executable-path-v1\0" + os.fsencode(path)).hexdigest(): path
+    for path in UBUNTU26_ROOT_SERVICES
+}
 REVIEWED_EXECUTABLE_PATHS = frozenset(
     {
         "/usr/bin/containerd",
@@ -626,7 +634,7 @@ def _socket_inode(target):
     return int(match.group(1))
 
 
-def _scan_process_owners(proc_root, relevant_listener_inodes):
+def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False):
     bounds = set()
     unavailable = set()
     owners = {}
@@ -725,16 +733,19 @@ def _scan_process_owners(proc_root, relevant_listener_inodes):
 
         cgroup_matches = before_cgroup == after_cgroup
         cgroup_reviewed = before_cgroup[2] and cgroup_matches
-        executable_reviewed = (
-            before["canonical_executable"] != UNREVIEWED_EXECUTABLE_PATH
-        )
+        executable = before["canonical_executable"]
+        if ubuntu26 and cgroup_reviewed:
+            candidate = UBUNTU26_SERVICE_PATHS_BY_DIGEST.get(before["_executable_path_fingerprint"])
+            if _ubuntu26_service_owner(before["uid"], before["executable_basename"], candidate, before_cgroup[0]):
+                executable = candidate
+        executable_reviewed = executable != UNREVIEWED_EXECUTABLE_PATH
         identity_complete = cgroup_reviewed and executable_reviewed
         if is_root_container and not cgroup_matches:
             unavailable.add("cgroup_identity")
         identity = {
             "uid": before["uid"],
             "executable_basename": before["executable_basename"],
-            "canonical_executable": before["canonical_executable"],
+            "canonical_executable": executable,
             "unified_cgroup": before_cgroup[0],
             "_executable_path_fingerprint": before[
                 "_executable_path_fingerprint"
@@ -1082,7 +1093,7 @@ def _read_listener_tables(proc_root):
 
 
 def _collect_snapshot(
-    proc_root=pathlib.Path("/proc"), filesystem_socket_access=None
+    proc_root=pathlib.Path("/proc"), filesystem_socket_access=None, ubuntu26=False
 ):
     unix_rows, tcp_rows, malformed_rows, table_unavailable = _read_listener_tables(
         proc_root
@@ -1099,7 +1110,7 @@ def _collect_snapshot(
         process_unavailable,
         _,
         _,
-    ) = _scan_process_owners(proc_root, relevant_listener_inodes)
+    ) = _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26)
     unavailable = set(table_unavailable) | set(process_unavailable)
 
     unix_listeners = []
@@ -1471,11 +1482,11 @@ def _security_relevant_private_stability_key(snapshot):
 
 
 def observe_local_control_inventory(
-    filesystem_socket_access=None, sample=None, sleeper=time.sleep
+    filesystem_socket_access=None, sample=None, sleeper=time.sleep, ubuntu26=False
 ):
     if sample is None:
         sample = lambda: _collect_snapshot(
-            filesystem_socket_access=filesystem_socket_access
+            filesystem_socket_access=filesystem_socket_access, ubuntu26=ubuntu26
         )
     last = None
     for attempt in range(1, STABILITY_ATTEMPTS + 1):
@@ -1538,7 +1549,22 @@ def _reviewed_reported_path(value):
     return value == UNREVIEWED_EXECUTABLE_PATH or value in REVIEWED_EXECUTABLE_PATHS
 
 
+def _ubuntu26_service_owner(uid, basename, executable, cgroup):
+    return (
+        uid == 0
+        and isinstance(executable, str)
+        and executable in UBUNTU26_ROOT_SERVICES
+        and basename == os.path.basename(executable)
+        and cgroup == UBUNTU26_ROOT_SERVICES[executable]
+    )
+
+
 def _owner_identity_reviewed(owner):
+    if owner["canonical_executable"] in UBUNTU26_ROOT_SERVICES:
+        return _ubuntu26_service_owner(
+            owner["uid"], owner["executable_basename"],
+            owner["canonical_executable"], owner["unified_cgroup"],
+        )
     return (
         owner["canonical_executable"] in REVIEWED_EXECUTABLE_PATHS
         and reviewed_cgroup(owner["unified_cgroup"])
@@ -1975,14 +2001,19 @@ def validate_schema4_observation(observation):
         ):
             raise ValueError("schema 4 absent ancestor state is invalid")
 
-    validate_local_control_inventory(observation["local_control_inventory"])
+    host = observation["host"]
+    validate_local_control_inventory(
+        observation["local_control_inventory"],
+        ubuntu26=(host["os_id"], host["os_version_id"], host["architecture"])
+        == ("ubuntu", "26.04", "x86_64"),
+    )
     encoded = json.dumps(observation, sort_keys=True, separators=(",", ":")).encode()
     if len(encoded) > MAX_SCHEMA4_OUTPUT_BYTES:
         raise ValueError("schema 4 observation exceeds its output bound")
     return observation
 
 
-def _validate_owner(owner):
+def _validate_owner(owner, ubuntu26=False):
     expected = {
         "uid",
         "executable_basename",
@@ -2003,7 +2034,11 @@ def _validate_owner(owner):
     ):
         raise ValueError("local control owner basename is invalid")
     executable = owner["canonical_executable"]
-    if not _reviewed_reported_path(executable):
+    if not _reviewed_reported_path(executable) and not (
+        ubuntu26 and _ubuntu26_service_owner(
+            owner["uid"], owner["executable_basename"], executable, owner["unified_cgroup"]
+        )
+    ):
         raise ValueError("local control owner executable is invalid")
     if owner["unified_cgroup"] != UNREVIEWED_CGROUP and not reviewed_cgroup(
         owner["unified_cgroup"]
@@ -2016,11 +2051,11 @@ def _validate_owner(owner):
         raise ValueError("local control owner process state is invalid")
 
 
-def _validate_owner_list(owners):
+def _validate_owner_list(owners, ubuntu26=False):
     if not isinstance(owners, list) or len(owners) > MAX_SOCKET_OWNERS:
         raise ValueError("local control owner set is invalid")
     for owner in owners:
-        _validate_owner(owner)
+        _validate_owner(owner, ubuntu26)
     if sum(owner["processes"] for owner in owners) > MAX_PROCESSES:
         raise ValueError("local control owner process count exceeded its bound")
     if owners != sorted(owners, key=_owner_sort_key):
@@ -2047,7 +2082,7 @@ def _validate_reason_list(value, allowed, label):
         raise ValueError(f"local control {label} set is invalid")
 
 
-def _validate_public_snapshot(snapshot):
+def _validate_public_snapshot(snapshot, ubuntu26=False):
     expected_fields = {
         "scan_status",
         "bounds_exceeded",
@@ -2162,7 +2197,7 @@ def _validate_public_snapshot(snapshot):
             or not _is_integer(listener["instances"], 1)
         ):
             raise ValueError("local control Unix listener value is invalid")
-        _validate_owner_list(listener["owners"])
+        _validate_owner_list(listener["owners"], ubuntu26)
         if listener["ownership_complete"] and (
             not listener["owners"]
             or not all(_owner_identity_reviewed(owner) for owner in listener["owners"])
@@ -2207,7 +2242,7 @@ def _validate_public_snapshot(snapshot):
             or not _is_integer(listener["instances"], 1)
         ):
             raise ValueError("local control TCP listener value is invalid")
-        _validate_owner_list(listener["owners"])
+        _validate_owner_list(listener["owners"], ubuntu26)
         if listener["ownership_complete"] and (
             not listener["owners"]
             or not all(_owner_identity_reviewed(owner) for owner in listener["owners"])
@@ -2245,7 +2280,7 @@ def _validate_public_snapshot(snapshot):
         raise ValueError("local control inventory summary is inconsistent")
 
 
-def validate_local_control_inventory(inventory):
+def validate_local_control_inventory(inventory, ubuntu26=False):
     if not isinstance(inventory, dict):
         raise ValueError("local control inventory is missing")
     if set(inventory) != {
@@ -2273,7 +2308,7 @@ def validate_local_control_inventory(inventory):
     if inventory.get("limits") != observation_limits():
         raise ValueError("local control inventory limits are invalid")
     snapshot = inventory.get("snapshot")
-    _validate_public_snapshot(snapshot)
+    _validate_public_snapshot(snapshot, ubuntu26)
     scan_status = snapshot.get("scan_status")
     expected_status = {
         "within_bounds": "stable",
@@ -2805,6 +2840,46 @@ class HostObservationTests(unittest.TestCase):
             self.assertEqual(
                 [owner["uid"] for owner in _public_owners(owners)], [0, 101]
             )
+
+    def test_ubuntu26_service_observation_requires_the_exact_service_owner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            proc_root = pathlib.Path(temp)
+            entry = proc_root / "100"
+            (entry / "fd").mkdir(parents=True)
+            (entry / "fd/3").symlink_to("socket:[42]")
+            for service_path, service_unit in UBUNTU26_ROOT_SERVICES.items():
+                basename = os.path.basename(service_path)
+                for ubuntu26, uid, path, cgroup, expected in (
+                    (True, 0, service_path, service_unit, True),
+                    (False, 0, service_path, service_unit, False),
+                    (True, 101, service_path, service_unit, False),
+                    (True, 0, f"/tmp/{basename}", service_unit, False),
+                    (True, 0, service_path, "/init.scope", False),
+                ):
+                    with self.subTest(ubuntu26=ubuntu26, uid=uid, path=path, cgroup=cgroup):
+                        (entry / "cgroup").write_text(f"0::{cgroup}\n", encoding="utf-8")
+                        observation = self._process_observation_fixture(
+                            uid=uid, basename=basename, executable=path
+                        )
+                        observation["canonical_executable"] = UNREVIEWED_EXECUTABLE_PATH
+                        with mock.patch.object(
+                            os.sys.modules[__name__], "_process_observation", return_value=observation
+                        ):
+                            result = _scan_process_owners(proc_root, {42}, ubuntu26)
+                        owners, truncated = _bounded_owners(result[0], 42, set())
+                        self.assertEqual(
+                            _socket_ownership_complete(42, owners, truncated, result[1]),
+                            expected,
+                        )
+                        owner, = _public_owners(owners)
+                        self.assertEqual(
+                            owner["canonical_executable"],
+                            service_path if expected else UNREVIEWED_EXECUTABLE_PATH,
+                        )
+                        _validate_owner(owner, ubuntu26)
+                        if expected:
+                            with self.assertRaises(ValueError):
+                                _validate_owner(owner, False)
 
     def test_public_host_strings_are_reviewed_or_reduced(self):
         self.assertEqual(public_runner_group_name("docker"), "docker")

@@ -59,7 +59,6 @@ if helper_spec is None or helper_spec.loader is None:
 helper = importlib.util.module_from_spec(helper_spec)
 helper_spec.loader.exec_module(helper)
 observe_local_control_inventory = helper.observe_local_control_inventory
-validate_local_control_inventory = helper.validate_local_control_inventory
 validate_schema4_observation = helper.validate_schema4_observation
 bounded_command_output = helper.bounded_command_output
 bounded_directory_entries = helper.bounded_directory_entries
@@ -639,10 +638,6 @@ def validate_result(result):
         fail("hosted-runner observation policy source bound mismatch")
     for item in policy_sources:
         validate_metadata_fields(item)
-    try:
-        validate_local_control_inventory(result.get("local_control_inventory"))
-    except ValueError as error:
-        fail(f"hosted-runner local control observation is invalid: {error}")
     encoded = json.dumps(result, sort_keys=True, separators=(",", ":"))
     if len(encoded.encode("utf-8")) > MAX_OUTPUT_BYTES:
         fail("hosted-runner observation exceeds its output bound")
@@ -755,7 +750,9 @@ result = {
     "local_control_inventory": observe_local_control_inventory(
         filesystem_socket_access=lambda path: runner_access(
             path, os.W_OK, identity
-        )
+        ),
+        ubuntu26=(os_identity["id"], os_identity["version_id"], platform.machine())
+        == ("ubuntu", "26.04", "x86_64"),
     ),
     "next_step": "review_closed_host_invariants_before_any_enforcement_change",
 }

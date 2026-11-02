@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+pub(crate) mod ubuntu26;
+
 use serde::Serialize;
 
 pub const HOSTED_RUNNER_FINGERPRINT_SCHEMA_VERSION: u32 = 3;
@@ -37,8 +40,8 @@ pub(crate) fn reviewed_ubuntu_version(contents: &str) -> Option<&str> {
         if !matches!(key, "ID" | "VERSION_ID") {
             continue;
         }
-        let value = if value.starts_with('"') {
-            let value = value.strip_prefix('"')?.strip_suffix('"')?;
+        let value = if let Some(quoted) = value.strip_prefix('"') {
+            let value = quoted.strip_suffix('"')?;
             if value.contains('"') {
                 return None;
             }
@@ -575,6 +578,20 @@ mod tests {
         ] {
             assert!(!reviewed_ubuntu_os_release(contents));
         }
+    }
+
+    #[test]
+    fn release_selection_preserves_the_exact_reviewed_version() {
+        for year in 0..=99 {
+            let version = format!("{year:02}.04");
+            let release = format!("ID=ubuntu\nVERSION_ID=\"{version}\"\n");
+            let expected = ((24..=40).contains(&year) && year % 2 == 0).then_some(version.as_str());
+            assert_eq!(reviewed_ubuntu_version(&release), expected);
+        }
+        assert_eq!(
+            reviewed_ubuntu_version("VERSION_ID=26.04\nID=\"ubuntu\"\n"),
+            Some("26.04")
+        );
     }
 
     #[test]

@@ -782,13 +782,14 @@ fn verify_test_local_control_inventory(
         Path::new("/proc"),
         &socket_access,
         &NoCurrentFenceOwner,
+        executables.contains(TrustedExecutable::ClassicSudo),
         MissingOwnerRetry::Never,
         None,
     );
     verify_reviewed_local_control_observation(
-        &hosted_runner_fingerprint_requirement()
-            .accepted
-            .local_control_inventory,
+        &executables
+            .reviewed_local_control_inventory()
+            .map_err(|error| LockdownError::new(error.code, error.message))?,
         &observed,
     )
     .map_err(|error| LockdownError::new(error.code, error.message))
@@ -1892,7 +1893,10 @@ fn verify_container_runtime_unavailable(
     let fence_owner = PinnedCurrentFenceOwner::capture(Path::new("/proc"))
         .map_err(|error| LockdownError::new(error.code, error.message))?;
     let host = hosted_runner_fingerprint_requirement().accepted;
-    let mut accepted = accepted_local_control_snapshot(&host.local_control_inventory)
+    let inventory = executables
+        .reviewed_local_control_inventory()
+        .map_err(|error| LockdownError::new(error.code, error.message))?;
+    let mut accepted = accepted_local_control_snapshot(&inventory)
         .map_err(|error| LockdownError::new(error.code, error.message))?;
     let (retry, startup_check) = match check {
         DockerCheck::Startup(check) => {
@@ -1905,6 +1909,7 @@ fn verify_container_runtime_unavailable(
         Path::new("/proc"),
         &socket_access,
         &fence_owner,
+        executables.contains(TrustedExecutable::ClassicSudo),
         retry,
         startup_check,
     );

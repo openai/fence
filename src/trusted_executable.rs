@@ -1,7 +1,7 @@
 mod ubuntu26;
 
 use crate::hosted_runner::{
-    AcceptedPermissionAncestorV2, AcceptedTrustedExecutableV2,
+    AcceptedLocalControlInventoryV2, AcceptedPermissionAncestorV2, AcceptedTrustedExecutableV2,
     hosted_runner_fingerprint_requirement, reviewed_ubuntu_version,
 };
 use serde::Serialize;
@@ -441,6 +441,40 @@ impl TrustedExecutableSet {
     }
 
     pub(crate) fn reviewed_resolver_identity(&self) -> Result<(u32, u32), TrustedExecutableError> {
+        let passwd = self.reviewed_passwd()?;
+        let runner = reviewed_account_identity(&passwd, RUNNER_PRINCIPAL)?;
+        let resolver = reviewed_account_identity(&passwd, RESOLVER_PRINCIPAL)?;
+        if runner.0 == resolver.0 {
+            return Err(TrustedExecutableError::unavailable());
+        }
+        Ok(resolver)
+    }
+
+    pub(crate) fn reviewed_local_control_inventory(
+        &self,
+    ) -> Result<AcceptedLocalControlInventoryV2, TrustedExecutableError> {
+        let mut accepted = hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        if self.ubuntu26.is_some() {
+            let passwd = self.reviewed_passwd()?;
+            // Account parsing rejects aliases and UID zero. Neither service may be the runner.
+            reviewed_account_identity(&passwd, RUNNER_PRINCIPAL)?;
+            let (network_uid, _) = reviewed_account_identity(&passwd, "systemd-network")?;
+            let (resolver_uid, _) = reviewed_account_identity(&passwd, RESOLVER_PRINCIPAL)?;
+            if network_uid >= 1000 || resolver_uid >= 1000 {
+                return Err(TrustedExecutableError::unavailable());
+            }
+            crate::hosted_runner::ubuntu26::extend_inventory(
+                &mut accepted,
+                network_uid,
+                resolver_uid,
+            );
+        }
+        Ok(accepted)
+    }
+
+    fn reviewed_passwd(&self) -> Result<Vec<u8>, TrustedExecutableError> {
         self.verify_all()?;
         let etc = open_reviewed_directory("/etc")?;
         if etc.metadata.uid() != ROOT_UID
@@ -449,13 +483,7 @@ impl TrustedExecutableSet {
         {
             return Err(TrustedExecutableError::unavailable());
         }
-        let (_, passwd) = read_reviewed_host_file(&etc.descriptor, "passwd")?;
-        let runner = reviewed_account_identity(&passwd, RUNNER_PRINCIPAL)?;
-        let resolver = reviewed_account_identity(&passwd, RESOLVER_PRINCIPAL)?;
-        if runner.0 == resolver.0 {
-            return Err(TrustedExecutableError::unavailable());
-        }
-        Ok(resolver)
+        read_reviewed_host_file(&etc.descriptor, "passwd").map(|(_, contents)| contents)
     }
 
     pub(crate) fn verify_all(&self) -> Result<(), TrustedExecutableError> {
