@@ -865,7 +865,9 @@ fn proc_endpoint(address: &IpAddr, port: u16, family: SocketFamily) -> String {
             .collect::<String>(),
         (IpAddr::V6(address), SocketFamily::Ipv6) => address
             .octets()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|chunk| chunk.iter().rev())
             .map(|byte| format!("{byte:02X}"))
             .collect::<String>(),
