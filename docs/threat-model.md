@@ -8,7 +8,7 @@ Fence uses a schema-`9` policy and schema-`5` runtime evidence. The `main` branc
 
 ## Executive summary
 
-Fence protects GitHub-hosted x64 jobs running `ubuntu-24.04` or `ubuntu-latest` when it runs as the first workflow step. Releases test block and audit modes on both runner labels. Fence verifies the runner's security controls instead of requiring a fixed image fingerprint.
+Fence protects GitHub-hosted x64 jobs running `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest` when it runs as the first workflow step. Releases test block and audit modes on all three runner labels. Fence verifies the runner's security controls instead of requiring a fixed image fingerprint.
 
 The main risks are how Fence starts its root-owned agent, translates DNS responses into firewall rules, removes sudo and container access, and verifies its post-job evidence. Fence limits outbound network access, but it cannot stop data from being sent to allowed GitHub services, user-approved destinations, or services sharing an allowed IP address.
 
@@ -25,8 +25,8 @@ Fence covers:
 
 This threat model assumes:
 
-- Fence runs before checkout, setup, or other untrusted workflow steps.
-- The runner is an ephemeral GitHub-hosted x64 job using `ubuntu-24.04` or `ubuntu-latest` and meets Fence's runner security requirements.
+- Fence runs before checkout, setup, or other untrusted workflow steps. On Ubuntu 26.04 this ordering also prevents earlier workflow code from retaining a connection to a privileged Unix socket before block mode restricts new connections.
+- The runner is an ephemeral GitHub-hosted x64 job using `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest` and meets Fence's runner security requirements.
 - The hosted image and privileged platform processes have not replaced a trusted executable before Fence captures it. Fence verifies executable identity after capture; it does not authenticate earlier file contents.
 - Later workflow steps can run arbitrary commands as the unprivileged `runner` user and may have access to credentials or sensitive source code.
 - The Linux kernel, GitHub runner control plane, hosted image supply chain, and GitHub Actions service are trusted.
@@ -70,7 +70,7 @@ Adding runner types, supporting job containers, or changing the default GitHub p
 - **Kernel NFLOG -> resident agent:** Group `4242` copies at most 64 packet bytes. Fence extracts approved endpoint metadata and discards the raw bytes (`src/nflog.rs`, `src/findings.rs`).
 - **Finding -> attribution worker:** A queue of up to 128 requests matches local sockets against bounded `/proc` snapshots. Reports include only attribution status, actor class, PID, executable name, and up to four parent executable names (`src/attribution.rs`).
 - **Resident agent -> post hook:** The runner can read root-owned readiness and report files but cannot modify them. The post hook verifies the live service, worker health, fresh evidence, wildcard records, rejection counters, protected mounts, and runtime identity before trusting a report (`src/runtime.rs`, `action/post.cts`).
-- **Release workflow -> distribution commit:** after all protected checks pass on source commit `M`, the workflow builds the artifact once, assembles the bundle offline, and creates signed child `D` with exactly the two generated bundle files. Full Action acceptance, block and audit checks on both runner labels, and asset attestations precede publication of the immutable tag and `action-release.json`. Fence verifies those published assets and clears the temporary refs before adding the consumer pin to the release notes (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
+- **Release workflow -> distribution commit:** after all protected checks pass on source commit `M`, the workflow builds the artifact once, assembles the bundle offline, and creates signed child `D` with exactly the two generated bundle files. Full Action acceptance, block and audit checks on all three runner labels, and asset attestations precede publication of the immutable tag and `action-release.json`. Fence verifies those published assets and clears the temporary refs before adding the consumer pin to the release notes (`.github/workflows/release.yml`, `script/assemble-action-bundle`).
 
 #### Diagram
 

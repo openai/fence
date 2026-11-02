@@ -11,7 +11,6 @@ use crate::findings::{
     ConnectionEvent, ConnectionEventDrain, ConnectionFinding, FindingCollection,
     bounded_timestamp_now, drain_connection_events,
 };
-use crate::hosted_runner::hosted_runner_fingerprint_requirement;
 use crate::hostname_policy::{
     ExactHostnamePolicy, HostnamePolicyOrigin, HostnameTransport, RuntimeHostnamePolicy,
 };
@@ -2514,6 +2513,7 @@ fn observe_local_control(
         Path::new("/proc"),
         &socket_access,
         current_fence,
+        executables.contains(TrustedExecutable::ClassicSudo),
         retry,
         startup_check,
     )
@@ -2522,9 +2522,9 @@ fn observe_local_control(
 fn verify_pre_activation_local_control(
     executables: &TrustedExecutableSet,
 ) -> Result<LocalControlSnapshot, DnsMediationError> {
-    let accepted = hosted_runner_fingerprint_requirement()
-        .accepted
-        .local_control_inventory;
+    let accepted = executables
+        .reviewed_local_control_inventory()
+        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
     let expected = accepted_local_control_snapshot(&accepted).map_err(local_control_error)?;
     let observed = observe_local_control(
         executables,
@@ -2540,10 +2540,31 @@ fn establish_local_control_baseline(
     mediation: &DnsMediationSession,
     posture: LockdownPosture,
     initial: &LocalControlSnapshot,
+    lockdown: Option<&SystemLockdownControl>,
 ) -> Result<LocalControlSnapshot, DnsMediationError> {
-    let accepted_inventory = hosted_runner_fingerprint_requirement()
-        .accepted
-        .local_control_inventory;
+    let accepted_inventory = mediation
+        .routing
+        .executables
+        .reviewed_local_control_inventory()
+        .map_err(|error| DnsMediationError::new(error.code, error.message))?;
+    let projected;
+    let initial = if posture != LockdownPosture::Audit
+        && mediation.routing.executables.uses_ubuntu26_layout()
+    {
+        lockdown
+            .ok_or_else(|| {
+                DnsMediationError::new(
+                    "local_control_inventory_incomplete",
+                    "host control sockets were not restricted",
+                )
+            })?
+            .verify_socket_seals()
+            .map_err(lockdown_error)?;
+        projected = initial.clone().without_sealed_ubuntu26_sockets();
+        &projected
+    } else {
+        initial
+    };
     let retry = match posture {
         LockdownPosture::StandardBlock => {
             MissingOwnerRetry::AfterLockdown(&accepted_inventory, initial)
@@ -2553,6 +2574,21 @@ fn establish_local_control_baseline(
         }
     };
     let observed = mediation.observe_local_control(retry, Some(StartupCheck::PostLockdownBaseline));
+    if posture != LockdownPosture::Audit
+        && mediation.routing.executables.uses_ubuntu26_layout()
+        && observed.snapshot.unix_listeners.iter().any(|listener| {
+            crate::hosted_runner::ubuntu26::CONTROL_SOCKETS
+                .iter()
+                .any(|entry| {
+                    entry.name_sha256 == listener.name_sha256 && entry.requires_block_seal()
+                })
+        })
+    {
+        return Err(DnsMediationError::new(
+            "local_control_inventory_additive_drift",
+            "an isolated host control endpoint remains reachable",
+        ));
+    }
     match posture {
         LockdownPosture::StandardBlock => {
             verify_no_additive_local_control_since(&accepted_inventory, initial, &observed)
@@ -2653,6 +2689,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 &mediation,
                 LockdownPosture::Audit,
                 initial_local_control,
+                None,
             )
         })();
         let local_control_baseline = match setup_result {
@@ -3049,6 +3086,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 &mediation,
                 scope.lockdown_posture(),
                 initial_local_control,
+                Some(&lockdown),
             )
         })();
         let local_control_baseline = match setup_result {
@@ -3085,7 +3123,10 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
+        evidence.resident_health = match lockdown
+            .verify_socket_seals()
+            .map_err(lockdown_error)
+            .and_then(|()| mediation.verify_before_readiness(&local_control_baseline))
         {
             Ok(health) => health,
             Err(error) => {

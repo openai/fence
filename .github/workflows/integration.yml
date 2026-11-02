@@ -36,14 +36,19 @@ jobs:
         run: script/validate-locks --ci
 
   lockdown:
-    name: lockdown ${{ matrix.scenario }} evidence
+    name: lockdown ${{ matrix.scenario }} evidence${{ matrix.label_suffix }}
     needs: preflight
     strategy:
       fail-fast: false
       matrix:
         scenario: [acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]
+        runner: [ubuntu-24.04]
+        include:
+          - scenario: rollback
+            runner: ubuntu-26.04
+            label_suffix: ' (ubuntu-26.04)'
     timeout-minutes: 8
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: checkout
@@ -65,6 +70,8 @@ jobs:
         run: script/test-privileged
 
       - name: test lockdown evidence
+        env:
+          REQUIRE_UBUNTU26_ROLLBACK: ${{ matrix.runner == 'ubuntu-26.04' }}
         run: script/test-lockdown "${{ matrix.scenario }}"
 
   selected-profile-runtime:

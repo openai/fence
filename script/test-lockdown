@@ -57,6 +57,14 @@ report="$runtime_root/$invocation/report.json"
 
 test_environment=()
 acl_fixture=""
+if [[ "${REQUIRE_UBUNTU26_ROLLBACK:-false}" == "true" ]]; then
+  [[ "$scenario" == "rollback" ]] || die "socket rollback evidence requires an injected failure"
+  original_sockets="$(python3 -E script/lib/ubuntu26_socket_evidence.py rollback)"
+  for provider in /usr/bin/sudo /usr/bin/sudo.ws; do
+    "$provider" --non-interactive --reset-timestamp /usr/bin/true >/dev/null
+  done
+  docker ps --quiet >/dev/null
+fi
 if [[ "$scenario" == "acl-reject" ]]; then
   for required in /usr/bin/install /usr/bin/rmdir /usr/bin/setfacl; do
     if [[ ! -x "$required" ]]; then
@@ -141,6 +149,14 @@ elif scenario == "rollback":
     )
     require(rollback_error_code == "none", f"rollback error: {rollback_error_code}")
 PY
+
+if [[ "${REQUIRE_UBUNTU26_ROLLBACK:-false}" == "true" ]]; then
+  restored_sockets="$(python3 -E script/lib/ubuntu26_socket_evidence.py rollback)"
+  [[ "$restored_sockets" == "$original_sockets" ]] || die "socket rollback did not restore the original inodes, mounts and permissions"
+  for provider in /usr/bin/sudo /usr/bin/sudo.ws; do
+    "$provider" --non-interactive --reset-timestamp /usr/bin/true >/dev/null
+  done
+fi
 
 if [[ -n "$acl_fixture" ]]; then
   sudo /usr/bin/rmdir "$acl_fixture"

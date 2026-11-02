@@ -5,7 +5,7 @@
 [![build](https://github.com/openai/fence/actions/workflows/build.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/build.yml)
 [![acceptance](https://github.com/openai/fence/actions/workflows/acceptance.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/acceptance.yml)
 [![action acceptance](https://github.com/openai/fence/actions/workflows/action-acceptance.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/action-acceptance.yml)
-[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)
+[![released action canaries](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)
 [![main / ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)
 [![integration](https://github.com/openai/fence/actions/workflows/integration.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/integration.yml)
 
@@ -27,7 +27,7 @@ jobs:
       - run: script/test
 ```
 
-Copy the full commit SHA and version comment from the [latest verified release](https://github.com/openai/fence/releases/latest). Fence supports GitHub-hosted `ubuntu-24.04` and `ubuntu-latest` x64 runners. If Fence stops working on an unchanged workflow, check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22).
+Copy the full commit SHA and version comment from the [latest verified release](https://github.com/openai/fence/releases/latest). Fence supports GitHub-hosted x64 runners on `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest`. For `ubuntu-26.04`, choose a release whose block and audit checks passed on that label. If Fence stops working on an unchanged workflow, check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22).
 
 By default, Fence:
 
@@ -140,7 +140,7 @@ See [Network reports](docs/how-it-works.md#network-reports) for an example.
 
 Fence makes it harder for later workflow steps to send data to unexpected destinations or undo the runner's network restrictions. It is not a full sandbox.
 
-- **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`. Fence checks the runner's security controls instead of rejecting routine image updates.
+- **Supported runners:** GitHub-hosted x64 jobs using `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest`. Fence checks the runner's security controls instead of rejecting routine image updates.
 - **Built-in connections:** GitHub Actions, job reporting, and the hosted runner still need a small set of GitHub and Azure connections.
 - **UDP:** Block mode stops outgoing packets when their allowance ends, even from the same source port. Audit mode reports those packets without blocking them. Replies to allowed requests still work.
 - **Azure platform:** Azure Instance Metadata Service remains reachable at `169.254.169.254:80`. In block mode, only root-owned host sockets can reach Azure WireServer. Neither service needs an allowlist entry.

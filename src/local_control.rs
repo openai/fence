@@ -1,3 +1,4 @@
+use crate::hosted_runner::ubuntu26;
 use crate::hosted_runner::{
     AcceptedLocalControlInventoryV2, AcceptedLocalControlOwnerV2, AcceptedSocketV2,
     UNIX_NAME_HASH_SCHEMA_V1,
@@ -209,8 +210,15 @@ pub struct TcpListener {
     pub instances: u32,
 }
 
+type EndpointPins = BTreeMap<PublicEndpointKey, BTreeMap<u64, BTreeSet<ProcessPin>>>;
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct LocalControlSnapshot {
+    // Kept in memory only. Synthetic reference inventories have no host pins.
+    #[serde(skip)]
+    ubuntu26_pins: EndpointPins,
+    #[serde(skip)]
+    ubuntu26: bool,
     pub scan_status: ScanStatus,
     pub bounds_exceeded: Vec<BoundReason>,
     pub unavailable_inputs: Vec<UnavailableReason>,
@@ -225,6 +233,20 @@ pub struct LocalControlSnapshot {
 }
 
 impl LocalControlSnapshot {
+    pub(crate) fn without_sealed_ubuntu26_sockets(mut self) -> Self {
+        let sealed = |digest: &str| {
+            ubuntu26::CONTROL_SOCKETS
+                .iter()
+                .any(|entry| entry.name_sha256 == digest && entry.requires_block_seal())
+        };
+        self.unix_listeners
+            .retain(|socket| !sealed(&socket.name_sha256));
+        self.ubuntu26_pins.retain(
+            |key, _| !matches!(key, PublicEndpointKey::Unix(_, _, digest) if sealed(digest)),
+        );
+        self
+    }
+
     pub(crate) fn without_container_controls(mut self, sockets: &[AcceptedSocketV2]) -> Self {
         self.root_container_processes.clear();
         // Systemd can hold a reachable control socket before the daemon starts.
@@ -438,14 +460,14 @@ impl PinnedCurrentFenceOwner {
     pub fn capture(proc_root: &Path) -> Result<Self, LocalControlVerificationError> {
         let pid = std::process::id();
         let process_root = proc_root.join(pid.to_string());
-        let before = observe_process(&process_root).map_err(|_| {
+        let before = observe_process(&process_root, false, 0).map_err(|_| {
             verification_error(
                 LocalControlVerificationErrorKind::Unavailable,
                 "local_control_current_process_unavailable",
                 "current Fence process identity could not be pinned",
             )
         })?;
-        let after = observe_process(&process_root).map_err(|_| {
+        let after = observe_process(&process_root, false, 0).map_err(|_| {
             verification_error(
                 LocalControlVerificationErrorKind::Unavailable,
                 "local_control_current_process_unavailable",
@@ -599,6 +621,9 @@ fn lockdown_removals_match(
     snapshot: &LocalControlSnapshot,
     owners: Owners,
 ) -> bool {
+    if !owners.pins_match(&accepted.ubuntu26_pins, &snapshot.ubuntu26_pins) {
+        return false;
+    }
     let reviewed_containers = &accepted.root_container_processes;
     let mut accepted_unix_projection =
         non_container_unix_projection(&accepted.unix_listeners, reviewed_containers);
@@ -661,7 +686,12 @@ fn reviewed_inventory_subset(
         &observed.root_container_processes,
         &accepted.root_container_processes,
     ) && tcp_listeners_are_subset(&observed.tcp_listeners, &accepted.tcp_listeners, owners)
-        && unix_listeners_are_subset(&observed.unix_listeners, &accepted.unix_listeners, owners)
+        && unix_listeners_are_subset(
+            &observed.unix_listeners,
+            &accepted.unix_listeners,
+            owners,
+            accepted.ubuntu26,
+        )
 }
 
 fn non_container_tcp_projection(
@@ -742,11 +772,24 @@ fn tcp_listeners_are_subset(
             item.instances == 0
                 || !accepted.iter().any(|expected| {
                     same_tcp_key(item, expected)
-                        && owners.match_subset(
-                            item.ownership_complete,
-                            &item.owners,
-                            &expected.owners,
-                        )
+                        && if expected
+                            .owners
+                            .iter()
+                            .any(|owner| owner.canonical_executable == ubuntu26::SSHD_PATH)
+                        {
+                            item.instances == 1
+                                && owners.match_exact(
+                                    item.ownership_complete,
+                                    &item.owners,
+                                    &expected.owners,
+                                )
+                        } else {
+                            owners.match_subset(
+                                item.ownership_complete,
+                                &item.owners,
+                                &expected.owners,
+                            )
+                        }
                 })
         })
     {
@@ -764,6 +807,7 @@ fn unix_listeners_are_subset(
     observed: &[UnixListener],
     accepted: &[UnixListener],
     owners: Owners,
+    ubuntu26: bool,
 ) -> bool {
     if contains_duplicate_unix_key(accepted)
         || contains_duplicate_unix_key(observed)
@@ -772,11 +816,25 @@ fn unix_listeners_are_subset(
                 || !item.runner_reachable
                 || !accepted.iter().any(|expected| {
                     same_unix_key(item, expected)
-                        && (owners.match_subset(
-                            item.ownership_complete,
-                            &item.owners,
-                            &expected.owners,
-                        ) || reviewed_uuidd_transition(expected, item))
+                        && if (ubuntu26
+                            && expected.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256)
+                            || ubuntu26::CONTROL_SOCKETS
+                                .iter()
+                                .any(|entry| entry.name_sha256 == expected.name_sha256)
+                        {
+                            item.instances == 1
+                                && owners.match_exact(
+                                    item.ownership_complete,
+                                    &item.owners,
+                                    &expected.owners,
+                                )
+                        } else {
+                            owners.match_subset(
+                                item.ownership_complete,
+                                &item.owners,
+                                &expected.owners,
+                            ) || reviewed_uuidd_transition(expected, item)
+                        }
                 })
         })
     {
@@ -834,8 +892,36 @@ enum Owners {
 }
 
 impl Owners {
+    fn pins_match(self, expected: &EndpointPins, observed: &EndpointPins) -> bool {
+        if expected == observed {
+            return true;
+        }
+        // Startup may retry a wholly ownerless listener, but its kernel socket must
+        // still be the same. Every other listener keeps its exact process pins.
+        matches!(self, Self::ForRetryOnly)
+            && expected.keys().eq(observed.keys())
+            && expected.iter().all(|(key, sockets)| {
+                let current = &observed[key];
+                sockets == current
+                    || sockets.keys().eq(current.keys()) && current.values().all(BTreeSet::is_empty)
+            })
+    }
+
     fn missing(self, complete: bool, owners: &[LocalControlOwner]) -> bool {
         matches!(self, Self::ForRetryOnly) && !complete && owners.is_empty()
+    }
+
+    fn match_exact(
+        self,
+        complete: bool,
+        observed: &[LocalControlOwner],
+        expected: &[LocalControlOwner],
+    ) -> bool {
+        self.missing(complete, observed)
+            || complete
+                && !expected.is_empty()
+                && observed.len() == expected.len()
+                && expected.iter().all(|owner| observed.contains(owner))
     }
 
     fn match_subset(
@@ -1076,6 +1162,8 @@ pub fn accepted_local_control_snapshot(
         return Err(invalid_accepted_fingerprint());
     }
     Ok(LocalControlSnapshot {
+        ubuntu26: accepted.ubuntu26,
+        ubuntu26_pins: BTreeMap::new(),
         scan_status: ScanStatus::WithinBounds,
         bounds_exceeded: Vec::new(),
         unavailable_inputs: Vec::new(),
@@ -1177,7 +1265,8 @@ fn local_control_snapshots_match(
     accepted: &LocalControlSnapshot,
     observed: &LocalControlSnapshot,
 ) -> bool {
-    accepted.scan_status == observed.scan_status
+    accepted.ubuntu26_pins == observed.ubuntu26_pins
+        && accepted.scan_status == observed.scan_status
         && accepted.bounds_exceeded == observed.bounds_exceeded
         && accepted.unavailable_inputs == observed.unavailable_inputs
         && accepted.malformed_row_count == observed.malformed_row_count
@@ -1333,6 +1422,7 @@ struct ExcludedUnixListener {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct PrivateSnapshot {
+    ubuntu26: bool,
     bounds_exceeded: BTreeSet<BoundReason>,
     unavailable_inputs: BTreeSet<UnavailableReason>,
     malformed_row_count: u64,
@@ -1370,6 +1460,7 @@ impl PrivateSnapshot {
 
     fn unavailable(reason: UnavailableReason) -> Self {
         Self {
+            ubuntu26: false,
             bounds_exceeded: BTreeSet::new(),
             unavailable_inputs: BTreeSet::from([reason]),
             malformed_row_count: 0,
@@ -1419,11 +1510,20 @@ pub(crate) fn observe_local_control_inventory(
     proc_root: &Path,
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
+    ubuntu26: bool,
     retry: MissingOwnerRetry<'_>,
     startup_check: Option<StartupCheck>,
 ) -> LocalControlObservation {
     let observed = observe_local_control_with(
-        || collect_private_snapshot(proc_root, socket_access, current_fence, read_tcp_listeners),
+        || {
+            collect_private_snapshot(
+                proc_root,
+                socket_access,
+                current_fence,
+                ubuntu26,
+                read_tcp_listeners,
+            )
+        },
         || thread::sleep(Duration::from_millis(STABILITY_INTERVAL_MILLISECONDS)),
         retry,
     );
@@ -1536,7 +1636,8 @@ impl MissingOwnerRetry<'_> {
                     && lockdown_removals_match(policy, initial, snapshot, owners)
             }
             Self::Baseline(expected) => {
-                snapshot.root_container_processes == expected.root_container_processes
+                owners.pins_match(&expected.ubuntu26_pins, &snapshot.ubuntu26_pins)
+                    && snapshot.root_container_processes == expected.root_container_processes
                     && owners.tcp_match(&expected.tcp_listeners, &snapshot.tcp_listeners)
                     && owners.unix_match(&expected.unix_listeners, &snapshot.unix_listeners)
             }
@@ -1603,6 +1704,7 @@ fn collect_private_snapshot(
     proc_root: &Path,
     socket_access: &dyn UnixSocketAccess,
     current_fence: &dyn CurrentFenceOwner,
+    ubuntu26: bool,
     tcp_listeners: impl Fn(
         InternetAddressFamily,
         Instant,
@@ -1663,7 +1765,7 @@ fn collect_private_snapshot(
         .map(|listener| listener.inode)
         .chain(all_tcp.iter().map(|listener| listener.inode))
         .collect::<BTreeSet<_>>();
-    let scan = scan_processes(proc_root, &relevant_inodes);
+    let scan = scan_processes(proc_root, &relevant_inodes, ubuntu26);
     unavailable.extend(scan.unavailable_inputs.iter().copied());
     bounds.extend(scan.bounds_exceeded);
 
@@ -1825,6 +1927,7 @@ fn collect_private_snapshot(
     }
 
     PrivateSnapshot {
+        ubuntu26,
         bounds_exceeded: bounds,
         unavailable_inputs: unavailable,
         malformed_row_count,
@@ -1948,7 +2051,11 @@ struct ProcessScan {
     unavailable_inputs: BTreeSet<UnavailableReason>,
 }
 
-fn scan_processes(proc_root: &Path, relevant_inodes: &BTreeSet<u64>) -> ProcessScan {
+fn scan_processes(
+    proc_root: &Path,
+    relevant_inodes: &BTreeSet<u64>,
+    ubuntu26: bool,
+) -> ProcessScan {
     let mut scan = ProcessScan::default();
     let mut process_entries = match numeric_process_entries(proc_root, &mut scan) {
         Some(entries) => entries,
@@ -1957,7 +2064,7 @@ fn scan_processes(proc_root: &Path, relevant_inodes: &BTreeSet<u64>) -> ProcessS
     process_entries.sort_by_key(|(pid, _)| *pid);
     let mut total_descriptors = 0_usize;
     'processes: for (pid, process_root) in process_entries {
-        let before = match observe_process(&process_root) {
+        let before = match observe_process(&process_root, ubuntu26, pid) {
             Ok(observation) => observation,
             Err(AcquisitionError::Missing) => continue,
             Err(_) => {
@@ -2022,7 +2129,7 @@ fn scan_processes(proc_root: &Path, relevant_inodes: &BTreeSet<u64>) -> ProcessS
             continue;
         }
 
-        let after = match observe_process(&process_root) {
+        let after = match observe_process(&process_root, ubuntu26, pid) {
             Ok(observation) => observation,
             Err(AcquisitionError::Missing) => {
                 mark_process_drift(
@@ -2197,7 +2304,11 @@ fn mark_process_drift(scan: &mut ProcessScan, inodes: &BTreeSet<u64>, scope: Pro
     }
 }
 
-fn observe_process(process_root: &Path) -> Result<ProcessObservation, AcquisitionError> {
+fn observe_process(
+    process_root: &Path,
+    ubuntu26: bool,
+    pid: u32,
+) -> Result<ProcessObservation, AcquisitionError> {
     let process_metadata = fs::metadata(process_root).map_err(acquisition_io)?;
     let stat_contents = read_bounded(&process_root.join("stat"), MAX_PROCESS_FILE_BYTES)?;
     let start_time_ticks = parse_process_start_time(&stat_contents)?;
@@ -2208,14 +2319,56 @@ fn observe_process(process_root: &Path) -> Result<ProcessObservation, Acquisitio
     }
     let executable_target = fs::read_link(executable_link).map_err(acquisition_io)?;
     let executable_bytes = strip_deleted_suffix(executable_target.as_os_str().as_bytes());
+    let mut canonical_executable = reviewed_executable(executable_bytes);
+    if ubuntu26 {
+        let candidate = matches!(
+            executable_bytes,
+            b"/usr/bin/dbus-daemon"
+                | b"/usr/lib/systemd/systemd"
+                | b"/usr/lib/systemd/systemd-journald"
+                | b"/usr/lib/systemd/systemd-resolved"
+                | b"/usr/lib/systemd/systemd-networkd"
+                | b"/usr/lib/systemd/systemd-logind"
+                | b"/usr/sbin/multipathd"
+                | b"/usr/sbin/sshd"
+        );
+        if candidate {
+            let direct = executable_target.as_os_str().as_bytes() == executable_bytes;
+            let is_manager = executable_bytes == b"/usr/lib/systemd/systemd";
+            canonical_executable = if direct
+                && (!is_manager || pid == 1)
+                && packaged_service_matches(&executable_target, &executable_metadata)
+            {
+                executable_target.to_string_lossy().into_owned()
+            } else {
+                UNREVIEWED_EXECUTABLE_PATH.to_owned()
+            };
+        }
+    }
     Ok(ProcessObservation {
         uid: process_metadata.uid(),
         start_time_ticks,
         executable_device: executable_metadata.dev(),
         executable_inode: executable_metadata.ino(),
         executable_basename: safe_basename(executable_bytes),
-        canonical_executable: reviewed_executable(executable_bytes),
+        canonical_executable,
         executable_path_fingerprint: domain_hash(b"fence-executable-path-v1\0", executable_bytes),
+    })
+}
+
+// Compare /proc's live executable to the reviewed file in Fence's host namespace.
+fn packaged_service_matches(path: &Path, live: &fs::Metadata) -> bool {
+    path.ancestors().skip(1).all(|ancestor| {
+        fs::symlink_metadata(ancestor).is_ok_and(|meta| {
+            meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o022 == 0
+        })
+    }) && fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_file()
+            && meta.uid() == 0
+            && meta.gid() == 0
+            && meta.mode() & 0o7777 == 0o755
+            && meta.ino() == live.ino()
+            && meta.dev() == live.dev()
     })
 }
 
@@ -2724,10 +2877,51 @@ fn excluded_unix_sort(
         ))
 }
 
+fn private_endpoint_pins(snapshot: &PrivateSnapshot) -> EndpointPins {
+    let mut pins = EndpointPins::new();
+    if !snapshot.ubuntu26 {
+        return pins;
+    }
+    let mut add = |key, inode, owners: &[PrivateOwner]| {
+        let socket = pins.entry(key).or_default().entry(inode).or_default();
+        for owner in owners {
+            socket.extend(owner.process_pins.iter().cloned());
+        }
+    };
+    for socket in &snapshot.unix_listeners {
+        if socket.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256
+            || ubuntu26::CONTROL_SOCKETS
+                .iter()
+                .any(|entry| entry.name_sha256 == socket.name_sha256)
+        {
+            add(
+                PublicEndpointKey::Unix(
+                    socket.socket_type,
+                    socket.name_kind,
+                    socket.name_sha256.clone(),
+                ),
+                socket.socket_inode,
+                &socket.owners,
+            );
+        }
+    }
+    for socket in &snapshot.tcp_listeners {
+        if socket.bind_class == BindClass::Wildcard && socket.port == 22 {
+            add(
+                PublicEndpointKey::Tcp(socket.family, socket.bind_class, socket.port),
+                socket.socket_inode,
+                &socket.owners,
+            );
+        }
+    }
+    pins
+}
+
 fn public_snapshot(private: PrivateSnapshot) -> LocalControlSnapshot {
     let root_container_processes = aggregate_containers(&private.root_container_processes);
     let unix_listeners = aggregate_unix_listeners(&private.unix_listeners);
     let tcp_listeners = aggregate_tcp_listeners(&private.tcp_listeners);
+    let ubuntu26_pins = private_endpoint_pins(&private);
     let mut unavailable_inputs = private.unavailable_inputs;
     if private.malformed_row_count > 0 {
         unavailable_inputs.insert(UnavailableReason::MalformedRows);
@@ -2769,6 +2963,8 @@ fn public_snapshot(private: PrivateSnapshot) -> LocalControlSnapshot {
         ScanStatus::Unavailable
     };
     LocalControlSnapshot {
+        ubuntu26_pins,
+        ubuntu26: private.ubuntu26,
         scan_status,
         bounds_exceeded: private.bounds_exceeded.into_iter().collect(),
         unavailable_inputs: unavailable_inputs.into_iter().collect(),
@@ -2946,12 +3142,40 @@ fn identities_reviewed(
         .iter()
         .all(root_container_identity_reviewed)
         && unix_listeners.iter().all(|listener| {
-            listener.owners.iter().all(owner_identity_reviewed) || reviewed_uuidd_listener(listener)
+            listener.owners.iter().all(|owner| {
+                owner_identity_reviewed(owner)
+                    || (listener.name_kind == UnixNameKind::Filesystem
+                        && listener.socket_type == UnixSocketType::Stream
+                        && listener.name_sha256 == ubuntu26::LOGIN_SOCKET_SHA256
+                        && exact_root_service(
+                            owner,
+                            "systemd-logind",
+                            ubuntu26::LOGIND_PATH,
+                            ubuntu26::LOGIND_CGROUP,
+                        ))
+            }) || reviewed_uuidd_listener(listener)
         })
-        && tcp_listeners
-            .iter()
-            .flat_map(|listener| &listener.owners)
-            .all(owner_identity_reviewed)
+        && tcp_listeners.iter().all(|listener| {
+            listener.owners.iter().all(|owner| {
+                owner_identity_reviewed(owner)
+                    || (listener.bind_class == BindClass::Wildcard
+                        && listener.port == 22
+                        && exact_root_service(
+                            owner,
+                            "sshd",
+                            ubuntu26::SSHD_PATH,
+                            ubuntu26::SSHD_CGROUP,
+                        ))
+            })
+        })
+}
+
+fn exact_root_service(owner: &LocalControlOwner, basename: &str, path: &str, cgroup: &str) -> bool {
+    owner.uid == 0
+        && owner.processes == 1
+        && owner.executable_basename == basename
+        && owner.canonical_executable == path
+        && owner.unified_cgroup == cgroup
 }
 
 fn root_container_identity_reviewed(process: &RootContainerProcess) -> bool {
@@ -3334,6 +3558,8 @@ mod tests {
             interval_milliseconds: 50,
             limits: LocalControlLimits::reviewed(),
             snapshot: LocalControlSnapshot {
+                ubuntu26: false,
+                ubuntu26_pins: BTreeMap::new(),
                 scan_status: ScanStatus::WithinBounds,
                 bounds_exceeded: Vec::new(),
                 unavailable_inputs: Vec::new(),
@@ -3395,6 +3621,7 @@ mod tests {
 
     fn empty_private() -> PrivateSnapshot {
         PrivateSnapshot {
+            ubuntu26: false,
             bounds_exceeded: BTreeSet::new(),
             unavailable_inputs: BTreeSet::new(),
             malformed_row_count: 0,
@@ -3433,6 +3660,249 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn ubuntu26_additions_require_one_socket_and_each_exact_owner() {
+        let mut inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let previous = accepted_local_control_snapshot(&inventory).unwrap();
+        ubuntu26::extend_inventory(&mut inventory, 998, 997, 995);
+        let expected = accepted_local_control_snapshot(&inventory).unwrap();
+        let mut actual = expected.clone();
+        assert!(reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        assert!(!reviewed_inventory_subset(
+            &previous,
+            &actual,
+            Owners::Required
+        ));
+
+        let login = actual
+            .unix_listeners
+            .iter_mut()
+            .find(|socket| socket.name_sha256 == ubuntu26::LOGIN_SOCKET_SHA256)
+            .unwrap();
+        login.owners.pop().unwrap();
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::ForRetryOnly
+        ));
+        actual = expected.clone();
+        let login = actual
+            .unix_listeners
+            .iter_mut()
+            .find(|socket| socket.name_sha256 == ubuntu26::LOGIN_SOCKET_SHA256)
+            .unwrap();
+        login.instances += 1;
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        actual = expected.clone();
+        let ssh = &mut actual.tcp_listeners[0];
+        ssh.owners[0].processes += 1;
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        actual = expected.clone();
+        actual.tcp_listeners[0].owners.clear();
+        actual.tcp_listeners[0].ownership_complete = false;
+        assert!(reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::ForRetryOnly
+        ));
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+    }
+
+    #[test]
+    fn ubuntu26_system_bus_requires_the_exact_named_account_and_service() {
+        let mut inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let legacy = accepted_local_control_snapshot(&inventory).unwrap();
+        ubuntu26::extend_inventory(&mut inventory, 998, 997, 995);
+        let expected = accepted_local_control_snapshot(&inventory).unwrap();
+        let mut actual = expected.clone();
+        let bus = |row: &&mut UnixListener| {
+            row.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256
+        };
+        let daemon = &mut actual.unix_listeners.iter_mut().find(bus).unwrap().owners[1];
+        assert_eq!(daemon.uid, 995);
+        daemon.uid = 101;
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::ForRetryOnly
+        ));
+        let daemon = &mut actual.unix_listeners.iter_mut().find(bus).unwrap().owners[1];
+        daemon.uid = 995;
+        daemon.unified_cgroup = "/system.slice/other.service".into();
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        actual = expected.clone();
+        actual
+            .unix_listeners
+            .iter_mut()
+            .find(bus)
+            .unwrap()
+            .owners
+            .remove(0);
+        assert!(!reviewed_inventory_subset(
+            &expected,
+            &actual,
+            Owners::Required
+        ));
+        assert_eq!(
+            legacy
+                .unix_listeners
+                .iter()
+                .find(|row| row.name_sha256 == crate::hosted_runner::SYSTEM_BUS_NAME_SHA256)
+                .unwrap()
+                .owners[1]
+                .uid,
+            101
+        );
+    }
+
+    #[test]
+    fn new_root_services_are_reviewed_only_on_their_packaged_endpoint() {
+        let mut inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        ubuntu26::extend_inventory(&mut inventory, 998, 997, 995);
+        let expected = accepted_local_control_snapshot(&inventory).unwrap();
+        let mut login = expected
+            .unix_listeners
+            .into_iter()
+            .find(|socket| socket.name_sha256 == ubuntu26::LOGIN_SOCKET_SHA256)
+            .unwrap();
+        let mut ssh = expected.tcp_listeners[0].clone();
+        assert!(identities_reviewed(
+            &[],
+            std::slice::from_ref(&login),
+            std::slice::from_ref(&ssh)
+        ));
+        login.owners[1].unified_cgroup = "/system.slice/other.service".into();
+        assert!(!identities_reviewed(&[], std::slice::from_ref(&login), &[]));
+        login.owners[1].unified_cgroup = ubuntu26::LOGIND_CGROUP.into();
+        login.name_sha256 = UUIDD_SOCKET_NAME_SHA256.into();
+        assert!(!identities_reviewed(&[], &[login], &[]));
+        let daemon = ssh
+            .owners
+            .iter_mut()
+            .find(|owner| owner.canonical_executable == ubuntu26::SSHD_PATH)
+            .unwrap();
+        daemon.uid = 1001;
+        assert!(!identities_reviewed(&[], &[], std::slice::from_ref(&ssh)));
+        ssh.owners
+            .iter_mut()
+            .find(|owner| owner.canonical_executable == ubuntu26::SSHD_PATH)
+            .unwrap()
+            .uid = 0;
+        ssh.port += 1;
+        assert!(!identities_reviewed(&[], &[], &[ssh]));
+    }
+
+    #[test]
+    fn ubuntu26_pins_survive_only_the_exact_sealed_socket_projection() {
+        let mut private = empty_private();
+        private.ubuntu26 = true;
+        let mut sshd = private_owner(0, true, &[10]);
+        sshd.key.executable_basename = "sshd".into();
+        sshd.key.canonical_executable = ubuntu26::SSHD_PATH.into();
+        sshd.key.unified_cgroup = ubuntu26::SSHD_CGROUP.into();
+        private.tcp_listeners.push(PrivateTcpListener {
+            socket_inode: 123,
+            socket_uid: 0,
+            family: InternetAddressFamily::Ipv4,
+            bind_class: BindClass::Wildcard,
+            port: 22,
+            ownership_complete: true,
+            owners: vec![private_owner(0, true, &[1]), sshd],
+        });
+        private.unix_listeners.push(PrivateUnixListener {
+            socket_inode: 456,
+            socket_type: UnixSocketType::Stream,
+            name_kind: UnixNameKind::Filesystem,
+            name_sha256: ubuntu26::LOGIN_SOCKET_SHA256.into(),
+            ownership_complete: true,
+            owners: vec![private_owner(0, true, &[1])],
+        });
+        for (inode, path) in [
+            (457, "/run/multipathd.socket"),
+            (458, "/run/systemd/resolve.hook/io.systemd.Network"),
+        ] {
+            private.unix_listeners.push(PrivateUnixListener {
+                socket_inode: inode,
+                socket_type: UnixSocketType::Stream,
+                name_kind: UnixNameKind::Filesystem,
+                name_sha256: unix_name_sha256(path.as_bytes()),
+                ownership_complete: true,
+                owners: vec![private_owner(0, true, &[1])],
+            });
+        }
+        let initial = public_snapshot(private.clone());
+        let projected = initial.clone().without_sealed_ubuntu26_sockets();
+        assert_eq!(initial.ubuntu26_pins.len(), 4);
+        assert_eq!(projected.ubuntu26_pins.len(), 3);
+        assert!(
+            !serde_json::to_string(&initial)
+                .unwrap()
+                .contains("ubuntu26_pins")
+        );
+        private.unix_listeners.remove(0);
+        assert!(local_control_snapshots_match(
+            &projected,
+            &public_snapshot(private.clone())
+        ));
+        for index in 0..private.unix_listeners.len() {
+            let mut replaced = private.clone();
+            replaced.unix_listeners[index].socket_inode += 100;
+            assert!(!local_control_snapshots_match(
+                &projected,
+                &public_snapshot(replaced)
+            ));
+            let mut changed_owner = private.clone();
+            let pins = &mut changed_owner.unix_listeners[index].owners[0].process_pins;
+            let mut pin = pins.pop_first().unwrap();
+            pin.start_time_ticks += 1;
+            pins.insert(pin);
+            assert!(!local_control_snapshots_match(
+                &projected,
+                &public_snapshot(changed_owner)
+            ));
+        }
+        private.tcp_listeners[0].socket_inode += 1;
+        assert!(!local_control_snapshots_match(
+            &projected,
+            &public_snapshot(private.clone())
+        ));
+        private.tcp_listeners[0].socket_inode -= 1;
+        let owner = &mut private.tcp_listeners[0].owners[1];
+        let mut pin = owner.process_pins.pop_first().unwrap();
+        pin.start_time_ticks += 1;
+        owner.process_pins.insert(pin);
+        assert!(!local_control_snapshots_match(
+            &projected,
+            &public_snapshot(private)
+        ));
     }
 
     #[test]
@@ -3724,6 +4194,42 @@ mod tests {
         snapshot.unix_listeners[0].owners.clear();
         snapshot.unix_listeners[0].ownership_complete = false;
         snapshot
+    }
+
+    #[test]
+    fn ubuntu26_missing_owner_retry_preserves_the_socket_and_other_owner_pins() {
+        let mut private = owned_listeners();
+        private.ubuntu26 = true;
+        private.unix_listeners[0].name_sha256 = ubuntu26::LOGIN_SOCKET_SHA256.into();
+        let baseline = public_snapshot(private.clone());
+        let policy = crate::hosted_runner::hosted_runner_fingerprint_requirement()
+            .accepted
+            .local_control_inventory;
+        let retries = [
+            MissingOwnerRetry::Baseline(&baseline),
+            MissingOwnerRetry::AfterLockdown(&policy, &baseline),
+        ];
+        for retry in retries {
+            for missing in [
+                without_tcp_owner(private.clone()),
+                without_unix_owner(private.clone()),
+            ] {
+                assert!(retry.permits(&public_snapshot(missing.clone())));
+                let mut reused = missing.clone();
+                reused.tcp_listeners[0].socket_inode += 1;
+                assert!(!retry.permits(&public_snapshot(reused)));
+                let mut drift = missing;
+                let owners = if drift.tcp_listeners[0].owners.is_empty() {
+                    &mut drift.unix_listeners[0].owners
+                } else {
+                    &mut drift.tcp_listeners[0].owners
+                };
+                let mut pin = owners[0].process_pins.pop_first().unwrap();
+                pin.start_time_ticks += 1;
+                owners[0].process_pins.insert(pin);
+                assert!(!retry.permits(&public_snapshot(drift)));
+            }
+        }
     }
 
     #[test]
@@ -4423,12 +4929,9 @@ mod tests {
             )]),
         };
         let private =
-            collect_private_snapshot(
-                &root.0,
-                &access,
-                &NoCurrentFenceOwner,
-                |_, _| Ok(Vec::new()),
-            );
+            collect_private_snapshot(&root.0, &access, &NoCurrentFenceOwner, false, |_, _| {
+                Ok(Vec::new())
+            });
         assert_eq!(private.unix_listeners.len(), 1);
         assert!(!private.unix_listeners[0].ownership_complete);
         let public = public_snapshot(private);
@@ -4581,9 +5084,13 @@ mod tests {
         let access = TestSocketAccess::default();
         let observation = observe_local_control_with(
             || {
-                collect_private_snapshot(&missing_proc, &access, &NoCurrentFenceOwner, |_, _| {
-                    Ok(Vec::new())
-                })
+                collect_private_snapshot(
+                    &missing_proc,
+                    &access,
+                    &NoCurrentFenceOwner,
+                    false,
+                    |_, _| Ok(Vec::new()),
+                )
             },
             || {},
             MissingOwnerRetry::Never,

@@ -1014,41 +1014,40 @@ require(
     "Action acceptance candidate-selection environment must use only reviewed GitHub metadata",
 )
 
-runner_case_match = re.search(
-    r'(?ms)^          case "\$acceptance_runner" in\n(.*?)^          esac$',
-    select_candidate,
-)
-require(runner_case_match is not None, "Action acceptance runner allowlist must be explicit")
-runner_case = runner_case_match.group(1)
-expected_runner_case = (
-    "            ubuntu-24.04) ;;\n"
-    "            ubuntu-latest)\n"
-    '              if [[ "$GITHUB_REF" != "refs/heads/main" ]] &&\n'
-    '                [[ "$GITHUB_EVENT_NAME" != "pull_request" ||\n'
-    '                   ! "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ ||\n'
-    '                   "$PULL_REQUEST_BASE_REF" != "main" ||\n'
-    '                   "$PULL_REQUEST_HEAD_REPOSITORY" != "$GITHUB_REPOSITORY" ||\n'
-    '                   "$action_ref" != "$GITHUB_SHA" ||\n'
-    '                   "$candidate_kind" != "source" ]]; then\n'
-    '                echo "ubuntu-latest acceptance requires main or its same-repository pull request" >&2\n'
-    "                exit 1\n"
-    "              fi\n"
-    "              ;;\n"
-    "            *)\n"
-    '              echo "acceptance_runner must be ubuntu-24.04 or ubuntu-latest" >&2\n'
-    "              exit 1\n"
-    "              ;;\n"
-)
+runner_guard = """          case "$acceptance_runner" in
+            ubuntu-24.04|ubuntu-26.04|ubuntu-latest) ;;
+            *)
+              echo "acceptance_runner must be a reviewed Ubuntu x64 label" >&2
+              exit 1
+              ;;
+          esac
+          compatibility_runners=$(printf '["%s"]' "$acceptance_runner")
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]] ||
+            [[ "$GITHUB_EVENT_NAME" == "pull_request" &&
+               "$GITHUB_REF" =~ ^refs/pull/[0-9]+/merge$ &&
+               "$PULL_REQUEST_BASE_REF" == "main" &&
+               "$PULL_REQUEST_HEAD_REPOSITORY" == "$GITHUB_REPOSITORY" &&
+               "$action_ref" == "$GITHUB_SHA" &&
+               "$candidate_kind" == "source" ]]; then
+            if [[ "$acceptance_runner" == "ubuntu-24.04" ]]; then
+              compatibility_runners='["ubuntu-24.04","ubuntu-26.04","ubuntu-latest"]'
+            fi
+          elif [[ "$acceptance_runner" != "ubuntu-24.04" ]]; then
+            echo "Additional runner labels require main or its same-repository source pull request" >&2
+            exit 1
+          fi
+          echo "compatibility_runners=$compatibility_runners" >> "$GITHUB_OUTPUT" """
 require(
-    runner_case == expected_runner_case,
-    "Action acceptance ubuntu-latest guard must permit only main and same-repository source pull requests",
+    runner_guard.rstrip() in select_candidate
+    and "compatibility_runners: ${{ steps.candidate.outputs.compatibility_runners }}" in prepare,
+    "Additional runner labels must require main or its same-repository source pull request",
 )
 
 validated_runner = "${{ needs.prepare-candidate.outputs.acceptance_runner }}"
 target_job_keys = {
     "action": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
-    "zero-input": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
-    "nested-layout": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
+    "zero-input": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
+    "nested-layout": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
     "setup-failure": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
     "tamper": ["name", "needs", "timeout-minutes", "runs-on", "steps"],
     "action-finalization": ["name", "needs", "strategy", "timeout-minutes", "runs-on", "steps"],
@@ -1065,9 +1064,15 @@ for job_name in target_jobs:
         target_job_keys[job_name],
         f"Action acceptance {job_name} fields must remain narrowly scoped",
     )
+    compatibility_job = job_name in {"zero-input", "nested-layout"}
+    if compatibility_job:
+        require(
+            "    strategy:\n      fail-fast: false\n      matrix:\n        runner: ${{ fromJSON(needs.prepare-candidate.outputs.compatibility_runners) }}\n" in job,
+            "Compatibility jobs must test each prepared runner label independently",
+        )
     require(
         scalar_mapping(job, 4).get("needs") == "prepare-candidate"
-        and scalar_mapping(job, 4).get("runs-on") == validated_runner,
+        and scalar_mapping(job, 4).get("runs-on") == ("${{ matrix.runner }}" if compatibility_job else validated_runner),
         f"Action acceptance {job_name} must depend on preparation and use only the validated runner output",
     )
 for job_name in support_jobs:
@@ -1087,7 +1092,8 @@ require(
     "Action acceptance must not interpolate the raw runner input into runs-on",
 )
 require(
-    workflow.count(f"runs-on: {validated_runner}") == len(target_jobs)
+    workflow.count(f"runs-on: {validated_runner}") == len(target_jobs) - 2
+    and workflow.count("runs-on: ${{ matrix.runner }}") == 2
     and workflow.count("runs-on: ubuntu-24.04") == len(support_jobs),
     "Action acceptance runner routing must remain complete and exclusive",
 )
@@ -1317,13 +1323,22 @@ for job_name in ["action", "zero-input", "nested-layout", "tamper", "action-fina
         classifier_scalars["working-directory"] = "target/action-layout/owner/project/revision"
         guard_keys = ["working-directory", "env", "run"]
         guard_scalars["working-directory"] = "target/action-layout/owner/project/revision"
-    require_step_contract(
+    compatibility_job = job_name in {"zero-input", "nested-layout"}
+    if compatibility_job:
+        classifier_keys.insert(1, "env")
+    classifier = require_step_contract(
         job,
         "classify bundled Action host compatibility",
         classifier_keys,
         classifier_scalars,
         f"Action acceptance {job_name} host classifier",
     )
+    if compatibility_job:
+        require(
+            scalar_mapping(indented_block(classifier, "        env:", "Expected runner label missing"), 10)
+            == {"FENCE_ACCEPTANCE_RUNNER": "${{ matrix.runner }}"},
+            "Fixed-label compatibility evidence must verify the actual observed release",
+        )
     guard = require_step_contract(
         job,
         "require bundled Action activation",
@@ -1900,11 +1915,12 @@ for job_name in integration_target_jobs:
         f"Integration {job_name} fields must remain narrowly scoped",
     )
     job_fields = scalar_mapping(job, 4)
+    expected_runner = "${{ matrix.runner }}" if job_name == "lockdown" else "ubuntu-24.04"
     require(
         job_fields.get("needs") == "preflight"
         and job_fields.get("timeout-minutes") == expected_target_timeouts[job_name]
-        and job_fields.get("runs-on") == "ubuntu-24.04",
-        f"Integration {job_name} must depend on preflight and remain bounded on fixed ubuntu-24.04",
+        and job_fields.get("runs-on") == expected_runner,
+        f"Integration {job_name} must depend on preflight and use its fixed runner selection and timeout",
     )
     strategy = indented_block(
         job,
@@ -1969,10 +1985,16 @@ lockdown = indented_block(
     "  lockdown:",
     "Integration lockdown job must be unique",
 )
-require(
-    "scenario: [acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]" in lockdown,
-    "Integration lockdown matrix must retain six isolated scenarios",
-)
+lockdown_matrix = indented_block(lockdown, "      matrix:", "Integration lockdown matrix must be unique")
+require_exact_mapping_keys(lockdown_matrix, 8, ["scenario", "runner", "include"], "Unexpected lockdown matrix dimensions")
+require(scalar_mapping(lockdown_matrix, 8) == {
+    "scenario": "[acl-reject, audit, local-control-reject, rollback, standard, unsafe-preserve]",
+    "runner": "[ubuntu-24.04]",
+}, "Integration lockdown must retain the six Ubuntu 24.04 scenarios")
+extra_lockdown = indented_block(lockdown_matrix, "        include:", "Integration lockdown matrix include must be unique")
+require([line.strip() for line in extra_lockdown.splitlines() if line.strip()] == [
+    "include:", "- scenario: rollback", "runner: ubuntu-26.04", "label_suffix: ' (ubuntu-26.04)'",
+], "Ubuntu 26.04 must add only the lockdown rollback scenario")
 require_step_contract(
     lockdown,
     "test resident lifecycle evidence",
@@ -1983,13 +2005,16 @@ require_step_contract(
     },
     "Integration standard namespace evidence",
 )
-require_step_contract(
+lockdown_evidence = require_step_contract(
     lockdown,
     "test lockdown evidence",
-    ["run"],
+    ["env", "run"],
     {"run": 'script/test-lockdown "${{ matrix.scenario }}"'},
     "Integration terminal lockdown evidence",
 )
+lockdown_env = indented_block(lockdown_evidence, "        env:", "Lockdown evidence environment must be unique")
+require(scalar_mapping(lockdown_env, 10) == {"REQUIRE_UBUNTU26_ROLLBACK": "${{ matrix.runner == 'ubuntu-26.04' }}"},
+        "The Ubuntu 26.04 rollback must verify original host sockets and both sudo providers")
 require(
     lockdown.count("run: script/test-privileged") == 1
     and lockdown.count('run: script/test-lockdown "${{ matrix.scenario }}"') == 1
@@ -2414,7 +2439,7 @@ ci_badges = [
     f"[![{name}](https://github.com/openai/fence/actions/workflows/{name}.yml/badge.svg)](https://github.com/openai/fence/actions/workflows/{name}.yml)"
     for name in ["lint", "test", "build", "acceptance"]
 ]
-release_canary_badge = "[![released action / ubuntu-24.04 + ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
+release_canary_badge = "[![released action canaries](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-drift-canary.yml?query=branch%3Amain+event%3Aschedule)"
 nightly_badge = "[![main / ubuntu-latest](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml/badge.svg?branch=main&event=schedule)](https://github.com/openai/fence/actions/workflows/action-acceptance-ubuntu-latest.yml?query=branch%3Amain+event%3Aschedule)"
 for name, badge in zip(["lint", "test", "build", "acceptance"], ci_badges):
     require(
@@ -2592,30 +2617,47 @@ canary_jobs = indented_block(
 require_exact_mapping_keys(
     canary_jobs,
     2,
-    ["released-block", "verify-released-block", "canary"],
+    ["released-block", "released-audit", "verify-released", "canary"],
     "Action drift canary must keep the consumer, final-log verifier, and diagnostic jobs separate",
 )
-consumer = indented_block(canary_jobs, "  released-block:", "Released block canary job must be unique")
-consumer_steps = [
-    line.strip() for line in consumer.split("    steps:\n", 1)[1].splitlines()
-    if line.strip() and not line.lstrip().startswith("#")
-]
+reporter = (root / "script/lib/release_canary_report.py").read_text(encoding="utf-8")
+runner_setting = re.findall(r"(?m)^SCHEDULED_RUNNERS = (\([^\n]*\))$", reporter)
+require(len(runner_setting) == 1, "Scheduled runner expectations must be explicit")
+scheduled_runners = ast.literal_eval(runner_setting[0])
 require(
-    "permissions:" not in consumer
-    and "if: inputs.action_ref == '' && (github.event_name == 'schedule' || github.event_name == 'pull_request')" in consumer
-    and "runner: [ubuntu-24.04, ubuntu-latest]" in consumer
-    and consumer_steps[0].startswith("- name: ")
-    and re.fullmatch(r"uses: openai/fence@[0-9a-f]{40} # pin@v[0-9]+\.[0-9]+\.[0-9]+", consumer_steps[1])
-    and consumer_steps[2].startswith("- name: ")
-    and consumer_steps[3].split(" #", 1)[0] == f"uses: {checkout_action}"
-    and "persist-credentials: false" in consumer_steps,
-    "Scheduled block must use the zero-input published pin before checkout, with only contents: read",
+    scheduled_runners in (("ubuntu-24.04", "ubuntu-latest"), ("ubuntu-24.04", "ubuntu-26.04", "ubuntu-latest")),
+    "Scheduled coverage must keep the reviewed fixed and rolling runner lanes",
 )
-verifier = indented_block(canary_jobs, "  verify-released-block:", "Released block verifier job must be unique")
+scheduled_runner_matrix = "[" + ", ".join(scheduled_runners) + "]"
+scheduled_runner_json = json.dumps(scheduled_runners, separators=(",", ":"))
+release_pins = []
+for mode in ("block", "audit"):
+    consumer = indented_block(canary_jobs, f"  released-{mode}:", f"Released {mode} canary job must be unique")
+    consumer_steps = [
+        line.strip() for line in consumer.split("    steps:\n", 1)[1].splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    activation_inputs = ["with:", "mode: audit"] if mode == "audit" else []
+    checkout_index = 2 + len(activation_inputs)
+    require(
+        "permissions:" not in consumer
+        and "if: inputs.action_ref == '' && (github.event_name == 'schedule' || github.event_name == 'pull_request')" in consumer
+        and f"runner: {scheduled_runner_matrix}" in consumer
+        and consumer_steps[0] == "- name: activate released Fence as the first workflow step"
+        and re.fullmatch(r"uses: openai/fence@[0-9a-f]{40} # pin@v[0-9]+\.[0-9]+\.[0-9]+", consumer_steps[1])
+        and consumer_steps[2:checkout_index] == activation_inputs
+        and consumer_steps[checkout_index] == "- name: check out repository under Fence"
+        and consumer_steps[checkout_index+1].split(" #", 1)[0] == f"uses: {checkout_action}"
+        and "persist-credentials: false" in consumer_steps,
+        f"Released {mode} must use the published pin with its exact inputs before checkout",
+    )
+    release_pins.append(consumer_steps[1])
+require(release_pins[0] == release_pins[1], "Both first-step modes must use the same published pin")
+verifier = indented_block(canary_jobs, "  verify-released:", "Released canary verifier job must be unique")
 verifier_permissions = indented_block(verifier, "    permissions:", "Released block verifier permissions must be unique")
 require(
     scalar_mapping(verifier_permissions, 6) == {"actions": "read", "contents": "read"}
-    and "needs: released-block" in verifier
+    and "needs: [released-block, released-audit]" in verifier
     and "run: script/verify-protected-finalization canary" in verifier,
     "Only the downstream read-only verifier should fetch the completed consumer jobs and logs",
 )
@@ -2669,7 +2711,7 @@ require_exact_mapping_keys(
 require(
     scalar_mapping(canary_matrix, 8)
     == {
-        "runner": "[ubuntu-24.04, ubuntu-latest]",
+        "runner": """${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '%s' || '["ubuntu-24.04","ubuntu-26.04","ubuntu-latest"]') }}""" % scheduled_runner_json,
         "mode": """${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '["audit"]' || '["block", "audit"]') }}""",
     },
     "Action drift canary must retain scheduled audit and test both modes for dispatch and explicit release candidates",

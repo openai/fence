@@ -240,6 +240,10 @@ expected = {
     "audit": ("audit", "protected_host_audit_observation", "resident_observation_only", "ready_observation_only", False, "preserved_verified", "preserved_verified"),
 }[scenario]
 mode, status, resident, readiness, protection, sudo_status, container_status = expected
+sys.path.insert(0, "script/lib")
+from ubuntu26_socket_evidence import check_sockets
+
+check_sockets(mode)
 if mode == "block":
     expected_workers.insert(-1, {"name": "hostname_refresh", "status": "running"})
 allow_github_artifacts = scenario == "github-artifacts"
@@ -413,16 +417,17 @@ if [[ "$docker_routing" == "local_root_resident_mediator" ]]; then
   require_cmd docker
 fi
 
-case "$scenario" in
-  standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts)
-    if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
-      die "Fence Action did not disable runner passwordless sudo"
-    fi
-    ;;
-  audit)
-    sudo --non-interactive /usr/bin/true >/dev/null
-    ;;
-esac
+sudo_providers=(/usr/bin/sudo)
+if [[ -e /usr/bin/sudo.ws ]]; then
+  sudo_providers+=(/usr/bin/sudo.ws)
+fi
+for provider in "${sudo_providers[@]}"; do
+  if [[ "$scenario" == "audit" ]]; then
+    "$provider" --non-interactive --reset-timestamp /usr/bin/true >/dev/null
+  elif "$provider" --non-interactive --reset-timestamp /usr/bin/true >/dev/null 2>&1; then
+    die "Fence Action did not disable runner passwordless sudo"
+  fi
+done
 case "$scenario" in
   standard|standard-opt-out|github-artifacts)
     if command -v docker >/dev/null && docker ps --quiet >/dev/null 2>&1; then

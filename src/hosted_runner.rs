@@ -1,3 +1,6 @@
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod ubuntu26;
+
 use serde::Serialize;
 
 pub const HOSTED_RUNNER_FINGERPRINT_SCHEMA_VERSION: u32 = 3;
@@ -23,6 +26,11 @@ pub(crate) fn reviewed_ubuntu_lts_version(version: &str) -> bool {
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn reviewed_ubuntu_os_release(contents: &str) -> bool {
+    reviewed_ubuntu_version(contents).is_some()
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn reviewed_ubuntu_version(contents: &str) -> Option<&str> {
     let mut id = None;
     let mut version = None;
     for line in contents.lines() {
@@ -32,29 +40,24 @@ pub(crate) fn reviewed_ubuntu_os_release(contents: &str) -> bool {
         if !matches!(key, "ID" | "VERSION_ID") {
             continue;
         }
-        let value = if value.starts_with('"') {
-            let Some(value) = value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-            else {
-                return false;
-            };
+        let value = if let Some(quoted) = value.strip_prefix('"') {
+            let value = quoted.strip_suffix('"')?;
             if value.contains('"') {
-                return false;
+                return None;
             }
             value
         } else {
             if value.contains('"') {
-                return false;
+                return None;
             }
             value
         };
         let selected = if key == "ID" { &mut id } else { &mut version };
         if selected.replace(value).is_some() {
-            return false;
+            return None;
         }
     }
-    id == Some("ubuntu") && version.is_some_and(reviewed_ubuntu_lts_version)
+    version.filter(|version| id == Some("ubuntu") && reviewed_ubuntu_lts_version(version))
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -137,6 +140,8 @@ pub struct AcceptedSocketV2 {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct AcceptedLocalControlInventoryV2 {
+    #[serde(skip)]
+    pub(crate) ubuntu26: bool,
     pub unix_name_hash_schema: &'static str,
     pub root_container_processes: Vec<AcceptedRootContainerProcessV2>,
     pub tcp_listeners: Vec<AcceptedTcpListenerV2>,
@@ -211,6 +216,9 @@ const JOURNALD_OWNER: AcceptedLocalControlOwnerV2 = AcceptedLocalControlOwnerV2 
     unified_cgroup: "/system.slice/systemd-journald.service",
     processes: 1,
 };
+
+pub(crate) const SYSTEM_BUS_NAME_SHA256: &str =
+    "8b5e213b2b72a7033476e1f46afb302f0e4123c6e6fd746f77eeb744050e3b91";
 
 const DBUS_OWNER: AcceptedLocalControlOwnerV2 = AcceptedLocalControlOwnerV2 {
     uid: 101,
@@ -430,6 +438,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV3 {
             ],
             required_docker_running_workload_count: 0,
             local_control_inventory: AcceptedLocalControlInventoryV2 {
+                ubuntu26: false,
                 unix_name_hash_schema: UNIX_NAME_HASH_SCHEMA_V1,
                 root_container_processes: vec![
                     AcceptedRootContainerProcessV2 {
@@ -502,7 +511,7 @@ pub fn hosted_runner_fingerprint_requirement() -> HostedRunnerFingerprintV3 {
                     AcceptedUnixListenerV2 {
                         socket_type: "stream",
                         name_kind: "filesystem",
-                        name_sha256: "8b5e213b2b72a7033476e1f46afb302f0e4123c6e6fd746f77eeb744050e3b91",
+                        name_sha256: SYSTEM_BUS_NAME_SHA256,
                         owners: vec![SYSTEMD_OWNER, DBUS_OWNER],
                         instances: 1,
                     },
@@ -575,6 +584,20 @@ mod tests {
         ] {
             assert!(!reviewed_ubuntu_os_release(contents));
         }
+    }
+
+    #[test]
+    fn release_selection_preserves_the_exact_reviewed_version() {
+        for year in 0..=99 {
+            let version = format!("{year:02}.04");
+            let release = format!("ID=ubuntu\nVERSION_ID=\"{version}\"\n");
+            let expected = ((24..=40).contains(&year) && year % 2 == 0).then_some(version.as_str());
+            assert_eq!(reviewed_ubuntu_version(&release), expected);
+        }
+        assert_eq!(
+            reviewed_ubuntu_version("VERSION_ID=26.04\nID=\"ubuntu\"\n"),
+            Some("26.04")
+        );
     }
 
     #[test]

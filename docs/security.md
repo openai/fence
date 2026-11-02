@@ -4,9 +4,9 @@ Fence limits where a GitHub Actions job can send network traffic and removes com
 
 ## Supported Runners
 
-Fence supports GitHub-hosted x64 jobs using `ubuntu-24.04` or `ubuntu-latest`.
+Fence supports GitHub-hosted x64 jobs using `ubuntu-24.04`, `ubuntu-26.04`, or `ubuntu-latest`.
 
-- Releases are tested on both runner labels in block and audit mode.
+- Releases are tested on all three runner labels in block and audit mode.
 - Fence checks the runner's security controls even when GitHub updates its images.
 - Self-hosted runners, container jobs, other architectures, Windows, and macOS are not supported.
 
