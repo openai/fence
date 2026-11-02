@@ -2510,6 +2510,7 @@ require(
         "branches: [main]", "paths:",
         "- .github/workflows/action-drift-canary.yml",
         "- script/lib/protected_finalization.py",
+        "- script/lib/release_canary_report.py",
         "- script/verify-protected-finalization",
     ],
     "Only changes to the released consumer canary or its verifier should trigger a pull-request run",
@@ -2625,11 +2626,10 @@ runner_setting = re.findall(r"(?m)^SCHEDULED_RUNNERS = (\([^\n]*\))$", reporter)
 require(len(runner_setting) == 1, "Scheduled runner expectations must be explicit")
 scheduled_runners = ast.literal_eval(runner_setting[0])
 require(
-    scheduled_runners in (("ubuntu-24.04", "ubuntu-latest"), ("ubuntu-24.04", "ubuntu-26.04", "ubuntu-latest")),
+    scheduled_runners == ("ubuntu-24.04", "ubuntu-26.04", "ubuntu-latest"),
     "Scheduled coverage must keep the reviewed fixed and rolling runner lanes",
 )
 scheduled_runner_matrix = "[" + ", ".join(scheduled_runners) + "]"
-scheduled_runner_json = json.dumps(scheduled_runners, separators=(",", ":"))
 release_pins = []
 for mode in ("block", "audit"):
     consumer = indented_block(canary_jobs, f"  released-{mode}:", f"Released {mode} canary job must be unique")
@@ -2711,7 +2711,7 @@ require_exact_mapping_keys(
 require(
     scalar_mapping(canary_matrix, 8)
     == {
-        "runner": """${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '%s' || '["ubuntu-24.04","ubuntu-26.04","ubuntu-latest"]') }}""" % scheduled_runner_json,
+        "runner": scheduled_runner_matrix,
         "mode": """${{ fromJSON(inputs.action_ref == '' && github.event_name == 'schedule' && '["audit"]' || '["block", "audit"]') }}""",
     },
     "Action drift canary must retain scheduled audit and test both modes for dispatch and explicit release candidates",
