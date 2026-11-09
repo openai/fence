@@ -1186,11 +1186,11 @@ expected_action_steps = {
         "require bundled Action activation",
         "activate bundled Fence agent",
         "exercise Azure CLI and UUID service activation",
-        "verify block denies privileged and outside-policy snapd operations",
-        "verify snapd activation and return to idle across resident checks",
         "create bounded GitHub artifact fixture",
         "upload bounded GitHub artifact under Fence",
         "verify Action lifecycle",
+        "verify block denies privileged and outside-policy snapd operations",
+        "verify snapd activation and return to idle across resident checks",
     ],
     "zero-input": [
         "checkout",
