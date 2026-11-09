@@ -1,0 +1,112 @@
+[
+  {
+    "name": "idle package socket",
+    "accepted": true,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "ac10a069436547a18b02df8078e06421de7fc8953887fcc32f817af06b1b09bb",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "systemd", "canonical_executable": "/usr/lib/systemd/systemd", "unified_cgroup": "/init.scope", "processes": 1}
+      ]
+    }
+  },
+  {
+    "name": "active snap socket",
+    "accepted": true,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "f7978cc2493e0ecd56d54a3f49e36c3bde79b3ac281baa0a0aed0efab0898c23",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "snapd", "canonical_executable": "/usr/lib/snapd/snapd", "unified_cgroup": "/system.slice/snapd.service", "processes": 1},
+        {"uid": 0, "executable_basename": "systemd", "canonical_executable": "/usr/lib/systemd/systemd", "unified_cgroup": "/init.scope", "processes": 1}
+      ]
+    }
+  },
+  {
+    "name": "daemon without PID 1",
+    "accepted": false,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "ac10a069436547a18b02df8078e06421de7fc8953887fcc32f817af06b1b09bb",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "snapd", "canonical_executable": "/usr/lib/snapd/snapd", "unified_cgroup": "/system.slice/snapd.service", "processes": 1}
+      ]
+    }
+  },
+  {
+    "name": "two daemon processes",
+    "accepted": false,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "f7978cc2493e0ecd56d54a3f49e36c3bde79b3ac281baa0a0aed0efab0898c23",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "snapd", "canonical_executable": "/usr/lib/snapd/snapd", "unified_cgroup": "/system.slice/snapd.service", "processes": 2},
+        {"uid": 0, "executable_basename": "systemd", "canonical_executable": "/usr/lib/systemd/systemd", "unified_cgroup": "/init.scope", "processes": 1}
+      ]
+    }
+  },
+  {
+    "name": "unreviewed executable",
+    "accepted": false,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "f7978cc2493e0ecd56d54a3f49e36c3bde79b3ac281baa0a0aed0efab0898c23",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "snapd", "canonical_executable": "unreviewed_executable_path", "unified_cgroup": "/system.slice/snapd.service", "processes": 1},
+        {"uid": 0, "executable_basename": "systemd", "canonical_executable": "/usr/lib/systemd/systemd", "unified_cgroup": "/init.scope", "processes": 1}
+      ]
+    }
+  },
+  {
+    "name": "daemon in the wrong unit",
+    "accepted": false,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "ac10a069436547a18b02df8078e06421de7fc8953887fcc32f817af06b1b09bb",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "snapd", "canonical_executable": "/usr/lib/snapd/snapd", "unified_cgroup": "/system.slice/other.service", "processes": 1},
+        {"uid": 0, "executable_basename": "systemd", "canonical_executable": "/usr/lib/systemd/systemd", "unified_cgroup": "/init.scope", "processes": 1}
+      ]
+    }
+  },
+  {
+    "name": "active daemon on a different listener",
+    "accepted": false,
+    "listener": {
+      "socket_type": "stream",
+      "name_kind": "filesystem",
+      "name_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "runner_reachable": true,
+      "ownership_complete": true,
+      "instances": 1,
+      "owners": [
+        {"uid": 0, "executable_basename": "snapd", "canonical_executable": "/usr/lib/snapd/snapd", "unified_cgroup": "/system.slice/snapd.service", "processes": 1},
+        {"uid": 0, "executable_basename": "systemd", "canonical_executable": "/usr/lib/systemd/systemd", "unified_cgroup": "/init.scope", "processes": 1}
+      ]
+    }
+  }
+]

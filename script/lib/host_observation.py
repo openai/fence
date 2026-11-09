@@ -233,6 +233,11 @@ DERIVED_UNAVAILABLE_REASONS = {
 
 UNREVIEWED_EXECUTABLE_PATH = "unreviewed_executable_path"
 UNREVIEWED_CGROUP = "unreviewed_cgroup"
+SNAPD_RULE_PATH = pathlib.Path(__file__).resolve().parents[2] / "src/hosted_runner/snapd_activation.json"
+SNAPD_ACTIVATION = json.loads(SNAPD_RULE_PATH.read_text(encoding="utf-8"))
+SYSTEMD_EXECUTABLE = "/usr/lib/systemd/systemd"
+SNAPD_EXECUTABLE = SNAPD_ACTIVATION["executable"]
+SNAPD_SOCKET_NAMES = frozenset(SNAPD_ACTIVATION["socket_name_sha256"])
 UBUNTU26_ROOT_SERVICES = {
     "/usr/lib/systemd/systemd-logind": "/system.slice/systemd-logind.service",
     "/usr/sbin/sshd": "/system.slice/ssh.service",
@@ -560,6 +565,29 @@ def _process_start_time(process_root):
     return int(remaining[19])
 
 
+def _snap_activation_executable(target, pid, live):
+    if target != SNAPD_EXECUTABLE and not (pid == "1" and target == SYSTEMD_EXECUTABLE):
+        return None
+    path = pathlib.Path(target)
+    try:
+        for directory in path.parents:
+            meta = directory.lstat()
+            if (
+                not stat.S_ISDIR(meta.st_mode) or meta.st_uid != 0
+                or meta.st_gid != 0 or meta.st_mode & 0o022
+            ):
+                return None
+        meta = path.lstat()
+        if (
+            stat.S_ISREG(meta.st_mode) and stat.S_IMODE(meta.st_mode) == 0o755
+            and meta.st_uid == meta.st_gid == 0 and os.path.samestat(meta, live)
+        ):
+            return target
+    except OSError:
+        pass
+    return None
+
+
 def _process_observation(process_root):
     process_metadata = process_root.stat()
     executable_link = process_root / "exe"
@@ -576,6 +604,9 @@ def _process_observation(process_root):
         "executable_inode": executable_metadata.st_ino,
         "executable_basename": basename,
         "canonical_executable": _reviewed_executable_path(executable_path),
+        "_snap_activation_executable": _snap_activation_executable(
+            executable_target, process_root.name, executable_metadata
+        ),
         "_executable_path_fingerprint": hashlib.sha256(
             b"fence-executable-path-v1\0" + os.fsencode(executable_path)
         ).hexdigest(),
@@ -601,6 +632,7 @@ def _same_process(first, second):
             "executable_inode",
             "executable_basename",
             "canonical_executable",
+            "_snap_activation_executable",
             "_executable_path_fingerprint",
         )
     )
@@ -634,7 +666,7 @@ def _socket_inode(target):
     return int(match.group(1))
 
 
-def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False):
+def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False, snap_inodes=()):
     bounds = set()
     unavailable = set()
     owners = {}
@@ -754,11 +786,20 @@ def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False):
         }
         pin = _process_pin(pid, before)
         for inode in socket_inodes:
-            key = _owner_key(identity)
+            socket_identity = identity
+            complete = identity_complete
+            if inode in snap_inodes:
+                verified = before["_snap_activation_executable"]
+                is_daemon = verified == SNAPD_EXECUTABLE and before_cgroup[0] == SNAPD_ACTIVATION["cgroup"]
+                is_manager = verified == SYSTEMD_EXECUTABLE and before_cgroup[0] == "/init.scope"
+                complete = before["uid"] == 0 and cgroup_reviewed and (is_manager or is_daemon)
+                if complete and is_daemon:
+                    socket_identity = {**identity, "canonical_executable": SNAPD_EXECUTABLE}
+            key = _owner_key(socket_identity)
             owner = owners.setdefault(inode, {}).setdefault(
                 key,
                 {
-                    **_public_owner(identity),
+                    **_public_owner(socket_identity),
                     "_executable_path_fingerprint": identity[
                         "_executable_path_fingerprint"
                     ],
@@ -767,7 +808,7 @@ def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False):
                     "_process_pins": set(),
                 },
             )
-            owner["_identity_complete"] &= identity_complete
+            owner["_identity_complete"] &= complete
             owner["_process_pins"].add(pin)
         if is_root_container:
             containers.append(
@@ -904,6 +945,49 @@ def _socket_ownership_complete(
         and inode not in unresolved_owner_inodes
         and all(owner["_identity_complete"] for owner in owners)
     )
+
+
+def _snapd_daemon_owner(owner):
+    return (
+        owner["canonical_executable"] == SNAPD_EXECUTABLE
+        and owner["executable_basename"] == "snapd"
+        and owner["unified_cgroup"] == SNAPD_ACTIVATION["cgroup"]
+        and owner["uid"] == 0
+    )
+
+
+def _unix_owners_reviewed(listener):
+    owners = listener["owners"]
+    if listener["name_sha256"] not in SNAPD_SOCKET_NAMES:
+        return bool(owners) and all(_owner_identity_reviewed(owner) for owner in owners)
+    managers = [
+        owner for owner in owners
+        if owner["canonical_executable"] == SYSTEMD_EXECUTABLE
+        and owner["executable_basename"] == "systemd" and owner["uid"] == 0
+        and owner["unified_cgroup"] == "/init.scope" and owner["processes"] == 1
+    ]
+    daemons = [owner for owner in owners if _snapd_daemon_owner(owner)]
+    return (
+        listener["socket_type"] == "stream" and listener["name_kind"] == "filesystem"
+        and listener["runner_reachable"] and listener.get("instances", 1) == 1
+        and len(managers) == 1 and sum(owner["processes"] for owner in daemons) <= 1
+        and len(owners) == 1 + len(daemons)
+    )
+
+
+def _check_snapd_owner_pins(listeners):
+    snap = [listener for listener in listeners if listener["name_sha256"] in SNAPD_SOCKET_NAMES]
+    daemon_pins = {
+        pin
+        for listener in snap
+        for owner in listener["owners"] if _snapd_daemon_owner(owner)
+        for pin in owner["_process_pins"]
+    }
+    unique = len({listener["name_sha256"] for listener in snap}) == len(snap)
+    for listener in snap:
+        listener["ownership_complete"] &= (
+            unique and len(daemon_pins) <= 1 and _unix_owners_reviewed(listener)
+        )
 
 
 def _unix_name(raw_name):
@@ -1101,6 +1185,11 @@ def _collect_snapshot(
     relevant_listener_inodes = {
         row["inode"] for row in unix_rows if row["name_kind"] != "unnamed"
     } | {row["inode"] for row in tcp_rows}
+    snap_inodes = {
+        row["inode"] for row in unix_rows
+        if row["socket_type"] == "stream" and row["name_kind"] == "filesystem"
+        and row["name_sha256"] in SNAPD_SOCKET_NAMES
+    }
     (
         owners,
         unresolved_owner_inodes,
@@ -1110,7 +1199,7 @@ def _collect_snapshot(
         process_unavailable,
         _,
         _,
-    ) = _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26)
+    ) = _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26, snap_inodes)
     unavailable = set(table_unavailable) | set(process_unavailable)
 
     unix_listeners = []
@@ -1203,6 +1292,7 @@ def _collect_snapshot(
         )
     unreachable_unix.sort(key=_excluded_unix_sort_key)
     unresolved_unix_private.sort(key=_excluded_unix_sort_key)
+    _check_snapd_owner_pins(unix_listeners)
     unix_listeners.sort(
         key=lambda item: (
             item["socket_type"],
@@ -1398,17 +1488,21 @@ def _summarize_public_snapshot(snapshot):
         _owner_identity_reviewed(process)
         for process in snapshot["root_container_processes"]
     ) and all(
+        _unix_owners_reviewed(listener) for listener in snapshot["unix_listeners"]
+    ) and all(
         _owner_identity_reviewed(owner)
-        for listener in [
-            *snapshot["unix_listeners"],
-            *snapshot["tcp_listeners"],
-        ]
+        for listener in snapshot["tcp_listeners"]
         for owner in listener["owners"]
     )
+    snap_names = [
+        listener["name_sha256"] for listener in snapshot["unix_listeners"]
+        if listener["name_sha256"] in SNAPD_SOCKET_NAMES
+    ]
     ownership_complete = (
         reachability_complete
         and unavailable.isdisjoint(ownership_failures)
         and identities_reviewed
+        and len(set(snap_names)) == len(snap_names)
         and all(
             listener["ownership_complete"]
             for listener in [
@@ -2013,7 +2107,7 @@ def validate_schema4_observation(observation):
     return observation
 
 
-def _validate_owner(owner, ubuntu26=False):
+def _validate_owner(owner, ubuntu26=False, snap_listener=False):
     expected = {
         "uid",
         "executable_basename",
@@ -2038,7 +2132,7 @@ def _validate_owner(owner, ubuntu26=False):
         ubuntu26 and _ubuntu26_service_owner(
             owner["uid"], owner["executable_basename"], executable, owner["unified_cgroup"]
         )
-    ):
+    ) and not (snap_listener and _snapd_daemon_owner(owner)):
         raise ValueError("local control owner executable is invalid")
     if owner["unified_cgroup"] != UNREVIEWED_CGROUP and not reviewed_cgroup(
         owner["unified_cgroup"]
@@ -2051,11 +2145,11 @@ def _validate_owner(owner, ubuntu26=False):
         raise ValueError("local control owner process state is invalid")
 
 
-def _validate_owner_list(owners, ubuntu26=False):
+def _validate_owner_list(owners, ubuntu26=False, snap_listener=False):
     if not isinstance(owners, list) or len(owners) > MAX_SOCKET_OWNERS:
         raise ValueError("local control owner set is invalid")
     for owner in owners:
-        _validate_owner(owner, ubuntu26)
+        _validate_owner(owner, ubuntu26, snap_listener)
     if sum(owner["processes"] for owner in owners) > MAX_PROCESSES:
         raise ValueError("local control owner process count exceeded its bound")
     if owners != sorted(owners, key=_owner_sort_key):
@@ -2197,11 +2291,12 @@ def _validate_public_snapshot(snapshot, ubuntu26=False):
             or not _is_integer(listener["instances"], 1)
         ):
             raise ValueError("local control Unix listener value is invalid")
-        _validate_owner_list(listener["owners"], ubuntu26)
-        if listener["ownership_complete"] and (
-            not listener["owners"]
-            or not all(_owner_identity_reviewed(owner) for owner in listener["owners"])
-        ):
+        snap_listener = (
+            listener["name_sha256"] in SNAPD_SOCKET_NAMES
+            and listener["socket_type"] == "stream" and listener["name_kind"] == "filesystem"
+        )
+        _validate_owner_list(listener["owners"], ubuntu26, snap_listener)
+        if listener["ownership_complete"] and not _unix_owners_reviewed(listener):
             raise ValueError("local control Unix listener ownership is invalid")
         unix_keys.append(
             (
@@ -2428,6 +2523,7 @@ class HostObservationTests(unittest.TestCase):
             "executable_inode": inode,
             "executable_basename": basename,
             "canonical_executable": executable,
+            "_snap_activation_executable": None,
             "_executable_path_fingerprint": hashlib.sha256(
                 b"fence-executable-path-v1\0" + os.fsencode(executable)
             ).hexdigest(),
@@ -2880,6 +2976,85 @@ class HostObservationTests(unittest.TestCase):
                         if expected:
                             with self.assertRaises(ValueError):
                                 _validate_owner(owner, False)
+
+    def test_snap_activation_checks_the_live_file_and_ancestors(self):
+        live = os.stat_result((stat.S_IFREG | 0o755, 15, 22, 1, 0, 0, 0, 0, 0, 0))
+        directory = os.stat_result((stat.S_IFDIR | 0o755, 6, 22, 1, 0, 0, 0, 0, 0, 0))
+        for path, pid, expected in (
+            (SNAPD_EXECUTABLE, "72", SNAPD_EXECUTABLE),
+            (SYSTEMD_EXECUTABLE, "1", SYSTEMD_EXECUTABLE),
+            (SYSTEMD_EXECUTABLE, "2", None),
+            (SNAPD_EXECUTABLE + " (deleted)", "72", None),
+            ("/tmp/snapd", "72", None),
+        ):
+            with self.subTest(path=path, pid=pid), mock.patch.object(
+                pathlib.Path, "lstat", autospec=True,
+                side_effect=lambda entry: live if str(entry) == path else directory,
+            ):
+                self.assertEqual(_snap_activation_executable(path, pid, live), expected)
+        for field, value, ancestor in (
+            (0, stat.S_IFLNK | 0o755, False), (0, stat.S_IFREG | 0o775, False),
+            (1, 16, False), (2, 23, False), (4, 1001, False), (5, 1001, False),
+            (0, stat.S_IFLNK | 0o755, True), (0, stat.S_IFDIR | 0o775, True),
+            (4, 1001, True),
+        ):
+            damaged = list(directory if ancestor else live)
+            damaged[field] = value
+            damaged = os.stat_result(damaged)
+
+            def metadata(entry):
+                if str(entry) == SNAPD_EXECUTABLE:
+                    return live if ancestor else damaged
+                if ancestor and entry == pathlib.Path(SNAPD_EXECUTABLE).parent:
+                    return damaged
+                return directory
+
+            with self.subTest(field=field, value=value, ancestor=ancestor), mock.patch.object(
+                pathlib.Path, "lstat", autospec=True, side_effect=metadata,
+            ):
+                self.assertIsNone(_snap_activation_executable(SNAPD_EXECUTABLE, "72", live))
+
+    def test_snap_activation_requires_the_same_daemon_on_reviewed_listeners(self):
+        manager = self._private_owner(pin=(1, 50, 1, 2))
+        daemon = self._private_owner(
+            pin=(72, 100, 1, 3), basename="snapd", executable=SNAPD_EXECUTABLE,
+            cgroup=SNAPD_ACTIVATION["cgroup"],
+        )
+        snap = [
+            {"_socket_inode": 50 + offset, "socket_type": "stream", "name_kind": "filesystem",
+             "name_sha256": name, "runner_reachable": True, "ownership_complete": True,
+             "owners": [copy.deepcopy(daemon), copy.deepcopy(manager)]}
+            for offset, name in enumerate(sorted(SNAPD_SOCKET_NAMES))
+        ]
+        _check_snapd_owner_pins(snap)
+        self.assertTrue(all(listener["ownership_complete"] for listener in snap))
+        snap[1]["owners"][0]["_process_pins"][0] = (73, 101, 1, 3)
+        _check_snapd_owner_pins(snap)
+        self.assertFalse(any(listener["ownership_complete"] for listener in snap))
+        inventory = observe_local_control_inventory(
+            sample=lambda: self._private_snapshot(unix_listeners=snap), sleeper=lambda _: None
+        )
+        self.assertEqual(inventory["status"], "unavailable")
+        self.assertNotIn("_process_pins", json.dumps(validate_local_control_inventory(inventory)))
+
+    def test_verified_snap_daemon_identity_is_local_to_the_reviewed_inodes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            service = root / "72"
+            (service / "fd").mkdir(parents=True)
+            (service / "cgroup").write_text(f"0::{SNAPD_ACTIVATION['cgroup']}\n")
+            (service / "fd/3").symlink_to("socket:[42]")
+            (service / "fd/4").symlink_to("socket:[43]")
+            seen = self._process_observation_fixture(basename="snapd", executable=UNREVIEWED_EXECUTABLE_PATH)
+            for verified in (None, SNAPD_EXECUTABLE):
+                seen["_snap_activation_executable"] = verified
+                with mock.patch.object(os.sys.modules[__name__], "_process_observation", return_value=seen):
+                    by_inode, *_ = _scan_process_owners(root, {42, 43}, snap_inodes={42})
+                expected = verified or UNREVIEWED_EXECUTABLE_PATH
+                for inode, executable in ((42, expected), (43, UNREVIEWED_EXECUTABLE_PATH)):
+                    owner, = by_inode[inode].values()
+                    self.assertEqual(owner["canonical_executable"], executable)
+                    self.assertEqual(owner["_identity_complete"], executable == SNAPD_EXECUTABLE)
 
     def test_public_host_strings_are_reviewed_or_reduced(self):
         self.assertEqual(public_runner_group_name("docker"), "docker")
