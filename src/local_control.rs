@@ -2244,8 +2244,9 @@ fn scan_processes(
         for inode in socket_inodes {
             let mut socket_key = key.clone();
             if snapd_inodes.contains(&inode) {
-                let executable = activation_executable
-                    .get_or_insert_with(|| snapd_owner_executable(&process_root, &pin, &key));
+                let executable = activation_executable.get_or_insert_with(|| {
+                    snapd_owner_executable(&process_root, &pin, &key, packaged_service_identity)
+                });
                 socket_key.canonical_executable = executable.to_string();
             }
             let identity_complete =
@@ -2409,11 +2410,9 @@ fn observe_process(
             let is_manager = executable_bytes == b"/usr/lib/systemd/systemd";
             canonical_executable = if direct
                 && (!is_manager || pid == 1)
-                && packaged_service_matches(
-                    &executable_target,
-                    executable_metadata.dev(),
-                    executable_metadata.ino(),
-                ) {
+                && packaged_service_identity(&executable_target)
+                    == Some((executable_metadata.dev(), executable_metadata.ino()))
+            {
                 executable_target.to_string_lossy().into_owned()
             } else {
                 UNREVIEWED_EXECUTABLE_PATH.to_owned()
@@ -2437,6 +2436,7 @@ fn snapd_owner_executable(
     process_root: &Path,
     pin: &ProcessPin,
     owner: &PrivateOwnerKey,
+    package_identity: impl FnOnce(&Path) -> Option<(u64, u64)>,
 ) -> &'static str {
     let expected = match (
         owner.uid,
@@ -2450,8 +2450,9 @@ fn snapd_owner_executable(
     let expected_path = Path::new(expected);
     if owner.executable_path_fingerprint
         == domain_hash(b"fence-executable-path-v1\0", expected.as_bytes())
-        && fs::read_link(process_root.join("exe")).is_ok_and(|target| target == expected_path)
-        && packaged_service_matches(expected_path, pin.executable_device, pin.executable_inode)
+        && fs::read_link(process_root.join("exe"))
+            .is_ok_and(|target| target.as_os_str() == expected_path.as_os_str())
+        && package_identity(expected_path) == Some((pin.executable_device, pin.executable_inode))
     {
         expected
     } else {
@@ -2459,20 +2460,18 @@ fn snapd_owner_executable(
     }
 }
 
-// Compare /proc's live executable to the reviewed file in Fence's host namespace.
-fn packaged_service_matches(path: &Path, device: u64, inode: u64) -> bool {
-    path.ancestors().skip(1).all(|ancestor| {
+// Read the identity only from a reviewed package file in Fence's host namespace.
+fn packaged_service_identity(path: &Path) -> Option<(u64, u64)> {
+    if !path.ancestors().skip(1).all(|ancestor| {
         fs::symlink_metadata(ancestor).is_ok_and(|meta| {
             meta.is_dir() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o022 == 0
         })
-    }) && fs::symlink_metadata(path).is_ok_and(|meta| {
-        meta.is_file()
-            && meta.uid() == 0
-            && meta.gid() == 0
-            && meta.mode() & 0o7777 == 0o755
-            && meta.ino() == inode
-            && meta.dev() == device
-    })
+    }) {
+        return None;
+    }
+    let meta = fs::symlink_metadata(path).ok()?;
+    (meta.is_file() && meta.uid() == 0 && meta.gid() == 0 && meta.mode() & 0o7777 == 0o755)
+        .then_some((meta.dev(), meta.ino()))
 }
 
 fn observe_cgroup(process_root: &Path) -> CgroupObservation {
@@ -3842,24 +3841,44 @@ mod tests {
             .into_iter()
             .find(|owner| owner.key.executable_basename == "snapd")
             .unwrap();
-        let mut pin = owner.process_pins.pop_first().unwrap();
-        pin.executable_inode = 0;
+        let pin = owner.process_pins.pop_first().unwrap();
+        // Supply only the protected package identity; exercise the real proc link,
+        // captured path fingerprint, and device/inode comparison independently.
+        let package_identity = |path: &Path| {
+            assert_eq!(path.as_os_str(), OsStr::new(SNAPD.executable));
+            Some((pin.executable_device, pin.executable_inode))
+        };
         owner.key.executable_path_fingerprint =
             domain_hash(b"fence-executable-path-v1\0", SNAPD.executable.as_bytes());
+        let link = proc.0.join("exe");
         for target in [
             "/tmp/snapd",
             "/usr/lib/snapd/snapd (deleted)",
-            SNAPD.executable,
+            "/usr/lib/snapd/./snapd",
         ] {
-            // Even the exact string fails when the live device/inode differs.
-            let link = proc.0.join("exe");
             std::os::unix::fs::symlink(target, &link).unwrap();
             assert_eq!(
-                snapd_owner_executable(&proc.0, &pin, &owner.key),
+                snapd_owner_executable(&proc.0, &pin, &owner.key, package_identity),
                 UNREVIEWED_EXECUTABLE_PATH
             );
-            fs::remove_file(link).unwrap();
+            fs::remove_file(&link).unwrap();
         }
+        std::os::unix::fs::symlink(SNAPD.executable, &link).unwrap();
+        assert_eq!(
+            snapd_owner_executable(&proc.0, &pin, &owner.key, package_identity),
+            SNAPD.executable
+        );
+        let mut replaced = pin.clone();
+        replaced.executable_inode += 1;
+        assert_eq!(
+            snapd_owner_executable(&proc.0, &replaced, &owner.key, package_identity),
+            UNREVIEWED_EXECUTABLE_PATH
+        );
+        owner.key.executable_path_fingerprint.clear();
+        assert_eq!(
+            snapd_owner_executable(&proc.0, &pin, &owner.key, package_identity),
+            UNREVIEWED_EXECUTABLE_PATH
+        );
     }
 
     #[test]

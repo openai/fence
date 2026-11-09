@@ -676,6 +676,16 @@ def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False, sn
     processes_seen = 0
     fds_seen = 0
     process_entries = []
+
+    def record_vanished_snap_holder(held, uid, reason):
+        # A surviving PID 1 descriptor alone cannot prove the listener was idle.
+        affected = held.intersection(snap_inodes)
+        if affected:
+            unavailable.add(reason)
+            unresolved_owner_inodes.update(affected)
+            if uid == 0:
+                unresolved_root_inodes.update(affected)
+
     try:
         with os.scandir(proc_root) as entries:
             for entry in entries:
@@ -732,6 +742,7 @@ def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False, sn
                     if inode is not None and inode in relevant_listener_inodes:
                         socket_inodes.add(inode)
         except FileNotFoundError:
+            record_vanished_snap_holder(socket_inodes, before["uid"], "process_fd_scan")
             continue
         except OSError:
             unavailable.add("process_fd_scan")
@@ -748,6 +759,7 @@ def _scan_process_owners(proc_root, relevant_listener_inodes, ubuntu26=False, sn
         try:
             after = _process_observation(process_root_path)
         except FileNotFoundError:
+            record_vanished_snap_holder(socket_inodes, before["uid"], "process_identity_drift")
             continue
         except (OSError, UnicodeDecodeError, ValueError):
             unavailable.add("process_identity_drift")
@@ -3144,6 +3156,67 @@ class HostObservationTests(unittest.TestCase):
             ):
                 result = _scan_process_owners(proc_root, {42})
             self.assertEqual(result[5], set())
+
+    def test_vanished_coholder_cannot_turn_a_partial_snap_observation_into_idle(self):
+        helper = os.sys.modules[__name__]
+        manager = self._process_observation_fixture()
+        manager["_snap_activation_executable"] = SYSTEMD_EXECUTABLE
+        coholder = self._process_observation_fixture(basename="other", executable=UNREVIEWED_EXECUTABLE_PATH)
+        name = b"/run/snapd.socket"
+        row = {"socket_type": "stream", "name_kind": "filesystem", "name_sha256": _unix_name(name)[1],
+               "raw_name": name, "inode": 42}
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for pid in ("1", "72"):
+                (root / pid / "fd").mkdir(parents=True)
+                (root / pid / "fd/3").symlink_to("socket:[42]")
+                (root / pid / "cgroup").write_text("0::/init.scope\n")
+            (root / "72/fd/4").symlink_to("socket:[43]")
+
+            with mock.patch.object(helper, "_read_listener_tables", return_value=([row], [], 0, set())), \
+                 mock.patch.object(helper, "_filesystem_socket_state", return_value=("root", "reachable")):
+                with mock.patch.object(helper, "_process_observation",
+                                       side_effect=[manager, manager, coholder, FileNotFoundError()]):
+                    partial = _collect_snapshot(root)
+                with mock.patch.object(helper, "_process_observation",
+                                       side_effect=[manager, manager, FileNotFoundError()]):
+                    idle = _collect_snapshot(root)
+
+            real_scandir = os.scandir
+
+            def disappear_after_descriptors(path):
+                if path != root / "72/fd":
+                    return real_scandir(path)
+
+                def entries():
+                    with real_scandir(path) as descriptors:
+                        yield from descriptors
+                    raise FileNotFoundError()
+
+                scanner = mock.MagicMock()
+                scanner.__enter__.return_value = entries()
+                return scanner
+
+            for uid in (0, 1001):
+                coholder["uid"] = uid
+                with mock.patch.object(os, "scandir", side_effect=disappear_after_descriptors), \
+                     mock.patch.object(helper, "_process_observation", side_effect=[manager, manager, coholder]):
+                    scan = _scan_process_owners(root, {42, 43}, snap_inodes={42})
+                self.assertEqual(scan[1], {42})
+                self.assertEqual(scan[2], {42} if uid == 0 else set())
+                self.assertEqual(scan[5], {"process_fd_scan"})
+
+        result = observe_local_control_inventory(sample=lambda: partial, sleeper=lambda _: None)
+        snapshot = validate_local_control_inventory(result)["snapshot"]
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(snapshot["unavailable_inputs"], ["process_identity_drift", "socket_ownership"])
+        listener, = snapshot["unix_listeners"]
+        self.assertEqual([owner["executable_basename"] for owner in listener["owners"]], ["systemd"])
+        self.assertFalse(listener["ownership_complete"])
+        samples = iter([partial, idle, idle, idle])
+        result = observe_local_control_inventory(sample=lambda: next(samples), sleeper=lambda _: None)
+        self.assertEqual((result["status"], result["attempts"]), ("stable", 2))
+        self.assertTrue(validate_local_control_inventory(result)["snapshot"]["ownership_complete"])
 
     def test_private_identity_controls_stability_but_is_never_public(self):
         first_owner = self._private_owner(pin=(10, 100, 1, 2))

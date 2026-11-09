@@ -76,16 +76,11 @@ print("verified both snapd owner sets in the saved observation")
 PY
     exit 0
     ;;
-  cycle:2|block-probes:1)
-    if [[ "$1" == cycle ]]; then
-      [[ "$2" == block || "$2" == audit ]] || die "expected block or audit"
-      mode="$2"
-      invocation="action-snapd-$mode"
-    else
-      mode=block
-      invocation=action-azure-cli-block
-    fi
-    /usr/bin/python3 -I - "$1" "$mode" "$invocation" <<'PY'
+  resident:4)
+    [[ "$2" == idle || "$2" == active ]] || die "expected idle or active"
+    [[ "$3" == block || "$3" == audit ]] || die "expected block or audit"
+    [[ ${#4} -le 64 && "$4" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "invalid invocation ID"
+    /usr/bin/python3 -I - "$2" "$3" "$4" <<'PY'
 import json
 import subprocess
 import sys
@@ -93,7 +88,7 @@ import time
 from pathlib import Path
 
 sys.excepthook = lambda *_: print("snapd transition evidence unavailable", file=sys.stderr)
-command, mode, invocation = sys.argv[1:]
+initial_state, mode, invocation = sys.argv[1:]
 runtime = Path("/run/fence") / invocation
 fixture = Path("/run/fence-snapd-fixture")
 cgroup = Path("/sys/fs/cgroup/system.slice/snapd.service/cgroup.procs")
@@ -173,31 +168,37 @@ def check_blocked_operations():
         time.sleep(0.25)
     raise SystemExit("Fence did not report a fresh snapd store DNS refusal")
 
-if command == "block-probes":
-    require(daemon_identity(), "snapd was no longer active after Fence startup")
-    check_blocked_operations()
-    print("verified block denied active snapd operations")
-    raise SystemExit(0)
+def activate():
+    require(local_status("/run/snapd.socket", "/v2/system-info") == 200, "snapd activation failed")
+    require(local_status("/run/snapd-snap.socket", "/v2/users") == 403, "snap-only socket did not deny the runner")
 
-require(daemon_identity() is None, "snapd was not idle at Fence readiness")
-require(local_status("/run/snapd.socket", "/v2/system-info") == 200, "snapd activation failed")
-require(local_status("/run/snapd-snap.socket", "/v2/users") == 403, "snap-only socket did not deny the runner")
+if initial_state == "idle":
+    require(daemon_identity() is None, "snapd was not idle at Fence readiness")
+    activate()
 active = daemon_identity()
-require(active, "snapd was not active after the local request")
+require(active is not None, "snapd was not active during resident verification")
 wait_for_checks(active)
 if mode == "block":
     check_blocked_operations()
+if initial_state == "active":
+    print("verified preactivated snapd stayed active across resident checks")
+    raise SystemExit(0)
+
 (fixture / "stop").write_bytes(b"stop\n")
 deadline = time.monotonic() + 45
 while not (fixture / "idle").is_file() and time.monotonic() < deadline:
     time.sleep(0.25)
 require((fixture / "idle").is_file(), "snapd did not return to socket activation")
 wait_for_checks(None)
-print("verified resident checks with snapd active and back at idle")
+activate()
+reactivated = daemon_identity()
+require(reactivated is not None and reactivated != active, "snapd did not activate a new daemon")
+wait_for_checks(reactivated)
+print("verified resident checks with snapd active, idle, and active again")
 PY
     exit 0
     ;;
-  *) die "usage: script/test-snapd-activation <activate|verify|prepare-cycle|saved active|saved idle|cycle block|cycle audit|block-probes>" ;;
+  *) die "usage: script/test-snapd-activation <activate|verify|prepare-cycle|saved STATE|resident STATE MODE INVOCATION_ID>" ;;
 esac
 
 # Keep live process identities and socket inodes private, including on failure.

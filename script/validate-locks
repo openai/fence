@@ -1189,8 +1189,7 @@ expected_action_steps = {
         "create bounded GitHub artifact fixture",
         "upload bounded GitHub artifact under Fence",
         "verify Action lifecycle",
-        "verify block denies privileged and outside-policy snapd operations",
-        "verify snapd activation and return to idle across resident checks",
+        "verify snapd ownership across resident checks",
     ],
     "zero-input": [
         "checkout",
@@ -1395,10 +1394,10 @@ for name, guard, command, env in (
     ("prepare idle snapd and a one-shot stop for the resident test", "matrix.scenario.snapd == 'idle'", "prepare-cycle", {}),
     ("verify snapd owners in the saved observation", "matrix.scenario.snapd", 'saved "$SNAPD_STATE"',
      {"SNAPD_STATE": "${{ matrix.scenario.snapd }}"}),
-    ("verify block denies privileged and outside-policy snapd operations",
-     "matrix.scenario.snapd == 'active' && matrix.scenario.mode == 'block'", "block-probes", {}),
-    ("verify snapd activation and return to idle across resident checks", "matrix.scenario.snapd == 'idle'",
-     'cycle "$FENCE_MODE"', {"FENCE_MODE": "${{ matrix.scenario.mode }}"}),
+    ("verify snapd ownership across resident checks", "matrix.scenario.snapd",
+     'resident "$SNAPD_STATE" "$FENCE_MODE" "$FENCE_INVOCATION_ID"',
+     {"SNAPD_STATE": "${{ matrix.scenario.snapd }}", "FENCE_MODE": "${{ matrix.scenario.mode }}",
+      "FENCE_INVOCATION_ID": "${{ matrix.scenario.invocation_id }}"}),
 ):
     step = require_step_contract(
         action_job_blocks["action"], name, ["if", "run", "env"] if env else ["if", "run"],
