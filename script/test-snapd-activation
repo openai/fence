@@ -1,0 +1,286 @@
+#! /usr/bin/env bash
+
+set -euo pipefail
+
+source script/env "$@"
+
+[[ "$PLATFORM" == linux && "$ARCH" == x86_64 && "${CI:-}" == true && "${GITHUB_ACTIONS:-}" == true && "${RUNNER_ENVIRONMENT:-}" == github-hosted ]] ||
+  die "snapd activation checks require a disposable GitHub-hosted Linux x64 runner"
+[[ "$EUID" != 0 && "$(id -un)" == runner ]] || die "snapd activation checks require the workflow user"
+
+if [[ $# == 1 && ( "$1" == activate || "$1" == prepare-cycle ) ]]; then
+  # An empty runner can put snapd back to sleep after five seconds. Hold the
+  # active fixture long enough for classification and two resident checks.
+  sudo -n /usr/bin/bash -euc '
+    set -C
+    umask 022
+    /usr/bin/mkdir -p /run/systemd/system/snapd.service.d
+    printf "%s\n" "[Service]" "Environment=SNAPD_STANDBY_WAIT=4m" > /run/systemd/system/snapd.service.d/fence-fixture.conf
+    /usr/bin/systemctl daemon-reload
+    /usr/bin/systemctl stop snapd.service
+  ' >/dev/null 2>&1 || die "could not prepare the snapd activation interval"
+fi
+
+case "${1:-}:$#" in
+  activate:1)
+    # This fixed local read activates both listeners without installing a snap.
+    status=$(/usr/bin/curl -q --noproxy '*' --unix-socket /run/snapd.socket --proto '=http' --silent --max-time 30 --output /dev/null --write-out '%{http_code}' http://localhost/v2/system-info) ||
+      die "snapd local activation request failed"
+    [[ "$status" == 200 ]] || die "snapd local activation request was unsuccessful"
+    ;;
+  verify:1) ;;
+  prepare-cycle:1)
+    # Arm exactly one bounded stop before sudo is removed. The service uses only
+    # installed host commands. The runner can signal it but cannot change its work.
+    /usr/bin/systemctl is-active --quiet snapd.socket || die "snap socket activation is unavailable"
+    sudo -n /usr/bin/mkdir -m 0755 /run/fence-snapd-fixture 2>/dev/null || die "could not create the snapd fixture"
+    sudo -n /usr/bin/install -m 0200 -o runner /dev/null /run/fence-snapd-fixture/stop 2>/dev/null || die "could not create the snapd trigger"
+    sudo -n /usr/bin/systemd-run --quiet --unit=fence-snapd-fixture --property=RuntimeMaxSec=240s -- \
+      /usr/bin/bash -ec '
+        while [[ ! -s /run/fence-snapd-fixture/stop ]]; do /usr/bin/sleep 1; done
+        /usr/bin/systemctl stop snapd.service
+        /usr/bin/systemctl is-active --quiet snapd.socket
+        [[ "$(/usr/bin/systemctl show --value --property=MainPID snapd.service)" == 0 ]]
+        /usr/bin/touch /run/fence-snapd-fixture/idle
+      ' >/dev/null 2>&1 || die "could not arm the snapd stop fixture"
+    exit 0
+    ;;
+  saved:2)
+    [[ "$2" == active || "$2" == idle ]] || die "expected an idle or active observation"
+    /usr/bin/python3 -I - "$RUNNER_TEMP/fence-hosted-runner-observation.json" "$2" <<'PY'
+import hashlib
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    inventory = json.load(handle)["local_control_inventory"]
+snapshot = inventory["snapshot"]
+if inventory["stable"] is not True or snapshot["ownership_complete"] is not True:
+    raise SystemExit("saved ownership observation was incomplete")
+owners = [(0, "systemd", "/usr/lib/systemd/systemd", "/init.scope", 1)]
+if sys.argv[2] == "active":
+    owners.append((0, "snapd", "/usr/lib/snapd/snapd", "/system.slice/snapd.service", 1))
+for endpoint in (b"/run/snapd.socket", b"/run/snapd-snap.socket"):
+    digest = hashlib.sha256(b"fence-unix-name-v1\0" + endpoint).hexdigest()
+    rows = [row for row in snapshot["unix_listeners"] if row["name_sha256"] == digest]
+    if len(rows) != 1:
+        raise SystemExit("saved snapd listener was missing or duplicated")
+    row = rows[0]
+    fields = ("uid", "executable_basename", "canonical_executable", "unified_cgroup", "processes")
+    actual = [tuple(item[key] for key in fields) for item in row["owners"]]
+    if (row["instances"] != 1 or row["socket_type"] != "stream" or row["name_kind"] != "filesystem"
+            or row["runner_reachable"] is not True or row["ownership_complete"] is not True
+            or sorted(actual) != sorted(owners)):
+        raise SystemExit("saved snapd listener owners did not match the test case")
+print("verified both snapd owner sets in the saved observation")
+PY
+    exit 0
+    ;;
+  resident:4)
+    [[ "$2" == idle || "$2" == active ]] || die "expected idle or active"
+    [[ "$3" == block || "$3" == audit ]] || die "expected block or audit"
+    [[ ${#4} -le 64 && "$4" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || die "invalid invocation ID"
+    /usr/bin/python3 -I - "$2" "$3" "$4" <<'PY'
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.excepthook = lambda *_: print("snapd transition evidence unavailable", file=sys.stderr)
+initial_state, mode, invocation = sys.argv[1:]
+runtime = Path("/run/fence") / invocation
+fixture = Path("/run/fence-snapd-fixture")
+cgroup = Path("/sys/fs/cgroup/system.slice/snapd.service/cgroup.procs")
+ready_pid = json.loads((runtime / "ready.json").read_bytes())["resident_health"]["resident_pid"]
+
+def require(condition, reason):
+    if not condition:
+        raise SystemExit(reason)
+
+def local_status(endpoint, path, method="GET"):
+    # No credentials, proxy, redirects, response bodies, or arbitrary destinations.
+    result = subprocess.run(
+        ["/usr/bin/curl", "-q", "--noproxy", "*", "--proto", "=http", "--silent", "--max-time", "40",
+         "--unix-socket", endpoint, "--request", method, "--output", "/dev/null", "--write-out", "%{http_code}",
+         "http://localhost" + path],
+        capture_output=True, timeout=45, check=False,
+    )
+    require(result.returncode == 0, "snapd did not complete the local probe")
+    return int(result.stdout)
+
+def health():
+    report = json.loads((runtime / "report.json").read_bytes())
+    health = report["resident_health"]
+    require(report["mode"] == mode and health["status"] == "healthy" and health["resident_pid"] == ready_pid
+            and not report["critical_findings"],
+            "resident was unhealthy during snapd transition")
+    return health["verification_sequence"]
+
+def daemon_identity():
+    try:
+        pids = cgroup.read_text().splitlines()
+    except FileNotFoundError:
+        return None
+    found = []
+    for pid in pids:
+        try:
+            proc_stat = (Path("/proc") / pid / "stat").read_bytes()
+        except FileNotFoundError:
+            continue
+        comm, fields = proc_stat.rsplit(b") ", 1)
+        if comm == pid.encode("ascii") + b" (snapd":
+            found.append((pid, fields.split()[19]))
+    require(len(found) <= 1, "multiple snapd processes in the service")
+    return found[0] if found else None
+
+def wait_for_checks(expected_daemon):
+    start = health()
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        require(daemon_identity() == expected_daemon, "snapd state changed during resident checks")
+        if health() >= start + 2:
+            return
+        time.sleep(0.25)
+    raise SystemExit("resident verification did not advance during snapd transition")
+
+def store_dns():
+    report = json.loads((runtime / "dns-report.json").read_bytes())
+    return report["blocked_non_profile_query_count"], sum(
+        row["occurrences"] for row in report["observations"]
+        if row["hostname"] == "api.snapcraft.io" and row["policy_classification"] == "outside_policy"
+        and not row["resolved_addresses"]
+    )
+
+def check_blocked_operations():
+    require(local_status("/run/snapd.socket", "/v2/users") == 403, "snapd root-only API did not deny the runner")
+    # An empty body cannot execute a package operation, even if authorization regresses.
+    require(local_status("/run/snapd.socket", "/v2/snaps/hello-world", "POST") in (401, 403),
+            "snapd package management did not deny the runner")
+    before = store_dns()
+    status = local_status("/run/snapd.socket", "/v2/find?q=hello-world")
+    require(400 <= status < 600, "snapd store lookup was not denied")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        after = store_dns()
+        if after[0] > before[0] and after[1] > before[1]:
+            return
+        time.sleep(0.25)
+    raise SystemExit("Fence did not report a fresh snapd store DNS refusal")
+
+def activate():
+    require(local_status("/run/snapd.socket", "/v2/system-info") == 200, "snapd activation failed")
+    require(local_status("/run/snapd-snap.socket", "/v2/users") == 403, "snap-only socket did not deny the runner")
+
+if initial_state == "idle":
+    require(daemon_identity() is None, "snapd was not idle at Fence readiness")
+    activate()
+active = daemon_identity()
+require(active is not None, "snapd was not active during resident verification")
+wait_for_checks(active)
+if mode == "block":
+    check_blocked_operations()
+if initial_state == "active":
+    print("verified preactivated snapd stayed active across resident checks")
+    raise SystemExit(0)
+
+(fixture / "stop").write_bytes(b"stop\n")
+deadline = time.monotonic() + 45
+while not (fixture / "idle").is_file() and time.monotonic() < deadline:
+    time.sleep(0.25)
+require((fixture / "idle").is_file(), "snapd did not return to socket activation")
+wait_for_checks(None)
+activate()
+reactivated = daemon_identity()
+require(reactivated is not None and reactivated != active, "snapd did not activate a new daemon")
+wait_for_checks(reactivated)
+print("verified resident checks with snapd active, idle, and active again")
+PY
+    exit 0
+    ;;
+  *) die "usage: script/test-snapd-activation <activate|verify|prepare-cycle|saved STATE|resident STATE MODE INVOCATION_ID>" ;;
+esac
+
+# Keep live process identities and socket inodes private, including on failure.
+if ! sudo --non-interactive /usr/bin/python3 -I -B - "$DIR/script/lib" 2>/dev/null <<'PY'
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from host_observation import (
+    MAX_FDS_PER_PROCESS, MAX_PROC_NET_TABLE_BYTES, _bounded_read,
+    bounded_command_output, bounded_directory_entries, parse_unix_table,
+)
+
+
+def require(condition, reason):
+    if not condition:
+        print(f"snapd activation evidence failed: {reason}", flush=True)
+        raise SystemExit(1)
+
+
+def trusted_executable(process, path):
+    require(os.readlink(process / "exe") == str(path), "unsupported executable layout")
+    for ancestor in path.parents:
+        meta = ancestor.lstat()
+        require(stat.S_ISDIR(meta.st_mode) and meta.st_uid == meta.st_gid == 0
+                and not meta.st_mode & 0o022, "unsafe executable ancestor")
+    reference = path.lstat()
+    live = (process / "exe").stat()
+    require(stat.S_ISREG(reference.st_mode) and stat.S_IMODE(reference.st_mode) == 0o755
+            and reference.st_uid == reference.st_gid == 0 and os.path.samestat(live, reference),
+            "unverified packaged executable")
+    return live.st_dev, live.st_ino
+
+
+def owner(pid, path, cgroup, listeners):
+    process = Path("/proc") / str(pid)
+    uids = [line.split()[1:] for line in _bounded_read(process / "status", 16384).splitlines()
+            if line.startswith(b"Uid:")]
+    require(uids == [[b"0"] * 4] and _bounded_read(process / "cgroup", 4096).splitlines() == [cgroup],
+            "unexpected service identity")
+    executable = trusted_executable(process, Path(path))
+    fields = _bounded_read(process / "stat", 4096).rsplit(b") ", 1)[1].split()
+    start_time = int(fields[19])
+    descriptors, truncated = bounded_directory_entries(process / "fd", MAX_FDS_PER_PROCESS)
+    require(not truncated, "descriptor bound exceeded")
+    held = set()
+    for descriptor in descriptors:
+        try:
+            held.add(os.readlink(descriptor))
+        except FileNotFoundError:
+            continue
+    require(all(f"socket:[{inode}]" in held for inode in listeners), "expected listeners not held")
+    return pid, start_time, executable
+
+
+def snapshot():
+    rows, malformed = parse_unix_table(_bounded_read("/proc/net/unix", MAX_PROC_NET_TABLE_BYTES))
+    require(not malformed, "incomplete listener table")
+    listeners = []
+    for endpoint in (b"/run/snapd.socket", b"/run/snapd-snap.socket"):
+        matches = [row for row in rows if row["raw_name"] == endpoint]
+        require(len(matches) == 1 and matches[0]["socket_type"] == "stream", "unexpected listener")
+        listeners.append(matches[0]["inode"])
+    require(len(set(listeners)) == 2, "unexpected listener identity")
+    result = bounded_command_output(["/usr/bin/systemctl", "show", "--property=MainPID", "--value", "snapd.service"], maximum=32)
+    require(result is not None and result.strip().isdecimal() and int(result) > 1, "service unavailable")
+    manager = owner(1, "/usr/lib/systemd/systemd", b"0::/init.scope", listeners)
+    daemon = owner(int(result), "/usr/lib/snapd/snapd", b"0::/system.slice/snapd.service", listeners)
+    return listeners, manager, daemon
+
+
+try:
+    first = snapshot()
+    time.sleep(0.05)
+    require(first == snapshot(), "unstable observation")
+except (OSError, ValueError, IndexError, RuntimeError):
+    require(False, "observation unavailable")
+PY
+then
+  die "snapd active layout could not be verified"
+fi
+echo "snapd activation verified: distro executable and both shared listeners"

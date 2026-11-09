@@ -1,0 +1,8 @@
+{
+  "executable": "/usr/lib/snapd/snapd",
+  "cgroup": "/system.slice/snapd.service",
+  "socket_name_sha256": [
+    "ac10a069436547a18b02df8078e06421de7fc8953887fcc32f817af06b1b09bb",
+    "f7978cc2493e0ecd56d54a3f49e36c3bde79b3ac281baa0a0aed0efab0898c23"
+  ]
+}

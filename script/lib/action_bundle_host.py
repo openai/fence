@@ -14,6 +14,7 @@ from host_observation import (
     SCHEMA4_REVIEWED_RESOLVER_TARGET,
     SCHEMA4_REVIEWED_UNIT_STATES,
     SCHEMA4_REQUIRED_PATHS,
+    UNREVIEWED_EXECUTABLE_PATH,
     UNREVIEWED_ARCHITECTURE,
     UNREVIEWED_METADATA_TARGET,
     UNREVIEWED_OS_ID,
@@ -976,6 +977,59 @@ class ClassificationTests(unittest.TestCase):
             classify(observation, support, transitions),
             {"run_bundle": True, "classification": "bundle_compatible"},
         )
+
+    def test_saved_snap_activation_uses_the_native_owner_cases(self):
+        cases_path = pathlib.Path(__file__).resolve().parents[2] / "tests/fixtures/snapd-socket-owners.json"
+        cases = json.loads(cases_path.read_text(encoding="utf-8"))
+        for version in ("24.04", "26.04"):
+            observation, support, transitions = fixture()
+            observation["host"]["os_version_id"] = version
+            snapshot = observation["local_control_inventory"]["snapshot"]
+            for case in cases:
+                with self.subTest(version=version, case=case["name"]):
+                    snapshot["unix_listeners"] = [case["listener"]]
+                    if case["accepted"]:
+                        self.assertTrue(classify(observation, support, transitions)["run_bundle"])
+                    else:
+                        with self.assertRaises(ClassificationError):
+                            classify(observation, support, transitions)
+
+        active = next(case["listener"] for case in cases if case["accepted"] and len(case["listener"]["owners"]) == 2)
+        daemon, manager = active["owners"]
+        # These have different owner sets and are distinct rows under the public
+        # aggregation key, but a reviewed socket may still occur only once.
+        snapshot["unix_listeners"] = [active, {**active, "owners": [manager]}]
+        with self.assertRaisesRegex(ClassificationError, "summary is inconsistent"):
+            classify(observation, support, transitions)
+        for label, changes in (
+            ("duplicate instance", {"instances": 2}),
+            ("wrong socket type", {"socket_type": "seqpacket"}),
+            ("abstract", {"name_kind": "abstract"}),
+            ("wrong uid", {"owners": [{**daemon, "uid": 101}, manager]}),
+            ("extra manager", {"owners": [daemon, {**manager, "processes": 2}]}),
+        ):
+            with self.subTest(label=label):
+                snapshot["unix_listeners"] = [{**active, **changes}]
+                with self.assertRaises(ClassificationError):
+                    classify(observation, support, transitions)
+        snapshot["unix_listeners"] = []
+        snapshot["tcp_listeners"][0]["owners"] = [daemon]
+        with self.assertRaises(ClassificationError):
+            classify(observation, support, transitions)
+
+        # An old, redacted active observation is still valid evidence of an
+        # unavailable scan. Only a new live observation can verify the executable.
+        observation, support, transitions = fixture()
+        inventory = observation["local_control_inventory"]
+        inventory["status"] = "unavailable"
+        inventory["snapshot"].update(
+            ownership_complete=False, scan_status="unavailable", unavailable_inputs=["socket_ownership"],
+            unix_listeners=[{**active, "ownership_complete": False,
+                             "owners": [{**daemon, "canonical_executable": UNREVIEWED_EXECUTABLE_PATH}, manager]}],
+        )
+        validate_schema4_observation(observation)
+        with self.assertRaisesRegex(ClassificationError, "local control inventory is incomplete"):
+            classify(observation, support, transitions)
 
     def test_reviewed_ubuntu_lts_updates_do_not_require_a_bundle_update(self):
         for version in ("24.04", "26.04", "40.04"):

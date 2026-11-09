@@ -2390,13 +2390,14 @@ impl DnsMediationSession {
 
     fn verify_before_readiness(
         &self,
-        baseline: &LocalControlSnapshot,
+        baseline: &mut LocalControlSnapshot,
     ) -> Result<ResidentHealth, DnsMediationError> {
         let observed = self.observe_local_control(
             MissingOwnerRetry::Baseline(baseline),
             Some(StartupCheck::FinalReadiness),
         );
-        let verified = verify_local_control_observation(baseline, &observed)
+        let verified = observed
+            .verify_and_record_activation(baseline)
             .map_err(local_control_error)
             .and_then(|()| {
                 self.routing
@@ -2692,7 +2693,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 None,
             )
         })();
-        let local_control_baseline = match setup_result {
+        let mut local_control_baseline = match setup_result {
             Ok(baseline) => baseline,
             Err(error) => {
                 evidence.setup_status = "failed_pre_ready";
@@ -2723,7 +2724,8 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
             let _ = runtime.replace_report(&evidence);
             return Err(runtime_error(error));
         }
-        evidence.resident_health = match mediation.verify_before_readiness(&local_control_baseline)
+        evidence.resident_health = match mediation
+            .verify_before_readiness(&mut local_control_baseline)
         {
             Ok(health) => health,
             Err(error) => {
@@ -2869,7 +2871,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
                 ._mediation
                 .observe_local_control(MissingOwnerRetry::Never, None);
             if let Err(error) = observed.verify_resident_baseline(
-                &self.local_control_baseline,
+                &mut self.local_control_baseline,
                 &mut self.evidence.first_failed_local_control_scan,
             ) {
                 verification_succeeded = false;
@@ -3089,7 +3091,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 Some(&lockdown),
             )
         })();
-        let local_control_baseline = match setup_result {
+        let mut local_control_baseline = match setup_result {
             Ok(baseline) => baseline,
             Err(error) => {
                 evidence.setup_status = "failed_pre_ready";
@@ -3126,7 +3128,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         evidence.resident_health = match lockdown
             .verify_socket_seals()
             .map_err(lockdown_error)
-            .and_then(|()| mediation.verify_before_readiness(&local_control_baseline))
+            .and_then(|()| mediation.verify_before_readiness(&mut local_control_baseline))
         {
             Ok(health) => health,
             Err(error) => {
@@ -3469,7 +3471,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
                 ._mediation
                 .observe_local_control(MissingOwnerRetry::Never, None);
             if let Err(error) = observed.verify_resident_baseline(
-                &self.local_control_baseline,
+                &mut self.local_control_baseline,
                 &mut self.evidence.first_failed_local_control_scan,
             ) {
                 verification_succeeded = false;

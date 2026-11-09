@@ -208,6 +208,7 @@ jobs:
           - name: azure-cli-block
             lifecycle: standard
             regular_resolver: true
+            snapd: active
             mode: block
             invocation_id: action-azure-cli-block
             container_policy: disable
@@ -217,12 +218,24 @@ jobs:
           - name: azure-cli-audit
             lifecycle: audit
             regular_resolver: true
+            snapd: active
             mode: audit
             invocation_id: action-azure-cli-audit
             container_policy: ''
             disable_broad_github_domains: 'false'
             allow_github_artifacts: 'false'
             allowlist: ''
+          - name: snapd-block
+            lifecycle: standard
+            snapd: idle
+            mode: block
+            invocation_id: action-snapd-block
+            container_policy: disable
+          - name: snapd-audit
+            lifecycle: audit
+            snapd: idle
+            mode: audit
+            invocation_id: action-snapd-audit
     timeout-minutes: 8
     runs-on: ${{ matrix.runner }}
 
@@ -244,8 +257,22 @@ jobs:
         if: matrix.scenario.regular_resolver
         run: script/test-action-acceptance prepare-regular-resolver
 
+      - name: activate and verify packaged snapd before startup
+        if: matrix.scenario.snapd == 'active'
+        run: script/test-snapd-activation activate
+
+      - name: prepare idle snapd and a one-shot stop for the resident test
+        if: matrix.scenario.snapd == 'idle'
+        run: script/test-snapd-activation prepare-cycle
+
       - name: observe hosted runner fingerprint candidate
         run: script/observe-hosted-runner
+
+      - name: verify snapd owners in the saved observation
+        if: matrix.scenario.snapd
+        env:
+          SNAPD_STATE: ${{ matrix.scenario.snapd }}
+        run: script/test-snapd-activation saved "$SNAPD_STATE"
 
       - name: classify bundled Action host compatibility
         id: bundle-host
@@ -303,6 +330,14 @@ jobs:
           FENCE_GITHUB_ARTIFACT_ID: ${{ steps.github-artifact-upload.outputs.artifact-id }}
           FENCE_GITHUB_ARTIFACT_DIGEST: ${{ steps.github-artifact-upload.outputs.artifact-digest }}
         run: script/test-action-acceptance "${{ matrix.scenario.lifecycle || matrix.scenario.name }}" "${{ matrix.scenario.invocation_id }}"
+
+      - name: verify snapd ownership across resident checks
+        if: matrix.scenario.snapd
+        env:
+          SNAPD_STATE: ${{ matrix.scenario.snapd }}
+          FENCE_MODE: ${{ matrix.scenario.mode }}
+          FENCE_INVOCATION_ID: ${{ matrix.scenario.invocation_id }}
+        run: script/test-snapd-activation resident "$SNAPD_STATE" "$FENCE_MODE" "$FENCE_INVOCATION_ID"
 
   zero-input:
     name: action zero-input standard${{ matrix.runner != needs.prepare-candidate.outputs.acceptance_runner && format(' ({0})', matrix.runner) || '' }}
