@@ -1125,6 +1125,7 @@ expected_action_entries = {
     "azure-cli-block": {
         "lifecycle": "standard",
         "regular_resolver": "true",
+        "snapd": "active",
         "mode": "block",
         "invocation_id": "action-azure-cli-block",
         "container_policy": "disable",
@@ -1135,12 +1136,26 @@ expected_action_entries = {
     "azure-cli-audit": {
         "lifecycle": "audit",
         "regular_resolver": "true",
+        "snapd": "active",
         "mode": "audit",
         "invocation_id": "action-azure-cli-audit",
         "container_policy": "''",
         "disable_broad_github_domains": "'false'",
         "allow_github_artifacts": "'false'",
         "allowlist": "''",
+    },
+    "snapd-block": {
+        "lifecycle": "standard",
+        "snapd": "idle",
+        "mode": "block",
+        "invocation_id": "action-snapd-block",
+        "container_policy": "disable",
+    },
+    "snapd-audit": {
+        "lifecycle": "audit",
+        "snapd": "idle",
+        "mode": "audit",
+        "invocation_id": "action-snapd-audit",
     },
 }
 require(
@@ -1163,11 +1178,16 @@ expected_action_steps = {
         "checkout",
         "install assembled Action bundle",
         "prepare regular host resolver fixture",
+        "activate and verify packaged snapd before startup",
+        "prepare idle snapd and a one-shot stop for the resident test",
         "observe hosted runner fingerprint candidate",
+        "verify snapd owners in the saved observation",
         "classify bundled Action host compatibility",
         "require bundled Action activation",
         "activate bundled Fence agent",
         "exercise Azure CLI and UUID service activation",
+        "verify block denies privileged and outside-policy snapd operations",
+        "verify snapd activation and return to idle across resident checks",
         "create bounded GitHub artifact fixture",
         "upload bounded GitHub artifact under Fence",
         "verify Action lifecycle",
@@ -1369,6 +1389,26 @@ require(
     == "          az version\n          systemctl is-active --quiet uuidd.service\n",
     "Azure CLI acceptance must check real UUID activation in both modes",
 )
+
+for name, guard, command, env in (
+    ("activate and verify packaged snapd before startup", "matrix.scenario.snapd == 'active'", "activate", {}),
+    ("prepare idle snapd and a one-shot stop for the resident test", "matrix.scenario.snapd == 'idle'", "prepare-cycle", {}),
+    ("verify snapd owners in the saved observation", "matrix.scenario.snapd", 'saved "$SNAPD_STATE"',
+     {"SNAPD_STATE": "${{ matrix.scenario.snapd }}"}),
+    ("verify block denies privileged and outside-policy snapd operations",
+     "matrix.scenario.snapd == 'active' && matrix.scenario.mode == 'block'", "block-probes", {}),
+    ("verify snapd activation and return to idle across resident checks", "matrix.scenario.snapd == 'idle'",
+     'cycle "$FENCE_MODE"', {"FENCE_MODE": "${{ matrix.scenario.mode }}"}),
+):
+    step = require_step_contract(
+        action_job_blocks["action"], name, ["if", "run", "env"] if env else ["if", "run"],
+        {"if": guard, "run": f"script/test-snapd-activation {command}"}, name,
+    )
+    if env:
+        step_env = indented_block(step, "        env:", f"{name} environment must be unique")
+        require_exact_mapping_keys(step_env, 10, env, f"{name} environment fields changed")
+        require(scalar_mapping(step_env, 10) == env, f"{name} must verify the selected scenario")
+
 action_lifecycle_env = indented_block(
     action_lifecycle,
     "        env:",
