@@ -347,6 +347,9 @@ enum OwnershipDetail {
     NoOwnerObserved,
     ObservedOwnershipIncomplete,
     IdentityNotReviewed,
+    SnapdPinConflict,
+    SnapSocketCheckFailed,
+    OtherSocketCheckFailed,
     RetryInventoryMismatch,
 }
 
@@ -1616,6 +1619,34 @@ fn ownership_detail(
     retry: MissingOwnerRetry<'_>,
 ) -> BTreeSet<OwnershipDetail> {
     let mut detail = BTreeSet::new();
+    if snapshot.snapd == SnapdOwner::Unverified {
+        detail.insert(OwnershipDetail::SnapdPinConflict);
+    }
+    for listener in &snapshot.unix_listeners {
+        if !unix_listener_identities_reviewed(listener) {
+            detail.insert(if snapd_socket(&listener.name_sha256) {
+                OwnershipDetail::SnapSocketCheckFailed
+            } else {
+                OwnershipDetail::OtherSocketCheckFailed
+            });
+        }
+    }
+    if !snapshot
+        .tcp_listeners
+        .iter()
+        .all(tcp_listener_identities_reviewed)
+    {
+        detail.insert(OwnershipDetail::OtherSocketCheckFailed);
+    }
+    if !detail.is_empty()
+        || !snapshot
+            .root_container_processes
+            .iter()
+            .all(root_container_identity_reviewed)
+    {
+        detail.insert(OwnershipDetail::IdentityNotReviewed);
+    }
+
     let unix = snapshot
         .unix_listeners
         .iter()
@@ -1632,15 +1663,6 @@ fn ownership_detail(
                 OwnershipDetail::ObservedOwnershipIncomplete
             });
         }
-    }
-    if snapshot.snapd == SnapdOwner::Unverified
-        || !identities_reviewed(
-            &snapshot.root_container_processes,
-            &snapshot.unix_listeners,
-            &snapshot.tcp_listeners,
-        )
-    {
-        detail.insert(OwnershipDetail::IdentityNotReviewed);
     }
     // The same ownerless listener can match one startup inventory and contradict another.
     if detail.contains(&OwnershipDetail::NoOwnerObserved)
@@ -3276,38 +3298,37 @@ fn identities_reviewed(
     root_container_processes
         .iter()
         .all(root_container_identity_reviewed)
-        && unix_listeners.iter().all(|listener| {
-            if snapd_socket(&listener.name_sha256) {
-                // Missing owners are handled separately by the bounded startup retry.
-                return (!listener.ownership_complete && listener.owners.is_empty())
-                    || reviewed_activation_listener(listener);
-            }
-            listener.owners.iter().all(|owner| {
-                owner_identity_reviewed(owner)
-                    || (listener.name_kind == UnixNameKind::Filesystem
-                        && listener.socket_type == UnixSocketType::Stream
-                        && listener.name_sha256 == ubuntu26::LOGIN_SOCKET_SHA256
-                        && exact_root_service(
-                            owner,
-                            "systemd-logind",
-                            ubuntu26::LOGIND_PATH,
-                            ubuntu26::LOGIND_CGROUP,
-                        ))
-            }) || reviewed_activation_listener(listener)
-        })
-        && tcp_listeners.iter().all(|listener| {
-            listener.owners.iter().all(|owner| {
-                owner_identity_reviewed(owner)
-                    || (listener.bind_class == BindClass::Wildcard
-                        && listener.port == 22
-                        && exact_root_service(
-                            owner,
-                            "sshd",
-                            ubuntu26::SSHD_PATH,
-                            ubuntu26::SSHD_CGROUP,
-                        ))
-            })
-        })
+        && unix_listeners.iter().all(unix_listener_identities_reviewed)
+        && tcp_listeners.iter().all(tcp_listener_identities_reviewed)
+}
+
+fn unix_listener_identities_reviewed(listener: &UnixListener) -> bool {
+    if snapd_socket(&listener.name_sha256) {
+        // Missing owners are handled separately by the bounded startup retry.
+        return (!listener.ownership_complete && listener.owners.is_empty())
+            || reviewed_activation_listener(listener);
+    }
+    listener.owners.iter().all(|owner| {
+        owner_identity_reviewed(owner)
+            || (listener.name_kind == UnixNameKind::Filesystem
+                && listener.socket_type == UnixSocketType::Stream
+                && listener.name_sha256 == ubuntu26::LOGIN_SOCKET_SHA256
+                && exact_root_service(
+                    owner,
+                    "systemd-logind",
+                    ubuntu26::LOGIND_PATH,
+                    ubuntu26::LOGIND_CGROUP,
+                ))
+    }) || reviewed_activation_listener(listener)
+}
+
+fn tcp_listener_identities_reviewed(listener: &TcpListener) -> bool {
+    listener.owners.iter().all(|owner| {
+        owner_identity_reviewed(owner)
+            || (listener.bind_class == BindClass::Wildcard
+                && listener.port == 22
+                && exact_root_service(owner, "sshd", ubuntu26::SSHD_PATH, ubuntu26::SSHD_CGROUP))
+    })
 }
 
 fn exact_root_service(owner: &LocalControlOwner, basename: &str, path: &str, cgroup: &str) -> bool {
@@ -3485,7 +3506,10 @@ mod tests {
         );
         assert_eq!(
             ownership_detail(&unreviewed, MissingOwnerRetry::Never),
-            BTreeSet::from([OwnershipDetail::IdentityNotReviewed])
+            BTreeSet::from([
+                OwnershipDetail::IdentityNotReviewed,
+                OwnershipDetail::OtherSocketCheckFailed
+            ])
         );
         private.unix_listeners.clear();
         private.tcp_listeners.push(PrivateTcpListener {
@@ -3953,6 +3977,42 @@ mod tests {
     }
 
     #[test]
+    fn ownership_details_identify_only_the_listeners_that_failed_review() {
+        use OwnershipDetail::{
+            IdentityNotReviewed, ObservedOwnershipIncomplete, OtherSocketCheckFailed,
+            SnapSocketCheckFailed,
+        };
+
+        let healthy_snap = snapd_sockets(true, Some(55));
+        let mut partial_snap = healthy_snap.clone();
+        partial_snap.unix_listeners[0].ownership_complete = false;
+        let mut other = owned_listeners().tcp_listeners;
+        other[0].owners = vec![private_owner(0, false, &[10])];
+        other[0].ownership_complete = false;
+
+        let mut mixed = partial_snap.clone();
+        mixed.tcp_listeners.clone_from(&other);
+        let mut unrelated = healthy_snap;
+        unrelated.tcp_listeners = other;
+
+        for (sample, expected) in [
+            (unrelated, vec![OtherSocketCheckFailed]),
+            (partial_snap, vec![SnapSocketCheckFailed]),
+            (mixed, vec![SnapSocketCheckFailed, OtherSocketCheckFailed]),
+        ] {
+            let observed = observe_samples([sample.clone(), sample]);
+            assert_eq!(observed.attempts, 1);
+            assert!(verify_complete_local_control_observation(&observed).is_err());
+            let mut reasons = BTreeSet::from([IdentityNotReviewed, ObservedOwnershipIncomplete]);
+            reasons.extend(expected);
+            assert_eq!(
+                ownership_detail(&observed.snapshot, MissingOwnerRetry::Never),
+                reasons
+            );
+        }
+    }
+
+    #[test]
     fn snapd_activation_rejects_split_owners_and_anchor_drift() {
         let inventory = crate::hosted_runner::hosted_runner_fingerprint_requirement()
             .accepted
@@ -3965,9 +4025,12 @@ mod tests {
             split.unix_listeners[1] = changed_daemon.unix_listeners[1].clone();
             let observed = observe_samples([split.clone(), split]);
             assert_eq!(observed.status, ObservationStatus::Unavailable);
-            assert!(
-                ownership_detail(&observed.snapshot, MissingOwnerRetry::Never)
-                    .contains(&OwnershipDetail::IdentityNotReviewed)
+            assert_eq!(
+                ownership_detail(&observed.snapshot, MissingOwnerRetry::Never),
+                BTreeSet::from([
+                    OwnershipDetail::IdentityNotReviewed,
+                    OwnershipDetail::SnapdPinConflict
+                ])
             );
             assert!(verify_reviewed_local_control_observation(&inventory, &observed).is_err());
             let mut new_socket = active.clone();
@@ -4947,6 +5010,13 @@ mod tests {
             identity_complete: false,
             process_pin: owner.process_pins.into_iter().next().unwrap(),
         });
+        assert_eq!(
+            ownership_detail(
+                &public_snapshot(unreviewed.clone()),
+                MissingOwnerRetry::Never
+            ),
+            BTreeSet::from([OwnershipDetail::IdentityNotReviewed])
+        );
         for snapshot in [bounded, malformed, unreviewed] {
             let observed = observe_samples([snapshot.clone(), snapshot]);
             assert_eq!(observed.attempts, 1);
@@ -5014,7 +5084,7 @@ mod tests {
             serde_json::json!({"fence_local_control": {
                 "status": "unavailable", "attempts": 1, "unavailable_inputs": ["socket_ownership"],
                 "bounds_exceeded": [], "startup_check": "initial_inventory",
-                "ownership_detail": ["no_owner_observed", "observed_ownership_incomplete", "identity_not_reviewed", "retry_inventory_mismatch"],
+                "ownership_detail": ["no_owner_observed", "observed_ownership_incomplete", "identity_not_reviewed", "other_socket_check_failed", "retry_inventory_mismatch"],
             }})
         );
         assert!(

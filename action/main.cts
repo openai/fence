@@ -181,8 +181,12 @@ const STARTUP_OWNERSHIP_CHECKS = new Set([
   "initial_host", "initial_inventory", "setup_host", "container_disable", "container_verification",
   "post_lockdown_baseline", "final_readiness", "docker_dns", "container_availability",
 ]);
+const OWNERSHIP_IDENTITY_DETAILS = new Set([
+  "snapd_pin_conflict", "snap_socket_check_failed", "other_socket_check_failed",
+]);
 const OWNERSHIP_DETAILS = new Set([
   "no_owner_observed", "observed_ownership_incomplete", "identity_not_reviewed", "retry_inventory_mismatch",
+  ...OWNERSHIP_IDENTITY_DETAILS,
 ]);
 
 function localControlDiagnosticFromJournal(output: string, expectedStatus?: string): string | undefined {
@@ -204,6 +208,8 @@ function localControlDiagnosticFromJournal(output: string, expectedStatus?: stri
         ownership_detail.length > 0 && ownership_detail.length <= OWNERSHIP_DETAILS.size &&
         ownership_detail.every((reason) => OWNERSHIP_DETAILS.has(reason)) &&
         new Set(ownership_detail).size === ownership_detail.length &&
+        (ownership_detail.includes("identity_not_reviewed") ||
+          !ownership_detail.some((reason) => OWNERSHIP_IDENTITY_DETAILS.has(reason))) &&
         ownership_detail.includes("retry_inventory_mismatch") ===
           (ownership_detail.includes("no_owner_observed") && diagnostic.attempts < LOCAL_CONTROL_SCAN_ATTEMPTS)
       ) {

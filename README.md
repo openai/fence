@@ -113,7 +113,7 @@ Fence runs before the rest of your job and controls which network destinations t
 
 See [how Fence works](docs/how-it-works.md) for more detail.
 
-Fence checks listening services without counting unrelated TCP connections against the inspection limit. At startup, it can check again if a known socket has no visible owner. If it still can't verify ownership, it stops. The setup error can identify which check failed and what Fence observed about ownership. See [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
+Fence checks listening services without counting unrelated TCP connections against the inspection limit. At startup, it can check again if a known socket has no visible owner. If it still can't verify ownership, it stops. The setup error can identify a Snap daemon pin conflict or an owner check that failed on a Snap socket or another listener. See [troubleshooting](docs/troubleshooting.md#fence-fails-to-start).
 
 If Fence can't verify the runner's local services during a job, the [post-job diagnostic](docs/troubleshooting.md#post-job-evidence-validation-fails) can show what the first failed check saw. The job still fails.
 

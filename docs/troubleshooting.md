@@ -20,7 +20,10 @@ When the samples match, socket ownership is the only unavailable input, and the 
 
 - `no_owner_observed` means Fence found a listener but could not identify any owner.
 - `observed_ownership_incomplete` means Fence found at least one owner but could not verify ownership completely.
-- `identity_not_reviewed` means a listener owner or root container process did not match a reviewed identity.
+- `identity_not_reviewed` means Fence could not verify a listener owner or a root container process. It can appear alone.
+- `snapd_pin_conflict` means verified Snap daemon owners on the two reviewed listeners had conflicting process identities.
+- `snap_socket_check_failed` means an owner check failed on a reviewed Snap listener. The check can also fail when another process shares that listener or ownership is incomplete.
+- `other_socket_check_failed` means an owner check failed on another Unix or TCP listener.
 - `retry_inventory_mismatch` means that even after allowing for the missing owner, the inventory did not match what that startup check permits.
 
 These fields omit socket and process identifiers.

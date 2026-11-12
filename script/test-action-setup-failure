@@ -65,8 +65,8 @@ wait "$ownership_pid"
 [[ "$ownership_exit" == 1 && ! -e "/run/fence/$ownership_invocation/ready.json" ]] ||
   die "Action setup unexpectedly accepted an unreviewed socket owner"
 grep -Fq "Fence resident service exited while the Action was waiting for readiness" "$stdout"
-grep -Eq "^::error::Fence could not verify readiness: .*unavailable=socket_ownership; bounds=none; startup_check=$ownership_check; ownership_detail=([a-z_]+,)*identity_not_reviewed(,[a-z_]+)* \(local_control_inventory_unavailable\)" "$stderr" ||
-  die "Action setup did not report the unreviewed owner in the expected startup check"
+grep -Eq "^::error::Fence could not verify readiness: .*unavailable=socket_ownership; bounds=none; startup_check=$ownership_check; ownership_detail=([a-z_]+,)*other_socket_check_failed(,[a-z_]+)* \(local_control_inventory_unavailable\)" "$stderr" ||
+  die "Action setup did not identify the failed non-Snap listener check"
 
 if INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"Action_Invalid","allowlist":[]}' \
   GITHUB_STATE="$state" \
