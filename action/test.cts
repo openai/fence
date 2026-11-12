@@ -1351,6 +1351,14 @@ test("startup socket ownership details require a recognized check and compatible
   assert.equal(localControlDiagnosticFromJournal(line({
     startup_check: "final_readiness", ownership_detail: ["observed_ownership_incomplete", "identity_not_reviewed"],
   })), summary + "; startup_check=final_readiness; ownership_detail=observed_ownership_incomplete,identity_not_reviewed");
+  const identityDetails = ["snapd_pin_conflict", "snap_socket_check_failed", "other_socket_check_failed"];
+  for (const details of [...identityDetails.map((reason) => [reason]), identityDetails]) {
+    const ownership_detail = ["identity_not_reviewed", ...details];
+    assert.equal(localControlDiagnosticFromJournal(line({
+      startup_check: "initial_inventory", ownership_detail, path: "/private/process",
+    })), summary + "; startup_check=initial_inventory; ownership_detail=" + ownership_detail.join(","));
+    assert.equal(localControlDiagnosticFromJournal(line({ ...context, ownership_detail: details })), summary);
+  }
   const exhausted = { attempts: LOCAL_CONTROL_SCAN_ATTEMPTS };
   const exhaustedSummary = localControlDiagnosticFromJournal(line(exhausted));
   assert.equal(localControlDiagnosticFromJournal(line({ ...context, ...exhausted })), exhaustedSummary);
@@ -1360,6 +1368,8 @@ test("startup socket ownership details require a recognized check and compatible
     {}, { startup_check: context.startup_check }, { ownership_detail: context.ownership_detail },
     { ...context, startup_check: "initial_host\n::error::injected" },
     ...[[], null, "no_owner_observed", ["identity_not_reviewed", "identity_not_reviewed"],
+      ["identity_not_reviewed", "snapd_pin_conflict", "snapd_pin_conflict"],
+      ["identity_not_reviewed", "other_socket_check_failed", "/private/process"],
       ["no_owner_observed", "/private/process"], ["no_owner_observed"], ["retry_inventory_mismatch"]]
       .map((ownership_detail) => ({ ...context, ownership_detail })),
   ]) {
