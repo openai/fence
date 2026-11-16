@@ -2508,9 +2508,10 @@ mod tests {
         // Only signal our own isolated synthetic command; unit tests need no root or hosted layout.
         fn kill_test_group(leader: u32) -> bool {
             Command::new("/bin/sh")
-                .args(["-c", "kill -9 \"-$1\"", "test", &leader.to_string()])
+                .process_group(leader as i32)
+                .args(["-c", "kill -9 0"])
                 .status()
-                .is_ok_and(|status| status.success())
+                .is_ok_and(|status| status.signal() == Some(libc::SIGKILL))
         }
         let attempt = |script: &str, kill: Option<fn(u32) -> bool>| {
             run_fixed_command_attempt(
