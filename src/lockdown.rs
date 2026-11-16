@@ -15,6 +15,7 @@ use crate::runtime::{RuntimeError, TestRuntimeStore};
 use crate::trusted_executable::{TrustedExecutable, TrustedExecutableSet};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -23,8 +24,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -379,16 +381,22 @@ enum SudoRollbackState {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum DockerCheck {
-    Startup(StartupCheck),
+pub(crate) enum DockerCheck<'a> {
+    Startup(StartupCheck, &'a Cell<bool>),
     Resident,
 }
 
 impl SudoRollbackState {
-    fn docker_check(&self, startup_check: StartupCheck) -> DockerCheck {
+    fn docker_check<'a>(
+        &self,
+        startup_check: StartupCheck,
+        retry_used: &'a Cell<bool>,
+    ) -> DockerCheck<'a> {
         match self {
             Self::CommittedNoRestore => DockerCheck::Resident,
-            Self::Unchanged | Self::RollbackAvailable(_) => DockerCheck::Startup(startup_check),
+            Self::Unchanged | Self::RollbackAvailable(_) => {
+                DockerCheck::Startup(startup_check, retry_used)
+            }
         }
     }
 }
@@ -396,6 +404,7 @@ impl SudoRollbackState {
 pub struct SystemLockdownControl {
     executables: Arc<TrustedExecutableSet>,
     sudo_rollback: SudoRollbackState,
+    docker_retry_used: Cell<bool>,
     sudo_source_pins: Option<Vec<SudoPolicySourcePin>>,
     removed_sudo_source_names: Vec<String>,
     containers_masked: bool,
@@ -407,11 +416,24 @@ impl SystemLockdownControl {
         Self {
             executables,
             sudo_rollback: SudoRollbackState::Unchanged,
+            docker_retry_used: Cell::new(false),
             sudo_source_pins: None,
             removed_sudo_source_names: Vec::new(),
             containers_masked: false,
             socket_seals: socket_seals::SocketSeals::default(),
         }
+    }
+
+    fn docker_check(&self, startup_check: StartupCheck) -> DockerCheck<'_> {
+        self.sudo_rollback
+            .docker_check(startup_check, &self.docker_retry_used)
+    }
+
+    pub(crate) fn docker_available(
+        &self,
+        startup_check: StartupCheck,
+    ) -> Result<bool, LockdownError> {
+        runner_docker_available(&self.executables, self.docker_check(startup_check))
     }
 
     pub(crate) fn verify_supported_host_at(
@@ -424,7 +446,7 @@ impl SystemLockdownControl {
             .map_err(|_| unsupported_fingerprint())?;
         self.sudo_source_pins = Some(verify_host_capabilities(
             executables,
-            self.sudo_rollback.docker_check(startup_check),
+            self.docker_check(startup_check),
         )?);
         Ok(())
     }
@@ -451,11 +473,7 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
-        if runner_docker_available(
-            executables,
-            self.sudo_rollback
-                .docker_check(StartupCheck::ContainerAvailability),
-        )? {
+        if self.docker_available(StartupCheck::ContainerAvailability)? {
             Ok(())
         } else {
             Err(LockdownError::new(
@@ -515,11 +533,7 @@ impl LockdownControl for SystemLockdownControl {
     }
 
     fn disable_containers(&mut self) -> Result<(), LockdownError> {
-        if !runner_docker_available(
-            &self.executables,
-            self.sudo_rollback
-                .docker_check(StartupCheck::ContainerDisable),
-        )? {
+        if !self.docker_available(StartupCheck::ContainerDisable)? {
             return Ok(());
         }
         self.containers_masked = true;
@@ -562,9 +576,10 @@ impl LockdownControl for SystemLockdownControl {
         executables
             .verify_all()
             .map_err(|_| unsupported_fingerprint())?;
+        let check = self.docker_check(StartupCheck::ContainerVerification);
         let docker_available = if self.containers_masked {
             if executables.contains(TrustedExecutable::Docker) {
-                let output = runner_docker_ps(executables)?;
+                let output = runner_docker_ps(executables, check)?;
                 if output.status.code().is_none() {
                     return Err(unsupported_fingerprint());
                 }
@@ -573,11 +588,7 @@ impl LockdownControl for SystemLockdownControl {
                 false
             }
         } else {
-            runner_docker_available(
-                executables,
-                self.sudo_rollback
-                    .docker_check(StartupCheck::ContainerVerification),
-            )?
+            runner_docker_available(executables, check)?
         };
         if docker_available {
             return Err(LockdownError::new(
@@ -1050,7 +1061,7 @@ fn verify_runner_identity(
 
 fn verify_host_capabilities(
     executables: &TrustedExecutableSet,
-    check: DockerCheck,
+    check: DockerCheck<'_>,
 ) -> Result<Vec<SudoPolicySourcePin>, LockdownError> {
     let accepted = hosted_runner_fingerprint_requirement().accepted;
     verify_host_identity(&accepted)?;
@@ -1060,7 +1071,7 @@ fn verify_host_capabilities(
     verify_runner_identity(executables, &accepted)?;
     let docker_available = runner_docker_available(executables, check)?;
     if docker_available {
-        let workloads = runner_docker_ps(executables)?;
+        let workloads = runner_docker_ps(executables, check)?;
         if !workloads.status.success() || !workloads.stdout.is_empty() {
             return Err(unsupported_fingerprint());
         }
@@ -1873,16 +1884,35 @@ fn verify_sudo_providers(
     Ok(())
 }
 
-fn runner_docker_ps(executables: &TrustedExecutableSet) -> Result<Output, LockdownError> {
-    runner_command(executables, TrustedExecutable::Docker, &["ps", "--quiet"])
+impl DockerCheck<'_> {
+    fn query(
+        self,
+        mut attempt: impl FnMut() -> Result<Output, DockerProbeError>,
+    ) -> Result<Output, LockdownError> {
+        let mut result = attempt();
+        if let (Self::Startup(_, retry_used), Err(DockerProbeError::RetryableTimeout(_))) =
+            (self, &result)
+            && !retry_used.replace(true)
+        {
+            result = attempt();
+        }
+        result.map_err(DockerProbeError::into_lockdown_error)
+    }
+}
+
+fn runner_docker_ps(
+    executables: &TrustedExecutableSet,
+    check: DockerCheck<'_>,
+) -> Result<Output, LockdownError> {
+    check.query(|| runner_docker_ps_attempt(executables, check))
 }
 
 pub(crate) fn runner_docker_available(
     executables: &TrustedExecutableSet,
-    check: DockerCheck,
+    check: DockerCheck<'_>,
 ) -> Result<bool, LockdownError> {
     if executables.contains(TrustedExecutable::Docker) {
-        let output = runner_docker_ps(executables)?;
+        let output = runner_docker_ps(executables, check)?;
         if output.status.success() {
             return Ok(true);
         }
@@ -1896,7 +1926,7 @@ pub(crate) fn runner_docker_available(
 
 fn verify_container_runtime_unavailable(
     executables: &TrustedExecutableSet,
-    check: DockerCheck,
+    check: DockerCheck<'_>,
 ) -> Result<(), LockdownError> {
     for unit in CONTAINER_UNITS {
         let state = observe_unit(executables, unit)?;
@@ -1927,7 +1957,7 @@ fn verify_container_runtime_unavailable(
     let mut accepted = accepted_local_control_snapshot(&inventory)
         .map_err(|error| LockdownError::new(error.code, error.message))?;
     let (retry, startup_check) = match check {
-        DockerCheck::Startup(check) => {
+        DockerCheck::Startup(check, _) => {
             accepted = accepted.without_container_controls(&host.container_sockets);
             (MissingOwnerRetry::Reviewed(&accepted), Some(check))
         }
@@ -2123,13 +2153,65 @@ enum CommandPrincipal {
     Runner,
 }
 
+#[derive(Debug)]
+enum DockerProbeError {
+    RetryableTimeout(LockdownError),
+    Other(LockdownError),
+}
+
+impl DockerProbeError {
+    fn into_lockdown_error(self) -> LockdownError {
+        match self {
+            Self::RetryableTimeout(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<LockdownError> for DockerProbeError {
+    fn from(error: LockdownError) -> Self {
+        Self::Other(error)
+    }
+}
+
+fn runner_docker_ps_attempt(
+    executables: &TrustedExecutableSet,
+    check: DockerCheck<'_>,
+) -> Result<Output, DockerProbeError> {
+    let command = executables
+        .runner_command(TrustedExecutable::Docker, &["ps", "--quiet"])
+        .map_err(|_| unsupported_fingerprint())?;
+    run_fixed_command_attempt(
+        command,
+        &[],
+        COMMAND_TIMEOUT,
+        TrustedExecutable::Docker,
+        CommandPrincipal::Runner,
+        match check {
+            DockerCheck::Startup(..) => Some(kill_docker_probe_group),
+            DockerCheck::Resident => None,
+        },
+    )
+}
+
 fn run_fixed_command_with_timeout(
-    mut command: Command,
+    command: Command,
     arguments: &[&str],
     timeout: Duration,
     executable: TrustedExecutable,
     principal: CommandPrincipal,
 ) -> Result<Output, LockdownError> {
+    run_fixed_command_attempt(command, arguments, timeout, executable, principal, None)
+        .map_err(DockerProbeError::into_lockdown_error)
+}
+
+fn run_fixed_command_attempt(
+    mut command: Command,
+    arguments: &[&str],
+    timeout: Duration,
+    executable: TrustedExecutable,
+    principal: CommandPrincipal,
+    group_kill: Option<fn(u32) -> bool>,
+) -> Result<Output, DockerProbeError> {
     // Nonblocking sockets let us bound both capture and elapsed time, including when
     // a descendant retains stdout after the direct child exits. Blocking reader
     // threads or wait_with_output could otherwise outlive the deadline.
@@ -2141,6 +2223,9 @@ fn run_fixed_command_with_timeout(
     stderr
         .set_nonblocking(true)
         .map_err(|_| unsupported_fingerprint())?;
+    if group_kill.is_some() {
+        command.process_group(0);
+    }
     let mut child = command
         .args(arguments)
         .env_clear()
@@ -2153,11 +2238,20 @@ fn run_fixed_command_with_timeout(
     // Command retains its configured descriptors after spawn; close those copies.
     drop(command);
     let deadline = Instant::now() + timeout;
+    let mut silent_docker_timeout = false;
+    let mut live_docker_timeout = false;
     let result = (|| {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let (mut out_eof, mut err_eof) = (false, false);
         loop {
             if Instant::now() >= deadline {
+                live_docker_timeout = group_kill.is_some() && matches!(child.try_wait(), Ok(None));
+                silent_docker_timeout = live_docker_timeout
+                    && out.is_empty()
+                    && err.is_empty()
+                    && [&mut stdout, &mut stderr].into_iter().all(|stream| {
+                        matches!(stream.read(&mut [0_u8]), Err(error) if error.kind() == ErrorKind::WouldBlock)
+                    });
                 return Err(LockdownError::new(
                     "lockdown_command_timeout",
                     "fixed lockdown command exceeded its deadline",
@@ -2181,9 +2275,17 @@ fn run_fixed_command_with_timeout(
             }
         }
     })();
-    if let Err(error) = &result {
-        let _ = child.kill();
-        let _ = child.wait();
+    result.map_err(|error| {
+        // The unreaped group leader reserves its PID. Never address the group after wait.
+        let group_killed = live_docker_timeout && group_kill.is_some_and(|kill| kill(child.id()));
+        if !group_killed {
+            let _ = child.kill();
+        }
+        let reaped = if group_kill.is_some() {
+            wait_for_probe_cleanup(&mut child)
+        } else {
+            child.wait().ok()
+        };
         if matches!(
             error.code,
             "lockdown_command_timeout" | "lockdown_command_output_too_large"
@@ -2201,8 +2303,63 @@ fn run_fixed_command_with_timeout(
                 })
             );
         }
+        // Even after sudo exits, another writer can hold a stream or leave buffered
+        // data. A retry requires empty EOF on both, in addition to successful cleanup.
+        if silent_docker_timeout
+            && group_killed
+            && reaped.is_some_and(|status| status.signal() == Some(libc::SIGKILL))
+            && docker_probe_streams_closed(&mut stdout, &mut stderr)
+        {
+            DockerProbeError::RetryableTimeout(error)
+        } else {
+            DockerProbeError::Other(error)
+        }
+    })
+}
+
+const DOCKER_PROBE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+
+fn kill_docker_probe_group(leader: u32) -> bool {
+    let Ok(mut helper) = crate::trusted_executable::spawn_docker_probe_group_kill(leader) else {
+        return false;
+    };
+    if let Some(status) = wait_for_probe_cleanup(&mut helper) {
+        // The helper belongs to the group it signals. It cannot return success
+        // normally, and a usage or permission error does not authorize a retry.
+        return status.signal() == Some(libc::SIGKILL);
     }
-    result
+    let _ = helper.kill();
+    let _ = wait_for_probe_cleanup(&mut helper);
+    false
+}
+
+fn wait_for_probe_cleanup(child: &mut Child) -> Option<ExitStatus> {
+    let deadline = Instant::now() + DOCKER_PROBE_CLEANUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            _ => return None,
+        }
+    }
+}
+
+fn docker_probe_streams_closed(stdout: &mut UnixStream, stderr: &mut UnixStream) -> bool {
+    let deadline = Instant::now() + DOCKER_PROBE_CLEANUP_TIMEOUT;
+    loop {
+        let mut closed = true;
+        for stream in [&mut *stdout, &mut *stderr] {
+            match stream.read(&mut [0_u8]) {
+                Ok(0) => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => closed = false,
+                _ => return false,
+            }
+        }
+        if closed || Instant::now() >= deadline {
+            return closed;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn drain_command_stream(
@@ -2344,6 +2501,55 @@ mod tests {
                 .code,
             "lockdown_command_timeout"
         );
+    }
+
+    #[test]
+    fn only_a_silent_runner_docker_command_killed_at_its_deadline_can_be_retried() {
+        // Only signal our own isolated synthetic command; unit tests need no root or hosted layout.
+        fn kill_test_group(leader: u32) -> bool {
+            Command::new("/bin/sh")
+                .args(["-c", "kill -9 \"-$1\"", "test", &leader.to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        }
+        let attempt = |script: &str, kill: Option<fn(u32) -> bool>| {
+            run_fixed_command_attempt(
+                Command::new("/bin/sh"),
+                &["-c", script],
+                Duration::from_millis(200),
+                TrustedExecutable::Docker,
+                CommandPrincipal::Runner,
+                kill,
+            )
+            .unwrap_err()
+        };
+        let isolated: Option<fn(u32) -> bool> = Some(kill_test_group);
+        for script in ["exec /bin/sleep 2", "/bin/sleep 2 & wait"] {
+            assert!(matches!(
+                attempt(script, isolated),
+                DockerProbeError::RetryableTimeout(error) if error.code == "lockdown_command_timeout"
+            ));
+        }
+        for (script, kill) in [
+            ("printf workload; exec /bin/sleep 2", isolated),
+            ("printf error >&2; exec /bin/sleep 2", isolated),
+            // The direct child exited, but another writer still holds its streams.
+            ("/bin/sleep 2 & exit 0", isolated),
+            ("exec >/dev/null 2>&1; exec /bin/sleep 2", isolated),
+            // An escaped writer cannot be assumed to have stopped with the group.
+            ("/usr/bin/setsid /bin/sleep 2 & wait", isolated),
+            ("exec /bin/sleep 2", None),
+            ("exec /bin/sleep 2", Some(|_| false)),
+        ] {
+            assert!(matches!(
+                attempt(script, kill),
+                DockerProbeError::Other(error) if error.code == "lockdown_command_timeout"
+            ));
+        }
+        assert!(matches!(
+            attempt("printf '%16384s' x", isolated),
+            DockerProbeError::Other(error) if error.code == "lockdown_command_output_too_large"
+        ));
     }
 
     struct FakeControl {
@@ -2929,19 +3135,102 @@ mod tests {
         assert!(!containers_masked);
     }
 
+    fn docker_timeout() -> DockerProbeError {
+        DockerProbeError::RetryableTimeout(LockdownError::new(
+            "lockdown_command_timeout",
+            "timed out",
+        ))
+    }
+
+    fn docker_query_output(code: i32, stdout: &[u8]) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn startup_docker_queries_share_one_retry_and_preserve_returned_evidence() {
+        let state = SudoRollbackState::Unchanged;
+        let used = Cell::new(false);
+        let initial = state.docker_check(StartupCheck::InitialHost, &used);
+        let mut attempts = [
+            Err(docker_timeout()),
+            Ok(docker_query_output(0, b"workload\n")),
+        ]
+        .into_iter();
+        let result = initial.query(|| attempts.next().unwrap()).unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"workload\n");
+
+        let later = state.docker_check(StartupCheck::DockerDns, &used);
+        let mut attempts = [Err(docker_timeout())].into_iter();
+        assert_eq!(
+            later.query(|| attempts.next().unwrap()).unwrap_err().code,
+            "lockdown_command_timeout"
+        );
+    }
+
+    #[test]
+    fn startup_docker_queries_retry_only_an_eligible_timeout() {
+        let used = Cell::new(false);
+        let startup = DockerCheck::Startup(StartupCheck::SetupHost, &used);
+        let mut attempts = [Ok(docker_query_output(1, b""))].into_iter();
+        assert_eq!(
+            startup
+                .query(|| attempts.next().unwrap())
+                .unwrap()
+                .status
+                .code(),
+            Some(1)
+        );
+
+        for code in [
+            "lockdown_command_timeout",
+            "lockdown_command_output_too_large",
+            "unsupported_host_fingerprint",
+        ] {
+            let error = LockdownError::new(code, "ineligible failure");
+            let mut attempts = [Err(DockerProbeError::Other(error.clone()))].into_iter();
+            assert_eq!(
+                startup.query(|| attempts.next().unwrap()).unwrap_err(),
+                error
+            );
+        }
+        assert!(!used.get());
+
+        let mut attempts = [Err(docker_timeout())].into_iter();
+        assert_eq!(
+            DockerCheck::Resident
+                .query(|| attempts.next().unwrap())
+                .unwrap_err()
+                .code,
+            "lockdown_command_timeout"
+        );
+
+        let mut attempts = [Err(docker_timeout()), Err(docker_timeout())].into_iter();
+        assert_eq!(
+            startup.query(|| attempts.next().unwrap()).unwrap_err().code,
+            "lockdown_command_timeout"
+        );
+        assert!(used.get());
+    }
+
     #[test]
     fn docker_checks_switch_to_resident_at_commit_with_or_without_sudo_changes() {
         for mut state in [
             SudoRollbackState::Unchanged,
             SudoRollbackState::RollbackAvailable(vec![test_rollback_source()]),
         ] {
+            let retry_used = Cell::new(false);
             assert!(matches!(
-                state.docker_check(StartupCheck::InitialHost),
-                DockerCheck::Startup(StartupCheck::InitialHost)
+                state.docker_check(StartupCheck::InitialHost, &retry_used),
+                DockerCheck::Startup(StartupCheck::InitialHost, _)
             ));
             commit_no_restore_state(&mut state);
             assert!(matches!(
-                state.docker_check(StartupCheck::ContainerVerification),
+                state.docker_check(StartupCheck::ContainerVerification, &retry_used),
                 DockerCheck::Resident
             ));
         }

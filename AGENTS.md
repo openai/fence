@@ -12,6 +12,8 @@ Mount and roll back only the host resolver target Fence reviewed: a direct regul
 
 Fixed host commands bound combined stdout/stderr capture while running and enforce the deadline even after the direct child exits. Timeout/overflow diagnostics carry only the trusted executable enum, principal, fixed code, and deadline; keep the Action whitelist in sync with native enums. Never infer successful pre-ready cleanup from job-writable state or skip post verification for missing mounts.
 
+Share one retry of the runner's pinned `docker ps --quiet` across all startup checks. Retry only a silent timeout after confirming the first probe stopped. Preserve completed results, partial output, and every caller's workload, access, or absence checks. Resident verification stays single-attempt.
+
 Resident and DNS evidence publication must share the same exclusive, no-follow atomic replacement path. After a failed write or rename, clean up only the pending file created by that attempt; preserve the original error and never clear a pre-existing pending path. Keep each report's existing write-synchronization behavior.
 
 Publish the final resident report before atomically making the complete readiness marker visible. Never replace an existing marker. Successful marker publication is the no-restore boundary; pending-file cleanup cannot turn it into a pre-ready failure. The Action post hook must validate this historical commit and a fresh resident report; neither alone proves both readiness and current health.
