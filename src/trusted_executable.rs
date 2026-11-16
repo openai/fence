@@ -13,7 +13,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 const ROOT_UID: u32 = 0;
 const ROOT_GID: u32 = 0;
@@ -335,6 +335,29 @@ fn validate_metadata(
         return Err(error());
     }
     Ok(())
+}
+
+// Optional timeout cleanup only. An unsupported helper layout never authorizes a retry.
+pub(crate) fn spawn_docker_probe_group_kill(leader: u32) -> Result<Child, TrustedExecutableError> {
+    if leader <= 1 || leader > i32::MAX as u32 {
+        return Err(TrustedExecutableError::unavailable());
+    }
+    for path in ["/", "/usr", "/usr/bin"] {
+        verify_repaired_ancestor(&open_reviewed_directory(path)?)?;
+    }
+    let path = "/usr/bin/kill";
+    let helper = PinnedExecutable::capture(Path::new(path), ROOT_UID, ROOT_GID, 0o755)?;
+    helper
+        .command(path)?
+        // Signal only the helper's own group, even if the original leader has since exited.
+        .process_group(leader as i32)
+        .args(["-KILL", "--", "0"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| TrustedExecutableError::unavailable())
 }
 
 #[derive(Debug)]
