@@ -1,0 +1,194 @@
+name: Verify the Docker startup probe retry
+
+on:
+  push:
+    branches: [verify-pr235-first-step]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  docker-probe:
+    name: ${{ matrix.runner }} ${{ matrix.mode }} Docker timeout ${{ matrix.scenario }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04]
+        mode: [block, audit]
+        scenario: [recover, persistent]
+    steps:
+      - name: Stall the first real Docker verification query
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+        run: |
+          set -eu
+          # Start from a responsive Docker engine before injecting a timeout.
+          timeout 5 /usr/bin/docker ps --quiet >/dev/null
+          sudo install -d -m 0755 /run/fence-probe-canary
+          sudo tee /run/fence-probe-canary/observer.py >/dev/null <<'PY'
+          import os
+          from pathlib import Path
+          import pwd
+          import select
+          import signal
+          import subprocess
+          import sys
+          import time
+
+          work = Path("/run/fence-probe-canary")
+          scenario = sys.argv[1]
+          if scenario not in ("recover", "persistent"):
+              raise SystemExit(1)
+
+          # Only a Docker client belonging to this exact Fence unit counts as an attempt.
+          unit = "fence-probe-canary.service"
+          docker = os.stat("/usr/bin/docker")
+          runner = pwd.getpwnam("runner").pw_uid
+
+
+          def fence_descendant(proc):
+              # sudo may move a child into a PAM scope. Its Fence parent remains in the unit.
+              prefix = f"0::/system.slice/{unit}"
+              for _ in range(12):
+                  cgroup = (proc / "cgroup").read_text().strip()
+                  if cgroup == prefix or cgroup.startswith(prefix + "/"):
+                      return True
+                  parent = next((int(line.split()[1]) for line in (proc / "status").read_text().splitlines() if line.startswith("PPid:")), 0)
+                  if parent <= 1:
+                      return False
+                  proc = Path("/proc") / str(parent)
+              return False
+
+
+          def observed_clients():
+              for proc in Path("/proc").iterdir():
+                  if not proc.name.isdecimal():
+                      continue
+                  try:
+                      if proc.stat().st_uid != runner:
+                          continue
+                      if not os.path.samestat((proc / "exe").stat(), docker):
+                          continue
+                      if (proc / "cmdline").read_bytes().split(b"\0")[1:] != [b"ps", b"--quiet", b""]:
+                          continue
+                      if not fence_descendant(proc):
+                          continue
+                      fd = os.pidfd_open(int(proc.name))
+                      # If a PID disappeared/reused between matching and pinning, skip it.
+                      try:
+                          if os.path.samestat((proc / "exe").stat(), docker) and (proc / "cmdline").read_bytes().split(b"\0")[1:] == [b"ps", b"--quiet", b""]:
+                              yield int(proc.name), fd
+                              continue
+                      finally:
+                          os.close(fd)
+                  except (FileNotFoundError, ProcessLookupError):
+                      continue
+
+
+          def run():
+              deadline = time.monotonic() + 20
+              main_pid = int(subprocess.check_output(
+                  ["systemctl", "show", "--property=MainPID", "--value", "docker.service"], timeout=2))
+              if main_pid < 2:
+                  raise RuntimeError("Docker service is unavailable")
+              daemon = os.pidfd_open(main_pid)
+              target = Path("/usr/bin/dockerd")
+              if target.stat().st_uid != 0 or not target.samefile(f"/proc/{main_pid}/exe"):
+                  raise RuntimeError("Docker service identity could not be verified")
+              clients = {}
+              try:
+                  signal.pidfd_send_signal(daemon, signal.SIGSTOP)
+                  (work / "armed").touch()
+                  while time.monotonic() < deadline:
+                      for pid, fd in observed_clients():
+                          if pid not in clients:
+                              clients[pid] = os.dup(fd)
+                      if len(clients) >= 2:
+                          # Establish that the timed-out client exited before accepting recovery.
+                          first, second, *extra = clients.values()
+                          if extra or not select.select([first], [], [], 0)[0]:
+                              raise RuntimeError("client cleanup or request count did not match")
+                          if scenario == "recover" or select.select([second], [], [], 0)[0]:
+                              return
+                      time.sleep(0.03)
+                  raise RuntimeError("timeout waiting for both fenced requests")
+              finally:
+                  signal.pidfd_send_signal(daemon, signal.SIGCONT)
+                  for fd in clients.values():
+                      os.close(fd)
+                  os.close(daemon)
+
+
+          try:
+              run()
+          except Exception:
+              (work / "failed").touch()
+              raise SystemExit(1)
+          (work / "observed-two").touch()
+          PY
+          # An independent timer resumes Docker even if the observer is killed.
+          sudo systemd-run --quiet --unit=fence-probe-resume --on-active=25s \
+            /usr/bin/systemctl kill --kill-whom=main --signal=CONT docker.service
+          sudo systemd-run --quiet --unit=fence-probe-observer --property=RuntimeMaxSec=23s \
+            /usr/bin/python3 /run/fence-probe-canary/observer.py "$SCENARIO"
+          for ((i=0; i<40; i++)); do
+            if test -f /run/fence-probe-canary/armed; then exit 0; fi
+            sleep 0.1
+          done
+          echo "::error::Could not arm the Docker timeout"
+          exit 1
+
+      - name: Run the candidate with the timed-out query
+        id: fence
+        uses: openai/fence@4e98de28bf7aeaea931c760c8da2eab1c3e1c99d
+        continue-on-error: ${{ matrix.scenario == 'persistent' }}
+        with:
+          invocation_id: probe-canary
+          mode: ${{ matrix.mode }}
+
+      - name: Verify the two attempts and the expected readiness result
+        if: ${{ always() }}
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          FENCE_OUTCOME: ${{ steps.fence.outcome }}
+        run: |
+          set -eu
+          for ((i=0; i<45; i++)); do
+            if test -f /run/fence-probe-canary/observed-two; then break; fi
+            if test -f /run/fence-probe-canary/failed; then break; fi
+            sleep 0.25
+          done
+          test -f /run/fence-probe-canary/observed-two
+          marker=/run/fence/probe-canary/ready.json
+          if [[ "$SCENARIO" == recover ]]; then
+            test "$FENCE_OUTCOME" = success
+            test -f "$marker"
+            echo 'Observed two distinct Docker requests, followed by Fence readiness.'
+          else
+            test "$FENCE_OUTCOME" = failure
+            sudo test ! -e "$marker"
+            sudo journalctl --unit=fence-probe-canary.service --output=cat --no-pager |
+              python3 -c 'import json,sys
+          rows = []
+          for line in sys.stdin:
+              try:
+                  record = json.loads(line)
+              except ValueError:
+                  continue
+              if isinstance(record, dict):
+                  rows.append(record)
+          expected = {"code": "lockdown_command_timeout", "principal": "runner", "executable": "docker", "timeout_ms": 5000}
+          timeouts = sum(row.get("fence_lockdown_command") == expected for row in rows)
+          terminal = any(row.get("command") == "run" and row.get("status") == "error" and row.get("error", {}).get("code") == "lockdown_command_timeout" for row in rows)
+          if timeouts != 2 or not terminal:
+              raise SystemExit("Expected exactly two Docker timeouts and the terminal startup timeout")'
+            echo 'Observed two Docker timeouts, a failed startup and no readiness marker.'
+          fi
