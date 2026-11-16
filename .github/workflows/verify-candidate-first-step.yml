@@ -1,0 +1,128 @@
+name: Verify the Fence candidate before checkout
+
+on:
+  push:
+    branches: [verify-v0.13.1-first-step]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  released-block:
+    name: ${{ matrix.runner }} block canary
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-latest]
+    timeout-minutes: 5
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # Keep this first, with no inputs, just as a consumer would use the published pin.
+      - name: activate released Fence as the first workflow step
+        uses: openai/fence@7cba9082252803421a0e433f29198de6d0063221 # v0.13.1 candidate
+
+      - name: check out repository under Fence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      - name: check protected checkout and policy
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -s README.md
+          curl --disable --noproxy '*' --head --fail --silent --show-error --max-time 10 --output /dev/null https://github.com
+
+          if sudo --non-interactive /usr/bin/true >/dev/null 2>&1; then
+            echo "::error::passwordless sudo was still available"
+            exit 1
+          fi
+          if curl --disable --noproxy '*' --unix-socket /run/docker.sock --silent --max-time 5 --output /dev/null http://localhost/_ping; then
+            echo "::error::the runner could still reach the Docker socket"
+            exit 1
+          fi
+
+          # A connection failure alone proves nothing. Require Fence to report this exact rejected probe.
+          if timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/443' 2>/dev/null; then
+            echo "::error::a connection outside the policy succeeded"
+            exit 1
+          fi
+          report="/run/fence/fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/report.json"
+          for ((i = 0; i < 15; i++)); do
+            if jq -e 'any(.findings[]; [.remote_address, .protocol, .remote_port, .classification] == ["192.0.2.1", "tcp", 443, "rejected"])' "$report" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Fence did not report rejecting the outside-policy connection"
+          exit 1
+
+  released-audit:
+    name: ${{ matrix.runner }} first-step audit canary
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-26.04, ubuntu-latest]
+    timeout-minutes: 5
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: activate released Fence as the first workflow step
+        uses: openai/fence@7cba9082252803421a0e433f29198de6d0063221 # v0.13.1 candidate
+        with:
+          mode: audit
+
+      - name: check out repository under Fence
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: README.md
+          sparse-checkout-cone-mode: false
+
+      - name: check protected checkout and audit observation
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -s README.md
+          sudo --non-interactive /usr/bin/true
+          curl --disable --noproxy '*' --head --fail --silent --show-error --max-time 10 --output /dev/null https://github.com
+
+          directory="/run/fence/fence-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          case "$(jq -er .docker_dns_routing "$directory/dns-report.json")" in
+            local_root_resident_mediator) docker ps --quiet >/dev/null ;;
+            not_present) ;;
+            *) exit 1 ;;
+          esac
+          printf audit >/dev/udp/192.0.2.10/443
+          for ((i = 0; i < 20; i++)); do
+            if jq -e '.resident_health.verification_sequence >= 2 and any(.findings[]; [.remote_address, .protocol, .remote_port, .rule_class, .classification] == ["192.0.2.10", "udp", 443, "undeclared_new_egress", "would_block"])' "$directory/report.json" >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Fence did not report observing the outside-policy connection"
+          exit 1
+
+  verify-released:
+    name: verify first-step canary jobs and final reports
+    needs: [released-block, released-audit]
+    timeout-minutes: 5
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # pin@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: verify completed jobs, post hooks, and downloaded reports
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: script/verify-protected-finalization canary
