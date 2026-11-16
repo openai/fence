@@ -31,6 +31,8 @@ These fields omit socket and process identifiers.
 
 `lockdown_command_timeout` means a trusted host command did not complete within its deadline. `lockdown_command_output_too_large` means the command produced more than 8 KiB total output. The setup error can identify the executable, whether it ran as root or runner, and its deadline in milliseconds; it never includes arguments, paths, or command output. An allowlist change will not fix either error.
 
+For `executable=docker` and `principal=runner`, Fence runs `docker ps --quiet` to check container access. All startup checks share one retry. A probe that times out without producing output or an exit status can be retried once Fence confirms it stopped. Each attempt has five seconds. A timeout never establishes that Docker is disabled.
+
 For more detail, set the `ACTIONS_STEP_DEBUG` repository secret to `true` and rerun the job. Fence does not include raw service journal text, even in debug logs.
 
 ## A Network Request Is Blocked

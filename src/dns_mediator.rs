@@ -2250,17 +2250,16 @@ impl DnsMediationSession {
     fn establish(
         runtime_directory: &Path,
         executables: Arc<TrustedExecutableSet>,
+        lockdown: &SystemLockdownControl,
         scope: DnsEvidenceScope,
         hostname_policy: RuntimeHostnamePolicy,
         materializations: Option<MaterializationSubmitter>,
     ) -> Result<Self, DnsMediationError> {
         let docker_dns = if scope.lockdown_posture() == LockdownPosture::StandardBlock {
             DockerDns::DisabledByPolicy
-        } else if runner_docker_available(
-            &executables,
-            DockerCheck::Startup(StartupCheck::DockerDns),
-        )
-        .map_err(lockdown_error)?
+        } else if lockdown
+            .docker_available(StartupCheck::DockerDns)
+            .map_err(lockdown_error)?
         {
             DockerDns::Mediated
         } else {
@@ -2619,6 +2618,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
     fn establish(
         runtime: R,
         mut mediation: DnsMediationSession,
+        mut lockdown: SystemLockdownControl,
         plan: &PlanData,
         initial_local_control: &LocalControlSnapshot,
     ) -> Result<Self, DnsMediationError> {
@@ -2652,8 +2652,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedAuditSession<R> {
         }
 
         let executables = Arc::clone(&mediation.routing.executables);
-        let mut backend = NativeNftBackend::new(SystemNftExecutor::host(Arc::clone(&executables)));
-        let mut lockdown = SystemLockdownControl::new(executables);
+        let mut backend = NativeNftBackend::new(SystemNftExecutor::host(executables));
         let reader = match NflogReader::bind(Mode::Audit) {
             Ok(reader) => reader,
             Err(error) => {
@@ -2971,6 +2970,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
     fn establish(
         runtime: R,
         mut mediation: DnsMediationSession,
+        mut lockdown: SystemLockdownControl,
         materialization_requests: Receiver<MaterializationRequest>,
         plan: &PlanData,
         scope: DnsBlockRuntimeScope,
@@ -3038,8 +3038,7 @@ impl<R: RuntimeDocumentStore> DnsMediatedBlockSession<R> {
         }
 
         let executables = Arc::clone(&mediation.routing.executables);
-        let mut backend = NativeNftBackend::new(SystemNftExecutor::host(Arc::clone(&executables)));
-        let mut lockdown = SystemLockdownControl::new(executables);
+        let mut backend = NativeNftBackend::new(SystemNftExecutor::host(executables));
         let reader = match NflogReader::bind(Mode::Block) {
             Ok(reader) => reader,
             Err(error) => {
@@ -3582,8 +3581,8 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
         ));
     }
     let hostname_policy = plan.runtime_hostname_policy.clone();
-    let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
-    fingerprint
+    let mut lockdown = SystemLockdownControl::new(Arc::clone(&executables));
+    lockdown
         .verify_supported_host_at(StartupCheck::InitialHost)
         .map_err(lockdown_error)?;
     let initial_local_control = verify_pre_activation_local_control(&executables)?;
@@ -3592,7 +3591,8 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
         (AssuranceStatus::AuditObservationOnly, None) => {
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
-                Arc::clone(&executables),
+                executables,
+                &lockdown,
                 DnsEvidenceScope::ProtectedHostAudit,
                 hostname_policy.clone(),
                 None,
@@ -3600,6 +3600,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             let mut session = DnsMediatedAuditSession::establish(
                 runtime,
                 mediation,
+                lockdown,
                 &plan,
                 &initial_local_control,
             )?;
@@ -3626,7 +3627,8 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
                 materialization_request_channel();
             let mediation = DnsMediationSession::establish(
                 runtime.directory(),
-                Arc::clone(&executables),
+                executables,
+                &lockdown,
                 scope.dns_scope(),
                 hostname_policy.clone(),
                 Some(materialization_submitter),
@@ -3634,6 +3636,7 @@ pub fn run_protected_service(config: &Path) -> Result<(), DnsMediationError> {
             let mut session = DnsMediatedBlockSession::establish(
                 runtime,
                 mediation,
+                lockdown,
                 materialization_requests,
                 &plan,
                 scope,
@@ -3684,8 +3687,8 @@ pub fn run_selected_profile_runtime_test_service(
             "DNS-mediated block evidence accepts only standard block with the reviewed hosted workflow-bootstrap profile and no user allowlist entries",
         ));
     }
-    let mut fingerprint = SystemLockdownControl::new(Arc::clone(&executables));
-    fingerprint
+    let mut lockdown = SystemLockdownControl::new(Arc::clone(&executables));
+    lockdown
         .verify_supported_host_at(StartupCheck::InitialHost)
         .map_err(lockdown_error)?;
     let initial_local_control = verify_pre_activation_local_control(&executables)?;
@@ -3695,6 +3698,7 @@ pub fn run_selected_profile_runtime_test_service(
     let mediation = DnsMediationSession::establish(
         &runtime.directory,
         executables,
+        &lockdown,
         DnsBlockRuntimeScope::TestEvidence.dns_scope(),
         plan.runtime_hostname_policy.clone(),
         Some(materialization_submitter),
@@ -3702,6 +3706,7 @@ pub fn run_selected_profile_runtime_test_service(
     let mut session = DnsMediatedBlockSession::establish(
         runtime,
         mediation,
+        lockdown,
         materialization_requests,
         plan,
         DnsBlockRuntimeScope::TestEvidence,
