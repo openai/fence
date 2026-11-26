@@ -1177,7 +1177,7 @@ expected_action_steps = {
     "action": [
         "checkout",
         "install assembled Action bundle",
-        "prepare regular host resolver fixture",
+        "prepare regular host resolver and noexec launcher state",
         "activate and verify packaged snapd before startup",
         "prepare idle snapd and a one-shot stop for the resident test",
         "observe hosted runner fingerprint candidate",
@@ -1366,12 +1366,21 @@ action_lifecycle = require_step_contract(
     {"run": 'script/test-action-acceptance "${{ matrix.scenario.lifecycle || matrix.scenario.name }}" "${{ matrix.scenario.invocation_id }}"'},
     "Action acceptance native-input lifecycle verification",
 )
-require_step_contract(
+host_fixture = require_step_contract(
     action_job_blocks["action"],
-    "prepare regular host resolver fixture",
+    "prepare regular host resolver and noexec launcher state",
     ["if", "run"],
-    {"if": "matrix.scenario.regular_resolver", "run": "script/test-action-acceptance prepare-regular-resolver"},
-    "Action acceptance regular resolver fixture",
+    {"if": "matrix.scenario.regular_resolver", "run": "|"},
+    "Action acceptance host fixture",
+)
+require(
+    literal_run_body(host_fixture, "Host fixture must use a literal run body")
+    == (
+        "          script/test-action-acceptance prepare-regular-resolver\n"
+        "          script/test-action-acceptance prepare-noexec-state\n"
+        "          echo 'FENCE_TEST_NOEXEC_STATE=true' >> \"$GITHUB_ENV\"\n"
+    ),
+    "Action acceptance must exercise a regular resolver and noexec launcher state together",
 )
 azure_cli = require_step_contract(
     action_job_blocks["action"],
