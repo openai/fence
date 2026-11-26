@@ -6,7 +6,9 @@ Start with the Fence job summary. It lists network activity, blocked destination
 
 Open the Fence setup step and look for `Fence could not verify readiness`. That error names the check the resident reported, when recognized, or says no recognized reason was available. It does not mean protection never started or that cleanup succeeded. Keep the job failed; don't use `continue-on-error` or weaken the policy to get past this check.
 
-If setup says `could not confirm whether the resident started`, Fence doesn't use the service journal to guess why: it could belong to an earlier failed launch. Run Fence only once per job.
+If setup says `protected agent execution denied` or `protected agent execution check unavailable`, Fence stopped before requesting a service launch. The executable lives outside `/run`, which can stay mounted with `noexec`. Don't relax mount restrictions.
+
+If setup says `could not confirm whether the resident started`, Fence requested a launch but could not verify the result. It won't try again or consult a journal that might belong to an earlier launch. Run Fence only once per job.
 
 Check [current and resolved runner compatibility issues](https://github.com/openai/fence/issues?q=is%3Aissue+in%3Atitle+%22Release+canary%22) for the affected version and a verified replacement pin, if available. A green run on a different runner doesn't mean your issue is fixed. Share the Fence version, runner image version, and error code if needed, not private job logs.
 
@@ -21,9 +23,12 @@ When the samples match, socket ownership is the only unavailable input, and the 
 - `no_owner_observed` means Fence found a listener but could not identify any owner.
 - `observed_ownership_incomplete` means Fence found at least one owner but could not verify ownership completely.
 - `identity_not_reviewed` means a listener owner or root container process did not match a reviewed identity.
+- `snapd_pin_conflict` means Fence could not pin a single consistent Snap daemon identity.
+- `snap_socket_check_failed`, `unix_socket_check_failed` and `tcp_socket_check_failed` identify failed checks for a Snap listener, another Unix listener or a TCP listener.
+- `executable_unverified` and `cgroup_unverified` mean Fence could not verify an owner's executable or control group.
 - `retry_inventory_mismatch` means that even after allowing for the missing owner, the inventory did not match what that startup check permits.
 
-These fields omit socket and process identifiers.
+These fields omit socket and process identifiers. Reasons can come from different listeners in the same scan. They don't identify a particular process or grant a retry. When comparing jobs, check the cloud in the setup log as well as the runner image and build.
 
 `dns_proxy_bind_failed` means Fence could not start a required DNS listener. For example, `docker UDP bind: address unavailable` means the required Docker address was not available. If only the error code is shown, the specific listener and reason aren't known. Changing the allowlist will not fix this error.
 

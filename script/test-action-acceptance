@@ -5,12 +5,12 @@ set -euo pipefail
 source script/env "$@"
 
 if [[ $# -lt 1 || $# -gt 2 ]]; then
-  die "usage: script/test-action-acceptance <prepare-regular-resolver|standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit> [invocation-id]"
+  die "usage: script/test-action-acceptance <prepare-regular-resolver|prepare-noexec-state|standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit> [invocation-id]"
 fi
 
 scenario="$1"
 case "$scenario" in
-  prepare-regular-resolver|standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit) ;;
+  prepare-regular-resolver|prepare-noexec-state|standard|standard-opt-out|unsafe-preserve|wildcard-docker|github-artifacts|audit) ;;
   *) die "unknown Action acceptance scenario: $scenario" ;;
 esac
 
@@ -19,6 +19,14 @@ if [[ "${CI:-}" != "true" || "${GITHUB_ACTIONS:-}" != "true" ]]; then
 fi
 if [[ "$PLATFORM" != "linux" || "$ARCH" != "x86_64" ]]; then
   die "Action acceptance requires Linux x86_64"
+fi
+
+if [[ "$scenario" == "prepare-noexec-state" ]]; then
+  [[ "${RUNNER_ENVIRONMENT:-}" == "github-hosted" ]] || die "noexec fixture requires a disposable GitHub-hosted runner"
+  # Restrict only the directory that previously held the executable. Never remount /run.
+  sudo --non-interactive mkdir --mode=0755 -- /run/fence-launcher
+  sudo --non-interactive mount -t tmpfs -o mode=0755,nodev,nosuid,noexec tmpfs /run/fence-launcher
+  exit 0
 fi
 
 if [[ "$scenario" == "prepare-regular-resolver" ]]; then
@@ -134,6 +142,13 @@ assert_action_runtime_immutable() {
   local replacement="$RUNNER_TEMP/fence-action-replacement-$invocation"
   local options
   local target
+
+  if [[ "${FENCE_TEST_NOEXEC_STATE:-}" == true ]]; then
+    options="$(findmnt --noheadings --target "$launcher_integrity" --output OPTIONS)"
+    [[ ",$options," == *,noexec,* ]] || die "launcher state lost its noexec restriction"
+    [[ -x /fence-launcher/bin/fence && /fence-launcher/bin/fence -ef "$action_root/bin/fence" ]] ||
+      die "the mounted Action does not use the protected executable"
+  fi
 
   printf '%s\n' 'replacement' >"$replacement"
   options="$(findmnt --noheadings --mountpoint "$action_root" --output OPTIONS)"
@@ -500,7 +515,7 @@ PY
   probe_https_once https://www.google.com
 fi
 
-if [[ "$scenario" == "standard" ]]; then
+if [[ "$scenario" == "standard" || "${FENCE_TEST_NOEXEC_STATE:-}" == true ]]; then
   assert_action_runtime_immutable
 fi
 

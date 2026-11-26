@@ -1175,10 +1175,33 @@ test("failed launches permit cleanup only for a stopped resident with no readine
   }
 });
 
+test("an execution denial or unavailable preflight prevents any launch or journal query", (t: any) => {
+  const paths = runtimePaths("action-denied");
+  const spawn = t.mock.method(require("node:child_process"), "spawnSync", () => {});
+  for (const [code, expected] of [
+    ["EACCES", "protected agent execution denied"],
+    ["ENOENT", "protected agent execution check unavailable"],
+  ]) {
+    const access = t.mock.method(fs, "accessSync", () => {
+      throw Object.assign(new Error("private_fixture_value"), { code });
+    });
+    const error = captureStderr(() => assert.throws(() => launchResidentService(paths), (failure: unknown) => {
+      emitError(failure, paths.unit);
+      return true;
+    }));
+    assert.deepEqual(access.mock.calls[0].arguments, ["/fence-launcher/bin/fence", fs.constants.X_OK]);
+    assert.ok(error.includes(`${expected}. No resident launch was attempted.`));
+    assert.doesNotMatch(error, /private_fixture_value/);
+    access.mock.restore();
+  }
+  assert.equal(spawn.mock.callCount(), 0);
+});
+
 test("an unconfirmed launch does not read or report a previous failure from the same unit", (t: any) => {
   const paths = runtimePaths("action-previously-failed");
   const previous = { schema_version: 1, command: "run", status: "error", error: { code: "dns_block_prehydration_failed" } };
   const calls: string[] = [];
+  t.mock.method(fs, "accessSync", () => {});
   t.mock.method(require("node:child_process"), "spawnSync", (executable: string) => {
     calls.push(executable);
     if (executable === "/usr/bin/journalctl") return { status: 0, stdout: JSON.stringify(previous) };
@@ -1188,7 +1211,7 @@ test("an unconfirmed launch does not read or report a previous failure from the 
 
   let error = "";
   const output = captureStdout(() => {
-    error = captureStderr(() => assert.throws(() => launchResidentService(residentServiceArgs(paths)), (failure: unknown) => {
+    error = captureStderr(() => assert.throws(() => launchResidentService(paths), (failure: unknown) => {
       emitError(failure, paths.unit);
       return true;
     }));
@@ -1351,6 +1374,17 @@ test("startup socket ownership details require a recognized check and compatible
   assert.equal(localControlDiagnosticFromJournal(line({
     startup_check: "final_readiness", ownership_detail: ["observed_ownership_incomplete", "identity_not_reviewed"],
   })), summary + "; startup_check=final_readiness; ownership_detail=observed_ownership_incomplete,identity_not_reviewed");
+  const identityDetails = [
+    "snapd_pin_conflict", "snap_socket_check_failed", "unix_socket_check_failed", "tcp_socket_check_failed",
+    "executable_unverified", "cgroup_unverified",
+  ];
+  for (const details of [...identityDetails.map((reason) => [reason]), identityDetails]) {
+    const ownership_detail = ["identity_not_reviewed", ...details];
+    assert.equal(localControlDiagnosticFromJournal(line({
+      startup_check: "initial_inventory", ownership_detail, path: "/private/process",
+    })), summary + "; startup_check=initial_inventory; ownership_detail=" + ownership_detail.join(","));
+    assert.equal(localControlDiagnosticFromJournal(line({ ...context, ownership_detail: details })), summary);
+  }
   const exhausted = { attempts: LOCAL_CONTROL_SCAN_ATTEMPTS };
   const exhaustedSummary = localControlDiagnosticFromJournal(line(exhausted));
   assert.equal(localControlDiagnosticFromJournal(line({ ...context, ...exhausted })), exhaustedSummary);
@@ -1360,6 +1394,8 @@ test("startup socket ownership details require a recognized check and compatible
     {}, { startup_check: context.startup_check }, { ownership_detail: context.ownership_detail },
     { ...context, startup_check: "initial_host\n::error::injected" },
     ...[[], null, "no_owner_observed", ["identity_not_reviewed", "identity_not_reviewed"],
+      ["identity_not_reviewed", "snapd_pin_conflict", "snapd_pin_conflict"],
+      ["identity_not_reviewed", "tcp_socket_check_failed", "/private/process"],
       ["no_owner_observed", "/private/process"], ["no_owner_observed"], ["retry_inventory_mismatch"]]
       .map((ownership_detail) => ({ ...context, ownership_detail })),
   ]) {
@@ -1471,7 +1507,7 @@ test("derives only bounded fixed runtime paths", () => {
     unit: "fence-action-test.service",
     launcherHostClaim: "/run/fence-launcher/.active",
     launcherDirectory: "/run/fence-launcher/action-test",
-    launcherActionDirectory: "/run/fence-launcher/action-test/action",
+    launcherActionDirectory: "/fence-launcher",
     launcherIntegrity: "/run/fence-launcher/action-test/integrity.json",
   });
   assert.throws(() => runtimePaths(".active"), /slug grammar/);
@@ -1488,7 +1524,7 @@ test("launches only the protected root-owned agent copy", () => {
     "--property=Type=exec",
     "--unit",
     "fence-action-test.service",
-    "/run/fence-launcher/action-test/action/bin/fence",
+    "/fence-launcher/bin/fence",
     "run",
     "--config",
     "/run/fence/action-test/config.json",
@@ -1496,8 +1532,35 @@ test("launches only the protected root-owned agent copy", () => {
   assert.equal(args.includes(path.join(__dirname, "bin", "fence")), false);
 });
 
+test("the mounted runtime must still be the protected copy under a trusted parent", (t: any) => {
+  const registered = "/registered/action";
+  const protectedRoot = runtimePaths("action-test").launcherActionDirectory;
+  let parent = { uid: 0, mode: 0o755, isDirectory: () => true };
+  let replaced = "";
+  t.mock.method(fs, "lstatSync", (file: string) => {
+    if (file === "/") return parent;
+    const base = file.startsWith(registered) ? registered : protectedRoot;
+    const relative = path.relative(base, file);
+    const directory = relative === "" || relative === "bin";
+    return {
+      mode: directory || relative === "bin/fence" ? 0o555n : 0o444n,
+      uid: 0n, dev: 1n, ino: file === replaced ? 2n : 1n,
+      isSymbolicLink: () => false, isDirectory: () => directory, isFile: () => !directory,
+    };
+  });
+  validateProtectedActionRuntime(registered);
+  for (replaced of [protectedRoot, path.join(protectedRoot, "bin/fence")]) {
+    assert.throws(() => validateProtectedActionRuntime(registered), /does not match the protected copy/);
+  }
+  for (const unsafe of [{ uid: 1000 }, { mode: 0o775 }, { mode: 0o757 }]) {
+    parent = { uid: 0, mode: 0o755, isDirectory: () => true, ...unsafe };
+    assert.throws(() => validateProtectedActionRuntime(protectedRoot), /parent is unsafe/);
+  }
+});
+
 test("binds launcher integrity to the exact Action runtime file set", () => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "fence-action-runtime-"));
+  const protectedRoot = runtimePaths("action-test").launcherActionDirectory;
   try {
     fs.mkdirSync(path.join(temporary, "bin"));
     for (const relativePath of ACTION_RUNTIME_FILES) {
@@ -1516,7 +1579,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
     const integrity = launcherIntegrityDocument(
       "action-test",
       "/opt/actions/fence/action",
-      "/run/fence-launcher/action-test/action",
+      protectedRoot,
       files,
       pathGuards,
     );
@@ -1524,7 +1587,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
       integrity,
       "action-test",
       "/opt/actions/fence/action",
-      "/run/fence-launcher/action-test/action",
+      protectedRoot,
       files,
       pathGuards,
     );
@@ -1533,7 +1596,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
         { ...integrity, runtime_digest: "0".repeat(64) },
         "action-test",
         "/opt/actions/fence/action",
-        "/run/fence-launcher/action-test/action",
+        protectedRoot,
         files,
         pathGuards,
       ),
@@ -1547,7 +1610,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
         integrity,
         "action-test",
         "/opt/actions/fence/action",
-        "/run/fence-launcher/action-test/action",
+        protectedRoot,
         modified,
         pathGuards,
       ),
@@ -1558,7 +1621,7 @@ test("binds launcher integrity to the exact Action runtime file set", () => {
         integrity,
         "action-test",
         "/opt/actions/fence/action",
-        "/run/fence-launcher/action-test/action",
+        protectedRoot,
         files,
         [{ ...pathGuards[0], inode: "3" }],
       ),

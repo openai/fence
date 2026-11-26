@@ -24,6 +24,7 @@ const {
   validateActionPathGuardMount,
   validateInlineConfig,
   validateLauncherIntegrity,
+  validateLauncherParent,
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,
   validateReady,
@@ -60,6 +61,7 @@ let readinessObserved = false;
 let launcherHostClaimCreated = false;
 let launcherMountUncertain = false;
 let launcherDirectoryCreated = false;
+let protectedCopyIdentity: { dev: bigint; ino: bigint } | undefined;
 let runtimeDirectoryCreated = false;
 
 class ResidentReadinessError extends Error {}
@@ -181,8 +183,13 @@ const STARTUP_OWNERSHIP_CHECKS = new Set([
   "initial_host", "initial_inventory", "setup_host", "container_disable", "container_verification",
   "post_lockdown_baseline", "final_readiness", "docker_dns", "container_availability",
 ]);
+const OWNERSHIP_IDENTITY_DETAILS = new Set([
+  "snapd_pin_conflict", "snap_socket_check_failed", "unix_socket_check_failed", "tcp_socket_check_failed",
+  "executable_unverified", "cgroup_unverified",
+]);
 const OWNERSHIP_DETAILS = new Set([
   "no_owner_observed", "observed_ownership_incomplete", "identity_not_reviewed", "retry_inventory_mismatch",
+  ...OWNERSHIP_IDENTITY_DETAILS,
 ]);
 
 function localControlDiagnosticFromJournal(output: string, expectedStatus?: string): string | undefined {
@@ -204,6 +211,8 @@ function localControlDiagnosticFromJournal(output: string, expectedStatus?: stri
         ownership_detail.length > 0 && ownership_detail.length <= OWNERSHIP_DETAILS.size &&
         ownership_detail.every((reason) => OWNERSHIP_DETAILS.has(reason)) &&
         new Set(ownership_detail).size === ownership_detail.length &&
+        (ownership_detail.includes("identity_not_reviewed") ||
+          !ownership_detail.some((reason) => OWNERSHIP_IDENTITY_DETAILS.has(reason))) &&
         ownership_detail.includes("retry_inventory_mismatch") ===
           (ownership_detail.includes("no_owner_observed") && diagnostic.attempts < LOCAL_CONTROL_SCAN_ATTEMPTS)
       ) {
@@ -455,6 +464,7 @@ function installProtectedActionRuntime(
   sourceFiles: ReturnType<typeof actionRuntimeFileDigests>,
   sourceManifest: any,
 ): void {
+  validateLauncherParent();
   createOrValidateRootDirectory(path.dirname(paths.launcherHostClaim));
   if (pathEntryExists(paths.launcherHostClaim)) {
     throw new Error("Fence already owns this runner; run Fence only once per job");
@@ -465,9 +475,15 @@ function installProtectedActionRuntime(
   if (pathEntryExists(paths.directory) || pathEntryExists(paths.launcherDirectory)) {
     throw new Error("Fence invocation directory already exists");
   }
+  if (pathEntryExists(paths.launcherActionDirectory)) {
+    throw new Error("Fence protected Action directory already exists");
+  }
   createInvocationDirectory(paths.launcherDirectory);
   launcherDirectoryCreated = true;
   assertRootDirectory(paths.launcherDirectory);
+  createInvocationDirectory(paths.launcherActionDirectory);
+  assertRootDirectory(paths.launcherActionDirectory);
+  protectedCopyIdentity = fs.lstatSync(paths.launcherActionDirectory, { bigint: true });
   run("/usr/bin/sudo", [
     "/usr/bin/install",
     "-d",
@@ -598,7 +614,25 @@ function residentServiceArgs(paths: ReturnType<typeof runtimePaths>): string[] {
   ];
 }
 
-function launchResidentService(args: string[]): void {
+function launchResidentService(paths: ReturnType<typeof runtimePaths>): void {
+  const protectedBinary = path.join(paths.launcherActionDirectory, "bin", "fence");
+  try {
+    // On Linux X_OK checks the effective mount's noexec flag as well as the mode.
+    fs.accessSync(protectedBinary, fs.constants.X_OK);
+  } catch (error) {
+    const reason = (error as NodeJS.ErrnoException).code === "EACCES"
+      ? "protected agent execution denied"
+      : "protected agent execution check unavailable";
+    throw new Error(`${reason}. No resident launch was attempted. Keep this job failed.`);
+  }
+  const args = residentServiceArgs(paths);
+  log.info("🚀 Starting resident service");
+  log.debugGroup("Fence debug: service launch", [
+    `executable=/usr/bin/sudo`,
+    `protected_binary=${protectedBinary}`,
+    `args=${args.join(" ")}`,
+    `child_timeout_ms=${CHILD_TIMEOUT_MS}`,
+  ]);
   serviceLaunchAttempted = true;
   try {
     run("/usr/bin/sudo", args);
@@ -660,6 +694,17 @@ function cleanupLauncherBeforeReadiness(): void {
       run("/usr/bin/sudo", ["/usr/bin/umount", guard]);
     }
     protectedActionPathGuards = [];
+    if (protectedCopyIdentity) {
+      validateLauncherParent();
+      const current = fs.lstatSync(paths.launcherActionDirectory, { bigint: true });
+      if (current.dev !== protectedCopyIdentity.dev || current.ino !== protectedCopyIdentity.ino) {
+        throw new Error("Fence protected Action directory changed before cleanup");
+      }
+      run("/usr/bin/sudo", [
+        "/usr/bin/rm", "--recursive", "--force", "--one-file-system", paths.launcherActionDirectory,
+      ]);
+      protectedCopyIdentity = undefined;
+    }
     if (runtimeDirectoryCreated) {
       run("/usr/bin/sudo", [
         "/usr/bin/rm",
@@ -799,16 +844,7 @@ function main(): void {
   appendState("dns_report_path", paths.dnsReport);
   appendState("ready_path", paths.ready);
   appendState("launcher_integrity_path", paths.launcherIntegrity);
-  log.info("🚀 Starting resident service");
-  const protectedBinary = path.join(paths.launcherActionDirectory, "bin", "fence");
-  const serviceArgs = residentServiceArgs(paths);
-  log.debugGroup("Fence debug: service launch", [
-    `executable=/usr/bin/sudo`,
-    `protected_binary=${protectedBinary}`,
-    `args=${serviceArgs.join(" ")}`,
-    `child_timeout_ms=${CHILD_TIMEOUT_MS}`,
-  ]);
-  launchResidentService(serviceArgs);
+  launchResidentService(paths);
   const report = waitForReady(paths);
   readinessObserved = true;
   log.ready(report);
