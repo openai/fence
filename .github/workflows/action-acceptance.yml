@@ -253,9 +253,12 @@ jobs:
           name: ${{ needs.prepare-candidate.outputs.artifact_name }}
           path: action
 
-      - name: prepare regular host resolver fixture
+      - name: prepare regular host resolver and noexec launcher state
         if: matrix.scenario.regular_resolver
-        run: script/test-action-acceptance prepare-regular-resolver
+        run: |
+          script/test-action-acceptance prepare-regular-resolver
+          script/test-action-acceptance prepare-noexec-state
+          echo 'FENCE_TEST_NOEXEC_STATE=true' >> "$GITHUB_ENV"
 
       - name: activate and verify packaged snapd before startup
         if: matrix.scenario.snapd == 'active'

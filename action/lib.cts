@@ -195,6 +195,8 @@ const RELEASE_TAG = /^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?
 const SHA256 = /^[0-9a-f]{64}$/;
 const RUNTIME_ROOT = "/run/fence";
 const LAUNCHER_RUNTIME_ROOT = "/run/fence-launcher";
+// /run may forbid execution. The host claim and launch evidence stay there.
+const PROTECTED_ACTION_ROOT = "/fence-launcher";
 const ACTION_RUNTIME_FILES = [
   "bin/fence",
   "bundle-manifest.json",
@@ -946,7 +948,7 @@ function runtimePaths(invocationId: unknown): RuntimePaths {
     unit: `fence-${invocationId}.service`,
     launcherHostClaim: path.join(LAUNCHER_RUNTIME_ROOT, ".active"),
     launcherDirectory,
-    launcherActionDirectory: path.join(launcherDirectory, "action"),
+    launcherActionDirectory: PROTECTED_ACTION_ROOT,
     launcherIntegrity: path.join(launcherDirectory, "integrity.json"),
   };
 }
@@ -1152,7 +1154,15 @@ function readLauncherIntegrity(file: string): any {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
+function validateLauncherParent(): void {
+  const parent = fs.lstatSync("/");
+  if (!parent.isDirectory() || parent.uid !== 0 || (parent.mode & 0o022) !== 0) {
+    fail("Fence protected Action parent is unsafe");
+  }
+}
+
 function validateProtectedActionRuntime(actionRoot: string): void {
+  validateLauncherParent();
   const expectedModes = new Map<string, number>([
     [".", 0o555],
     ["bin", 0o555],
@@ -1165,15 +1175,21 @@ function validateProtectedActionRuntime(actionRoot: string): void {
   ]);
   for (const [relativePath, expectedMode] of expectedModes) {
     const item = relativePath === "." ? actionRoot : path.join(actionRoot, relativePath);
-    const stat = fs.lstatSync(item);
+    const stat = fs.lstatSync(item, { bigint: true });
     const expectsDirectory = relativePath === "." || relativePath === "bin";
     if (
       stat.isSymbolicLink() ||
-      stat.uid !== 0 ||
-      (stat.mode & 0o777) !== expectedMode ||
+      stat.uid !== 0n ||
+      (stat.mode & 0o7777n) !== BigInt(expectedMode) ||
       (expectsDirectory ? !stat.isDirectory() : !stat.isFile())
     ) {
       fail(`Fence protected Action runtime has unsafe ownership or mode: ${relativePath}`);
+    }
+    if (actionRoot !== PROTECTED_ACTION_ROOT) {
+      const source = fs.lstatSync(path.join(PROTECTED_ACTION_ROOT, relativePath), { bigint: true });
+      if (source.dev !== stat.dev || source.ino !== stat.ino) {
+        fail("Fence registered Action mount does not match the protected copy");
+      }
     }
   }
 }
@@ -3144,6 +3160,7 @@ module.exports = {
   validatedActionRuntimeSnapshot,
   validateInlineConfig,
   validateLauncherIntegrity,
+  validateLauncherParent,
   validateActionPathGuardMount,
   validateProtectedActionRuntime,
   validateReadOnlyActionMount,

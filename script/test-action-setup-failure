@@ -36,6 +36,24 @@ if [[ -e /run/fence/Action_Invalid || -e /run/fence/action-invalid ]]; then
   die "Action setup-failure evidence requires no preexisting invalid runtime directory"
 fi
 
+script/test-action-acceptance prepare-noexec-state
+# Verify that even a mode-0555 file is denied execute access here.
+sudo --non-interactive install -m 0555 /dev/null /run/fence-launcher/probe
+node -e 'const fs = require("node:fs"); require("node:assert/strict").throws(
+  () => fs.accessSync("/run/fence-launcher/probe", fs.constants.X_OK), { code: "EACCES" })'
+sudo --non-interactive rm -- /run/fence-launcher/probe
+
+sudo --non-interactive mkdir --mode=0755 -- /fence-launcher
+existing_copy="$(stat --format='%d:%i:%u:%a' /fence-launcher)"
+if INPUT_INVOCATION_ID=action-existing-copy GITHUB_STATE="$temporary_directory/existing-state" \
+  GITHUB_STEP_SUMMARY="$summary" node action/main.cts >"$stdout" 2>"$stderr"; then
+  die "Action took over an existing protected runtime"
+fi
+grep -Fq "Fence protected Action directory already exists" "$stderr"
+[[ "$(stat --format='%d:%i:%u:%a' /fence-launcher)" == "$existing_copy" && ! -e /run/fence-launcher/.active ]] ||
+  die "Action changed a pre-existing protected runtime or retained its claim"
+sudo --non-interactive rmdir -- /fence-launcher
+
 # A container-free host checks socket owners during its initial Docker absence proof.
 ownership_check=initial_host
 if [[ -x /usr/bin/docker ]] && timeout 5 /usr/bin/docker ps --quiet >/dev/null 2>&1; then
@@ -65,7 +83,7 @@ wait "$ownership_pid"
 [[ "$ownership_exit" == 1 && ! -e "/run/fence/$ownership_invocation/ready.json" ]] ||
   die "Action setup unexpectedly accepted an unreviewed socket owner"
 grep -Fq "Fence resident service exited while the Action was waiting for readiness" "$stdout"
-grep -Eq "^::error::Fence could not verify readiness: .*unavailable=socket_ownership; bounds=none; startup_check=$ownership_check; ownership_detail=([a-z_]+,)*identity_not_reviewed(,[a-z_]+)* \(local_control_inventory_unavailable\)" "$stderr" ||
+grep -Eq "^::error::Fence could not verify readiness: .*unavailable=socket_ownership; bounds=none; startup_check=$ownership_check; ownership_detail=([a-z_]+,)*identity_not_reviewed(,[a-z_]+)*,tcp_socket_check_failed,executable_unverified(,[a-z_]+)* \(local_control_inventory_unavailable\)" "$stderr" ||
   die "Action setup did not report the unreviewed owner in the expected startup check"
 
 if INPUT_CONFIG='{"schema_version":1,"mode":"audit","invocation_id":"Action_Invalid","allowlist":[]}' \
@@ -372,6 +390,7 @@ if [[ -e "/run/fence/$runtime_failure_invocation" || -e "/run/fence-launcher/$ru
   die "Action runtime-failure evidence left provisional runtime state"
 fi
 [[ ! -e /run/fence-launcher/.active ]] || die "failed Fence startup retained its provisional host claim"
+[[ ! -e /fence-launcher && ! -L /fence-launcher ]] || die "failed Fence startup retained its executable copy"
 resolver_after="$(host_resolver_identity)"
 [[ "$resolver_after" == "$resolver_before" ]] || die "failed Fence startup did not restore the original regular host resolver"
 if sudo --non-interactive /usr/sbin/nft list table inet fence_v0 >/dev/null 2>&1; then
